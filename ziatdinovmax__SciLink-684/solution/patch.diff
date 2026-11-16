@@ -1,0 +1,507 @@
+diff --git a/scilink/executors.py b/scilink/executors.py
+index d43d5e1a..1fabe88e 100644
+--- a/scilink/executors.py
++++ b/scilink/executors.py
+@@ -15,10 +15,24 @@
+ 
+ # Global registry of active subprocesses, keyed by thread ID.
+ # Accessible from any thread so the UI stop handler can kill them.
+-_active_subprocesses_lock = threading.Lock()
++# Re-entrant: the SIGHUP/SIGTERM handler below takes it on the main thread,
++# which may be holding it (inside _register_subprocess) when the signal lands.
++_active_subprocesses_lock = threading.RLock()
+ _active_subprocesses: dict[int, set[subprocess.Popen]] = {}
+ 
+ 
++def _forget_inherited_subprocesses() -> None:
++    """In a forked child the registry holds the PARENT's scripts; a SIGTERM
++    to the child must not end them."""
++    global _active_subprocesses_lock
++    _active_subprocesses_lock = threading.RLock()
++    _active_subprocesses.clear()
++
++
++if hasattr(os, "register_at_fork"):
++    os.register_at_fork(after_in_child=_forget_inherited_subprocesses)
++
++
+ def _register_subprocess(proc: subprocess.Popen) -> None:
+     """Register a subprocess so it can be killed when the user clicks Stop."""
+     tid = threading.get_ident()
+@@ -37,6 +51,142 @@ def _unregister_subprocess(proc: subprocess.Popen) -> None:
+                 del _active_subprocesses[tid]
+ 
+ 
++# A generated script runs in its own session and process group (POSIX), so a
++# timeout or a Stop can end the whole tree it started: a loky or
++# multiprocessing pool for per-pixel fits, a solver it shelled out to.
++# Killing only the direct child left those grandchildren running, holding
++# memory and CPU after the analysis had moved on.
++_NEW_SESSION = os.name == "posix"
++
++
++def _mark_own_group(proc: subprocess.Popen) -> subprocess.Popen:
++    """Record that ``proc`` was started in a new session by us, so its
++    process group id is its pid by construction."""
++    if _NEW_SESSION:
++        proc._scilink_own_group = True       # type: ignore[attr-defined]
++    return proc
++
++
++def _group_of(proc: subprocess.Popen) -> "int | None":
++    """The process group to signal for ``proc``, or None to signal it alone.
++
++    A group we created is ``proc.pid``, known without asking: on macOS
++    ``getpgid`` of a script that has already exited (a zombie whose helper
++    still holds its pipes) raises ``ESRCH``, which is exactly the case where
++    the group matters. The id cannot name someone else's group while the
++    leader is unreaped or any member of the group is alive. For a process
++    we did not start, the group is used only if it leads its own.
++    """
++    if not _NEW_SESSION:
++        return None
++    if getattr(proc, "_scilink_own_group", False):
++        return proc.pid
++    try:
++        pgid = os.getpgid(proc.pid)
++        if pgid == proc.pid and pgid != os.getpgrp():
++            return pgid
++    except OSError:              # already gone and reaped
++        pass
++    return None
++
++
++def _end_leftover_group(proc: subprocess.Popen) -> None:
++    """After a script exited on its own: end anything it left running in its
++    group (a detached helper that does not hold its pipes). A generated
++    script has no business leaving a daemon behind."""
++    if _NEW_SESSION and getattr(proc, "_scilink_own_group", False):
++        try:
++            os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
++        except OSError:          # the group is already empty
++            pass
++
++
++def _kill_process_tree(proc: subprocess.Popen, grace: float = 2.0) -> None:
++    """SIGTERM the script's process group, give it ``grace`` seconds, then
++    SIGKILL whatever is left of the group.
++
++    The group is signalled only when the process leads its own group;
++    otherwise, and off POSIX, only the process itself is signalled, so a
++    caller's own group is never hit.
++    """
++    group = _group_of(proc)
++
++    def send(sig):
++        if group is not None:
++            try:
++                os.killpg(group, sig)
++                return
++            except OSError:      # the group is empty
++                pass
++        try:
++            proc.send_signal(sig)
++        except OSError:
++            pass
++
++    if proc.poll() is None:
++        send(signal.SIGTERM)
++        try:
++            proc.wait(timeout=grace)
++        except subprocess.TimeoutExpired:
++            pass
++    # Always: the leader may have exited on SIGTERM while its pool workers
++    # ignored it.
++    send(getattr(signal, "SIGKILL", signal.SIGTERM))
++    try:
++        proc.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        pass
++
++
++def _kill_all_registered() -> None:
++    """At interpreter exit: a script in its own session no longer gets the
++    terminal's SIGINT or SIGHUP, so end the ones still registered."""
++    with _active_subprocesses_lock:
++        procs = [p for ps in _active_subprocesses.values() for p in ps]
++        _active_subprocesses.clear()
++    for proc in procs:
++        try:
++            _kill_process_tree(proc, grace=0.5)
++        except Exception:  # noqa: BLE001 - best effort at exit
++            pass
++
++
++import atexit as _atexit
++_atexit.register(_kill_all_registered)
++
++
++def _on_fatal_signal(signum, frame):  # noqa: ARG001 - signal handler signature
++    """SIGHUP (the terminal closed, an SSH session dropped) and SIGTERM end
++    the interpreter WITHOUT running atexit, and a script in its own session
++    does not receive them. End the registered scripts, then die of the same
++    signal as before."""
++    try:
++        _kill_all_registered()
++    finally:
++        signal.signal(signum, signal.SIG_DFL)
++        os.kill(os.getpid(), signum)
++
++
++def _install_fatal_signal_cleanup() -> None:
++    """Only on the main thread (signal handlers can be set nowhere else) and
++    only where nobody else handles the signal: a web server's or uvicorn's
++    own handlers stay untouched, and they shut down through atexit."""
++    if not _NEW_SESSION or threading.current_thread() is not threading.main_thread():
++        return
++    for name in ("SIGHUP", "SIGTERM"):
++        sig = getattr(signal, name, None)
++        if sig is None:
++            continue
++        try:
++            if signal.getsignal(sig) is signal.SIG_DFL:
++                signal.signal(sig, _on_fatal_signal)
++        except (ValueError, OSError):
++            pass
++
++
++_install_fatal_signal_cleanup()
++
++
+ def kill_subprocesses_for_thread(tid: int) -> None:
+     """Terminate all subprocesses registered by a given thread — including
+     subprocesses of fan-out worker threads registered (via
+@@ -52,15 +202,7 @@ def kill_subprocesses_for_thread(tid: int) -> None:
+         procs = [p for t in target_tids
+                  for p in _active_subprocesses.pop(t, [])]
+     for proc in procs:
+-        try:
+-            proc.terminate()          # SIGTERM first
+-            try:
+-                proc.wait(timeout=2)  # Give it a moment to clean up
+-            except subprocess.TimeoutExpired:
+-                proc.kill()           # SIGKILL if still alive
+-                proc.wait()
+-        except OSError:
+-            pass  # Already dead
++        _kill_process_tree(proc)      # SIGTERM, a moment to clean up, SIGKILL
+ 
+ # Global cache for sandbox approval (shared across all agents in session)
+ _GLOBAL_SANDBOX_APPROVED: bool = False
+@@ -441,15 +583,22 @@ def execute_script(self, script_content: str, working_dir: str = None,
+                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                 text=True, env=env, cwd=script_dir,
+                 preexec_fn=_sandbox_preexec(),
++                start_new_session=_NEW_SESSION,
+             )
++            _mark_own_group(proc)
+             # Register so OutputCapture.kill_subprocesses() can terminate it.
+             _register_subprocess(proc)
+             try:
+                 stdout, stderr = proc.communicate(timeout=effective_timeout)
++                _end_leftover_group(proc)
+             except subprocess.TimeoutExpired:
+-                proc.kill()
+-                proc.wait()
++                _kill_process_tree(proc, grace=0.5)
+                 return {"status": "error", "message": f"Script execution timed out after {effective_timeout} seconds."}
++            except BaseException:
++                # Interrupted while waiting (Ctrl-C, a stop): the script is in
++                # its own session and would otherwise outlive us.
++                _kill_process_tree(proc, grace=0.5)
++                raise
+             finally:
+                 _unregister_subprocess(proc)
+ 
+@@ -485,7 +634,9 @@ class WarmScriptExecutor(ScriptExecutor):
+     - each run has its own working directory, and the caller's is never touched;
+     - the timeout is hard: the worker is killed and replaced, as a fresh process
+       would be;
+-    - the user's Stop reaches it (the worker is registered like any subprocess);
++    - a chat turn's Stop reaches it (the worker is registered like any
++      subprocess); the Live tab's Stop only sets its loop's event, so a replay
++      already running there finishes or times out;
+     - stdout / stderr are captured at the file-descriptor level, so the result
+       has the same shape and the same success rule (exit code 0).
+ 
+@@ -512,7 +663,8 @@ def _start(self) -> bool:
+                 [sys.executable, "-u", worker], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                 stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                 env=sandbox_env({"MP_API_KEY": self.mp_api_key} if self.mp_api_key else None),
+-                preexec_fn=_sandbox_preexec())
++                preexec_fn=_sandbox_preexec(), start_new_session=_NEW_SESSION)
++            _mark_own_group(self._proc)
+             ready = self._read_line(30.0)
+             self._runs = 0
+             return bool(ready and json.loads(ready).get("ready"))
+@@ -549,8 +701,7 @@ def close(self) -> None:
+                     proc.stdin.flush()
+                     proc.wait(timeout=2)
+                 except Exception:  # noqa: BLE001
+-                    proc.kill()
+-                    proc.wait(timeout=5)
++                    _kill_process_tree(proc, grace=0.5)
+         except Exception:  # noqa: BLE001
+             pass
+ 
+@@ -590,7 +741,7 @@ def execute_script(self, script_content: str, working_dir: str = None,
+                 self._runs += 1
+                 if line is None:
+                     dead = self._proc.poll() is not None
+-                    self._proc.kill()
++                    _kill_process_tree(self._proc, grace=0.5)
+                     self.close()
+                     if dead:                      # the worker died (a crash in native code, a Stop)
+                         return {"status": "error", "message": "Script execution was stopped or the "
+diff --git a/tests/test_script_process_groups.py b/tests/test_script_process_groups.py
+new file mode 100644
+index 00000000..ac4bec46
+--- /dev/null
++++ b/tests/test_script_process_groups.py
+@@ -0,0 +1,246 @@
++"""A timed-out or stopped script takes the processes it started with it.
++
++ScriptExecutor killed only its direct child. A generated script that starts
++workers (a loky or multiprocessing pool for per-pixel fits, a solver it shells
++out to) left them running after a timeout or a Stop, holding memory and CPU
++after the analysis had moved on. Scripts now run in their own session and
++process group, and the whole group is ended.
++"""
++
++import os
++import subprocess
++import sys
++import textwrap
++import threading
++import time
++from pathlib import Path
++from unittest import mock
++
++import pytest
++
++from scilink import executors as ex
++
++pytestmark = pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX")
++
++# The script starts a grandchild that would sleep for a minute, records its
++# pid, and then sleeps itself.
++SCRIPT = textwrap.dedent("""
++    import subprocess, sys, time
++    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
++    open("grandchild.pid", "w").write(str(child.pid))
++    time.sleep(60)
++""")
++
++
++def _alive(pid: int) -> bool:
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    # A zombie still answers kill(0); check it is not one.
++    out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
++    return bool(out.strip()) and not out.strip().startswith("Z")
++
++
++def _wait_gone(pid: int, timeout: float = 10.0) -> bool:
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        if not _alive(pid):
++            return True
++        time.sleep(0.1)
++    return False
++
++
++def _grandchild(tmp_path: Path, timeout: float = 15.0) -> int:
++    f = tmp_path / "grandchild.pid"
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        if f.exists() and f.read_text().strip():
++            return int(f.read_text())
++        time.sleep(0.05)
++    raise AssertionError("the script never started its grandchild")
++
++
++def test_a_timeout_ends_the_grandchild_too(tmp_path):
++    result = ex.ScriptExecutor(timeout=3).execute_script(SCRIPT, working_dir=str(tmp_path))
++    assert result["status"] == "error" and "timed out" in result["message"]
++    assert _wait_gone(_grandchild(tmp_path))
++
++
++def test_a_stop_ends_the_grandchild_too(tmp_path):
++    results = {}
++    t = threading.Thread(target=lambda: results.update(
++        r=ex.ScriptExecutor(timeout=120).execute_script(SCRIPT, working_dir=str(tmp_path))))
++    t.start()
++    gc = _grandchild(tmp_path)
++    ex.kill_subprocesses_for_thread(t.ident)      # what a user Stop calls
++    t.join(timeout=20)
++    assert not t.is_alive()
++    assert results["r"]["status"] == "error"
++    assert _wait_gone(gc)
++
++
++def test_an_interrupted_wait_ends_the_script_tree(tmp_path):
++    """Ctrl-C no longer reaches a script in its own session, so an interrupt
++    while waiting on it must end it explicitly."""
++    real = subprocess.Popen.communicate
++
++    def interrupted(self, *a, **k):
++        _grandchild(tmp_path)
++        raise KeyboardInterrupt
++
++    with mock.patch.object(subprocess.Popen, "communicate", interrupted):
++        with pytest.raises(KeyboardInterrupt):
++            ex.ScriptExecutor(timeout=120).execute_script(SCRIPT, working_dir=str(tmp_path))
++    assert _wait_gone(_grandchild(tmp_path))
++    assert subprocess.Popen.communicate is real
++
++
++def test_exit_cleanup_ends_registered_script_trees(tmp_path):
++    proc = subprocess.Popen([sys.executable, "-c", SCRIPT], cwd=tmp_path, start_new_session=True)
++    ex._register_subprocess(proc)
++    gc = _grandchild(tmp_path)
++    ex._kill_all_registered()
++    assert _wait_gone(gc) and proc.poll() is not None
++
++
++def test_a_process_sharing_our_group_is_killed_alone(tmp_path):
++    """A registered process that is not a group leader (started without a new
++    session) is signalled by itself: the caller's own group is never hit."""
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
++    assert os.getpgid(proc.pid) == os.getpgrp()
++    ex._kill_process_tree(proc, grace=0.5)
++    assert proc.poll() is not None               # and this test process is still here
++
++
++def test_a_successful_script_is_unaffected(tmp_path):
++    r = ex.ScriptExecutor(timeout=30).execute_script("print('hello')", working_dir=str(tmp_path))
++    assert r["status"] == "success" and r["stdout"].strip() == "hello"
++
++
++# ── review follow-ups ─────────────────────────────────────────────────────
++
++# The script starts a helper that INHERITS its stdout/stderr and exits at
++# once: communicate() waits for EOF the helper holds, and the leader is a
++# zombie. On macOS getpgid() of that zombie raises ESRCH.
++LEADER_EXITS = textwrap.dedent("""
++    import subprocess, sys
++    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
++    open("grandchild.pid", "w").write(str(child.pid))
++""")
++
++# A helper that does NOT hold the pipes: the script exits 0 and returns.
++DETACHED = textwrap.dedent("""
++    import subprocess, sys
++    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
++                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    open("grandchild.pid", "w").write(str(child.pid))
++    print("done")
++""")
++
++
++def test_a_timeout_ends_a_helper_after_the_script_itself_exited(tmp_path):
++    t0 = time.time()
++    result = ex.ScriptExecutor(timeout=3).execute_script(LEADER_EXITS, working_dir=str(tmp_path))
++    assert result["status"] == "error" and "timed out" in result["message"]
++    assert time.time() - t0 < 15
++    assert _wait_gone(_grandchild(tmp_path))
++
++
++def test_a_stop_ends_a_helper_after_the_script_itself_exited(tmp_path):
++    results = {}
++    t = threading.Thread(target=lambda: results.update(
++        r=ex.ScriptExecutor(timeout=120).execute_script(LEADER_EXITS, working_dir=str(tmp_path))))
++    t.start()
++    gc = _grandchild(tmp_path)
++    time.sleep(0.5)                                  # the leader has exited by now
++    t0 = time.time()
++    ex.kill_subprocesses_for_thread(t.ident)
++    t.join(timeout=20)
++    assert not t.is_alive() and time.time() - t0 < 10
++    assert _wait_gone(gc)
++
++
++def test_a_detached_helper_does_not_outlive_a_successful_script(tmp_path):
++    r = ex.ScriptExecutor(timeout=30).execute_script(DETACHED, working_dir=str(tmp_path))
++    assert r["status"] == "success" and r["stdout"].strip() == "done"
++    assert _wait_gone(_grandchild(tmp_path))
++
++
++@pytest.mark.parametrize("signame", ["SIGHUP", "SIGTERM"])
++def test_a_hangup_or_terminate_of_the_parent_ends_the_script_tree(tmp_path, signame):
++    """A new session no longer receives the terminal's SIGHUP (window closed,
++    SSH dropped); Python dies of SIGHUP/SIGTERM without running atexit."""
++    import signal
++    parent_code = textwrap.dedent(f"""
++        import sys
++        from scilink import executors as ex
++        ex.ScriptExecutor(timeout=120).execute_script({SCRIPT!r}, working_dir={str(tmp_path)!r})
++    """)
++    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
++    parent = subprocess.Popen([sys.executable, "-c", parent_code], env=env)
++    gc = _grandchild(tmp_path, timeout=30)
++    os.kill(parent.pid, getattr(signal, signame))
++    parent.wait(timeout=20)
++    assert parent.returncode == -getattr(signal, signame)     # still dies of the same signal
++    assert _wait_gone(gc)
++
++
++def test_a_warm_run_that_times_out_takes_its_helper_with_it(tmp_path):
++    w = ex.WarmScriptExecutor(timeout=3)
++    try:
++        r = w.execute_script(SCRIPT, working_dir=str(tmp_path))
++        assert r["status"] == "error"
++        assert _wait_gone(_grandchild(tmp_path))
++    finally:
++        w.close()
++
++
++def test_a_stop_during_a_warm_run_takes_its_helper_with_it(tmp_path):
++    w = ex.WarmScriptExecutor(timeout=120)
++    results = {}
++    try:
++        t = threading.Thread(target=lambda: results.update(r=w.execute_script(SCRIPT, working_dir=str(tmp_path))))
++        t.start()
++        gc = _grandchild(tmp_path, timeout=30)
++        ex.kill_subprocesses_for_thread(t.ident)
++        t.join(timeout=20)
++        assert not t.is_alive()
++        assert _wait_gone(gc)
++    finally:
++        w.close()
++
++
++def test_the_signal_handler_cannot_deadlock_on_the_registry_lock():
++    """A SIGTERM landing while the main thread holds the registry lock ran a
++    handler that waited for that same lock forever."""
++    # In a subprocess with a timeout, so a regression fails instead of
++    # hanging the suite.
++    code = ("from scilink import executors as ex\n"
++            "with ex._active_subprocesses_lock:\n"      # the main thread is inside _register_subprocess
++            "    ex._kill_all_registered()\n"          # what the handler does, on this same thread
++            "print('ok')")
++    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
++    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
++    assert out.stdout.strip() == "ok", out.stderr[-400:]
++
++
++@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
++def test_a_forked_child_does_not_inherit_the_parents_scripts(tmp_path):
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
++    ex._mark_own_group(proc)
++    ex._register_subprocess(proc)
++    try:
++        r, w = os.pipe()
++        pid = os.fork()
++        if pid == 0:                                # child: the registry must be empty
++            os.write(w, str(sum(len(v) for v in ex._active_subprocesses.values())).encode())
++            os._exit(0)
++        os.waitpid(pid, 0)
++        assert os.read(r, 16) == b"0"
++        assert proc.poll() is None                  # the parent's script is untouched
++    finally:
++        ex._unregister_subprocess(proc)
++        ex._kill_process_tree(proc, grace=0.2)

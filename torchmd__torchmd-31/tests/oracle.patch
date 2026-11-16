@@ -1,0 +1,208 @@
+diff --git a/torchmd/npzMol.py b/torchmd/npzMol.py
+new file mode 100644
+index 0000000..dd5ca61
+--- /dev/null
++++ b/torchmd/npzMol.py
+@@ -0,0 +1,53 @@
++import numpy as np
++import torch
++
++
++class npzMolecule:
++    """Class to load npz files in torchmd, essentially a wrapper around the npz file. Necessary information is extracted from the npz file
++    and stored in the class, such as the coordinates and the atomic numbers. The class also contains a dictionary to convert atomic numbers to
++    atomic symbols. Additional properties such as the box, the charges and the bonds are also stored in the class but are not necessary for the
++    simulation."""
++
++    def __init__(self, file: str):
++        self.converter = {
++            "1": ["H", 1.0080],
++            "6": ["C", 12.011],
++            "7": ["N", 14.007],
++            "8": ["O", 15.999],
++            "9": ["F", 18.99840316],
++            "15": ["P", 30.97376200],
++            "16": ["S", 32.07],
++            "17": ["Cl", 35.45],
++            "35": ["Br", 79.90],
++            "53": ["I", 126.9045],
++        }
++        self.data = np.load(file)
++        self.z = torch.from_numpy(self.data["z"])
++        self.coords = torch.from_numpy(self.data["coord"])[:, :, None]
++        self.numAtoms = len(self.z)
++        self.masses = self.make_masses_npz(self.z)
++        self.atomtype = self.get_atom_types(self.z)
++        self.embedding = self.z.tolist()
++
++        if "charges" in self.data.files:
++            self.charge = torch.from_numpy(self.data["charges"])
++        else:
++            self.charge = np.zeros_like(self.z)
++
++        if "bonds" in self.data.files:
++            self.bonds = torch.from_numpy(self.data["bonds"])
++        else:
++            self.bonds = []
++
++        if "box" in self.data.files:
++            self.box = self.data["box"]
++        else:
++            self.box = np.zeros((3, 1))
++
++    def make_masses_npz(self, z):
++        masses = torch.tensor([self.converter[str(el)][1] for el in z.tolist()])
++        return masses[:, None]
++
++    def get_atom_types(self, z):
++        atomtypes = [self.converter[str(at)][0] for at in z.tolist()]
++        return atomtypes
+diff --git a/torchmd/parameters.py b/torchmd/parameters.py
+index 2e5fdf8..2979bed 100644
+--- a/torchmd/parameters.py
++++ b/torchmd/parameters.py
+@@ -113,7 +113,10 @@ def build_parameters(self, ff, mol, terms):
+ 
+         self.mapped_atom_types = torch.tensor(indexes)
+         self.charges = torch.tensor(mol.charge.astype(np.float64))
+-        self.masses = self.make_masses(ff, mol.atomtype)
++        if mol.masses is not None and isinstance(mol.masses, torch.Tensor):
++            self.masses = mol.masses
++        else:
++            self.masses = self.make_masses(ff, mol.atomtype)
+         if "lj" in terms or "LJ" in terms:
+             self.A, self.B = self.make_lj(ff, uqatomtypes)
+         if "bonds" in terms and len(mol.bonds):
+diff --git a/torchmd/run.py b/torchmd/run.py
+index c8ed6c1..34a159e 100644
+--- a/torchmd/run.py
++++ b/torchmd/run.py
+@@ -15,8 +15,12 @@
+ from torchmd.integrator import maxwell_boltzmann
+ from torchmd.utils import save_argparse, LogWriter, LoadFromFile
+ from torchmd.minimizers import minimize_bfgs
++from npzMol import npzMolecule
++from utils import elements, converter_xyz_output
+ 
+ FS2NS = 1e-6
++batch_comp = False
++# set to false by default, it become True when you use the .npz file
+ 
+ 
+ def viewFrame(mol, pos, forces):
+@@ -124,6 +128,9 @@ def get_args(arguments=None):
+         type=tuple,
+         help="exclusions for the LJ or repulsionCG term",
+     )
++    parser.add_argument(
++        "--npz_file", default=None, type=str, help="Input file.npz with coord and z"
++    )
+ 
+     args = parser.parse_args(args=arguments)
+     os.makedirs(args.log_dir, exist_ok=True)
+@@ -161,6 +168,9 @@ def setup(args):
+             .reshape(3, 1)
+             .astype(np.float32)
+         )
++    elif args.npz_file is not None:
++        mol = npzMolecule(args.npz_file)
++        batch_comp = True
+ 
+     if args.coordinates is not None:
+         mol.read(args.coordinates)
+@@ -179,7 +189,12 @@ def setup(args):
+     external = None
+     if args.external is not None:
+         externalmodule = importlib.import_module(args.external["module"])
+-        embeddings = torch.tensor(args.external["embeddings"]).repeat(args.replicas, 1)
++        if batch_comp:
++            embeddings = torch.tensor(mol.embedding).repeat(args.replicas, 1)
++        else:
++            embeddings = torch.tensor(args.external["embeddings"]).repeat(
++                args.replicas, 1
++            )
+         external = externalmodule.External(args.external["file"], embeddings, device)
+ 
+     system = System(mol.numAtoms, args.replicas, precision, device)
+@@ -205,7 +220,6 @@ def dynamics(args, mol, system, forces):
+     torch.manual_seed(args.seed)
+     torch.cuda.manual_seed_all(args.seed)
+     device = torch.device(args.device)
+-
+     integrator = Integrator(
+         system,
+         forces,
+@@ -234,6 +248,7 @@ def dynamics(args, mol, system, forces):
+ 
+     iterator = tqdm(range(1, int(args.steps / args.output_period) + 1))
+     Epot = forces.compute(system.pos, system.box, system.forces)
++
+     for i in iterator:
+         # viewFrame(mol, system.pos, system.forces)
+         Ekin, Epot, T = integrator.step(niter=args.output_period)
+@@ -258,6 +273,12 @@ def dynamics(args, mol, system, forces):
+                 }
+             )
+ 
++    # new for on replicas because we start from .npy file saved in the previous step
++    for k in range(args.replicas):
++        npy_name = os.path.join(args.log_dir, args.output + f"_{k}.npy")
++        xyz_name = os.path.join(args.log_dir, args.output + f"_{k}.xyz")
++        converter_xyz_output(npy_name, xyz_name, mol.z)
++
+ 
+ if __name__ == "__main__":
+     args = get_args()
+diff --git a/torchmd/utils.py b/torchmd/utils.py
+index 73ad7d6..3b7705b 100644
+--- a/torchmd/utils.py
++++ b/torchmd/utils.py
+@@ -1,6 +1,7 @@
+ import csv
+ import json
+ import os
++import numpy as np
+ import time
+ import argparse
+ import yaml
+@@ -72,3 +73,40 @@ def save_argparse(args, filename, exclude=None):
+                 if k is exclude:
+                     continue
+                 f.write(f"{k}={v}\n")
++
++
++#%% Converter
++# fmt: off
++
++elements=["A", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na",
++      "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca", "Sc", "Ti", "V", "Cr", 
++      "Mn", "Fe", "Co", "Ni", "Cu",  "Zn", "Ga", "Ge", "As", "Se", "Br",  "Kr",
++      "Rb", "Sr", "Y", "Zr", "Nb", "Mo",  "Tc", "Ru", "Rh",  "Pd", "Ag",  "Cd",
++      "In", "Sn", "Sb", "Te", "I", "Xe",  "Cs", "Ba", "La",  "Ce", "Pr",  "Nd",
++      "Pm", "Sm", "Eu", "Gd",  "Tb", "Dy", "Ho", "Er",  "Tm", "Yb", "Lu", "Hf",
++      "Ta", "W", "Re", "Os", "Ir",  "Pt", "Au", "Hg",  "Tl",  "Pb", "Bi", "Po",
++      "At", "Rn", "Fr", "Ra", "Ac", "Th",  "Pa", "U",  "Np",  "Pu", "Am", "Cm",
++      "Bk", "Cf", "Es", "Fm",  "Md", "No",  "Lr", "Rf", "Db", "Sg", "Bh", "Hs",
++      "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og"]
++# fmt: on
++
++
++def converter_xyz_output(input_file, output_file, z=None):
++    # it gets the embedding data from the mol.z attribute
++    mol_elements = z
++    npy_file = np.load(input_file)
++    Nsteps = npy_file.shape[2]
++    Nats = npy_file.shape[0]
++    for i in range(Nsteps):
++        with open(output_file, "a") as f:
++            if "forces" not in input_file:
++                f.write(str(Nats))
++            f.write("\n\n")
++            for j in range(Nats):
++                if "forces" not in input_file:
++                    f.write(elements[mol_elements[j]])
++                    f.write(" ")
++                for k in range(3):
++                    f.write(str(npy_file[j, k, i]))
++                    f.write(" ")
++                f.write("\n")

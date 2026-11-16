@@ -1,0 +1,870 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1487281..31916ae 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -18,6 +18,8 @@ enable_testing()
+ set(SRC_FILES src/ani/CpuANISymmetryFunctions.cpp
+               src/ani/CudaANISymmetryFunctions.cu
+               src/pytorch/BatchedNN.cpp
++              src/pytorch/CFConv.cpp
++              src/pytorch/CFConvNeighbors.cpp
+               src/pytorch/SymmetryFunctions.cpp
+               src/schnet/CpuCFConv.cpp
+               src/schnet/CudaCFConv.cu)
+@@ -47,6 +49,8 @@ endforeach()
+ 
+ # Tests of PyTorch wrappers
+ add_test(TestBatchedNN         pytest -v ${CMAKE_SOURCE_DIR}/src/pytorch/TestBatchedNN.py)
++add_test(TestCFConv            pytest -v ${CMAKE_SOURCE_DIR}/src/pytorch/TestCFConv.py)
++add_test(TestCFConvNeighbors   pytest -v ${CMAKE_SOURCE_DIR}/src/pytorch/TestCFConvNeighbors.py)
+ add_test(TestEnergyShifter     pytest -v ${CMAKE_SOURCE_DIR}/src/pytorch/TestEnergyShifter.py)
+ add_test(TestOptimizedTorchANI pytest -v ${CMAKE_SOURCE_DIR}/src/pytorch/TestOptimizedTorchANI.py)
+ add_test(TestSpeciesConverter  pytest -v ${CMAKE_SOURCE_DIR}/src/pytorch/TestSpeciesConverter.py)
+@@ -56,6 +60,8 @@ add_test(TestSymmetryFunctions pytest -v ${CMAKE_SOURCE_DIR}/src/pytorch/TestSym
+ install(TARGETS ${LIBRARY} DESTINATION ${Python_SITEARCH}/${NAME})
+ install(FILES src/pytorch/__init__.py
+               src/pytorch/BatchedNN.py
++              src/pytorch/CFConv.py
++              src/pytorch/CFConvNeighbors.py
+               src/pytorch/EnergyShifter.py
+               src/pytorch/OptimizedTorchANI.py
+               src/pytorch/SpeciesConverter.py
+diff --git a/src/pytorch/CFConv.cpp b/src/pytorch/CFConv.cpp
+new file mode 100644
+index 0000000..68dd6bf
+--- /dev/null
++++ b/src/pytorch/CFConv.cpp
+@@ -0,0 +1,301 @@
++/**
++ * Copyright (c) 2020-2021 Acellera
++ * Authors: Raimondas Galvelis
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#include <torch/script.h>
++#include <torch/serialize/archive.h>
++#include "CpuCFConv.h"
++#include "CFConvNeighbors.h"
++
++#ifdef ENABLE_CUDA
++#include <stdexcept>
++#include <cuda_runtime.h>
++// #include <c10/cuda/CUDAStream.h>
++#include "CudaCFConv.h"
++
++#define CHECK_CUDA_RESULT(result) \
++    if (result != cudaSuccess) { \
++        throw std::runtime_error(std::string("Encountered error ")+cudaGetErrorName(result)+" at "+__FILE__+":"+std::to_string(__LINE__));\
++    }
++#endif
++
++namespace NNPOps {
++namespace CFConv {
++
++class Holder;
++using Activation = ::CFConv::ActivationFunction;
++using Context = torch::autograd::AutogradContext;
++using HolderPtr = torch::intrusive_ptr<Holder>;
++using Neighbors = NNPOps::CFConvNeighbors::Holder;
++using NeighborsPtr = torch::intrusive_ptr<Neighbors>;
++using std::string;
++using torch::autograd::tensor_list;
++using torch::Device;
++using torch::IValue;
++using torch::optional;
++using torch::Tensor;
++using torch::TensorOptions;
++
++class Holder : public torch::CustomClassHolder {
++public:
++    Holder(double gaussianWidth,
++           const string& activation,
++           const Tensor& weights1,
++           const Tensor& biases1,
++           const Tensor& weights2,
++           const Tensor& biases2) :
++
++        torch::CustomClassHolder(),
++        gaussianWidth(gaussianWidth),
++        activation(activation),
++        // Note: weights and biases have to be in the CPU memory
++        weights1(weights1.to(torch::kFloat32).cpu().clone()),
++        biases1(biases1.to(torch::kFloat32).cpu().clone()),
++        weights2(weights2.to(torch::kFloat32).cpu().clone()),
++        biases2(biases2.to(torch::kFloat32).cpu().clone()),
++        device(torch::kCPU),
++        impl(nullptr)
++    {};
++
++    Tensor forward(const IValue& neighbors_, const Tensor& positions, const Tensor& input) {
++
++        neighbors = neighbors_.toCustomClass<Neighbors>(); // save for the backward pass
++
++        this->positions = positions; // save for the backward pass
++        if (positions.scalar_type() != torch::kFloat32)
++            throw std::runtime_error("The type of \"positions\" has to be float32");
++        if (positions.dim() != 2)
++            throw std::runtime_error("The shape of \"positions\" has to have 2 dimensions");
++        if (positions.size(1) != 3)
++            throw std::runtime_error("The size of the 2nd dimension of \"positions\" has to be 3");
++
++        this->input = input; // save for the backward pass
++        if (input.device() != positions.device())
++            throw std::runtime_error("The device of \"input\" and \"positions\" has to be the same");
++        if (input.scalar_type() != torch::kFloat32)
++            throw std::runtime_error("The type of \"input\" has to be float32");
++        if (input.dim() != 2)
++            throw std::runtime_error("The shape of \"input\" has to have 2 dimensions");
++        if (input.size(0) != positions.size(0))
++            throw std::runtime_error("The size of the 1nd dimension of \"input\" has to be equal to the 1st dimension of \"positions\"");
++
++        if(!impl) {
++            device = positions.device();
++            numAtoms = positions.size(0);
++            numFilters = input.size(1);
++            cutoff = neighbors->getCutoff();
++
++            Activation activation_;
++            if (activation == "ssp")
++                activation_ == ::CFConv::ShiftedSoftplus;
++            else if (activation == "tanh")
++                activation_ == ::CFConv::Tanh;
++            else
++                throw std::invalid_argument("Invalid value of \"activation\"");
++
++            if (weights1.dim() != 2)
++                throw std::runtime_error("The shape of \"weights1\" has to have 2 dimensions");
++            int64_t numGaussians = weights1.size(0);
++            if (weights1.size(1) != numFilters)
++                throw std::runtime_error("The size of the 2nd dimension of \"weights1\" has to be equal to the 2st dimension of \"input\"");
++
++            if (biases1.dim() != 1)
++                throw std::runtime_error("The shape of \"biases1\" has to have 1 dimension");
++            if (biases1.size(0) != numFilters)
++                throw std::runtime_error("The size of \"biases1\" has to be equal to the 2st dimension of \"input\"");
++
++            if (weights2.dim() != 2)
++                throw std::runtime_error("The shape of \"weights2\" has to have 2 dimensions");
++            if (weights2.size(0) != numFilters)
++                throw std::runtime_error("The size of the 1nd dimension of \"weights2\" has to be equal to the 2st dimension of \"input\"");
++            if (weights2.size(1) != numFilters)
++                throw std::runtime_error("The size of the 2nd dimension of \"weights2\" has to be equal to the 2st dimension of \"input\"");
++
++            if (biases2.dim() != 1)
++                throw std::runtime_error("The shape of \"biases2\" has to have 1 dimension");
++            if (biases2.size(0) != numFilters)
++                throw std::runtime_error("The size of \"biases2\" has to be equal to the 2st dimension of \"input\"");
++
++            if (device.is_cpu()) {
++                impl = std::make_shared<::CpuCFConv>(numAtoms, numFilters, numGaussians, cutoff, false, gaussianWidth, activation_,
++                                                     weights1.data_ptr<float>(), biases1.data_ptr<float>(), weights2.data_ptr<float>(), biases2.data_ptr<float>());
++#ifdef ENABLE_CUDA
++            } else if (device.is_cuda()) {
++                // PyTorch allow to chose GPU with "torch.device", but it doesn't set as the default one.
++                CHECK_CUDA_RESULT(cudaSetDevice(device.index()));
++                impl = std::make_shared<::CudaCFConv>(numAtoms, numFilters, numGaussians, cutoff, false, gaussianWidth, activation_,
++                                                      weights1.data_ptr<float>(), biases1.data_ptr<float>(), weights2.data_ptr<float>(), biases2.data_ptr<float>());
++#endif
++            } else
++                throw std::runtime_error("Unsupported device");
++
++            // Create the output tensors
++            const TensorOptions options = torch::TensorOptions().device(device); // Data type of float by default
++            output = torch::empty({numAtoms, numFilters}, options);
++            inputGrad = torch::empty({numAtoms, numFilters}, options);
++            positionsGrad = torch::empty({numAtoms, 3}, options);
++
++            // cudaImpl = dynamic_cast<CudaCFConv*>(Impl.get());
++        }
++
++        if (neighbors->getCutoff() != cutoff)
++            throw std::runtime_error("The cutoff of \"neighbors\" has changed");
++
++        if (positions.size(0) != numAtoms)
++            throw std::runtime_error("The size of the 1nd dimension of \"positions\" has changed");
++        if (positions.device() != device)
++            throw std::runtime_error("The device of \"positions\" has changed");
++
++        if (input.size(0) != numAtoms)
++            throw std::runtime_error("The size of the 1nd dimension of \"input\" has changed");
++        if (input.size(1) != numFilters)
++            throw std::runtime_error("The size of the 2nd dimension of \"input\" has changed");
++        if (input.device() != device)
++            throw std::runtime_error("The device of \"input\" has changed");
++
++        // if (cudaImpl) {
++        //     const torch::cuda::CUDAStream stream = torch::cuda::getCurrentCUDAStream(tensorOptions.device().index());
++        //     cudaImpl->setStream(stream.stream());
++        // }
++
++        impl->compute(neighbors->getImpl(), positions.data_ptr<float>(), nullptr, input.data_ptr<float>(), output.data_ptr<float>());
++
++        return output;
++    };
++
++    tensor_list backward(const tensor_list& grads) {
++
++        const Tensor outputGrad = grads[0].clone(); // check if actually is needed to clone
++
++        // if (cudaImpl) {
++        //     const torch::cuda::CUDAStream stream = torch::cuda::getCurrentCUDAStream(tensorOptions.device().index());
++        //     cudaImpl->setStream(stream.stream());
++        // }
++
++        impl->backprop(neighbors->getImpl(), positions.data_ptr<float>(), nullptr, input.data_ptr<float>(),
++                       outputGrad.data_ptr<float>(), inputGrad.data_ptr<float>(), positionsGrad.data_ptr<float>());
++
++        return {Tensor(), Tensor(), positionsGrad, inputGrad}; // empty grad for the holder and neighbors
++    };
++
++    static const string serialize(const HolderPtr& self) {
++
++        torch::serialize::OutputArchive archive;
++        archive.write("gaussianWidth", self->gaussianWidth);
++        archive.write("activation", self->activation);
++        archive.write("weights1", self->weights1);
++        archive.write("biases1", self->biases1);
++        archive.write("weights2", self->weights2);
++        archive.write("biases2", self->biases2);
++
++        std::stringstream stream;
++        archive.save_to(stream);
++        return stream.str();
++    };
++
++    static HolderPtr deserialize(const string& state) {
++
++        std::stringstream stream(state);
++        torch::serialize::InputArchive archive;
++        archive.load_from(stream, torch::kCPU);
++
++        IValue gaussianWidth, activation;
++        Tensor weights1, biases1, weights2, biases2;
++        archive.read("gaussianWidth", gaussianWidth);
++        archive.read("activation", activation);
++        archive.read("weights1", weights1);
++        archive.read("biases1", biases1);
++        archive.read("weights2", weights2);
++        archive.read("biases2", biases2);
++        return HolderPtr::make(gaussianWidth.toDouble(), activation.toStringRef(), weights1, biases1, weights2, biases2);
++    }
++
++private:
++    string activation;
++    Tensor biases1;
++    Tensor biases2;
++    std::shared_ptr<::CFConv> impl;
++    // CudaCFConv* cudaImpl;
++    double cutoff;
++    Device device;
++    Tensor input;
++    Tensor inputGrad;
++    double gaussianWidth;
++    NeighborsPtr neighbors;
++    int64_t numAtoms;
++    int64_t numFilters;
++    Tensor output;
++    Tensor positions;
++    Tensor positionsGrad;
++    Tensor weights1;
++    Tensor weights2;
++};
++
++class AutogradFunctions : public torch::autograd::Function<AutogradFunctions> {
++
++public:
++    static Tensor forward(Context *ctx,
++                          const HolderPtr& holder,
++                          const IValue& neighbors,
++                          const Tensor& positions,
++                          const Tensor& input) {
++
++        ctx->saved_data["holder"] = holder;
++
++        return holder->forward(neighbors, positions, input);
++    };
++
++    static tensor_list backward(Context *ctx, const tensor_list& grads) {
++
++        const HolderPtr holder = ctx->saved_data["holder"].toCustomClass<Holder>();
++        ctx->saved_data.erase("holder");
++
++        return holder->backward(grads);
++    };
++};
++
++Tensor operation(const optional<HolderPtr>& holder,
++                 const IValue& neighbors,
++                 const Tensor& positions,
++                 const Tensor& input) {
++
++    return AutogradFunctions::apply(*holder, neighbors, positions, input);
++}
++
++TORCH_LIBRARY(NNPOpsCFConv, m) {
++    m.class_<Holder>("Holder")
++        .def(torch::init<double,           // gaussianWidth
++                         const string&,    // activation
++                         const Tensor&,    // weights1
++                         const Tensor&,    // biases1
++                         const Tensor&,    // weights2
++                         const Tensor&>()) // biases2
++        .def("forward", &Holder::forward)
++        .def("backward", &Holder::backward)
++        .def_pickle(
++            [](const HolderPtr& self) -> const string { return Holder::serialize(self); }, // __getstate__
++            [](const string& state) -> HolderPtr { return Holder::deserialize(state); }    // __setstate__
++        );
++    m.def("operation", operation);
++}
++
++} // namespace CFConv
++} // namespace NNPOps
+\ No newline at end of file
+diff --git a/src/pytorch/CFConv.py b/src/pytorch/CFConv.py
+new file mode 100644
+index 0000000..7229cf0
+--- /dev/null
++++ b/src/pytorch/CFConv.py
+@@ -0,0 +1,87 @@
++#
++# Copyright (c) 2020-2021 Acellera
++# Authors: Raimondas Galvelis
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++#
++
++import os.path
++import torch
++from torch import Tensor
++
++from NNPOps.CFConvNeighbors import CFConvNeighbors
++
++torch.ops.load_library(os.path.join(os.path.dirname(__file__), 'libNNPOpsPyTorch.so'))
++torch.classes.load_library(os.path.join(os.path.dirname(__file__), 'libNNPOpsPyTorch.so'))
++
++class CFConv(torch.nn.Module):
++    """
++    Optimized continious-filter convolution layer (CFConv)
++
++    CFConv is used in SchNet (https://arxiv.org/abs/1706.08566).
++
++    Example::
++
++        import torch
++        from NNPOps.CFConvNeighbors import CFConvNeighbors
++        from NNPOps.CFConv import CFConv
++
++        # Set parameters
++        numAtoms = 7
++        numFilters = 5
++        numGaussians = 3
++        cutoff = 5.0
++        gaussianWidth = 1.0
++        activation = 'ssp'
++        weights1 = torch.rand(numGaussians, numFilters)
++        biases1 = torch.rand(numFilters)
++        weights2 = torch.rand(numFilters, numFilters)
++        biases2 = torch.rand(numFilters)
++
++        # Generate random input
++        positions = (10*torch.rand(numAtoms, 3) - 5).detach()
++        positions.requires_grad = True
++        input = torch.rand(numAtoms, numFilters)
++
++        # Create objects
++        neighbors = CFConvNeighbors(cutoff)
++        conv = CFConv(gaussianWidth, activation, weights1, biases1, weights2, biases2)
++
++        # Run forward and backward passes
++        neighbors.build(positions)
++        output = conv(neighbors, positions, input)
++        total = torch.sum(output)
++        total.backward()
++        grad = positions.grad
++    """
++
++    Holder = torch.classes.NNPOpsCFConv.Holder
++    operation = torch.ops.NNPOpsCFConv.operation
++
++    def __init__(self, gaussianWidth: float, activation: str,
++                 weights1: Tensor, biases1: Tensor,
++                 weights2: Tensor, biases2: Tensor) -> None:
++
++        super().__init__()
++
++        self.holder = CFConv.Holder(gaussianWidth, activation, weights1, biases1, weights2, biases2)
++
++    def forward(self, neighbors: CFConvNeighbors, positions: Tensor, input: Tensor) -> Tensor:
++
++        return CFConv.operation(self.holder, neighbors.holder, positions, input)
+\ No newline at end of file
+diff --git a/src/pytorch/CFConvNeighbors.cpp b/src/pytorch/CFConvNeighbors.cpp
+new file mode 100644
+index 0000000..a786532
+--- /dev/null
++++ b/src/pytorch/CFConvNeighbors.cpp
+@@ -0,0 +1,98 @@
++/**
++ * Copyright (c) 2020-2021 Acellera
++ * Authors: Raimondas Galvelis
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#include "CFConvNeighbors.h"
++#include "CpuCFConv.h"
++
++#ifdef ENABLE_CUDA
++#include <stdexcept>
++#include <cuda_runtime.h>
++// #include <c10/cuda/CUDAStream.h>
++#include "CudaCFConv.h"
++
++#define int2 int[2]
++#define float3 float[3]
++
++#define CHECK_CUDA_RESULT(result) \
++    if (result != cudaSuccess) { \
++        throw std::runtime_error(std::string("Encountered error ")+cudaGetErrorName(result)+" at "+__FILE__+":"+std::to_string(__LINE__));\
++    }
++#endif
++
++namespace NNPOps {
++namespace CFConvNeighbors {
++
++using HolderPtr = torch::intrusive_ptr<Holder>;
++using torch::Tensor;
++
++Holder::Holder(double cutoff) : torch::CustomClassHolder(), cutoff(cutoff), numAtoms(0), device(torch::kCPU), impl(nullptr) {}
++
++void Holder::build(const Tensor& positions) {
++
++    if (positions.scalar_type() != torch::kFloat32)
++        throw std::runtime_error("The type of \"positions\" has to be float32");
++    if (positions.dim() != 2)
++        throw std::runtime_error("The shape of \"positions\" has to have 2 dimensions");
++    if (positions.size(1) != 3)
++        throw std::runtime_error("The size of the 2nd dimension of \"positions\" has to be 3");
++
++    if (!impl) {
++        numAtoms = positions.size(0);
++        device = positions.device();
++        if (device.is_cpu()) {
++            impl = std::make_shared<::CpuCFConvNeighbors>(numAtoms, cutoff, false);
++#ifdef ENABLE_CUDA
++        } else if (device.is_cuda()) {
++            // PyTorch allow to chose GPU with "torch.device", but it doesn't set as the default one.
++            CHECK_CUDA_RESULT(cudaSetDevice(device.index()));
++            impl = std::make_shared<::CudaCFConvNeighbors>(numAtoms, cutoff, false);
++#endif
++        } else
++            throw std::runtime_error("Unsupported device");
++    }
++
++    if (positions.size(0) != numAtoms)
++        throw std::runtime_error("The size of the 2nd dimension of \"positions\" has changed");
++    if (positions.device() != device)
++        throw std::runtime_error("The device of \"positions\" has changed");
++
++    // ::CudaCFConvNeighbors* cudaImpl = dynamic_cast<CudaCFConvNeighbors*>(impl.get());
++    // if (cudaImpl) {
++    //     const torch::cuda::CUDAStream stream = torch::cuda::getCurrentCUDAStream(positions.device().index());
++    //     cudaImpl->setStream(stream.stream());
++    // }
++
++    impl->build(positions.data_ptr<float>(), nullptr);
++}
++
++TORCH_LIBRARY(NNPOpsCFConvNeighbors, m) {
++    m.class_<Holder>("Holder")
++        .def(torch::init<double>())
++        .def("build", &Holder::build)
++        .def_pickle(
++            [](const HolderPtr& self) -> double { return self->getCutoff(); }, // __getstate__
++            [](double cutoff) -> HolderPtr { return HolderPtr::make(cutoff); } // __setstate__
++        );
++}
++
++} // namespace CFConvNeighbors
++} // namespace NNPOps
+\ No newline at end of file
+diff --git a/src/pytorch/CFConvNeighbors.h b/src/pytorch/CFConvNeighbors.h
+new file mode 100644
+index 0000000..60ecd1f
+--- /dev/null
++++ b/src/pytorch/CFConvNeighbors.h
+@@ -0,0 +1,48 @@
++/**
++ * Copyright (c) 2020-2021 Acellera
++ * Authors: Raimondas Galvelis
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#ifndef NNPOPS_CFCONVNEIGHBORS
++#define NNPOPS_CFCONVNEIGHBORS
++
++#include <torch/script.h>
++#include "CFConv.h"
++
++namespace NNPOps {
++namespace CFConvNeighbors {
++
++class Holder : public torch::CustomClassHolder {
++public:
++    Holder(double cutoff);
++    void build(const torch::Tensor& positions);
++    double getCutoff() const { return cutoff; }
++    const ::CFConvNeighbors& getImpl() const { return *impl.get(); }
++private:
++    double cutoff;
++    int numAtoms;
++    torch::Device device;
++    std::shared_ptr<::CFConvNeighbors> impl;
++};
++
++} // namespace CFConvNeighbors
++} // namespace NNPOps
++
++#endif
+\ No newline at end of file
+diff --git a/src/pytorch/CFConvNeighbors.py b/src/pytorch/CFConvNeighbors.py
+new file mode 100644
+index 0000000..e5ca8a9
+--- /dev/null
++++ b/src/pytorch/CFConvNeighbors.py
+@@ -0,0 +1,48 @@
++#
++# Copyright (c) 2020-2021 Acellera
++# Authors: Raimondas Galvelis
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++#
++
++import os.path
++import torch
++from torch import Tensor
++
++torch.classes.load_library(os.path.join(os.path.dirname(__file__), 'libNNPOpsPyTorch.so'))
++
++class CFConvNeighbors(torch.nn.Module):
++    """
++    Optimized nearest-neighbor implementation for the continious-filter convolution (CFConf)
++
++    CFConv is used in SchNet (https://arxiv.org/abs/1706.08566).
++
++    See NNPOps.CFConv for more details.
++    """
++
++    def __init__(self, cutoff: float) -> None:
++
++        super().__init__()
++
++        self.holder = torch.classes.NNPOpsCFConvNeighbors.Holder(cutoff)
++
++    @torch.jit.export
++    def build(self, positions: Tensor) -> None:
++
++        self.holder.build(positions)
+\ No newline at end of file
+diff --git a/src/pytorch/TestCFConv.py b/src/pytorch/TestCFConv.py
+new file mode 100644
+index 0000000..113dda3
+--- /dev/null
++++ b/src/pytorch/TestCFConv.py
+@@ -0,0 +1,128 @@
++#
++# Copyright (c) 2020 Acellera
++# Authors: Raimondas Galvelis
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++#
++
++import os
++import pytest
++import tempfile
++import torch
++
++molecules = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'molecules')
++
++def getCFConv(numFilters, device):
++
++    from NNPOps.CFConvNeighbors import CFConvNeighbors
++    from NNPOps.CFConv import CFConv
++
++    numGaussians = 3
++    cutoff = 5.0
++    gaussianWidth = 1.0
++    activation = 'ssp'
++    weights1 = torch.rand(numGaussians, numFilters, dtype=torch.float32, device=device)
++    biases1 = torch.rand(numFilters, dtype=torch.float32, device=device)
++    weights2 = torch.rand(numFilters, numFilters, dtype=torch.float32, device=device)
++    biases2 = torch.rand(numFilters, dtype=torch.float32, device=device)
++
++    neighbors = CFConvNeighbors(cutoff)
++    conv = CFConv(gaussianWidth, activation, weights1, biases1, weights2, biases2)
++
++    return neighbors, conv
++
++def test_import():
++    import NNPOps
++    import NNPOps.CFConvNeighbors
++    import NNPOps.CFConv
++
++@pytest.mark.parametrize('deviceString', ['cpu', 'cuda'])
++def test_gradients(deviceString):
++
++    if deviceString == 'cuda' and not torch.cuda.is_available():
++        pytest.skip('CUDA is not available')
++
++    device = torch.device(deviceString)
++    numAtoms = 7
++    numFilters = 5
++
++    neighbors, conv = getCFConv(numFilters, device)
++    positions = (10*torch.rand(numAtoms, 3, dtype=torch.float32, device=device) - 5).detach()
++    positions.requires_grad = True
++    input = torch.rand(numAtoms, numFilters, dtype=torch.float32, device=device)
++
++    neighbors.build(positions)
++    output = conv(neighbors, positions, input)
++    total = torch.sum(output)
++    total.backward()
++    grad = positions.grad
++
++    assert output.device == positions.device
++    assert output.dtype == torch.float32
++    assert output.shape == (numAtoms, numFilters)
++
++    assert grad.device == positions.device
++    assert grad.dtype == torch.float32
++    assert grad.shape == (numAtoms, 3)
++
++    # def func(pos):
++    #     return torch.sum(conv(neighbors, pos, input))
++    # assert torch.autograd.gradcheck(func, positions)
++
++@pytest.mark.parametrize('deviceString', ['cpu', 'cuda'])
++def test_model_serialization(deviceString):
++
++    if deviceString == 'cuda' and not torch.cuda.is_available():
++        pytest.skip('CUDA is not available')
++
++    device = torch.device(deviceString)
++    numAtoms = 7
++    numFilters = 5
++
++    neighbors_ref, conv_ref = getCFConv(numFilters, device)
++    positions = (10*torch.rand(numAtoms, 3, dtype=torch.float32, device=device) - 5).detach()
++    positions.requires_grad = True
++    input = torch.rand(numAtoms, numFilters, dtype=torch.float32, device=device)
++
++    neighbors_ref.build(positions)
++    output_ref = conv_ref(neighbors_ref, positions, input)
++    total_ref = torch.sum(output_ref)
++    total_ref.backward()
++    grad_ref = positions.grad.clone()
++
++    with tempfile.NamedTemporaryFile() as fd1, tempfile.NamedTemporaryFile() as fd2:
++
++        torch.jit.script(neighbors_ref).save(fd1.name)
++        neighbors = torch.jit.load(fd1.name).to(device)
++
++        torch.jit.script(conv_ref).save(fd2.name)
++        conv = torch.jit.load(fd2.name).to(device)
++
++        neighbors.build(positions)
++        output = conv(neighbors, positions, input)
++        total = torch.sum(output)
++        positions.grad.zero_()
++        total.backward()
++        grad = positions.grad.clone()
++
++    assert torch.allclose(output, output_ref, rtol=1e-07)
++    if deviceString == 'cuda':
++        assert torch.allclose(grad, grad_ref, rtol=1e-07, atol=1e-6) # Numerical noise
++    else:
++        assert torch.allclose(grad, grad_ref, rtol=1e-07)
+\ No newline at end of file
+diff --git a/src/pytorch/TestCFConvNeighbors.py b/src/pytorch/TestCFConvNeighbors.py
+new file mode 100644
+index 0000000..27d08e8
+--- /dev/null
++++ b/src/pytorch/TestCFConvNeighbors.py
+@@ -0,0 +1,80 @@
++#
++# Copyright (c) 2020 Acellera
++# Authors: Raimondas Galvelis
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++#
++
++import os
++import pytest
++import tempfile
++import torch
++
++molecules = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'molecules')
++
++def test_import():
++    import NNPOps
++    import NNPOps.CFConvNeighbors
++
++@pytest.mark.parametrize('deviceString', ['cpu', 'cuda'])
++def test_build(deviceString):
++
++    if deviceString == 'cuda' and not torch.cuda.is_available():
++        pytest.skip('CUDA is not available')
++
++    from NNPOps.CFConvNeighbors import CFConvNeighbors
++
++    device = torch.device(deviceString)
++
++    numAtoms = 10
++    cutoff = 5
++    positions = 10*torch.rand(numAtoms, 3, dtype=torch.float32, device=device) - 5
++
++    neighbors = CFConvNeighbors(cutoff)
++
++    for _ in range(3):
++        neighbors.build(positions)
++
++
++@pytest.mark.parametrize('deviceString', ['cpu', 'cuda'])
++def test_model_serialization(deviceString):
++
++    if deviceString == 'cuda' and not torch.cuda.is_available():
++        pytest.skip('CUDA is not available')
++
++    from NNPOps.CFConvNeighbors import CFConvNeighbors
++
++    device = torch.device(deviceString)
++
++    numAtoms = 10
++    cutoff = 5
++    positions = 10*torch.rand(numAtoms, 3, dtype=torch.float32, device=device) - 5
++
++    neighbors_ref = CFConvNeighbors(cutoff)
++
++    for _ in range(3):
++        neighbors_ref.build(positions)
++
++    with tempfile.NamedTemporaryFile() as fd:
++
++        torch.jit.script(neighbors_ref).save(fd.name)
++        neighbors = torch.jit.load(fd.name)
++
++        for _ in range(3):
++            neighbors.build(positions)
+\ No newline at end of file

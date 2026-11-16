@@ -1,0 +1,412 @@
+diff --git a/cryosparc/dataset.py b/cryosparc/dataset.py
+index caa4442c..aa3bcf28 100644
+--- a/cryosparc/dataset.py
++++ b/cryosparc/dataset.py
+@@ -47,6 +47,7 @@
+ import numpy as n
+ import numpy.core.records
+ 
++
+ if TYPE_CHECKING:
+     from numpy.typing import NDArray, ArrayLike, DTypeLike
+ 
+@@ -65,6 +66,7 @@
+     arraydtype,
+     safe_makefield,
+ )
++from .stream import AsyncBinaryIO, Streamable
+ from .column import Column
+ from .row import Row, Spool, R
+ from .util import bopen, default_rng, hashcache, random_integers, u32bytesle, u32intle
+@@ -97,7 +99,7 @@
+ MAGIC_PREFIX_FORMATS = {v: k for k, v in FORMAT_MAGIC_PREFIXES.items()}  # inverse dict
+ 
+ 
+-class Dataset(MutableMapping[str, Column], Generic[R]):
++class Dataset(Streamable, MutableMapping[str, Column], Generic[R]):
+     """
+     Accessor class for working with CryoSPARC .cs files.
+ 
+@@ -512,6 +514,21 @@ def load(cls, file: Union[str, PurePath, IO[bytes]]):
+ 
+         raise TypeError(f"Could not determine dataset format for file {file} (prefix is {prefix})")
+ 
++    @classmethod
++    async def from_async_stream(cls, stream: AsyncBinaryIO):
++        import snappy
++
++        headersize = u32intle(await stream.read(4))
++        header = decode_dataset_header(await stream.read(headersize))
++        cols = {}
++        for field in header["dtype"]:
++            colsize = u32intle(await stream.read(4))
++            buffer = await stream.read(colsize)
++            if field[0] in header["compressed_fields"]:
++                buffer = snappy.uncompress(buffer)
++            cols[field[0]] = n.frombuffer(buffer, dtype=fielddtype(field))
++        return cls(cols)
++
+     def save(self, file: Union[str, PurePath, IO[bytes]], format: int = DEFAULT_FORMAT):
+         """
+         Save a dataset to the given path or I/O buffer.
+diff --git a/cryosparc/job.py b/cryosparc/job.py
+index cc8bdfb1..9722f7cc 100644
+--- a/cryosparc/job.py
++++ b/cryosparc/job.py
+@@ -665,8 +665,8 @@ def upload_asset(
+         (PNG, JPG, GIF, PDF, SVG), text file (TXT, CSV, JSON, XML) or a binary
+         IO object with data in one of those formats.
+ 
+-        If a binary IO object is specified, either a filename or mimetype must
+-        be specified.
++        If a binary IO object is specified, either a filename or file format
++        must be specified.
+ 
+         Unlike the ``upload`` method which saves files to the job directory,
+         this method saves images to the database and exposes them for use in the
+diff --git a/cryosparc/spec.py b/cryosparc/spec.py
+index 985e7fdb..016c241f 100644
+--- a/cryosparc/spec.py
++++ b/cryosparc/spec.py
+@@ -27,7 +27,16 @@
+ 
+ 
+ Datatype = Literal[
+-    "exposure", "particle", "template", "volume", "mask", "ml_model", "symmetry_candidate", "flex_mesh", "flex_model"
++    "exposure",
++    "particle",
++    "template",
++    "volume",
++    "mask",
++    "live",
++    "ml_model",
++    "symmetry_candidate",
++    "flex_mesh",
++    "flex_model",
+ ]
+ """Supported data types for job inputs and outputs."""
+ 
+@@ -85,7 +94,7 @@
+ Supported job image asset MIME types.
+ """
+ 
+-AssetContentType = Union[TextContentType, ImageContentType]
++AssetContentType = Union[TextContentType, ImageContentType, Literal["application/octet-stream"]]
+ """
+ Supported job asset MIME types.
+ """
+diff --git a/cryosparc/stream.py b/cryosparc/stream.py
+new file mode 100644
+index 00000000..8e50ff50
+--- /dev/null
++++ b/cryosparc/stream.py
+@@ -0,0 +1,157 @@
++"""Stream processing utilities
++"""
++from abc import ABC, abstractmethod
++from pathlib import PurePath
++from typing import (
++    IO,
++    Any,
++    AsyncGenerator,
++    AsyncIterator,
++    BinaryIO,
++    Generator,
++    Iterator,
++    Optional,
++    Union,
++)
++from typing_extensions import Protocol, Self
++
++
++class AsyncBinaryIO(Protocol):
++    async def read(self, n: Optional[int] = None) -> bytes:
++        ...
++
++
++class BinaryIteratorIO(BinaryIO):
++    """Read through a iterator that yields bytes as if it was a file"""
++
++    def __init__(self, iter: Union[Iterator[bytes], Generator[bytes, Any, Any]]):
++        self._iter = iter
++        self._left = b""
++
++    def readable(self):
++        return True
++
++    def seekable(self) -> bool:
++        return False
++
++    def _read1(self, n: Optional[int] = None):
++        while not self._left:
++            try:
++                self._left = next(self._iter)
++            except StopIteration:
++                break
++        ret = self._left[:n]
++        self._left = self._left[len(ret) :]
++        return ret
++
++    def read(self, n: Optional[int] = None):
++        out = []
++        if n is None or n < 0:
++            while True:
++                m = self._read1()
++                if not m:
++                    break
++                out.append(m)
++        else:
++            while n > 0:
++                m = self._read1(n)
++                if not m:
++                    break
++                n -= len(m)
++                out.append(m)
++        return b"".join(out)
++
++
++class AsyncBinaryIteratorIO(AsyncBinaryIO):
++    """Similar to BinaryIteratorIO except the iterator yields bytes asynchronously"""
++
++    def __init__(self, iter: Union[AsyncIterator[bytes], AsyncGenerator[bytes, Any]]):
++        self._iter = iter
++        self._left = b""
++
++    def readable(self):
++        return True
++
++    def seekable(self) -> bool:
++        return False
++
++    async def _read1(self, n: Optional[int] = None):
++        while not self._left:
++            try:
++                self._left = await self._iter.__anext__()
++            except StopAsyncIteration:
++                break
++        ret = self._left[:n]
++        self._left = self._left[len(ret) :]
++        return ret
++
++    async def read(self, n: Optional[int] = None):
++        out = []
++        if n is None or n < 0:
++            while True:
++                m = self._read1()
++                if not m:
++                    break
++                out.append(m)
++        else:
++            while n > 0:
++                m = await self._read1(n)
++                if not m:
++                    break
++                n -= len(m)
++                out.append(m)
++        return b"".join(out)
++
++
++class Streamable(ABC):
++    @classmethod
++    def mime_type(cls) -> str:
++        """
++        Return the binary mime type to use in HTTP requests when streaming this
++        data e.g., "application/x-cryosparc-dataset"
++        """
++        return f"application/x-cryosparc-{cls.__name__.lower()}"
++
++    @classmethod
++    def api_schema(cls):
++        """
++        Schema to use when an API endpoint returns or requests this streamable
++        instance in the request or response body.
++        """
++        return {
++            "description": f"A binary stream representing a CryoSPARC {cls.__name__}",
++            "content": {cls.mime_type(): {"schema": {"title": cls.__name__, "type": "string", "format": "binary"}}},
++        }
++
++    @classmethod
++    @abstractmethod
++    def load(cls, file: Union[str, PurePath, IO[bytes]]) -> Self:
++        """
++        The given stream param must at least implement an async read method
++        """
++        ...
++
++    @classmethod
++    def from_iterator(cls, source: Iterator[bytes]):
++        return cls.load(BinaryIteratorIO(source))
++
++    @classmethod
++    @abstractmethod
++    async def from_async_stream(cls, stream: AsyncBinaryIO) -> Self:
++        """
++        Asynchronously load from the given binary stream. The given stream
++        parameter must at least have ``async read(n: int | None) -> bytes`` method.
++        """
++        ...
++
++    @classmethod
++    async def from_async_iterator(cls, iterator: Union[AsyncIterator[bytes], AsyncGenerator[bytes, None]]):
++        return await cls.from_async_stream(AsyncBinaryIteratorIO(iterator))
++
++    @abstractmethod
++    def stream(self) -> Generator[bytes, None, None]:
++        ...
++
++    async def astream(self):
++        for chunk in self.stream():
++            yield chunk
+diff --git a/cryosparc/util.py b/cryosparc/util.py
+index 5da83cfe..b210fba5 100644
+--- a/cryosparc/util.py
++++ b/cryosparc/util.py
+@@ -4,9 +4,6 @@
+     IO,
+     TYPE_CHECKING,
+     Any,
+-    AsyncGenerator,
+-    AsyncIterator,
+-    BinaryIO,
+     Callable,
+     ContextManager,
+     Dict,
+@@ -113,137 +110,6 @@ def __missing__(self, key):
+         return new
+ 
+ 
+-class BinaryIteratorIO(BinaryIO):
+-    """
+-    Read through a iterator that yields bytes as if it was a file.
+-
+-    Args:
+-        iter (Iterator[bytes]): Generator that yields bytes
+-    """
+-
+-    def __init__(self, iter: Iterator[bytes]):
+-        self._iter = iter
+-        self._left = b""
+-
+-    def readable(self):
+-        """
+-        Returns:
+-            bool: True
+-        """
+-        return True
+-
+-    def seekable(self) -> bool:
+-        """
+-        Returns:
+-            bool: False
+-        """
+-        return False
+-
+-    def _read1(self, n: Optional[int] = None):
+-        while not self._left:
+-            try:
+-                self._left = next(self._iter)
+-            except StopIteration:
+-                break
+-        ret = self._left[:n]
+-        self._left = self._left[len(ret) :]
+-        return ret
+-
+-    def read(self, n: Optional[int] = None) -> bytes:
+-        """
+-        Read the given number of bytes from the iterator
+-
+-        Args:
+-            n (int, optional): Number of bytes to read. Reads all bytes if not
+-                specified. Defaults to None.
+-
+-        Returns:
+-            bytes: Zero or more bytes read
+-        """
+-        r = []
+-        if n is None or n < 0:
+-            while True:
+-                m = self._read1()
+-                if not m:
+-                    break
+-                r.append(m)
+-        else:
+-            while n > 0:
+-                m = self._read1(n)
+-                if not m:
+-                    break
+-                n -= len(m)
+-                r.append(m)
+-        return b"".join(r)
+-
+-
+-class AsyncBinaryIteratorIO:
+-    """
+-    Similar to ``BinaryIteratorIO`` except the iterator yields bytes
+-    asynchronously.
+-
+-    Args:
+-        iter (AsyncIterator[bytes]): Generator that asynchronously yields bytes.
+-
+-    """
+-
+-    def __init__(self, iter: Union[AsyncIterator[bytes], AsyncGenerator[bytes, None]]):
+-        self._iter = iter
+-        self._left = b""
+-
+-    def readable(self):
+-        """
+-        Returns:
+-            bool: True
+-        """
+-
+-        return True
+-
+-    def seekable(self) -> bool:
+-        """
+-        Returns:
+-            bool: False
+-        """
+-        return False
+-
+-    async def _read1(self, n: Optional[int] = None):
+-        while not self._left:
+-            try:
+-                self._left = await self._iter.__anext__()
+-            except StopAsyncIteration:
+-                break
+-        ret = self._left[:n]
+-        self._left = self._left[len(ret) :]
+-        return ret
+-
+-    async def read(self, n: Optional[int] = None):
+-        """
+-        Read the given number of bytes from the async iterator.
+-
+-        Args:
+-            n (int, optional): Number of bytes to read. Reads all bytes if not
+-                specified. Defaults to None.
+-
+-        Returns:
+-            bytes: Zero or more bytes read
+-        """
+-        r = []
+-        if n is None or n < 0:
+-            while True:
+-                m = await self._read1()
+-                if not m:
+-                    break
+-                r.append(m)
+-        else:
+-            while n > 0:
+-                m = await self._read1(n)
+-                if not m:
+-                    break
+-                n -= len(m)
+-                r.append(m)
+-        return b"".join(r)
+-
+-
+ def first(it: Union[Iterator[V], Sequence[V]]) -> Optional[V]:
+     """
+     Get the first item from the given iterator. Returns None if the iterator is

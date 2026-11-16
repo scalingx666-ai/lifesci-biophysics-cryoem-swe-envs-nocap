@@ -1,0 +1,661 @@
+diff --git a/docs/src/docs.md b/docs/src/docs.md
+index 2a9db0f8c..26c1bf185 100644
+--- a/docs/src/docs.md
++++ b/docs/src/docs.md
+@@ -677,6 +677,7 @@ The available simulators are:
+ - [`StormerVerlet`](@ref)
+ - [`Langevin`](@ref)
+ - [`LangevinSplitting`](@ref)
++- [`TemperatureREMD`](@ref)
+ 
+ The [`LangevinSplitting`](@ref) simulator can be used to define a variety of integrators such as velocity Verlet (splitting `"BAB"`), the Langevin implementation in [`Langevin`](@ref) (`"BAOA"`), and symplectic Euler integrators (`"AB"` and `"BA"`).
+ 
+@@ -816,6 +817,7 @@ The available loggers are:
+ - [`TimeCorrelationLogger`](@ref)
+ - [`AutoCorrelationLogger`](@ref)
+ - [`AverageObservableLogger`](@ref)
++- [`ReplicaExchangeLogger`](@ref)
+ 
+ Many of the loggers can be initialised with just the number of steps between recorded values, e.g. `CoordinateLogger(10)`.
+ An optional first argument is the type of the recorded value; the above is equivalent to `CoordinateLogger(typeof(1.0u"nm"), 10)` but if the simulation did not use units then `CoordinateLogger(Float64, 10)` would be required.
+diff --git a/src/loggers.jl b/src/loggers.jl
+index 3f1ed1763..ed54ccebe 100644
+--- a/src/loggers.jl
++++ b/src/loggers.jl
+@@ -14,7 +14,8 @@ export
+     StructureWriter,
+     TimeCorrelationLogger,
+     AutoCorrelationLogger,
+-    AverageObservableLogger
++    AverageObservableLogger,
++    ReplicaExchangeLogger
+ 
+ """
+     run_loggers!(system, neighbors=nothing, step_n=0; n_threads=Threads.nthreads())
+@@ -473,3 +474,41 @@ function Base.show(io::IO, aol::AverageObservableLogger)
+             aol.current_block_size * length(aol.block_averages),
+             " samples collected for observable ", aol.observable)
+ end
++
++"""
++    ReplicaExchangeLogger(n_steps::Int, T::DataType=DefaultFloat)
++
++A logger that records exchanges in a replica exchange simulation. The logged quantities include: number of exchange attempts (`n_attempts`),
++number of successful exchanges (`n_exchanges`), exchanged replica indices (`indices`), exchange steps (`steps`) and
++the value of Δ i.e. the argument of metropolis rate for the exchanges (`delta`).
++"""
++mutable struct ReplicaExchangeLogger{T}
++    n_replicas::Int
++    n_attempts::Int
++    n_exchanges::Int
++    indices::Vector{Tuple{Int,Int}}
++    steps::Vector{Int}
++    delta::Vector{T}
++    end_step::Int
++end
++
++ReplicaExchangeLogger(n_replicas::Int, T::DataType=DefaultFloat) = ReplicaExchangeLogger{T}(n_replicas, 0, 0, Tuple{Int, Int}[], Int[], T[], 0)
++
++function log_property!(
++                    rexl::ReplicaExchangeLogger,
++                    sys::ReplicaSystem,
++                    neighbors=nothing,
++                    step_n::Int=0;
++                    indices::Tuple{Int,Int},
++                    delta::Real,
++                    n_threads=Threads.nthreads())
++    push!(rexl.indices, indices)
++    push!(rexl.steps, step_n+rexl.end_step)
++    push!(rexl.delta, delta)
++    rexl.n_exchanges += 1
++end
++
++function finish_logs!(rexl::ReplicaExchangeLogger; n_steps::Int=0, n_attempts::Int=0)
++    rexl.end_step += n_steps
++    rexl.n_attempts += n_attempts
++end
+diff --git a/src/simulators.jl b/src/simulators.jl
+index bbeaac431..0cd2ac468 100644
+--- a/src/simulators.jl
++++ b/src/simulators.jl
+@@ -7,7 +7,8 @@ export
+     Verlet,
+     StormerVerlet,
+     Langevin,
+-    LangevinSplitting
++    LangevinSplitting,
++    TemperatureREMD
+ 
+ """
+     SteepestDescentMinimizer(; <keyword arguments>)
+@@ -438,3 +439,132 @@ function B_step!(s, dt_eff, acceleration_vector, compute_forces::Bool, n_threads
+     end
+     s.velocities += dt_eff * remove_molar.(acceleration_vector)
+ end
++
++"""
++    TemperatureREMD(; <keyword arguments>)
++
++A simulator for a parallel temperature replica exchange (TREX) simulation on a [`ReplicaSystem`](@ref). More information on this algorithm can be found in [Sugita Y., Okamoto Y. 1999](https://doi.org/10.1016/S0009-2614(99)01123-9).
++The corresponding [`ReplicaSystem`](@ref) should have the same number of replicas as the number of temperatures in the simulator.
++
++arguments:
++- `dt::S`: the time step of the simulation.
++- `temperatures::TP`: the temperatures corresponding to the replicas.
++- `simulators::ST`: individual simulators for simulating each replica.
++- `exchange_time::ET`: the time interval between replica exchange attempt.
++"""
++struct TemperatureREMD{N, T, S, DT, TP, ST, ET}
++    dt::DT
++    temperatures::TP
++    simulators::ST
++    exchange_time::ET
++end
++
++function TemperatureREMD(;
++                dt,
++                temperatures,
++                simulators,
++                exchange_time,
++                kwargs...)
++    S = eltype(simulators)
++    T = eltype(temperatures)
++    N = length(temperatures)
++    DT = typeof(dt)
++    TP = typeof(temperatures)
++    ET = typeof(exchange_time)
++    if length(simulators) != length(temperatures)
++        throw(ArgumentError("Number of temperatures must match number of simulators"))
++    end
++    if exchange_time <= dt
++        throw(ArgumentError("Exchange time must be greater than the time step"))
++    end
++    simulators = Tuple(simulators[i] for i in 1:N)
++    ST = typeof(simulators)
++    
++    return TemperatureREMD{N, T, S, DT, TP, ST, ET}(dt, temperatures, simulators, exchange_time)
++end
++
++function simulate!(sys::ReplicaSystem{D, G, T},
++                    sim::TemperatureREMD,
++                    n_steps::Int;
++                    assign_velocities::Bool=false,
++                    rng=Random.GLOBAL_RNG,
++                    n_threads::Int=Threads.nthreads()) where {D, G, T}
++    if sys.n_replicas != length(sim.simulators)
++        throw(ArgumentError("Number of replicas in ReplicaSystem and simulators in TemperatureREMD do not match."))
++    end
++
++    if n_threads > sys.n_replicas
++        thread_div = equal_parts(n_threads, sys.n_replicas)
++    else # pass 1 thread per replica
++        thread_div = equal_parts(sys.n_replicas, sys.n_replicas)
++    end
++
++    # calculate n_cycles and n_steps_per_cycle from dt and exchange_time
++    n_cycles = convert(Int, (n_steps * sim.dt) ÷ sim.exchange_time)
++    cycle_length = (n_cycles > 0) ? n_steps ÷ n_cycles : 0
++    remaining_steps = (n_cycles > 0) ? n_steps % n_cycles : n_steps
++    n_attempts = 0
++
++    if assign_velocities
++        for i in eachindex(sys.replicas)
++            random_velocities!(sys.replicas[i], sim.temperatures[i]; rng=rng)
++        end
++    end
++
++    for cycle=1:n_cycles
++        @sync for idx in eachindex(sim.simulators)
++            Threads.@spawn simulate!(sys.replicas[idx], sim.simulators[idx], cycle_length; n_threads=thread_div[idx])
++        end
++
++        cycle_parity = cycle % 2
++        for n in 1+cycle_parity:2:sys.n_replicas-1
++            n_attempts += 1
++            m = n + 1
++            if dimension(sys.energy_units) == u"𝐋^2 * 𝐌 * 𝐍^-1 * 𝐓^-2"
++                k_b = sys.k * T(Unitful.Na)
++            else
++                k_b = sys.k
++            end
++            T_n, T_m = sim.temperatures[n], sim.temperatures[m]
++            β_n, β_m = 1/(k_b*T_n), 1/(k_b*T_m)
++            neighbors_n = find_neighbors(sys.replicas[n], sys.replicas[n].neighbor_finder; n_threads=n_threads)
++            neighbors_m = find_neighbors(sys.replicas[m], sys.replicas[m].neighbor_finder; n_threads=n_threads)
++            V_n, V_m = potential_energy(sys.replicas[n], neighbors_n), potential_energy(sys.replicas[m], neighbors_m)
++            Δ = (β_m - β_n)*(V_n - V_m)
++            if Δ <= 0 || rand(rng) < exp(-Δ)
++                # exchange coordinates and velocities
++                sys.replicas[n].coords, sys.replicas[m].coords = sys.replicas[m].coords, sys.replicas[n].coords
++                sys.replicas[n].velocities, sys.replicas[m].velocities = sys.replicas[m].velocities, sys.replicas[n].velocities
++                # scale velocities
++                sys.replicas[n].velocities .*= sqrt(T_n/T_m)
++                sys.replicas[m].velocities .*= sqrt(T_m/T_n)
++                if !isnothing(sys.exchange_logger)
++                    log_property!(sys.exchange_logger, sys, nothing, cycle*cycle_length; indices=(n, m), delta=Δ, n_threads=n_threads)
++                end
++            end
++        end
++    end
++
++    # run for remaining_steps (if >0) for all replicas
++    if remaining_steps > 0
++        @sync for idx in eachindex(sim.simulators)
++            Threads.@spawn simulate!(sys.replicas[idx], sim.simulators[idx], remaining_steps; n_threads=thread_div[idx])
++        end
++    end
++
++    if !isnothing(sys.exchange_logger)
++        finish_logs!(sys.exchange_logger; n_steps=n_steps, n_attempts=n_attempts)
++    end
++
++    return sys
++end
++
++"""
++Returns k almost equal patitions of n
++"""
++@inline function equal_parts(n::Int, k::Int)
++    ndiv = n ÷ k
++    nrem = n % k
++    n_parts = ntuple(i -> (i <= nrem) ? ndiv+1 : ndiv, k)
++    return n_parts
++end
+diff --git a/src/types.jl b/src/types.jl
+index c647fc941..3bb1fbfb4 100644
+--- a/src/types.jl
++++ b/src/types.jl
+@@ -15,6 +15,7 @@ export
+     NeighborList,
+     NeighborListVec,
+     System,
++    ReplicaSystem,
+     is_gpu_diff_safe,
+     float_type,
+     is_on_gpu,
+@@ -366,6 +367,182 @@ function System(;
+         throw(ArgumentError("The velocities are on the GPU but the atoms are not"))
+     end
+ 
++    k_converted = convert_k_units(k, energy_units, T)
++    K = typeof(k_converted)
++
++    return System{D, G, T, CU, A, AD, PI, SI, GI, C, V, B, NF, L, F, E, K}(
++                    atoms, atoms_data, pairwise_inters, specific_inter_lists,
++                    general_inters, coords, vels, boundary, neighbor_finder,
++                    loggers, force_units, energy_units, k_converted)
++end
++
++"""
++    ReplicaSystem(; <keyword arguments>)
++
++A wrapper for replicas in a replica exchange simulation. Each individual replica 
++is a [`System`](@ref). Properties unused in the simulation or in analysis can be 
++left with their default values.
++`atoms`, `atoms_data`, `coords` and the elements in `replica_velocities` should have the same length. 
++Number of loggers in `replica_loggers` should be equal to `n_replicas`. Number of elements in `replica_velocities` should be equal to `n_replicas`.
++
++# Arguments
++- `atoms::A`: the atoms, or atom equivalents, in the system. Can be
++    of any type but should be a bits type if the GPU is used.
++- `atoms_data::AD`: other data associated with the atoms, allowing the atoms to
++    be bits types and hence work on the GPU.
++- `pairwise_inters::PI=()`: the pairwise interactions in the system, i.e.
++    interactions between all or most atom pairs such as electrostatics.
++    Typically a `Tuple`.
++- `specific_inter_lists::SI=()`: the specific interactions in the system,
++    i.e. interactions between specific atoms such as bonds or angles. Typically
++    a `Tuple`.
++- `general_inters::GI=()`: the general interactions in the system,
++    i.e. interactions involving all atoms such as implicit solvent. Typically
++    a `Tuple`.
++- `n_replicas::Int`: the number of replicas of the system.
++- `coords::C`: the coordinates of the atoms in the system. Typically a
++    vector of `SVector`s of 2 or 3 dimensions.
++- `replica_velocities::V=[zero(coords) * u"ps^-1" for _ in 1:n_replicas]`: the velocities of the atoms in the
++    system.
++- `boundary::B`: the bounding box in which the simulation takes place.
++- `neighbor_finder::NF=NoNeighborFinder()`: the neighbor finder used to find
++    close atoms and save on computation.
++- `exchange_logger::EL=ReplicaExchangeLogger(n_replicas)`: the logger used to record
++    the exchange of replicas.
++- `replica_loggers::RL=Tuple(() for _ in 1:n_replicas)`: the loggers for each replica 
++    that record properties of interest during a simulation.
++- `force_units::F=u"kJ * mol^-1 * nm^-1"`: the units of force of the system.
++    Should be set to `NoUnits` if units are not being used.
++- `energy_units::E=u"kJ * mol^-1"`: the units of energy of the system. Should
++    be set to `NoUnits` if units are not being used.
++- `k::K=Unitful.k`: the Boltzmann constant, which may be modified in some
++    simulations.
++- `gpu_diff_safe::Bool`: whether to use the code path suitable for the
++    GPU and taking gradients. Defaults to `isa(coords, CuArray)`.
++"""
++mutable struct ReplicaSystem{D, G, T, CU, A, AD, PI, SI, GI, RS, B, EL, F, E, K} <: AbstractSystem{D}
++    atoms::A
++    atoms_data::AD
++    pairwise_inters::PI
++    specific_inter_lists::SI
++    general_inters::GI
++    n_replicas::Integer
++    replicas::RS
++    boundary::B
++    exchange_logger::EL
++    force_units::F
++    energy_units::E
++    k::K
++end
++
++function ReplicaSystem(;
++                atoms,
++                atoms_data=[],
++                pairwise_inters=(),
++                specific_inter_lists=(),
++                general_inters=(),
++                coords,
++                replica_velocities=nothing,
++                n_replicas,
++                boundary,
++                neighbor_finder=NoNeighborFinder(),
++                exchange_logger=nothing,
++                replica_loggers=Tuple(() for _ in 1:n_replicas),
++                force_units=u"kJ * mol^-1 * nm^-1",
++                energy_units=u"kJ * mol^-1",
++                k=Unitful.k,
++                gpu_diff_safe=isa(coords, CuArray))
++    D = n_dimensions(boundary)
++    G = gpu_diff_safe
++    T = float_type(boundary)
++    CU = isa(coords, CuArray)
++    A = typeof(atoms)
++    AD = typeof(atoms_data)
++    PI = typeof(pairwise_inters)
++    SI = typeof(specific_inter_lists)
++    GI = typeof(general_inters)
++    C = typeof(coords)
++    B = typeof(boundary)
++    NF = typeof(neighbor_finder)
++    F = typeof(force_units)
++    E = typeof(energy_units)
++    
++
++    if isnothing(replica_velocities)
++        if force_units == NoUnits
++            replica_velocities = [zero(coords) for _ in 1:n_replicas]
++        else
++            replica_velocities = [zero(coords) * u"ps^-1" for _ in 1:n_replicas]
++        end
++    end
++    V = typeof(replica_velocities[1])
++
++    if isnothing(exchange_logger)
++        exchange_logger = ReplicaExchangeLogger(n_replicas, T)
++    end
++    EL = typeof(exchange_logger)
++    
++    if !all(y -> typeof(y) == V, replica_velocities)
++        throw(ArgumentError("The velocities for all the replicas are not of the same type."))
++    end
++    if length(replica_velocities) != n_replicas
++        throw(ArgumentError("There are $(length(replica_velocities)) velocities for replicas but $(n_replicas) replicas."))
++    end
++
++    if !all(y -> length(y)==length(replica_velocities[1]), replica_velocities)
++        throw(ArgumentError("Some replicas have different number of velocities."))
++    end
++    if length(atoms) != length(coords)
++        throw(ArgumentError("There are $(length(atoms)) atoms but $(length(coords)) coordinates"))
++    end
++    if length(atoms) != length(replica_velocities[1])
++        throw(ArgumentError("There are $(length(atoms)) atoms but $(length(replica_velocities[1])) velocities"))
++    end
++    if length(atoms_data) > 0 && length(atoms) != length(atoms_data)
++        throw(ArgumentError("There are $(length(atoms)) atoms but $(length(atoms_data)) atom data entries"))
++    end
++
++    if isa(atoms, CuArray) && !isa(coords, CuArray)
++        throw(ArgumentError("The atoms are on the GPU but the coordinates are not"))
++    end
++    if isa(coords, CuArray) && !isa(atoms, CuArray)
++        throw(ArgumentError("The coordinates are on the GPU but the atoms are not"))
++    end
++
++    n_cuarray = sum(y -> isa(y, CuArray), replica_velocities)
++    if !(n_cuarray == n_replicas || n_cuarray == 0)
++        throw(ArgumentError("The velocities for $(n_cuarray) out of $(n_replicas) replicas are on GPU."))
++    end
++    if isa(atoms, CuArray) && n_cuarray != n_replicas
++        throw(ArgumentError("The atoms are on the GPU but the velocities are not"))
++    end
++    if n_cuarray == n_replicas && !isa(atoms, CuArray)
++        throw(ArgumentError("The velocities are on the GPU but the atoms are not"))
++    end
++
++    if length(replica_loggers) != n_replicas
++        throw(ArgumentError("There are $(length(replica_loggers)) loggers but $(n_replicas) replicas"))
++    end
++
++    k_converted = convert_k_units(k, energy_units, T)
++    K = typeof(k_converted)
++
++    replicas = Tuple(System{D, G, T, CU, A, AD, PI, SI, GI, C, V, B, NF, typeof(replica_loggers[i]), F, E, K}(
++            atoms, atoms_data, pairwise_inters, specific_inter_lists,
++            general_inters, copy(coords), replica_velocities[i], boundary, deepcopy(neighbor_finder),
++            replica_loggers[i], force_units, energy_units, k_converted) for i=1:n_replicas)
++    RS = typeof(replicas)
++
++    return ReplicaSystem{D, G, T, CU, A, AD, PI, SI, GI, RS, B, EL, F, E, K}(
++            atoms, atoms_data, pairwise_inters, specific_inter_lists,
++            general_inters, n_replicas, replicas, boundary, 
++            exchange_logger, force_units, energy_units, k_converted)
++end
++
++"""
++Convert the value k to suitable units and float type.
++"""
++function convert_k_units(k, energy_units, T::Type)
+     if energy_units == NoUnits
+         if unit(k) == NoUnits
+             # Use user-supplied unitless Boltzmann constant
+@@ -379,12 +556,7 @@ function System(;
+     else
+         k_converted = T(uconvert(energy_units * u"K^-1", k))
+     end
+-    K = typeof(k_converted)
+-
+-    return System{D, G, T, CU, A, AD, PI, SI, GI, C, V, B, NF, L, F, E, K}(
+-                    atoms, atoms_data, pairwise_inters, specific_inter_lists,
+-                    general_inters, coords, vels, boundary, neighbor_finder,
+-                    loggers, force_units, energy_units, k_converted)
++    return k_converted
+ end
+ 
+ """
+@@ -393,7 +565,7 @@ end
+ Whether a [`System`](@ref) uses the code path suitable for the GPU and
+ for taking gradients.
+ """
+-is_gpu_diff_safe(::System{D, G}) where {D, G} = G
++is_gpu_diff_safe(::Union{System{D, G}, ReplicaSystem{D, G}}) where {D, G} = G
+ 
+ """
+     float_type(sys)
+@@ -401,7 +573,7 @@ is_gpu_diff_safe(::System{D, G}) where {D, G} = G
+ 
+ The float type a [`System`](@ref) or bounding box uses.
+ """
+-float_type(::System{D, G, T}) where {D, G, T} = T
++float_type(::Union{System{D, G, T}, ReplicaSystem{D, G, T}}) where {D, G, T} = T
+ 
+ """
+     is_on_gpu(sys)
+@@ -421,23 +593,27 @@ masses(s::System) = mass.(s.atoms)
+ move_array(arr, ::System{D, G, T, false}) where {D, G, T} = arr
+ move_array(arr, ::System{D, G, T, true }) where {D, G, T} = CuArray(arr)
+ 
+-AtomsBase.species_type(s::System) = eltype(s.atoms)
++AtomsBase.species_type(s::Union{System, ReplicaSystem}) = eltype(s.atoms)
+ 
+-Base.getindex(s::System, i::Integer) = AtomView(s, i)
+-Base.length(s::System) = length(s.atoms)
++Base.getindex(s::Union{System, ReplicaSystem}, i::Integer) = AtomView(s, i)
++Base.length(s::Union{System, ReplicaSystem}) = length(s.atoms)
+ 
+ AtomsBase.position(s::System) = s.coords
+ AtomsBase.position(s::System, i::Integer) = s.coords[i]
++AtomsBase.position(s::ReplicaSystem) = s.replicas[1].coords
++AtomsBase.position(s::ReplicaSystem, i::Integer) = s.replicas[1].coords[i]
+ 
+ AtomsBase.velocity(s::System) = s.velocities
+ AtomsBase.velocity(s::System, i::Integer) = s.velocities[i]
++AtomsBase.velocity(s::ReplicaSystem) = s.replicas[1].velocities
++AtomsBase.velocity(s::ReplicaSystem, i::Integer) = s.replicas[1].velocities[i]
+ 
+-AtomsBase.atomic_mass(s::System, i::Integer) = mass(s.atoms[i])
+-AtomsBase.atomic_symbol(s::System, i::Integer) = Symbol(s.atoms_data[i].element)
+-AtomsBase.atomic_number(s::System, i::Integer) = missing
++AtomsBase.atomic_mass(s::Union{System, ReplicaSystem}, i::Integer) = mass(s.atoms[i])
++AtomsBase.atomic_symbol(s::Union{System, ReplicaSystem}, i::Integer) = Symbol(s.atoms_data[i].element)
++AtomsBase.atomic_number(s::Union{System, ReplicaSystem}, i::Integer) = missing
+ 
+-AtomsBase.boundary_conditions(::System{3}) = SVector(Periodic(), Periodic(), Periodic())
+-AtomsBase.boundary_conditions(::System{2}) = SVector(Periodic(), Periodic())
++AtomsBase.boundary_conditions(::Union{System{3}, ReplicaSystem{3}}) = SVector(Periodic(), Periodic(), Periodic())
++AtomsBase.boundary_conditions(::Union{System{2}, ReplicaSystem{2}}) = SVector(Periodic(), Periodic())
+ 
+ edges_to_box(bs::SVector{3}, z) = SVector{3}([
+     SVector(bs[1], z    , z    ),
+@@ -449,7 +625,7 @@ edges_to_box(bs::SVector{2}, z) = SVector{2}([
+     SVector(z    , bs[2]),
+ ])
+ 
+-function AtomsBase.bounding_box(s::System)
++function AtomsBase.bounding_box(s::Union{System, ReplicaSystem})
+     bs = s.boundary.side_lengths
+     z = zero(bs[1])
+     bb = edges_to_box(bs, z)
+@@ -459,3 +635,7 @@ end
+ function Base.show(io::IO, s::System)
+     print(io, "System with ", length(s), " atoms, boundary ", s.boundary)
+ end
++
++function Base.show(io::IO, s::ReplicaSystem)
++    print(io, "ReplicaSystem containing ",  s.n_replicas, " replicas with ", length(s), " atoms, boundary ", s.boundary)
++end
+diff --git a/test/basic.jl b/test/basic.jl
+index 0355fd41b..9232268c5 100644
+--- a/test/basic.jl
++++ b/test/basic.jl
+@@ -384,3 +384,83 @@ end
+     atoms = [Atom(mass=bb_to_mass[BioStructures.element(bb_atoms[i])]) for i in 1:length(bb_atoms)]
+     @test isapprox(radius_gyration(coords, atoms), 11.51225678195222u"Å", atol=1e-6u"nm")
+ end
++
++@testset "Replica System" begin
++    n_atoms = 100
++    boundary = CubicBoundary(2.0u"nm", 2.0u"nm", 2.0u"nm") 
++    temp = 298.0u"K"
++    atom_mass = 10.0u"u"
++    
++    atoms = [Atom(mass=atom_mass, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1") for i in 1:n_atoms]
++    coords = place_atoms(n_atoms, boundary, 0.3u"nm")
++    replica_velocities = nothing
++    pairwise_inters = (LennardJones(nl_only=true),)
++    n_replicas = 4
++
++    nb_matrix = trues(n_atoms, n_atoms)
++    for i in 1:(n_atoms ÷ 2)
++        nb_matrix[i, i + (n_atoms ÷ 2)] = false
++        nb_matrix[i + (n_atoms ÷ 2), i] = false
++    end
++    
++    neighbor_finder = DistanceNeighborFinder(
++        nb_matrix=nb_matrix,
++        n_steps=10,
++        dist_cutoff=1.5u"nm",
++    )
++
++    repsys = ReplicaSystem(;
++        n_replicas=n_replicas,
++        atoms=atoms,
++        coords=coords,
++        replica_velocities=replica_velocities,
++        pairwise_inters=pairwise_inters,
++        boundary=boundary,
++    )
++
++    sys = System(;
++        atoms=atoms,
++        coords=coords,
++        velocities=nothing,
++        pairwise_inters=pairwise_inters,
++        boundary=boundary,
++    )
++
++    for i in 1:n_replicas
++        @test all(
++            [getfield(repsys.replicas[i], f) for f in fieldnames(System)] .== [getfield(sys, f) for f in fieldnames(System)]
++        )
++    end
++
++    repsys2 = ReplicaSystem(;
++        n_replicas=n_replicas,
++        atoms=atoms,
++        coords=coords,
++        replica_velocities=replica_velocities,
++        pairwise_inters=pairwise_inters,
++        boundary=boundary,
++        replica_loggers=Tuple((temp=TemperatureLogger(10), coords=CoordinateLogger(10)) for i in 1:n_replicas),
++        neighbor_finder=neighbor_finder,
++    )
++
++    sys2 = System(;
++        atoms=atoms,
++        coords=coords,
++        velocities=nothing,
++        pairwise_inters=pairwise_inters,
++        boundary=boundary,
++        loggers=(temp=TemperatureLogger(10), coords=CoordinateLogger(10)),
++        neighbor_finder=neighbor_finder,
++    )
++
++    for i in 1:n_replicas
++        l1 = repsys2.replicas[i].loggers
++        l2 = sys2.loggers
++        @test typeof(l1) == typeof(l2)
++        @test propertynames(l1) == propertynames(l2)
++
++        nf1 = [getproperty(repsys2.replicas[i].neighbor_finder, p) for p in propertynames(repsys2.replicas[i].neighbor_finder)]
++        nf2 = [getproperty(sys2.neighbor_finder, p) for p in propertynames(sys2.neighbor_finder)]
++        @test all(nf1 .== nf2)
++    end
++end
+diff --git a/test/simulation.jl b/test/simulation.jl
+index d3000441f..a784824fb 100644
+--- a/test/simulation.jl
++++ b/test/simulation.jl
+@@ -451,6 +451,65 @@ end
+     @test maximum(maximum(abs.(v)) for v in (s1.coords .- s2.coords)) < 1e-5u"nm"
+ end
+ 
++@testset "Temperature Replica Exchange" begin
++    n_atoms = 100
++    atom_mass = 10.0u"u"
++    atoms = [Atom(mass=atom_mass, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1") for i in 1:n_atoms]
++    boundary = CubicBoundary(2.0u"nm", 2.0u"nm", 2.0u"nm")
++    coords = place_atoms(n_atoms, boundary, 0.3u"nm")
++
++    pairwise_inters = (LennardJones(nl_only=true),)
++
++    nb_matrix = trues(n_atoms, n_atoms)
++    for i in 1:(n_atoms ÷ 2)
++        nb_matrix[i, i + (n_atoms ÷ 2)] = false
++        nb_matrix[i + (n_atoms ÷ 2), i] = false
++    end
++    
++    neighbor_finder = DistanceNeighborFinder(
++        nb_matrix=nb_matrix,
++        n_steps=10,
++        dist_cutoff=1.5u"nm",
++    )
++
++    n_replicas = 4
++
++    repsys = ReplicaSystem(
++        atoms=atoms,
++        coords=coords,
++        replica_velocities=nothing,
++        n_replicas=n_replicas,
++        boundary=boundary,
++        pairwise_inters=pairwise_inters,
++        replica_loggers=Tuple((temp=TemperatureLogger(10), coords=CoordinateLogger(10)) for i in 1:n_replicas),
++        neighbor_finder=neighbor_finder,
++    )
++
++    temp_vals = [120.0u"K", 180.0u"K", 240.0u"K", 300.0u"K"]
++    simulator = TemperatureREMD(
++        dt=0.005u"ps",
++        temperatures=temp_vals,
++        simulators=[
++            Langevin(
++                dt=0.005u"ps",
++                temperature=temp,
++                friction=0.1u"ps^-1",
++            )
++            for temp in temp_vals],
++        exchange_time=2.5u"ps",
++    )
++
++    @time simulate!(repsys, simulator, 10_000; assign_velocities=true);
++    @time simulate!(repsys, simulator, 10_000; assign_velocities=false);
++
++    efficiency = repsys.exchange_logger.n_exchanges / repsys.exchange_logger.n_attempts
++    @test efficiency > 0.35  # This is a fairly arbitrary threshold, but it's a good tests for very bad cases
++
++    for id in eachindex(repsys.replicas)
++        @test 0.95temp_vals[id] < mean(values(repsys.replicas[id].loggers.temp)) < 1.05temp_vals[id]
++    end
++end
++
+ @testset "Different implementations" begin
+     n_atoms = 400
+     atom_mass = 10.0u"u"

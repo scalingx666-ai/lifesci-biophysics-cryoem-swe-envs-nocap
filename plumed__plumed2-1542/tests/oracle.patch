@@ -1,0 +1,905 @@
+diff --git a/CHANGES/v2.11.md b/CHANGES/v2.11.md
+index 32452e0549..2e7f742c98 100644
+--- a/CHANGES/v2.11.md
++++ b/CHANGES/v2.11.md
+@@ -32,6 +32,15 @@ This page contains changes that will end up in 2.11
+   - [FIT_TO_TEMPLATE](FIT_TO_TEMPLATE.md) and [RESET_CELL](RESET_CELL.md), which move all the atoms, are 2 to 5 times faster: they loop
+     directly on the arrays of positions and forces. With `plumed benchmark`, 7000 atoms and `TYPE=OPTIMAL` with 200 aligned atoms,
+     FIT_TO_TEMPLATE went from 148 to 90 microseconds per step for the positions and from 260 to 48 for the forces. The results are identical.
++  - The forces on the eigenvectors computed by [DIAGONALIZE](DIAGONALIZE.md) (used e.g. when biasing [SPRINT](SPRINT.md)) are computed in a time that scales
++    as N^2 instead of N^4 with the size N of the matrix. With a 200x200 contact matrix, applying the forces went from 5 seconds to 0.3 milliseconds per step.
++  - The iterations of the SMACOF algorithm (used by [ARRANGE_POINTS](ARRANGE_POINTS.md) with `MINTYPE=smacof` and by [SKETCHMAP](SKETCHMAP.md) with `USE_SMACOF`) scale as M^2 instead of M^3 with the number of points M: with 1000 points an iteration went from 3 seconds to 6 milliseconds.
++  - Symmetric positive definite matrices (e.g. the covariance matrices of multivariate Gaussians) are inverted with a Cholesky factorization instead of being diagonalized,
++    which is 5 to 25 times faster for matrices with up to 10 rows and about 4 times faster for large matrices; matrix products are 2 to 5 times faster.
++    [METAD](METAD.md) with `ADAPTIVE=DIFF` and three CVs depositing a Gaussian at every step is about 20% faster, and reading 20000 multivariate Gaussians when restarting is about 25% faster.
++  - When no derivatives are needed, [DIAGONALIZE](DIAGONALIZE.md) computes only the requested eigenvalues and eigenvectors (from the largest one down to the smallest requested one) instead of all of them.
++    With `VECTORS=1` this is 3 to 4 times faster: e.g. for a 1000x1000 contact matrix it went from 180 to 70 milliseconds per frame. [CLASSICAL_MDS](CLASSICAL_MDS.md) also benefits: with 2000 frames the analysis is about 20% faster.
++    The results are identical.
+   - PLUMED stops with an error, instead of crashing, when it has to apply forces on the atoms or on a value passed with [PUT](PUT.md)
+     and the MD code did not pass the array for these forces. The size of the arrays passed with domain decomposition is now checked
+     also when PLUMED is compiled without debug flags.
+@@ -100,6 +109,7 @@ This page contains changes that will end up in 2.11
+     When a `Subprocess` is destroyed, the group receives `SIGTERM` (and `SIGCONT`, in case it was stopped) and, if the shell has not exited after one second, `SIGKILL`.
+   - The `xdrfile` and `molfile` modules are now always compiled: since the trajectory parser was moved to `src/tools` it requires them, and configuring with `--enable-modules=none` (or removing one of them) failed at link time.
+   - The core module does not call blas directly anymore: the only call (a `daxpy` used to sum the forces in `ActionWithValue`) has been replaced by a plain loop, which is as fast and avoids calling a threaded blas within an OpenMP region. The configure warnings printed when the internal blas/lapack are used have been reworded, since the internal versions are only slower than an optimized external library with large matrices.
++  - `pseudoInvert` builds the pseudoinverse with a single product, without the intermediate dense matrices; the result is the same and it is up to 2 times faster for large matrices. `diagMatRange` computes only a range of the eigenvalues and eigenvectors of a symmetric matrix.
+   - The inputlines now are parsed using a dictionary instead of an array. This speeds up the parsing of massive input lines.
+   - Abstracted the AtomDistribution functionality from the benchmark. It can be used in tests or in other
+   - It is not possible anymore to register lowercase keywords and the developer must always specify the keywords completely as uppercase while parsing in the action constructor. There are no differences for the user, apart the entry in the manual for the DEBUG action: the user can still specify lowercase and mixed case keywords in the input file.
+diff --git a/src/dimred/SMACOF.cpp b/src/dimred/SMACOF.cpp
+index 6ae97316e3..1ca8aa482d 100644
+--- a/src/dimred/SMACOF.cpp
++++ b/src/dimred/SMACOF.cpp
+@@ -71,7 +71,7 @@ void SMACOF::optimize( const double& tol, const unsigned& maxloops, std::vector<
+   double myfirstsig = calculateSigma( Z, dists );
+ 
+   // initial sigma is made up of the original distances minus the distances between the projections all squared.
+-  Matrix<double> temp( M, M ), BZ( M, M ), newZ( M, nlow );
++  Matrix<double> temp( M, nlow ), BZ( M, M ), newZ( M, nlow );
+   for(unsigned n=0; n<maxloops; ++n) {
+     if(n==maxloops-1) {
+       plumed_merror("ran out of steps in SMACOF algorithm");
+@@ -100,8 +100,9 @@ void SMACOF::optimize( const double& tol, const unsigned& maxloops, std::vector<
+       }
+     }
+ 
+-    mult( mypseudo, BZ, temp);
+-    mult(temp, Z, newZ);
++    // computing pseudo*(BZ*Z) costs O(M^2*nlow), while (pseudo*BZ)*Z costs O(M^3)
++    mult( BZ, Z, temp );
++    mult( mypseudo, temp, newZ );
+     //Compute new sigma
+     double newsig = calculateSigma( newZ, dists );
+     //Computing whether the algorithm has converged (has the mass of the potato changed
+diff --git a/src/lapack/import.sh b/src/lapack/import.sh
+index a6d7e0f4a5..b52a7f0ff3 100755
+--- a/src/lapack/import.sh
++++ b/src/lapack/import.sh
+@@ -111,7 +111,10 @@ done
+ echo "#endif"
+ # removing static seems to be still necessary
+ # even though the problem was reported upstream https://gerrit.gromacs.org/#/c/4651/
+-} | sed 's/static //' > lapack.cpp
++} | sed 's/static //' |
++# dlarrex and slarrex read isplit[0], which is out of bounds, when the requested
++# eigenvalues are all in the first block (as before the loop, it should be 1)
++perl -0pe 's/(cnt = iwork\[\*n \+ iwork\[j\]\];\n\s*)ibegin = isplit\[itmp - 1\] \+ 1;/${1}ibegin = (itmp == 1) ? 1 : isplit[itmp - 1] + 1;/g' > lapack.cpp
+ 
+ cd ../
+ ./header.sh lapack
+diff --git a/src/lapack/lapack.cpp b/src/lapack/lapack.cpp
+index 3fe953ff6d..b31db92ea6 100644
+--- a/src/lapack/lapack.cpp
++++ b/src/lapack/lapack.cpp
+@@ -5545,7 +5545,7 @@ PLUMED_BLAS_F77_FUNC(dlarrex,DLARREX)(const char *range,
+ 		    j = i__;
+ 		    itmp = iblock[j];
+ 		    cnt = iwork[*n + iwork[j]];
+-		    ibegin = isplit[itmp - 1] + 1;
++		    ibegin = (itmp == 1) ? 1 : isplit[itmp - 1] + 1;
+ 		    if (i__ == *m && till < *m) {
+ 			indexw[*m] = cnt - ibegin + 1;
+ 		    }
+@@ -21147,7 +21147,7 @@ PLUMED_BLAS_F77_FUNC(slarrex,SLARREX)(const char *range,
+ 		    j = i__;
+ 		    itmp = iblock[j];
+ 		    cnt = iwork[*n + iwork[j]];
+-		    ibegin = isplit[itmp - 1] + 1;
++		    ibegin = (itmp == 1) ? 1 : isplit[itmp - 1] + 1;
+ 		    if (i__ == *m && till < *m) {
+ 			indexw[*m] = cnt - ibegin + 1;
+ 		    }
+diff --git a/src/matrixtools/DiagonalizeMatrix.cpp b/src/matrixtools/DiagonalizeMatrix.cpp
+index 1613c89310..8f8b93a6ff 100644
+--- a/src/matrixtools/DiagonalizeMatrix.cpp
++++ b/src/matrixtools/DiagonalizeMatrix.cpp
+@@ -22,6 +22,8 @@
+ #include "MatrixOperationBase.h"
+ #include "core/ActionRegister.h"
+ 
++#include <algorithm>
++
+ //+PLUMEDOC ANALYSIS DIAGONALIZE
+ /*
+ Calculate the eigenvalues and eigenvectors of a square matrix
+@@ -57,6 +59,15 @@ class DiagonalizeMatrix : public MatrixOperationBase {
+   Matrix<double> mymatrix;
+   std::vector<double> eigvals;
+   Matrix<double> eigvecs;
++/// For each requested eigenpair that has forces: the index of the eigenpair in eigvecs,
++/// the force on the eigenvalue and a vector used to compute the forces from the eigenvector
++  struct ForceTerm {
++    unsigned ncol;
++    double evalForce;
++    bool hasEvecForce;
++    std::vector<double> w;
++  };
++  std::vector<ForceTerm> forceTerms;
+ public:
+   static void registerKeywords( Keywords& keys );
+ /// Constructor
+@@ -69,6 +80,8 @@ class DiagonalizeMatrix : public MatrixOperationBase {
+   void prepare() override ;
+ ///
+   void calculate() override ;
++/// Prepare the quantities needed to compute the forces on the matrix elements
++  void apply() override ;
+ ///
+   double getForceOnMatrixElement( const unsigned& jrow, const unsigned& krow ) const override;
+ };
+@@ -159,8 +172,16 @@ void DiagonalizeMatrix::calculate() {
+ 
+   // Retrieve the matrix from input
+   retrieveFullMatrix( mymatrix );
+-  // Now diagonalize the matrix
+-  diagMat( mymatrix, eigvals, eigvecs );
++  // Now diagonalize the matrix. The forces on an eigenvector depend on all the eigenvectors,
++  // so they are all computed when derivatives are needed. Otherwise only the eigenpairs from
++  // the smallest requested one to the largest eigenvalue are computed, which is faster
++  // when only a few of the largest eigenvalues are requested (e.g. VECTORS=1)
++  if( doNotCalculateDerivatives() ) {
++    const unsigned maxvec=*std::max_element( desired_vectors.begin(), desired_vectors.end() );
++    diagMatRange( mymatrix, nvals-maxvec, nvals-1, eigvals, eigvecs );
++  } else {
++    diagMat( mymatrix, eigvals, eigvecs );
++  }
+   // And set the eigenvalues and eigenvectors
+   for(unsigned i=0; i<desired_vectors.size(); ++i) {
+     getPntrToComponent(2*i)->set( eigvals[ mymatrix.ncols()-desired_vectors[i]] );
+@@ -172,29 +193,57 @@ void DiagonalizeMatrix::calculate() {
+   }
+ }
+ 
+-double DiagonalizeMatrix::getForceOnMatrixElement( const unsigned& jrow, const unsigned& kcol ) const {
+-  double ff = 0;
++void DiagonalizeMatrix::apply() {
++  if( doNotCalculateDerivatives() ) {
++    return;
++  }
++  // The derivative of eigenvector c with respect to element (j,k) of the matrix is
++  //   d v_c[n] / d A(j,k) = sum_{m!=c} v_m[n] v_m[j] v_c[k] / (lambda_c-lambda_m)
++  // so the force on (j,k) from the forces f on v_c is v_c[k]*w[j], with
++  //   w[j] = sum_{m!=c} v_m[j] (v_m.f) / (lambda_c-lambda_m)
++  // computing w once here costs O(N^2), instead of O(N^2) for each matrix element
++  const unsigned nvals=eigvals.size();
++  forceTerms.clear();
+   for(unsigned i=0; i<desired_vectors.size(); ++i) {
+-    // Deal with forces on eigenvalues
+-    if( getConstPntrToComponent(2*i)->forcesWereAdded() ) {
+-      unsigned ncol = mymatrix.ncols()-desired_vectors[i];
+-      ff += getConstPntrToComponent(2*i)->getForce(0)*eigvecs(ncol,jrow)*eigvecs(ncol,kcol);
+-    }
+-    // And forces on eigenvectors
+-    if( !getConstPntrToComponent(2*i+1)->forcesWereAdded() ) {
++    const bool evalForce=getConstPntrToComponent(2*i)->forcesWereAdded();
++    const bool evecForce=getConstPntrToComponent(2*i+1)->forcesWereAdded();
++    if( !evalForce && !evecForce ) {
+       continue;
+     }
+-
+-    unsigned ncol = mymatrix.ncols()-desired_vectors[i];
+-    for(unsigned n=0; n<mymatrix.nrows(); ++n) {
+-      double tmp2 = 0;
+-      for(unsigned m=0; m<mymatrix.nrows(); ++m) {
+-        if( m==ncol ) {
++    ForceTerm ft;
++    ft.ncol=nvals-desired_vectors[i];
++    ft.evalForce=( evalForce ? getConstPntrToComponent(2*i)->getForce(0) : 0.0 );
++    ft.hasEvecForce=evecForce;
++    if( evecForce ) {
++      const Value* evec=getConstPntrToComponent(2*i+1);
++      ft.w.assign(nvals,0.0);
++      for(unsigned m=0; m<nvals; ++m) {
++        if( m==ft.ncol ) {
+           continue;
+         }
+-        tmp2 += eigvecs(m,n)*eigvecs(m,jrow)*eigvecs(ncol,kcol) / (eigvals[ncol]-eigvals[m]);
++        double vf=0;
++        for(unsigned n=0; n<nvals; ++n) {
++          vf += eigvecs(m,n)*evec->getForce(n);
++        }
++        vf /= (eigvals[ft.ncol]-eigvals[m]);
++        for(unsigned j=0; j<nvals; ++j) {
++          ft.w[j] += vf*eigvecs(m,j);
++        }
+       }
+-      ff += getConstPntrToComponent(2*i+1)->getForce(n) * tmp2;
++    }
++    forceTerms.push_back(std::move(ft));
++  }
++  MatrixOperationBase::apply();
++}
++
++double DiagonalizeMatrix::getForceOnMatrixElement( const unsigned& jrow, const unsigned& kcol ) const {
++  double ff = 0;
++  for(const auto & ft : forceTerms) {
++    // Forces on eigenvalues
++    ff += ft.evalForce*eigvecs(ft.ncol,jrow)*eigvecs(ft.ncol,kcol);
++    // Forces on eigenvectors
++    if( ft.hasEvecForce ) {
++      ff += ft.w[jrow]*eigvecs(ft.ncol,kcol);
+     }
+   }
+   return ff;
+diff --git a/src/tools/KernelFunctions.cpp b/src/tools/KernelFunctions.cpp
+index fcb2c8e692..58087238c7 100644
+--- a/src/tools/KernelFunctions.cpp
++++ b/src/tools/KernelFunctions.cpp
+@@ -225,11 +225,11 @@ void KernelFunctions::normalize( const std::vector<Value*>& myvals ) {
+       det*=width[i]*width[i];
+     }
+   } else if(dtype==matrixType::multi) {
+-    Matrix<double> mymatrix( getMatrix() ), myinv( ncv, ncv );
+-    Invert(mymatrix,myinv);
++    // det is the determinant of the inverse of mymatrix
++    Matrix<double> mymatrix( getMatrix() );
+     double logd;
+-    logdet( myinv, logd );
+-    det=std::exp(logd);
++    logdet( mymatrix, logd );
++    det=std::exp(-logd);
+   }
+   if( dtype==matrixType::diagonal || dtype==matrixType::multi ) {
+     double volume;
+diff --git a/src/tools/Matrix.h b/src/tools/Matrix.h
+index 33649f000e..ed7d2e9d6a 100644
+--- a/src/tools/Matrix.h
++++ b/src/tools/Matrix.h
+@@ -72,6 +72,8 @@ class Matrix:
+   template <typename U> friend void matrixOut( Log&, const Matrix<U>& );
+   /// Diagonalize a symmetric matrix - returns zero if diagonalization worked
+   template <typename U> friend int diagMat( const Matrix<U>&, std::vector<U>&, Matrix<U>& );
++  /// Diagonalize a symmetric matrix computing only the eigenpairs from first to last (0-based, ascending eigenvalues) - returns zero if diagonalization worked
++  template <typename U> friend int diagMatRange( const Matrix<U>&, unsigned, unsigned, std::vector<U>&, Matrix<U>& );
+   /// Calculate the Moore-Penrose Pseudoinverse of a matrix
+   template <typename U> friend int pseudoInvert( const Matrix<U>&, Matrix<U>& );
+   /// Calculate the logarithm of the determinant of a symmetric matrix - returns zero if successful
+@@ -248,11 +250,22 @@ template <typename T> void mult( const Matrix<T>& A, const Matrix<T>& B, Matrix<
+     C.resize( A.rw, B.cl );
+   }
+   C=static_cast<T>( 0 );
+-  for(unsigned i=0; i<A.rw; ++i)
+-    for(unsigned j=0; j<B.cl; ++j)
+-      for (unsigned k=0; k<A.cl; ++k) {
+-        C(i,j)+=A(i,k)*B(k,j);
++  // i-k-j loop order: the innermost loop runs over contiguous elements of B and C,
++  // so it is cache friendly and can be vectorized. For each element of C the
++  // products are summed in the same order as with the i-j-k loop order.
++  const T* a=A.data.data();
++  const T* b=B.data.data();
++  T* c=C.data.data();
++  for(unsigned i=0; i<A.rw; ++i) {
++    T* ci=c+i*B.cl;
++    for(unsigned k=0; k<A.cl; ++k) {
++      const T aik=a[i*A.cl+k];
++      const T* bk=b+k*B.cl;
++      for(unsigned j=0; j<B.cl; ++j) {
++        ci[j]+=aik*bk[j];
+       }
++    }
++  }
+ }
+ 
+ template <typename T> void mult( const Matrix<T>& A, const std::vector<T>& B, std::vector<T>& C) {
+@@ -277,8 +290,9 @@ template <typename T> void mult( const std::vector<T>& A, const Matrix<T>& B, st
+   for(unsigned i=0; i<B.cl; ++i) {
+     C[i]=static_cast<T>( 0 );
+   }
+-  for(unsigned i=0; i<B.cl; ++i)
+-    for(unsigned k=0; k<B.rw; ++k) {
++  // loop on the rows of B in the outer loop, so that the inner loop is on contiguous elements
++  for(unsigned k=0; k<B.rw; ++k)
++    for(unsigned i=0; i<B.cl; ++i) {
+       C[i]+=A[k]*B(k,i);
+     }
+ }
+@@ -310,11 +324,108 @@ template <typename T> void matrixOut( Log& ostr, const Matrix<T>& mat) {
+   return;
+ }
+ 
+-template <typename T> int diagMat( const Matrix<T>& A, std::vector<T>& eigenvals, Matrix<T>& eigenvecs ) {
++/// Cholesky factorization A=L*L^T of a symmetric positive definite n x n matrix.
++/// Only the upper triangle of A is read (as done by diagMat). L is returned as a lower
++/// triangular matrix stored row by row in a vector of size n*n.
++/// Returns false if A is not positive definite (or contains NaNs).
++template <typename T> bool choleskyFactorization( const Matrix<T>& A, std::vector<T>& L ) {
++  const unsigned n=A.nrows();
++  plumed_assert( A.ncols()==n );
++  // Right-looking factorization A=U^T*U working on the rows of the upper triangle,
++  // so that the innermost loop is a vectorizable update of contiguous elements
++  std::vector<T> U(static_cast<std::size_t>(n)*n,static_cast<T>(0));
++  for(unsigned j=0; j<n; ++j)
++    for(unsigned i=j; i<n; ++i) {
++      U[static_cast<std::size_t>(j)*n+i]=A(j,i);
++    }
++  for(unsigned j=0; j<n; ++j) {
++    T* Uj=U.data()+static_cast<std::size_t>(j)*n;
++    if( !(Uj[j]>0) ) {
++      return false;
++    }
++    Uj[j]=std::sqrt(Uj[j]);
++    const T invd=static_cast<T>(1)/Uj[j];
++    for(unsigned i=j+1; i<n; ++i) {
++      Uj[i]*=invd;
++    }
++    for(unsigned i=j+1; i<n; ++i) {
++      const T uji=Uj[i];
++      T* Ui=U.data()+static_cast<std::size_t>(i)*n;
++      for(unsigned k=i; k<n; ++k) {
++        Ui[k]-=uji*Uj[k];
++      }
++    }
++  }
++  L.assign(static_cast<std::size_t>(n)*n,static_cast<T>(0));
++  for(unsigned i=0; i<n; ++i)
++    for(unsigned j=0; j<=i; ++j) {
++      L[static_cast<std::size_t>(i)*n+j]=U[static_cast<std::size_t>(j)*n+i];
++    }
++  return true;
++}
++
++/// Inverse of a symmetric positive definite matrix from its Cholesky factorization.
++/// Returns false (and leaves inverse untouched) if A is not positive definite.
++template <typename T> bool choleskyInvert( const Matrix<T>& A, Matrix<T>& inverse ) {
++  const unsigned n=A.nrows();
++  std::vector<T> L;
++  if( !choleskyFactorization( A, L ) ) {
++    return false;
++  }
++  // Compute M=L^{-1} (lower triangular) row by row: M_i = (e_i - sum_{k<i} L_ik M_k) / L_ii
++  std::vector<T> M(static_cast<std::size_t>(n)*n,static_cast<T>(0));
++  for(unsigned i=0; i<n; ++i) {
++    const T* Li=L.data()+static_cast<std::size_t>(i)*n;
++    T* Mi=M.data()+static_cast<std::size_t>(i)*n;
++    Mi[i]=static_cast<T>(1);
++    for(unsigned k=0; k<i; ++k) {
++      const T lik=Li[k];
++      const T* Mk=M.data()+static_cast<std::size_t>(k)*n;
++      for(unsigned j=0; j<=k; ++j) {
++        Mi[j]-=lik*Mk[j];
++      }
++    }
++    const T invd=static_cast<T>(1)/Li[i];
++    for(unsigned j=0; j<=i; ++j) {
++      Mi[j]*=invd;
++    }
++  }
++  // A^{-1} = M^T M = sum_k (row k of M)^T (row k of M); compute the lower triangle
++  if( inverse.nrows()!=n || inverse.ncols()!=n ) {
++    inverse.resize(n,n);
++  }
++  inverse=static_cast<T>(0);
++  for(unsigned k=0; k<n; ++k) {
++    const T* Mk=M.data()+static_cast<std::size_t>(k)*n;
++    for(unsigned p=0; p<=k; ++p) {
++      const T mkp=Mk[p];
++      for(unsigned q=0; q<=p; ++q) {
++        inverse(p,q)+=mkp*Mk[q];
++      }
++    }
++  }
++  for(unsigned p=0; p<n; ++p)
++    for(unsigned q=0; q<p; ++q) {
++      inverse(q,p)=inverse(p,q);
++    }
++  return true;
++}
++
++template <typename T> int diagMatRange( const Matrix<T>& A, unsigned first, unsigned last, std::vector<T>& eigenvals, Matrix<T>& eigenvecs ) {
+ 
+   // Check matrix is square and symmetric
+   plumed_assert( A.rw==A.cl );
+   plumed_assert( A.isSymmetric()==1 );
++  if( eigenvals.size()!=A.cl ) {
++    eigenvals.resize( A.cl );
++  }
++  if( eigenvecs.rw!=A.rw || eigenvecs.cl!=A.cl ) {
++    eigenvecs.resize( A.rw, A.cl );
++  }
++  if( A.cl==0 ) {
++    return 0;
++  }
++  plumed_assert( first<=last && last<A.cl );
+   std::vector<T> da(A.sz);
+   unsigned k=0;
+   std::vector<T> evals(A.cl);
+@@ -329,18 +440,29 @@ template <typename T> int diagMat( const Matrix<T>& A, std::vector<T>& eigenvals
+   int liwork=-1;
+   int m;
+   int info=0;
+-  int one=1;
++#ifdef __PLUMED_HAS_EXTERNAL_LAPACK
++  const bool partial=true;
++#else
++  // The internal dsyevr reads out of bounds when only a subset of the eigenpairs is
++  // requested, so all of them are computed and then the requested ones are copied
++  const bool partial=false;
++#endif
++  // dsyevr numbers the eigenvalues from 1, in ascending order
++  const unsigned offset=( partial ? first : 0 );
++  int il=offset+1;
++  int iu=( partial ? last+1 : A.cl );
++  const unsigned nev=iu-il+1;
+   std::vector<T> work(A.cl);
+   std::vector<int> iwork(A.cl);
+   T vl, vu, abstol=0.0;
+-  std::vector<int> isup(2*A.cl);
+-  std::vector<T> evecs(A.sz);
++  std::vector<int> isup(2*nev);
++  std::vector<T> evecs(static_cast<std::size_t>(A.cl)*nev);
+   if constexpr (std::is_same_v<T,double>) {
+-    plumed_lapack_dsyevr("V", "I", "U", &n, da.data(), &n, &vl, &vu, &one, &n,
++    plumed_lapack_dsyevr("V", "I", "U", &n, da.data(), &n, &vl, &vu, &il, &iu,
+                          &abstol, &m, evals.data(), evecs.data(), &n,
+                          isup.data(), work.data(), &lwork, iwork.data(), &liwork, &info);
+   } else if constexpr (std::is_same_v<T,float>) {
+-    plumed_lapack_ssyevr("V", "I", "U", &n, da.data(), &n, &vl, &vu, &one, &n,
++    plumed_lapack_ssyevr("V", "I", "U", &n, da.data(), &n, &vl, &vu, &il, &iu,
+                          &abstol, &m, evals.data(), evecs.data(), &n,
+                          isup.data(), work.data(), &lwork, iwork.data(), &liwork, &info);
+   } else {
+@@ -357,11 +479,11 @@ template <typename T> int diagMat( const Matrix<T>& A, std::vector<T>& eigenvals
+   work.resize(lwork);
+ 
+   if constexpr (std::is_same_v<T,double>) {
+-    plumed_lapack_dsyevr("V", "I", "U", &n, da.data(), &n, &vl, &vu, &one, &n,
++    plumed_lapack_dsyevr("V", "I", "U", &n, da.data(), &n, &vl, &vu, &il, &iu,
+                          &abstol, &m, evals.data(), evecs.data(), &n,
+                          isup.data(), work.data(), &lwork, iwork.data(), &liwork, &info);
+   } else if constexpr (std::is_same_v<T,float>) {
+-    plumed_lapack_ssyevr("V", "I", "U", &n, da.data(), &n, &vl, &vu, &one, &n,
++    plumed_lapack_ssyevr("V", "I", "U", &n, da.data(), &n, &vl, &vu, &il, &iu,
+                          &abstol, &m, evals.data(), evecs.data(), &n,
+                          isup.data(), work.data(), &lwork, iwork.data(), &liwork, &info);
+   } else {
+@@ -371,15 +493,9 @@ template <typename T> int diagMat( const Matrix<T>& A, std::vector<T>& eigenvals
+     return info;
+   }
+ 
+-  if( eigenvals.size()!=A.cl ) {
+-    eigenvals.resize( A.cl );
+-  }
+-  if( eigenvecs.rw!=A.rw || eigenvecs.cl!=A.cl ) {
+-    eigenvecs.resize( A.rw, A.cl );
+-  }
+-  k=0;
+-  for(unsigned i=0; i<A.cl; ++i) {
+-    eigenvals[i]=evals[i];
++  k=(first-offset)*A.rw;
++  for(unsigned i=first; i<=last; ++i) {
++    eigenvals[i]=evals[i-offset];
+     // N.B. For ease of producing projectors we store the eigenvectors
+     // ROW-WISE in the eigenvectors matrix.  The first index is the
+     // eigenvector number and the second the component
+@@ -392,7 +508,7 @@ template <typename T> int diagMat( const Matrix<T>& A, std::vector<T>& eigenvals
+   // of each of them is positive
+   // We can do it because the phase is arbitrary, and helps making
+   // the result reproducible
+-  for(int i=0; i<n; ++i) {
++  for(unsigned i=first; i<=last; ++i) {
+     int j;
+     for(j=0; j<n; j++)
+       if(eigenvecs(i,j)*eigenvecs(i,j)>1e-14) {
+@@ -407,7 +523,24 @@ template <typename T> int diagMat( const Matrix<T>& A, std::vector<T>& eigenvals
+   return 0;
+ }
+ 
++template <typename T> int diagMat( const Matrix<T>& A, std::vector<T>& eigenvals, Matrix<T>& eigenvecs ) {
++  if( A.cl==0 ) {
++    return diagMatRange( A, 0, 0, eigenvals, eigenvecs );
++  }
++  return diagMatRange( A, 0, A.cl-1, eigenvals, eigenvecs );
++}
++
+ template <typename T> int pseudoInvert( const Matrix<T>& A, Matrix<T>& pseudoinverse ) {
++  const unsigned nrows=A.rw, ncols=A.cl;
++  const unsigned nsv=std::min(nrows,ncols);
++  if( pseudoinverse.rw!=ncols || pseudoinverse.cl!=nrows ) {
++    pseudoinverse.resize( ncols, nrows );
++  }
++  pseudoinverse=static_cast<T>( 0 );
++  if( nsv==0 ) {
++    return 0;
++  }
++
+   std::vector<T> da(A.sz);
+   unsigned k=0;
+   // Transfer the matrix to the local array
+@@ -416,31 +549,28 @@ template <typename T> int pseudoInvert( const Matrix<T>& A, Matrix<T>& pseudoinv
+       da[k++]=static_cast<T>( A(j,i) );
+     }
+ 
+-  int nsv;
+   int info=0;
+-  int nrows=A.rw, ncols=A.cl;
+-  if(A.rw>A.cl) {
+-    nsv=A.cl;
+-  } else {
+-    nsv=A.rw;
+-  }
++  int nr=nrows, nc=ncols;
+ 
+-  // Create some containers for stuff from single value decomposition
++  // Create some containers for stuff from the singular value decomposition A=U*S*VT
++  // (U is nrows x nrows and VT is ncols x ncols, both stored column by column).
++  // The thin decomposition (JOBZ='S') would be enough, but the internal dgesdd
++  // writes out of bounds with JOBZ='S', so the full one is used.
+   std::vector<T> S(nsv);
+-  std::vector<T> U(nrows*nrows);
+-  std::vector<T> VT(ncols*ncols);
++  std::vector<T> U(static_cast<std::size_t>(nrows)*nrows);
++  std::vector<T> VT(static_cast<std::size_t>(ncols)*ncols);
+   std::vector<int> iwork(8*nsv);
+ 
+   // This optimizes the size of the work array used in lapack singular value decomposition
+   int lwork=-1;
+   std::vector<T> work(1);
+   if constexpr (std::is_same_v<T,double> ) {
+-    plumed_lapack_dgesdd( "A", &nrows, &ncols, da.data(), &nrows, S.data(),
+-                          U.data(), &nrows, VT.data(), &ncols, work.data(),
++    plumed_lapack_dgesdd( "A", &nr, &nc, da.data(), &nr, S.data(),
++                          U.data(), &nr, VT.data(), &nc, work.data(),
+                           &lwork, iwork.data(), &info );
+   } else if constexpr (std::is_same_v<T,float>) {
+-    plumed_lapack_sgesdd( "A", &nrows, &ncols, da.data(), &nrows, S.data(),
+-                          U.data(), &nrows, VT.data(), &ncols, work.data(),
++    plumed_lapack_sgesdd( "A", &nr, &nc, da.data(), &nr, S.data(),
++                          U.data(), &nr, VT.data(), &nc, work.data(),
+                           &lwork, iwork.data(), &info );
+   } else {
+     static_assert(std::is_same_v<T,double> || std::is_same_v<T,float>, "pseudoInvert works only for float and double");
+@@ -455,12 +585,12 @@ template <typename T> int pseudoInvert( const Matrix<T>& A, Matrix<T>& pseudoinv
+ 
+   // This does the singular value decomposition
+   if constexpr (std::is_same_v<T,double> ) {
+-    plumed_lapack_dgesdd( "A", &nrows, &ncols, da.data(), &nrows, S.data(),
+-                          U.data(), &nrows, VT.data(), &ncols, work.data(),
++    plumed_lapack_dgesdd( "A", &nr, &nc, da.data(), &nr, S.data(),
++                          U.data(), &nr, VT.data(), &nc, work.data(),
+                           &lwork, iwork.data(), &info );
+   } else if constexpr (std::is_same_v<T,float>) {
+-    plumed_lapack_sgesdd( "A", &nrows, &ncols, da.data(), &nrows, S.data(),
+-                          U.data(), &nrows, VT.data(), &ncols, work.data(),
++    plumed_lapack_sgesdd( "A", &nr, &nc, da.data(), &nr, S.data(),
++                          U.data(), &nr, VT.data(), &nc, work.data(),
+                           &lwork, iwork.data(), &info );
+   } else {
+     static_assert(std::is_same_v<T,double> || std::is_same_v<T,float>, "pseudoInvert works only for float and double");
+@@ -472,53 +602,40 @@ template <typename T> int pseudoInvert( const Matrix<T>& A, Matrix<T>& pseudoinv
+   // Compute the tolerance on the singular values ( machine epsilon * number of singular values * maximum singular value )
+   T tol;
+   tol=S[0];
+-  for(int i=1; i<nsv; ++i) {
++  for(unsigned i=1; i<nsv; ++i) {
+     if( S[i]>tol ) {
+       tol=S[i];
+     }
+   }
+   tol*=nsv*epsilon;
+ 
+-  // Get the inverses of the singlular values
+-  Matrix<T> Si( ncols, nrows );
+-  Si=0.0;
+-  for(int i=0; i<nsv; ++i) {
+-    if( S[i]>tol ) {
+-      Si(i,i)=1./S[i];
+-    } else {
+-      Si(i,i)=0.0;
+-    }
+-  }
+-
+-  // Now extract matrices for pseudoinverse
+-  Matrix<T> V( ncols, ncols ), UT( nrows, nrows ), tmp( ncols, nrows );
+-  k=0;
+-  for(int i=0; i<nrows; ++i) {
+-    for(int j=0; j<nrows; ++j) {
+-      UT(i,j)=U[k++];
+-    }
+-  }
+-  k=0;
+-  for(int i=0; i<ncols; ++i) {
+-    for(int j=0; j<ncols; ++j) {
+-      V(i,j)=VT[k++];
++  // pseudoinverse = V * S^{-1} * U^T = sum_k (column k of V) (column k of U)^T / S_k,
++  // summing only over the singular values larger than the tolerance
++  for(unsigned isv=0; isv<nsv; ++isv) {
++    if( !(S[isv]>tol) ) {
++      continue;
++    }
++    const T inv=static_cast<T>(1)/S[isv];
++    const T* Uk=U.data()+static_cast<std::size_t>(isv)*nrows;
++    for(unsigned i=0; i<ncols; ++i) {
++      const T a=inv*VT[isv+static_cast<std::size_t>(i)*ncols];
++      for(unsigned j=0; j<nrows; ++j) {
++        pseudoinverse(i,j)+=a*Uk[j];
++      }
+     }
+   }
+ 
+-  // And do matrix algebra to construct the pseudoinverse
+-  if( pseudoinverse.rw!=static_cast<unsigned>(ncols)
+-      || pseudoinverse.cl!=static_cast<unsigned>(nrows) ) {
+-    pseudoinverse.resize( ncols, nrows );
+-  }
+-  mult( V, Si, tmp );
+-  mult( tmp, UT, pseudoinverse );
+-
+   return 0;
+ }
+ 
+ template <typename T> int Invert( const Matrix<T>& A, Matrix<T>& inverse ) {
+ 
+   if( A.isSymmetric()==1 ) {
++    // Symmetric positive definite matrices (e.g. covariance and metric matrices) are inverted
++    // with a Cholesky factorization, which is several times faster than diagonalizing them.
++    if( choleskyInvert( A, inverse ) ) {
++      return 0;
++    }
+     // GAT -- I only ever use symmetric matrices so I can invert them like this.
+     // I choose to do this as I have had problems with the more general way of doing this that
+     // is implemented below.
+@@ -651,6 +768,18 @@ template <typename T> int logdet( const Matrix<T>& M, T& ldet ) {
+   // Check matrix is square and symmetric
+   plumed_assert( M.rw==M.cl || M.isSymmetric() );
+ 
++  // For a positive definite matrix, log(det(M)) = 2 sum_i log(L_ii) with M=L*L^T
++  {
++    std::vector<T> L;
++    if( choleskyFactorization( M, L ) ) {
++      ldet=0;
++      for(unsigned i=0; i<M.rw; ++i) {
++        ldet+=2*std::log(L[static_cast<std::size_t>(i)*M.rw+i]);
++      }
++      return 0;
++    }
++  }
++
+   std::vector<T> da(M.sz);
+   unsigned k=0;
+   std::vector<T> evals(M.cl);
+diff --git a/src/tools/RMSD.cpp b/src/tools/RMSD.cpp
+index 7a58dc8f8e..4a4fb353ea 100644
+--- a/src/tools/RMSD.cpp
++++ b/src/tools/RMSD.cpp
+@@ -1186,13 +1186,11 @@ double RMSD::optimalAlignment_Fit(const std::vector<double>& alignTo,
+ /// but automatically should properly account for non removed components: if not removed then it
+ /// removes prior to calculation of the alignment
+ void RMSDCoreData::doCoreCalc(const bool setSafe,
+-                              const bool setAlEqDis,
+-                              const bool only_rotation) {
++                              const bool setAlEqDis) {
+ 
+   // transfer this bools to the cd so that this settings will be reflected in the other calls
+   alEqDis=setAlEqDis;
+   safe=setSafe;
+-  retrieve_only_rotation=only_rotation;
+   const unsigned n=static_cast<unsigned int>(reference.size());
+ 
+   plumed_massert(creference_is_calculated,"the center of the reference frame must be already provided at this stage");
+@@ -1244,61 +1242,48 @@ void RMSDCoreData::doCoreCalc(const bool setSafe,
+ 
+ 
+   Tensor dm_drr01[4][4];
+-  if(!alEqDis or !retrieve_only_rotation) {
+-    dm_drr01[0][0] = 2.0*Tensor(-1.0, 0.0, 0.0,  0.0,-1.0, 0.0,  0.0, 0.0,-1.0);
+-    dm_drr01[1][1] = 2.0*Tensor(-1.0, 0.0, 0.0,  0.0,+1.0, 0.0,  0.0, 0.0,+1.0);
+-    dm_drr01[2][2] = 2.0*Tensor(+1.0, 0.0, 0.0,  0.0,-1.0, 0.0,  0.0, 0.0,+1.0);
+-    dm_drr01[3][3] = 2.0*Tensor(+1.0, 0.0, 0.0,  0.0,+1.0, 0.0,  0.0, 0.0,-1.0);
+-    dm_drr01[0][1] = 2.0*Tensor( 0.0, 0.0, 0.0,  0.0, 0.0,-1.0,  0.0,+1.0, 0.0);
+-    dm_drr01[0][2] = 2.0*Tensor( 0.0, 0.0,+1.0,  0.0, 0.0, 0.0, -1.0, 0.0, 0.0);
+-    dm_drr01[0][3] = 2.0*Tensor( 0.0,-1.0, 0.0, +1.0, 0.0, 0.0,  0.0, 0.0, 0.0);
+-    dm_drr01[1][2] = 2.0*Tensor( 0.0,-1.0, 0.0, -1.0, 0.0, 0.0,  0.0, 0.0, 0.0);
+-    dm_drr01[1][3] = 2.0*Tensor( 0.0, 0.0,-1.0,  0.0, 0.0, 0.0, -1.0, 0.0, 0.0);
+-    dm_drr01[2][3] = 2.0*Tensor( 0.0, 0.0, 0.0,  0.0, 0.0,-1.0,  0.0,-1.0, 0.0);
+-    dm_drr01[1][0] = dm_drr01[0][1];
+-    dm_drr01[2][0] = dm_drr01[0][2];
+-    dm_drr01[2][1] = dm_drr01[1][2];
+-    dm_drr01[3][0] = dm_drr01[0][3];
+-    dm_drr01[3][1] = dm_drr01[1][3];
+-    dm_drr01[3][2] = dm_drr01[2][3];
+-  }
++  dm_drr01[0][0] = 2.0*Tensor(-1.0, 0.0, 0.0,  0.0,-1.0, 0.0,  0.0, 0.0,-1.0);
++  dm_drr01[1][1] = 2.0*Tensor(-1.0, 0.0, 0.0,  0.0,+1.0, 0.0,  0.0, 0.0,+1.0);
++  dm_drr01[2][2] = 2.0*Tensor(+1.0, 0.0, 0.0,  0.0,-1.0, 0.0,  0.0, 0.0,+1.0);
++  dm_drr01[3][3] = 2.0*Tensor(+1.0, 0.0, 0.0,  0.0,+1.0, 0.0,  0.0, 0.0,-1.0);
++  dm_drr01[0][1] = 2.0*Tensor( 0.0, 0.0, 0.0,  0.0, 0.0,-1.0,  0.0,+1.0, 0.0);
++  dm_drr01[0][2] = 2.0*Tensor( 0.0, 0.0,+1.0,  0.0, 0.0, 0.0, -1.0, 0.0, 0.0);
++  dm_drr01[0][3] = 2.0*Tensor( 0.0,-1.0, 0.0, +1.0, 0.0, 0.0,  0.0, 0.0, 0.0);
++  dm_drr01[1][2] = 2.0*Tensor( 0.0,-1.0, 0.0, -1.0, 0.0, 0.0,  0.0, 0.0, 0.0);
++  dm_drr01[1][3] = 2.0*Tensor( 0.0, 0.0,-1.0,  0.0, 0.0, 0.0, -1.0, 0.0, 0.0);
++  dm_drr01[2][3] = 2.0*Tensor( 0.0, 0.0, 0.0,  0.0, 0.0,-1.0,  0.0,-1.0, 0.0);
++  dm_drr01[1][0] = dm_drr01[0][1];
++  dm_drr01[2][0] = dm_drr01[0][2];
++  dm_drr01[2][1] = dm_drr01[1][2];
++  dm_drr01[3][0] = dm_drr01[0][3];
++  dm_drr01[3][1] = dm_drr01[1][3];
++  dm_drr01[3][2] = dm_drr01[2][3];
+ 
+ 
+   Vector4d q;
+ 
+   Tensor dq_drr01[4];
+-  if(!alEqDis or !only_rotation) {
+-    diagMatSym(m, eigenvals, eigenvecs );
+-    q=Vector4d(eigenvecs[0][0],eigenvecs[0][1],eigenvecs[0][2],eigenvecs[0][3]);
+-    double dq_dm[4][4][4];
+-    for(unsigned i=0; i<4; i++)
+-      for(unsigned j=0; j<4; j++)
+-        for(unsigned k=0; k<4; k++) {
+-          double tmp=0.0;
++  diagMatSym(m, eigenvals, eigenvecs );
++  q=Vector4d(eigenvecs[0][0],eigenvecs[0][1],eigenvecs[0][2],eigenvecs[0][3]);
++  double dq_dm[4][4][4];
++  for(unsigned i=0; i<4; i++)
++    for(unsigned j=0; j<4; j++)
++      for(unsigned k=0; k<4; k++) {
++        double tmp=0.0;
+ // perturbation theory for matrix m
+-          for(unsigned l=1; l<4; l++) {
+-            tmp+=eigenvecs[l][j]*eigenvecs[l][i]/(eigenvals[0]-eigenvals[l])*eigenvecs[0][k];
+-          }
+-          dq_dm[i][j][k]=tmp;
++        for(unsigned l=1; l<4; l++) {
++          tmp+=eigenvecs[l][j]*eigenvecs[l][i]/(eigenvals[0]-eigenvals[l])*eigenvecs[0][k];
+         }
++        dq_dm[i][j][k]=tmp;
++      }
+ // propagation to _drr01
+-    for(unsigned i=0; i<4; i++) {
+-      Tensor tmp;
+-      for(unsigned j=0; j<4; j++)
+-        for(unsigned k=0; k<4; k++) {
+-          tmp+=dq_dm[i][j][k]*dm_drr01[j][k];
+-        }
+-      dq_drr01[i]=tmp;
+-    }
+-  } else {
+-    TensorGeneric<1,4> here_eigenvecs;
+-    VectorGeneric<1> here_eigenvals;
+-    diagMatSym(m, here_eigenvals, here_eigenvecs );
+-    for(unsigned i=0; i<4; i++) {
+-      eigenvecs[0][i]=here_eigenvecs[0][i];
+-    }
+-    eigenvals[0]=here_eigenvals[0];
+-    q=Vector4d(eigenvecs[0][0],eigenvecs[0][1],eigenvecs[0][2],eigenvecs[0][3]);
++  for(unsigned i=0; i<4; i++) {
++    Tensor tmp;
++    for(unsigned j=0; j<4; j++)
++      for(unsigned k=0; k<4; k++) {
++        tmp+=dq_dm[i][j][k]*dm_drr01[j][k];
++      }
++    dq_drr01[i]=tmp;
+   }
+ 
+ // This is the rotation matrix that brings reference to positions
+@@ -1315,17 +1300,15 @@ void RMSDCoreData::doCoreCalc(const bool setSafe,
+   rotation[2][1]=2*(-q[0]*q[1]+q[2]*q[3]);
+ 
+ 
+-  if(!alEqDis or !only_rotation) {
+-    drotation_drr01[0][0]=2*q[0]*dq_drr01[0]+2*q[1]*dq_drr01[1]-2*q[2]*dq_drr01[2]-2*q[3]*dq_drr01[3];
+-    drotation_drr01[1][1]=2*q[0]*dq_drr01[0]-2*q[1]*dq_drr01[1]+2*q[2]*dq_drr01[2]-2*q[3]*dq_drr01[3];
+-    drotation_drr01[2][2]=2*q[0]*dq_drr01[0]-2*q[1]*dq_drr01[1]-2*q[2]*dq_drr01[2]+2*q[3]*dq_drr01[3];
+-    drotation_drr01[0][1]=2*(+(q[0]*dq_drr01[3]+dq_drr01[0]*q[3])+(q[1]*dq_drr01[2]+dq_drr01[1]*q[2]));
+-    drotation_drr01[0][2]=2*(-(q[0]*dq_drr01[2]+dq_drr01[0]*q[2])+(q[1]*dq_drr01[3]+dq_drr01[1]*q[3]));
+-    drotation_drr01[1][2]=2*(+(q[0]*dq_drr01[1]+dq_drr01[0]*q[1])+(q[2]*dq_drr01[3]+dq_drr01[2]*q[3]));
+-    drotation_drr01[1][0]=2*(-(q[0]*dq_drr01[3]+dq_drr01[0]*q[3])+(q[1]*dq_drr01[2]+dq_drr01[1]*q[2]));
+-    drotation_drr01[2][0]=2*(+(q[0]*dq_drr01[2]+dq_drr01[0]*q[2])+(q[1]*dq_drr01[3]+dq_drr01[1]*q[3]));
+-    drotation_drr01[2][1]=2*(-(q[0]*dq_drr01[1]+dq_drr01[0]*q[1])+(q[2]*dq_drr01[3]+dq_drr01[2]*q[3]));
+-  }
++  drotation_drr01[0][0]=2*q[0]*dq_drr01[0]+2*q[1]*dq_drr01[1]-2*q[2]*dq_drr01[2]-2*q[3]*dq_drr01[3];
++  drotation_drr01[1][1]=2*q[0]*dq_drr01[0]-2*q[1]*dq_drr01[1]+2*q[2]*dq_drr01[2]-2*q[3]*dq_drr01[3];
++  drotation_drr01[2][2]=2*q[0]*dq_drr01[0]-2*q[1]*dq_drr01[1]-2*q[2]*dq_drr01[2]+2*q[3]*dq_drr01[3];
++  drotation_drr01[0][1]=2*(+(q[0]*dq_drr01[3]+dq_drr01[0]*q[3])+(q[1]*dq_drr01[2]+dq_drr01[1]*q[2]));
++  drotation_drr01[0][2]=2*(-(q[0]*dq_drr01[2]+dq_drr01[0]*q[2])+(q[1]*dq_drr01[3]+dq_drr01[1]*q[3]));
++  drotation_drr01[1][2]=2*(+(q[0]*dq_drr01[1]+dq_drr01[0]*q[1])+(q[2]*dq_drr01[3]+dq_drr01[2]*q[3]));
++  drotation_drr01[1][0]=2*(-(q[0]*dq_drr01[3]+dq_drr01[0]*q[3])+(q[1]*dq_drr01[2]+dq_drr01[1]*q[2]));
++  drotation_drr01[2][0]=2*(+(q[0]*dq_drr01[2]+dq_drr01[0]*q[2])+(q[1]*dq_drr01[3]+dq_drr01[1]*q[3]));
++  drotation_drr01[2][1]=2*(-(q[0]*dq_drr01[1]+dq_drr01[0]*q[1])+(q[2]*dq_drr01[3]+dq_drr01[2]*q[3]));
+ 
+   d.resize(n);
+ 
+@@ -1343,17 +1326,15 @@ void RMSDCoreData::doCoreCalc(const bool setSafe,
+     //cerr<<"D "<<iat<<" "<<d[iat][0]<<" "<<d[iat][1]<<" "<<d[iat][2]<<"\n";
+   }
+   // ddist_drotation if needed
+-  if(!alEqDis or !only_rotation) {
+-    for (unsigned iat=0; iat<n; iat++) {
+-      ddist_drotation+=-2*displace[iat]*extProduct(d[iat],reference[iat]-cr);
+-    }
+-
+-    ddist_drr01.zero();
+-    for(unsigned i=0; i<3; i++)
+-      for(unsigned j=0; j<3; j++) {
+-        ddist_drr01+=ddist_drotation[i][j]*drotation_drr01[i][j];
+-      }
++  for (unsigned iat=0; iat<n; iat++) {
++    ddist_drotation+=-2*displace[iat]*extProduct(d[iat],reference[iat]-cr);
+   }
++
++  ddist_drr01.zero();
++  for(unsigned i=0; i<3; i++)
++    for(unsigned j=0; j<3; j++) {
++      ddist_drr01+=ddist_drotation[i][j]*drotation_drr01[i][j];
++    }
+   isInitialized=true;
+ 
+ }
+@@ -1452,7 +1433,6 @@ std::vector<Vector> RMSDCoreData::getDDistanceDPositions() {
+   if(!distanceIsMSD) {
+     prefactor*=0.5/dist;
+   }
+-  plumed_massert(!retrieve_only_rotation,"You used  only_rotation=true in doCoreCalc therefore you cannot retrieve this information now");
+   if(!hasDistance) {
+     plumed_merror("getDPositionsDerivatives needs to calculate the distance via getDistance first !");
+   }
+@@ -1503,7 +1483,6 @@ std::vector<Vector> RMSDCoreData::getDDistanceDReference() {
+   }
+   Vector csum;
+ 
+-  plumed_massert(!retrieve_only_rotation,"You used  only_rotation=true in doCoreCalc therefore you cannot retrieve this information now");
+   if(!hasDistance) {
+     plumed_merror("getDDistanceDReference needs to calculate the distance via getDistance first !");
+   }
+@@ -1560,7 +1539,6 @@ std::vector<Vector> RMSDCoreData::getDDistanceDReferenceSOMA() {
+   }
+   Vector tmp1;
+ 
+-  plumed_massert(!retrieve_only_rotation,"You used  only_rotation=true in doCoreCalc therefore you cannot retrieve this information now");
+   if(!hasDistance) {
+     plumed_merror("getDDistanceDReference needs to calculate the distance via getDistance first !");
+   }
+@@ -1604,7 +1582,6 @@ if inverseTransform=true then aligns the positions onto reference
+ */
+ Matrix<std::vector<Vector> >  RMSDCoreData::getDRotationDPositions( const bool inverseTransform ) {
+   const unsigned n=static_cast<unsigned int>(reference.size());
+-  plumed_massert(!retrieve_only_rotation,"You used  only_rotation=true in doCoreCalc therefore you cannot retrieve this information now");
+   if(!isInitialized) {
+     plumed_merror("getDRotationDPosition to initialize the coreData first!");
+   }
+@@ -1656,7 +1633,6 @@ if inverseTransform=true then aligns the positions onto reference
+ */
+ Matrix<std::vector<Vector> >  RMSDCoreData::getDRotationDReference( const bool inverseTransform ) {
+   const unsigned n=static_cast<unsigned int>(reference.size());
+-  plumed_massert(!retrieve_only_rotation,"You used  only_rotation=true in doCoreCalc therefore you cannot retrieve this information now");
+   if(!isInitialized) {
+     plumed_merror("getDRotationDPositions to initialize the coreData first!");
+   }
+diff --git a/src/tools/RMSD.h b/src/tools/RMSD.h
+index 98f3cfc364..1d4936942a 100644
+--- a/src/tools/RMSD.h
++++ b/src/tools/RMSD.h
+@@ -340,7 +340,6 @@ class RMSDCoreData {
+   Vector cpositions;
+   bool cpositions_is_calculated;
+   bool cpositions_is_removed;
+-  bool retrieve_only_rotation;
+ 
+   // use reference assignment to speed up instead of copying
+   const View<Vector> positions;
+@@ -376,7 +375,6 @@ class RMSDCoreData {
+       cpositions(cp),
+       cpositions_is_calculated(true),
+       cpositions_is_removed(true),
+-      retrieve_only_rotation(false),
+       positions(p),
+       reference(r),
+       align(a),
+@@ -393,7 +391,6 @@ class RMSDCoreData {
+       cpositions(0.0,0.0,0.0),
+       cpositions_is_calculated(false),
+       cpositions_is_removed(false),
+-      retrieve_only_rotation(false),
+       positions(p),
+       reference(r),
+       align(a),
+@@ -444,8 +441,7 @@ class RMSDCoreData {
+     return creference_is_removed;
+   }
+   //  does the core calc : first thing to call after the constructor:
+-  // only_rotation=true does not retrieve the derivatives, just retrieve the optimal rotation (the same calc cannot be exploit further)
+-  void doCoreCalc(bool setSafe,bool setAlEqDis, bool only_rotation=false);
++  void doCoreCalc(bool setSafe,bool setAlEqDis);
+   // do calculation with close structure data structures
+   void doCoreCalcWithCloseStructure(bool setSafe,
+                                     bool setAlEqDis,

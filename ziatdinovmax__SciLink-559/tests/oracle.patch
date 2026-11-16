@@ -1,0 +1,808 @@
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index 0f9c28976..79a823582 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -1067,10 +1067,136 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+     "progress. Continue from the recorded results — do not redo completed "
+     "steps.")
+ 
++_RETRY_NOTE = (
++    "\n\nRETRY NOTE: a previous attempt of this branch failed ({error}). "
++    "This is a fresh retry of the SAME task; if the failure came from the "
++    "approach, take a different one.")
++
++
++def _branch_productive(e: dict) -> bool:
++    """A branch that reports success but yields neither findings nor files
++    did no usable work (e.g. codegen aborted with no sandbox). Mirrors the
++    'empty_but_successful' guard in _summarize_delegation_result."""
++    return (e.get("status") == "success"
++            and (bool(e.get("key_findings")) or bool(e.get("files_produced"))))
++
++
++def _branch_set_key(items) -> frozenset:
++    """Identity of a branch set for the 'already ran' / 'already declined'
++    checks: (data_path, pattern) pairs — the same datasets, however the
++    caller re-labels or re-words the tasks."""
++    return frozenset((str(b.get("data_path")), str(b.get("pattern") or ""))
++                     for b in items if b.get("data_path"))
++
++
++def _prior_group_for_set(orch, branches: List[dict]) -> Optional[dict]:
++    """The most recent COMPLETED fan-out group over exactly this dataset set
++    (issue #557 part 2), summarized as productive / failed branches — or
++    None when no such group exists or none of its branches produced output
++    (a full re-run is then legitimate)."""
++    want = _branch_set_key(branches)
++    groups: Dict[str, List[dict]] = {}
++    for e in orch._delegation_ledger:
++        if e.get("fanout") and e.get("parallel_group"):
++            groups.setdefault(e["parallel_group"], []).append(e)
++    for gid in sorted(groups, key=lambda g: max(x["index"] for x in groups[g]),
++                      reverse=True):
++        ents = groups[gid]
++        if _branch_set_key(ents) != want:
++            continue
++        if any(e.get("status") in ("running", "interrupted") for e in ents):
++            return None   # unfinished: resume_fanout's job, not a re-run
++        productive = [e for e in ents if _branch_productive(e)]
++        if not productive:
++            return None
++        failed = [e for e in ents if not _branch_productive(e)]
++        return {"parallel_group": gid,
++                "productive": [{"delegation_index": e["index"],
++                                "label": e.get("label")} for e in productive],
++                "failed": [{"delegation_index": e["index"],
++                            "label": e.get("label"),
++                            "status": e.get("status"),
++                            "timed_out": bool(e.get("timed_out")),
++                            "error": (str(e.get("error") or "")[:200] or None)}
++                           for e in failed]}
++    return None
++
++
++def _already_ran_decline(orch, items: List[dict]) -> Optional[str]:
++    """JSON refusal when ``items`` (a branch set) already ran as a fan-out
++    with productive branches (issue #557 part 2), else None."""
++    prior = _prior_group_for_set(orch, items)
++    if not prior:
++        return None
++    p_idx = [p["delegation_index"] for p in prior["productive"]]
++    f_lab = [f["label"] for f in prior["failed"]]
++    retryable = [f["label"] for f in prior["failed"] if not f["timed_out"]]
++    msg = (f"This dataset set already ran as {prior['parallel_group']}: "
++           f"{len(p_idx)} branch(es) produced output (delegation_index {p_idx})"
++           + (f" and {len(f_lab)} failed ({f_lab})" if f_lab else "")
++           + ". Do NOT re-run the whole fan-out. "
++           + (f"Fuse the productive branches with fuse_delegations("
++              f"delegation_indices={p_idx}) " if len(p_idx) >= 2 else
++              "Report the productive branch's findings ")
++           + ("and retry ONLY the failed branch(es) with "
++              "resume_fanout(retry_failed=true), then fuse. " if retryable else "")
++           + ("A branch abandoned on the wall-clock budget is not retried that "
++              "way; give it its own delegate_to_analysis with a larger budget. "
++              if len(retryable) < len(f_lab) else "")
++           + "To deliberately re-run everything (e.g. the data or the task "
++             "changed), pass force_rerun=true.")
++    print("  ⛔ " + msg)
++    return json.dumps({"status": "declined", "reason": "already_ran",
++                       **prior, "message": msg}, indent=2, default=str)
++
++
++def _declined_by_user_payload(fanout_set: List[str], reason: str,
++                              repeated: bool = False) -> str:
++    """The decline the LLM sees when the USER refused the launch gate (issue
++    #557 part 1). Deliberately carries NO complementarity verdict — the
++    positive verdict is what kept re-motivating the same proposal — and a
++    directive that ends the proposal for this turn."""
++    return json.dumps({
++        "status": "declined_by_user",
++        "reason": reason,
++        "fanout_set": fanout_set,
++        "message": (
++            ("The user already declined this parallel analysis in this turn; "
++             "the launch was refused without asking again. " if repeated else
++             "The user declined launching this parallel analysis. ")
++            + "Do NOT call delegate_to_analyses again for these datasets in "
++              "this turn. Either analyze them independently with "
++              "delegate_to_analysis, or end the turn and ask the user how to "
++              "proceed."),
++    }, indent=2, default=str)
++
++
++def _note_user_decline(orch, *sets) -> None:
++    declined = getattr(orch, "_fanout_declined_sets", None)
++    if declined is None:
++        declined = orch._fanout_declined_sets = []
++    for s in sets:
++        k = frozenset(s)
++        if k and k not in declined:
++            declined.append(k)
+ 
+-def resume_fanout(orch) -> str:
++
++def _user_already_declined(orch, ids) -> bool:
++    return frozenset(ids) in (getattr(orch, "_fanout_declined_sets", None) or [])
++
++
++
++def resume_fanout(orch, retry_failed: bool = False) -> str:
+     """Re-run fan-out branches left unfinished by a dead or stopped session.
+ 
++    ``retry_failed=True`` (issue #557 part 2) additionally re-runs the
++    ERRORED / empty branches of the most recent fan-out group — the
++    targeted recovery after a mixed-outcome run, instead of re-issuing the
++    whole fan-out and discarding the branches that already produced output.
++    A retried branch runs in its original session dir (restored when it
++    left a checkpoint, fresh otherwise) with a retry note on its recorded
++    task; budget-degraded (timed_out) branches are still left alone.
++
+     A coordinator death (or user stop) leaves a fan-out's provisional ledger
+     entries 'running' — swept to 'interrupted' at the next turn start. Each
+     such branch is re-created IN its original ``fanout/<NN>_<slug>/`` session
+@@ -1090,32 +1216,68 @@ def resume_fanout(orch) -> str:
+             e["resumed_from_interruption"] = True
+             e["status"] = "running"
+             e.pop("completed_at", None)
++        retried: List[dict] = []
++        if retry_failed:
++            fan = [e for e in orch._delegation_ledger
++                   if e.get("fanout") and e.get("parallel_group")]
++            if fan:
++                latest = max(fan, key=lambda e: e["index"])["parallel_group"]
++                retried = [e for e in fan
++                           if e.get("parallel_group") == latest
++                           and e not in stale
++                           and not e.get("timed_out")
++                           and not _branch_productive(e)
++                           and e.get("status") != "running"]
++            for e in retried:
++                e["retry_of_error"] = str(e.get("error") or "")[:300] or (
++                    "succeeded without findings or files")
++                e["retries"] = int(e.get("retries") or 0) + 1
++                e["status"] = "running"
++                e.pop("completed_at", None)
++                e.pop("error", None)
++        stale = stale + retried
+     if not stale:
+         return json.dumps({
+             "status": "no_op",
+-            "message": "No interrupted fan-out branches to resume."})
++            "message": ("No interrupted fan-out branches to resume"
++                        + (" and no failed branches to retry in the latest "
++                           "fan-out." if retry_failed else
++                           " (pass retry_failed=true to re-run the FAILED "
++                           "branches of the latest fan-out)."))})
+ 
+     # Persist the reopened entries (and their audit stamps) NOW, so a crash
+     # DURING the resume leaves them recoverable again — resume must converge
+     # under repeated interruption, mirroring the launch-time persistence.
+     orch._auto_checkpoint(verbose=False)
+ 
+-    print(f"  🔁 Resuming {len(stale)} interrupted fan-out branch(es) in "
+-          "their original sessions...")
++    print(f"  🔁 Resuming {len(stale)} fan-out branch(es) in their original "
++          "sessions"
++          + (f" ({len(retried)} failed branch(es) retried)" if retried else "")
++          + "...")
+     _ensure_stop_guard_installed()
+     budget = FANOUT_BRANCH_TIME_BUDGET_S
+     pool = ThreadPoolExecutor(max_workers=min(len(stale), FANOUT_MAX_WORKERS))
+     try:
+         fut_entry, fut_stop, fut_label = {}, {}, {}
+         for e in stale:
++            is_retry = e in retried
++            if is_retry:
++                note = _RETRY_NOTE.format(error=e.get("retry_of_error"))
++                # Restore only where the failed attempt left a checkpoint;
++                # a branch that died before its first tool call has none.
++                slug = _slug(e.get("label") or "branch")
++                has_ckpt = (orch.fanout_dir / f"{e['index']:02d}_{slug}"
++                            / "checkpoint.json").exists()
++            else:
++                note, has_ckpt = _RESUME_NOTE, True
+             branch = {
+-                "task": (e.get("task") or "") + _RESUME_NOTE,
++                "task": (e.get("task") or "") + note,
+                 "label": e.get("label"),
+                 "data_path": e.get("data_path"),
+                 "pattern": e.get("pattern"),
+                 "metadata": e.get("metadata"),
+                 "_premeshed": True,
+-                "_resume": True,
++                "_resume": has_ckpt,
+             }
+             stop_ev = _threading.Event()
+             fut = pool.submit(_run_one_branch, orch, branch, [], e,
+@@ -1152,7 +1314,8 @@ def resume_fanout(orch) -> str:
+     ok = [r["delegation_index"] for r in results if r["status"] == "success"]
+     return json.dumps({
+         "status": "success" if ok else "error",
+-        "branches_resumed": len(stale),
++        "branches_resumed": len(stale) - len(retried),
++        "branches_retried": len(retried),
+         "results": results,
+         "message": ("Resumed branches finished. Combine them with the "
+                     "fan-out's already-completed branches and pass the "
+@@ -1223,9 +1386,16 @@ def run_fanout(orch, branches: List[dict],
+                branch_time_budget_s: Optional[float] = None,
+                figure_style: Optional[str] = None,
+                harmonize: bool = False,
+-               allow_raw_branches: bool = False) -> str:
++               allow_raw_branches: bool = False,
++               force_rerun: bool = False) -> str:
+     """Gate → confirm → run branches concurrently. Returns JSON.
+ 
++    Two refusals precede the gate (issue #557): a dataset set the user
++    already declined at the launch gate THIS TURN is refused without asking
++    again, and a set that already ran as a fan-out whose branches (some or
++    all) produced output is refused with the fuse-and-retry-the-failed
++    directive — ``force_rerun=True`` overrides the latter.
++
+     `branches` is a list of ``{"data_path", "task", "label", "metadata"?,
+     "context"?, "pattern"?, "steer"?}``. ``pattern`` is a filename glob
+     selecting the branch's own files when ``data_path`` is a directory
+@@ -1325,6 +1495,22 @@ def run_fanout(orch, branches: List[dict],
+             b["branch_id"] = f"{dp}#{nth[dp]}"
+     by_id = {b["branch_id"]: b for b in norm}
+ 
++    # --- sticky user decline (issue #557 part 1) ---
++    if _user_already_declined(orch, by_id):
++        print("  ⛔ Fan-out over this dataset set was already declined by the "
++              "user this turn; not asking again.")
++        return _declined_by_user_payload(list(by_id), "user declined earlier "
++                                         "this turn", repeated=True)
++
++    # --- already ran (issue #557 part 2) ---
++    # A completed fan-out over exactly this set with at least one productive
++    # branch is not re-run: that discards finished work and re-pays the
++    # whole parallel cost for the branch(es) that failed.
++    if not force_rerun:
++        _ran = _already_ran_decline(orch, norm)
++        if _ran:
++            return _ran
++
+     # --- entry gate (reuses cached verdict if assess_complementarity ran) ---
+     datasets = [{"path": b["data_path"], "metadata": b.get("metadata"),
+                  "id": b["branch_id"], "task": b["task"], "label": b["label"],
+@@ -1362,10 +1548,26 @@ def run_fanout(orch, branches: List[dict],
+             ),
+         }, indent=2, default=str)
+ 
++    # The gate may have PRUNED the request down to a set that already ran.
++    if not force_rerun:
++        _ran = _already_ran_decline(orch, [by_id[i] for i in fanout_set])
++        if _ran:
++            return _ran
++
+     # --- confirmation ---
++    if _user_already_declined(orch, fanout_set):
++        print("  ⛔ The pruned fan-out set was already declined by the user "
++              "this turn; not asking again.")
++        return _declined_by_user_payload(fanout_set, "user declined earlier "
++                                         "this turn", repeated=True)
+     proceed, reason = _confirm_fanout(orch, verdict, fanout_set, by_id,
+                                       harmonize=harmonize)
+     if not proceed:
++        if reason.startswith(("user declined", "no confirmation received")):
++            # The refusal is the user's: make it stick for the turn and
++            # hand back a directive, not the verdict that motivated it.
++            _note_user_decline(orch, fanout_set, by_id)
++            return _declined_by_user_payload(fanout_set, reason)
+         return json.dumps({"status": "declined", "reason": reason,
+                            "verdict": verdict,
+                            "fanout_set": fanout_set}, indent=2, default=str)
+@@ -1639,12 +1841,7 @@ def _companions_for(i):
+     finally:
+         pool.shutdown(wait=False, cancel_futures=True)
+ 
+-    def _productive(e):
+-        # A branch that reports success but yields neither findings nor files
+-        # did no usable work (e.g. codegen aborted with no sandbox). Mirrors the
+-        # 'empty_but_successful' guard in _summarize_delegation_result.
+-        return (e.get("status") == "success"
+-                and (bool(e.get("key_findings")) or bool(e.get("files_produced"))))
++    _productive = _branch_productive
+ 
+     results = [{
+         "delegation_index": e["index"],
+@@ -1675,9 +1872,15 @@ def _productive(e):
+             "Call fuse_delegations with delegation_indices="
+             f"{[r['delegation_index'] for r in productive]} to reconcile these "
+             "complementary findings into one cross-dataset interpretation."
++            + (" Then retry ONLY the failed branch(es) with "
++               "resume_fanout(retry_failed=true) — do NOT re-run the whole "
++               "fan-out." if degraded else "")
+             if len(productive) >= 2 else
+             "Fewer than two branches produced usable output — report what ran "
+             "to the user; do NOT fuse empty branches into a synthesis."
++            + (" Retry ONLY the failed branch(es) with "
++               "resume_fanout(retry_failed=true) rather than re-running the "
++               "whole fan-out." if degraded and productive else "")
+         ),
+     }
+     if degraded:
+@@ -1691,7 +1894,19 @@ def _productive(e):
+             + f", {len(degraded) - n_err} succeeded-but-empty, "
+             "e.g. analysis code could not execute). Do not treat these as "
+             "completed analyses or fuse them; report the gap to the user."
++            + (" The productive branches' results are on disk and stay "
++               "valid: retry only the failed branch(es) "
++               "(resume_fanout(retry_failed=true)), never the whole fan-out."
++               if productive else "")
+         )
++        # The targeted retry spec (issue #557 part 2): what failed and why,
++        # so the recovery is one resume_fanout(retry_failed=true) call.
++        out["failed_branches"] = [{
++            "delegation_index": e["index"], "label": e["label"],
++            "data_path": e.get("data_path"), "status": e.get("status"),
++            "timed_out": bool(e.get("timed_out")),
++            "error": (str(e.get("error") or "")[:300] or None),
++        } for e in entries if not _productive(e)]
+         if n_timeout:
+             out["branches_timed_out"] = n_timeout
+     return json.dumps(out, indent=2, default=str)
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index d038f1261..f0153a1a4 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -240,6 +240,10 @@ def _missing_(cls, value):
+ - Sequential `delegate_to_analysis` calls threaded through `context` remain the
+   fallback when fan-out is not appropriate; still end with ONE correlated
+   interpretation across modalities — not N separate reports.
++- A fan-out with MIXED outcomes is recovered by fusing the branches that produced
++  output and retrying ONLY the failed ones (`resume_fanout(retry_failed=true)`),
++  never by re-issuing the whole fan-out. When the user DECLINES the launch gate,
++  that proposal is over for the turn: analyze independently or ask, do not re-propose.
+ 
+ **ENSEMBLE / BEST-OF-N ON ONE DATASET (distinct from the above):**
+ - Several INDEPENDENT analysis trajectories over the SAME single dataset,
+@@ -1643,19 +1647,22 @@ def _run_fanout(self, branches: list,
+                     branch_time_budget_s: Optional[float] = None,
+                     figure_style: Optional[str] = None,
+                     harmonize: bool = False,
+-                    allow_raw_branches: bool = False) -> str:
++                    allow_raw_branches: bool = False,
++                    force_rerun: bool = False) -> str:
+         """Gate, confirm, then run analysis branches concurrently."""
+         from .fanout import run_fanout
+         return run_fanout(self, branches,
+                           branch_time_budget_s=branch_time_budget_s,
+                           figure_style=figure_style,
+                           harmonize=harmonize,
+-                          allow_raw_branches=allow_raw_branches)
++                          allow_raw_branches=allow_raw_branches,
++                          force_rerun=force_rerun)
+ 
+-    def _resume_fanout(self) -> str:
+-        """Re-run fan-out branches left unfinished by a dead/stopped session."""
++    def _resume_fanout(self, retry_failed: bool = False) -> str:
++        """Re-run fan-out branches left unfinished by a dead/stopped session
++        (and, with ``retry_failed``, the failed branches of the latest one)."""
+         from .fanout import resume_fanout
+-        return resume_fanout(self)
++        return resume_fanout(self, retry_failed=retry_failed)
+ 
+     def _fuse_delegations(self, indices: list, focus: Optional[str] = None) -> str:
+         """Reconcile finished complementary branch findings into one narrative."""
+@@ -1882,6 +1889,10 @@ def chat(self, user_input: str) -> str:
+ 
+         # Close out any delegation a mid-run Stop left dangling as 'running'.
+         self._sweep_interrupted_delegations()
++        # A user's decline of the fan-out launch gate is sticky for ONE turn
++        # (#557): the same set is refused without asking again until the
++        # user speaks — their next message may well be "go ahead".
++        self._fanout_declined_sets = []
+ 
+         # Auto-checkpoint every N messages.
+         if self.message_count - self.last_checkpoint_message_count >= self.CHECKPOINT_INTERVAL:
+diff --git a/scilink/agents/meta_agent/meta_orchestrator_tools.py b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+index 64d3debf8..edb3962a4 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator_tools.py
++++ b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+@@ -725,14 +725,16 @@ def delegate_to_analyses(branches: list,
+                                  figure_style: str = None,
+                                  harmonize: bool = False,
+                                  branch_time_budget_s: float = None,
+-                                 allow_raw_branches: bool = False) -> str:
++                                 allow_raw_branches: bool = False,
++                                 force_rerun: bool = False) -> str:
+             print(f"  🔀 Parallel analysis over {len(branches or [])} dataset(s)"
+                   + (" (harmonized pipeline replay)" if harmonize else "")
+                   + "...")
+             return self.orch._run_fanout(branches, figure_style=figure_style,
+                                          harmonize=harmonize,
+                                          branch_time_budget_s=branch_time_budget_s,
+-                                         allow_raw_branches=allow_raw_branches)
++                                         allow_raw_branches=allow_raw_branches,
++                                         force_rerun=force_rerun)
+ 
+         self._register_tool(
+             func=delegate_to_analyses,
+@@ -764,7 +766,12 @@ def delegate_to_analyses(branches: list,
+                 "self-contained instruction with the absolute data path; the "
+                 "companions are wired in automatically. Returns the per-branch "
+                 "delegation_index list and the indices to pass to "
+-                "`fuse_delegations`."
++                "`fuse_delegations`. A set the user DECLINED at the gate this "
++                "turn is refused without asking again; a set that ALREADY RAN "
++                "is refused with a fuse-and-retry-the-failed directive "
++                "(recover a mixed-outcome fan-out with "
++                "`resume_fanout(retry_failed=true)`, not a re-run; "
++                "force_rerun=true overrides when the data or task changed)."
+             ),
+             parameters={
+                 "branches": {
+@@ -873,14 +880,25 @@ def delegate_to_analyses(branches: list,
+                         "approved script."
+                     ),
+                 },
++                "force_rerun": {
++                    "type": "boolean",
++                    "description": (
++                        "Default false: a dataset set that already ran as a "
++                        "fan-out with productive branches is refused (fuse "
++                        "those, retry the failed ones via resume_fanout). Set "
++                        "true only to deliberately re-run everything because "
++                        "the data or the task changed."
++                    ),
++                },
+             },
+             required=["branches"],
+         )
+ 
+         # -- resume_fanout (finish an interrupted parallel run) --------------
+-        def resume_fanout() -> str:
+-            print("  🔁 Resuming interrupted fan-out branches...")
+-            return self.orch._resume_fanout()
++        def resume_fanout(retry_failed: bool = False) -> str:
++            print("  🔁 Resuming fan-out branches"
++                  + (" (retrying failed ones)" if retry_failed else "") + "...")
++            return self.orch._resume_fanout(retry_failed=retry_failed)
+ 
+         self._register_tool(
+             func=resume_fanout,
+@@ -897,9 +915,22 @@ def resume_fanout() -> str:
+                 "interrupted fan-out branches or the user asks to resume/"
+                 "finish an interrupted parallel analysis; afterwards fuse "
+                 "the successful branches with `fuse_delegations` as usual. "
+-                "No-op (with a message) when nothing is interrupted."
++                "No-op (with a message) when nothing is interrupted. With "
++                "retry_failed=true it ALSO re-runs the ERRORED / empty branches "
++                "of the latest fan-out — the way to recover a mixed-outcome "
++                "fan-out: keep the productive branches, redo only the failed "
++                "ones, then fuse. Never re-issue `delegate_to_analyses` for that."
+             ),
+-            parameters={},
++            parameters={
++                "retry_failed": {
++                    "type": "boolean",
++                    "description": (
++                        "Default false. True: also retry the failed (errored "
++                        "or no-output) branches of the most recent fan-out in "
++                        "their original sessions."
++                    ),
++                },
++            },
+             required=[],
+         )
+ 
+diff --git a/tests/test_fanout_decline_and_retry.py b/tests/test_fanout_decline_and_retry.py
+new file mode 100644
+index 000000000..ab055a098
+--- /dev/null
++++ b/tests/test_fanout_decline_and_retry.py
+@@ -0,0 +1,313 @@
++"""#557 — the AUTOPILOT fan-out gate: a user decline is sticky for the turn
++and directive (no verdict, no re-proposal), a dataset set that already ran
++is refused with a fuse-and-retry directive, a mixed-outcome result names the
++failed branches, and resume_fanout(retry_failed=True) re-runs only them.
++
++  python -m pytest tests/test_fanout_decline_and_retry.py -v
++"""
++import json
++import os
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import numpy as np
++import pytest
++
++import scilink.agents.meta_agent.fanout as fo
++from scilink.agents.meta_agent.meta_orchestrator import (
++    MetaOrchestratorAgent, MetaMode)
++
++
++@pytest.fixture()
++def paths(tmp_path):
++    ps = [str(tmp_path / f"{n}.npy") for n in "AB"]
++    for p in ps:
++        np.save(p, np.zeros((4, 4)))
++    return ps
++
++
++def _branches(paths):
++    return [{"data_path": p, "task": f"Analyze {p}", "label": os.path.basename(p)}
++            for p in paths]
++
++
++def _verdict(paths):
++    def fake_llm(orch, prompt, extra_parts=None):
++        return {"verdict": "complementary", "confidence": 0.9, "rationale": "r",
++                "join_axis": "T", "join_type": "shared_parameter_axis",
++                "fanout_set": list(paths), "redundant_clusters": [],
++                "unrelated": [], "excluded_notes": ""}
++    return fake_llm
++
++
++def _child_factory(fail_paths=(), calls=None):
++    def fake_child(orch, base_dir, restore=False):
++        class C:
++            def run_task(self, task, context=None, autonomy=None):
++                if calls is not None:
++                    calls.append({"task": task, "restore": restore,
++                                  "base_dir": str(base_dir)})
++                for fp in fail_paths:
++                    if fp in task:
++                        raise RuntimeError("synthetic branch failure")
++                return {"status": "success", "summary": "ok",
++                        "key_findings": ["finding"], "files_produced": []}
++        return C()
++    return fake_child
++
++
++def _autopilot(tmp_path):
++    return MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path / "s"),
++                                 meta_mode=MetaMode.AUTOPILOT)
++
++
++def _autonomous(tmp_path):
++    return MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path / "s"),
++                                 meta_mode=MetaMode.AUTONOMOUS)
++
++
++# ------------------------------------------------------- part 1: decline --
++
++def test_user_decline_is_directive_and_sticky_for_the_turn(tmp_path, paths, monkeypatch):
++    meta = _autopilot(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    prompts = []
++    monkeypatch.setattr(fo, "request_human_feedback",
++                        lambda *a, **k: prompts.append(k.get("origin")) or "n")
++    out = json.loads(meta._run_fanout(_branches(paths)))
++    assert out["status"] == "declined_by_user"
++    assert "verdict" not in out                       # no re-motivation
++    assert "Do NOT call delegate_to_analyses again" in out["message"]
++    assert len(prompts) == 1
++
++    # Same set again in the same turn: refused WITHOUT asking.
++    out2 = json.loads(meta._run_fanout(_branches(paths)))
++    assert out2["status"] == "declined_by_user"
++    assert "already declined" in out2["message"]
++    assert len(prompts) == 1
++    # Re-labelled / re-worded tasks over the same datasets: still refused.
++    relabel = [{"data_path": p, "task": "Different wording", "label": "x" + str(i)}
++               for i, p in enumerate(paths)]
++    assert json.loads(meta._run_fanout(relabel))["status"] == "declined_by_user"
++    assert len(prompts) == 1
++
++
++def test_decline_resets_at_the_next_user_turn(tmp_path, paths, monkeypatch):
++    meta = _autopilot(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    prompts = []
++    monkeypatch.setattr(fo, "request_human_feedback",
++                        lambda *a, **k: prompts.append(1) or "n")
++    meta._run_fanout(_branches(paths))
++    assert len(prompts) == 1
++    # What chat() does at the start of every user turn.
++    meta._fanout_declined_sets = []
++    meta._run_fanout(_branches(paths))
++    assert len(prompts) == 2                          # asked again
++
++
++def test_no_input_channel_counts_as_user_decline(tmp_path, paths, monkeypatch):
++    meta = _autopilot(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++
++    def eof(*a, **k):
++        raise EOFError
++    monkeypatch.setattr(fo, "request_human_feedback", eof)
++    out = json.loads(meta._run_fanout(_branches(paths)))
++    assert out["status"] == "declined_by_user"
++    assert fo._user_already_declined(meta, paths)
++
++
++def test_user_confirm_runs_and_records_nothing(tmp_path, paths, monkeypatch):
++    meta = _autopilot(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    monkeypatch.setattr(fo, "request_human_feedback", lambda *a, **k: "y")
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", _child_factory())
++    out = json.loads(meta._run_fanout(_branches(paths)))
++    assert out["status"] == "success" and out["branches_with_output"] == 2
++    assert not getattr(meta, "_fanout_declined_sets", [])
++
++
++def test_autonomous_verdict_decline_keeps_verdict_payload(tmp_path, paths, monkeypatch):
++    """A machine decline (verdict / caps) is unchanged: it still carries
++    the verdict so the model can act on redundant/unrelated groupings."""
++    meta = _autonomous(tmp_path)
++
++    def weak(orch, prompt, extra_parts=None):
++        v = _verdict(paths)(orch, prompt)
++        v["confidence"] = 0.2
++        return v
++    monkeypatch.setattr(fo, "_llm_json", weak)
++    out = json.loads(meta._run_fanout(_branches(paths)))
++    assert out["status"] == "declined" and "verdict" in out
++    assert not getattr(meta, "_fanout_declined_sets", [])
++
++
++# ------------------------------------------------ part 2: mixed outcomes --
++
++def test_mixed_outcome_names_failed_branches_and_targets_retry(tmp_path, paths, monkeypatch):
++    meta = _autonomous(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _child_factory(fail_paths=[paths[1]]))
++    out = json.loads(meta._run_fanout(_branches(paths)))
++    assert out["status"] == "success"
++    assert out["branches_with_output"] == 1
++    assert [f["label"] for f in out["failed_branches"]] == ["B.npy"]
++    assert "synthetic branch failure" in out["failed_branches"][0]["error"]
++    assert "resume_fanout(retry_failed=true)" in out["next_step"]
++    assert "never the whole fan-out" in out["warning"]
++
++
++def test_already_ran_set_is_refused_with_fuse_and_retry_directive(tmp_path, paths, monkeypatch):
++    meta = _autonomous(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _child_factory(fail_paths=[paths[1]]))
++    first = json.loads(meta._run_fanout(_branches(paths)))
++    gates = []
++    monkeypatch.setattr(fo, "_llm_json",
++                        lambda *a, **k: gates.append(1) or _verdict(paths)(*a, **k))
++    again = json.loads(meta._run_fanout(_branches(paths)))
++    assert again["status"] == "declined" and again["reason"] == "already_ran"
++    assert again["parallel_group"] == first["parallel_group"]
++    assert [p["delegation_index"] for p in again["productive"]] == [1]
++    assert [f["label"] for f in again["failed"]] == ["B.npy"]
++    assert "resume_fanout(retry_failed=true)" in again["message"]
++    assert "force_rerun=true" in again["message"]
++    assert gates == []                                # refused before the gate
++    # Explicit override re-runs (the gate verdict is served from its cache).
++    forced = json.loads(meta._run_fanout(_branches(paths), force_rerun=True))
++    assert forced["status"] == "success" and forced["parallel_group"] != first["parallel_group"]
++
++
++def test_already_ran_guard_applies_to_the_gate_pruned_set(tmp_path, paths, monkeypatch):
++    """Request A+B+C; the gate prunes C; A+B already ran -> refused."""
++    meta = _autonomous(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", _child_factory())
++    meta._run_fanout(_branches(paths))
++    extra = str(tmp_path / "C.npy")
++    np.save(extra, np.zeros((4, 4)))
++
++    def prune_c(orch, prompt, extra_parts=None):
++        v = _verdict(paths)(orch, prompt)
++        v["unrelated"] = [extra]
++        return v
++    monkeypatch.setattr(fo, "_llm_json", prune_c)
++    out = json.loads(meta._run_fanout(_branches(paths + [extra])))
++    assert out["status"] == "declined" and out["reason"] == "already_ran"
++
++
++def test_already_ran_guard_needs_a_productive_branch(tmp_path, paths, monkeypatch):
++    """Every branch failed -> a full re-run is the right recovery; not refused."""
++    meta = _autonomous(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _child_factory(fail_paths=list(paths)))
++    meta._run_fanout(_branches(paths))
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", _child_factory())
++    out = json.loads(meta._run_fanout(_branches(paths)))
++    assert out["status"] == "success" and out["branches_with_output"] == 2
++
++
++def test_different_set_is_not_refused(tmp_path, paths, monkeypatch):
++    meta = _autonomous(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", _child_factory())
++    meta._run_fanout(_branches(paths))
++    extra = str(tmp_path / "C.npy")
++    np.save(extra, np.zeros((4, 4)))
++    ps3 = paths + [extra]
++    monkeypatch.setattr(fo, "_llm_json", _verdict(ps3))
++    out = json.loads(meta._run_fanout(_branches(ps3)))
++    assert out["status"] == "success" and out["branches_run"] == 3
++
++
++def test_retry_failed_reruns_only_the_failed_branch_of_latest_group(tmp_path, paths, monkeypatch):
++    meta = _autonomous(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _child_factory(fail_paths=[paths[1]]))
++    meta._run_fanout(_branches(paths))
++    failed = [e for e in meta._delegation_ledger if e.get("status") == "error"]
++    assert len(failed) == 1 and failed[0]["label"] == "B.npy"
++
++    calls = []
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _child_factory(calls=calls))
++    out = json.loads(meta._resume_fanout(retry_failed=True))
++    assert out["status"] == "success"
++    assert out["branches_retried"] == 1 and out["branches_resumed"] == 0
++    assert len(calls) == 1
++    assert "RETRY NOTE" in calls[0]["task"] and "synthetic branch failure" in calls[0]["task"]
++    assert calls[0]["restore"] is False            # no checkpoint was left behind
++    e = failed[0]
++    assert e["status"] == "success" and e["retries"] == 1
++    assert e["key_findings"] == ["finding"] and not e.get("error")
++    # Now the set is fully productive: nothing left to retry.
++    out2 = json.loads(meta._resume_fanout(retry_failed=True))
++    assert out2["status"] == "no_op" and "no failed branches" in out2["message"]
++
++
++def test_retry_failed_restores_when_the_failed_attempt_left_a_checkpoint(tmp_path, paths, monkeypatch):
++    meta = _autonomous(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _child_factory(fail_paths=[paths[1]]))
++    meta._run_fanout(_branches(paths))
++    e = next(x for x in meta._delegation_ledger if x.get("status") == "error")
++    bdir = meta.fanout_dir / f"{e['index']:02d}_{fo._slug(e['label'])}"
++    bdir.mkdir(parents=True, exist_ok=True)
++    (bdir / "checkpoint.json").write_text("{}")
++    calls = []
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _child_factory(calls=calls))
++    meta._resume_fanout(retry_failed=True)
++    assert calls and calls[0]["restore"] is True
++
++
++def test_retry_failed_leaves_timed_out_and_older_groups_alone(tmp_path, monkeypatch):
++    meta = _autonomous(tmp_path)
++
++    def entry(index, label, group, status, **kw):
++        d = {"index": index, "label": label, "status": status, "task": "t",
++             "mode": "analysis", "fanout": True, "parallel_group": group,
++             "key_findings": [], "files_produced": [], "summary": "",
++             "data_path": f"/d/{label}"}
++        d.update(kw)
++        return d
++    meta._delegation_ledger = [
++        entry(1, "old_fail", "fanout_1", "error", error="old"),
++        entry(2, "old_ok", "fanout_1", "success", key_findings=["f"]),
++        entry(3, "new_ok", "fanout_3", "success", key_findings=["f"]),
++        entry(4, "new_fail", "fanout_3", "error", error="boom"),
++        entry(5, "new_timeout", "fanout_3", "error", timed_out=True),
++    ]
++    calls = []
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _child_factory(calls=calls))
++    out = json.loads(meta._resume_fanout(retry_failed=True))
++    assert out["branches_retried"] == 1
++    assert [r["label"] for r in out["results"]] == ["new_fail"]
++    assert meta._delegation_ledger[0]["status"] == "error"     # older group untouched
++    assert meta._delegation_ledger[4]["status"] == "error"     # timed_out untouched
++
++
++def test_plain_resume_is_unchanged_without_retry_flag(tmp_path, monkeypatch):
++    meta = _autonomous(tmp_path)
++    meta._delegation_ledger = [
++        {"index": 1, "label": "f", "status": "error", "task": "t", "mode": "analysis",
++         "fanout": True, "parallel_group": "fanout_1", "key_findings": [],
++         "files_produced": [], "summary": "", "error": "boom"}]
++    out = json.loads(meta._resume_fanout())
++    assert out["status"] == "no_op" and "retry_failed=true" in out["message"]
++
++
++def test_tools_expose_the_new_flags(tmp_path):
++    meta = _autonomous(tmp_path)
++    by_name = {s["function"]["name"]: s["function"]
++               for s in meta.tools.openai_schemas}
++    assert "force_rerun" in by_name["delegate_to_analyses"]["parameters"]["properties"]
++    assert "retry_failed" in by_name["resume_fanout"]["parameters"]["properties"]
++    assert "retry_failed=true" in by_name["delegate_to_analyses"]["description"]

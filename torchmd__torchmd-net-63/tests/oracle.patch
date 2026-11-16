@@ -1,0 +1,261 @@
+diff --git a/scripts/train.py b/scripts/train.py
+index 4f19a72f9..08f53465f 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -64,6 +64,8 @@ def get_args():
+     parser.add_argument('--prior-model', type=str, default=None, choices=priors.__all__, help='Which prior model to use')
+ 
+     # architectural args
++    parser.add_argument('--charge', type=bool, default=False, help='Model needs a total charge')
++    parser.add_argument('--spin', type=bool, default=False, help='Model needs a spin state')
+     parser.add_argument('--embedding-dimension', type=int, default=256, help='Embedding dimension')
+     parser.add_argument('--num-layers', type=int, default=6, help='Number of interaction layers in the model')
+     parser.add_argument('--num-rbf', type=int, default=64, help='Number of radial basis functions in model')
+diff --git a/torchmdnet/datasets/__init__.py b/torchmdnet/datasets/__init__.py
+index 8102766d6..916f54163 100644
+--- a/torchmdnet/datasets/__init__.py
++++ b/torchmdnet/datasets/__init__.py
+@@ -3,5 +3,6 @@
+ from .ani1 import ANI1
+ from .custom import Custom
+ from .hdf import HDF5
++from .ace import Ace
+ 
+-__all__ = ["QM9", "MD17", "ANI1", "Custom", "HDF5"]
++__all__ = ["QM9", "MD17", "ANI1", "Custom", "HDF5", "Ace"]
+diff --git a/torchmdnet/datasets/ace.py b/torchmdnet/datasets/ace.py
+new file mode 100644
+index 000000000..23d05281e
+--- /dev/null
++++ b/torchmdnet/datasets/ace.py
+@@ -0,0 +1,45 @@
++from glob import glob
++import h5py
++import torch as pt
++from torch_geometric.data import Dataset, Data
++
++
++class Ace(Dataset):
++
++    def __init__(self, filenames, **kwargs):
++        super().__init__()
++
++        # Open HDF5 files
++        self.files = [h5py.File(name) for name in glob(filenames)]
++
++        # Index samples
++        self.mol_indices = []
++        for ifile, file_ in enumerate(self.files):
++            for name in file_:
++                if 'error' in file_[name]:
++                    continue # Skip failed molecules
++                num_confs = len(file_[name]['energy'])
++                for iconf in range(num_confs):
++                    self.mol_indices.append((ifile, name, iconf))
++
++    def get(self, i):
++
++        # Get a molecule
++        ifile, name, iconf = self.mol_indices[i]
++        mol = self.files[ifile][name]
++
++        # Get molecular data
++        return Data(
++            q=pt.tensor(mol.attrs['charge'], dtype=pt.long),
++            s=pt.tensor(mol.attrs['spin'], dtype=pt.long),
++            z=pt.tensor(mol['atomic_numbers'], dtype=pt.long),
++            pos=pt.tensor(mol['positions'][iconf], dtype=pt.float32),
++            y=pt.tensor(mol['energy'][iconf], dtype=pt.float32),
++            dy=pt.tensor(mol['forces'][iconf], dtype=pt.float32),
++            d=pt.tensor(mol['dipole_moment'][iconf], dtype=pt.float32))
++
++    def len(self):
++        return len(self.mol_indices)
++
++    def get_atomref(self):
++        raise NotImplementedError
+\ No newline at end of file
+diff --git a/torchmdnet/models/model.py b/torchmdnet/models/model.py
+index a2cabd91e..52e7b49f7 100644
+--- a/torchmdnet/models/model.py
++++ b/torchmdnet/models/model.py
+@@ -1,8 +1,8 @@
+ import re
+-from typing import Optional, List
++from typing import Optional, List, Tuple
+ import torch
+ from torch.autograd import grad
+-from torch import nn
++from torch import nn, Tensor
+ from torch_scatter import scatter
+ from pytorch_lightning.utilities import rank_zero_warn
+ from torchmdnet.models import output_modules
+@@ -153,7 +153,13 @@ def reset_parameters(self):
+         if self.prior_model is not None:
+             self.prior_model.reset_parameters()
+ 
+-    def forward(self, z, pos, batch: Optional[torch.Tensor] = None):
++    def forward(self,
++                z: Tensor,
++                pos: Tensor,
++                batch: Optional[Tensor] = None,
++                q: Optional[Tensor] = None,
++                s: Optional[Tensor] = None) -> Tuple[Tensor, Optional[Tensor]]:
++
+         assert z.dim() == 1 and z.dtype == torch.long
+         batch = torch.zeros_like(z) if batch is None else batch
+ 
+@@ -161,7 +167,7 @@ def forward(self, z, pos, batch: Optional[torch.Tensor] = None):
+             pos.requires_grad_(True)
+ 
+         # run the potentially wrapped representation model
+-        x, v, z, pos, batch = self.representation_model(z, pos, batch=batch)
++        x, v, z, pos, batch = self.representation_model(z, pos, batch, q=q, s=s)
+ 
+         # apply the output network
+         x = self.output_model.pre_reduce(x, v, z, pos, batch)
+diff --git a/torchmdnet/models/torchmd_et.py b/torchmdnet/models/torchmd_et.py
+index 8d6f57ea4..4e208ccea 100644
+--- a/torchmdnet/models/torchmd_et.py
++++ b/torchmdnet/models/torchmd_et.py
+@@ -1,6 +1,6 @@
+ from typing import Optional, Tuple
+ import torch
+-from torch import nn
++from torch import Tensor, nn
+ from torch_geometric.nn import MessagePassing
+ from torch_scatter import scatter
+ from torchmdnet.models.utils import (
+@@ -147,7 +147,14 @@ def reset_parameters(self):
+             attn.reset_parameters()
+         self.out_norm.reset_parameters()
+ 
+-    def forward(self, z, pos, batch):
++    def forward(self,
++                z: Tensor,
++                pos: Tensor,
++                batch: Tensor,
++                q: Optional[Tensor] = None,
++                s: Optional[Tensor] = None
++                ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
++
+         x = self.embedding(z)
+ 
+         edge_index, edge_weight, edge_vec = self.distance(pos, batch)
+diff --git a/torchmdnet/models/torchmd_gn.py b/torchmdnet/models/torchmd_gn.py
+index 468ecfee9..e0fb020e6 100644
+--- a/torchmdnet/models/torchmd_gn.py
++++ b/torchmdnet/models/torchmd_gn.py
+@@ -1,4 +1,5 @@
+-from torch import nn
++from typing import Optional, Tuple
++from torch import Tensor, nn
+ from torch_geometric.nn import MessagePassing
+ from torchmdnet.models.utils import (
+     NeighborEmbedding,
+@@ -141,7 +142,14 @@ def reset_parameters(self):
+         for interaction in self.interactions:
+             interaction.reset_parameters()
+ 
+-    def forward(self, z, pos, batch):
++    def forward(self,
++                z: Tensor,
++                pos: Tensor,
++                batch: Tensor,
++                s: Optional[Tensor] = None,
++                q: Optional[Tensor] = None
++                ) -> Tuple[Tensor, Optional[Tensor], Tensor, Tensor, Tensor]:
++
+         x = self.embedding(z)
+ 
+         edge_index, edge_weight, _ = self.distance(pos, batch)
+diff --git a/torchmdnet/models/torchmd_t.py b/torchmdnet/models/torchmd_t.py
+index 10f649c8f..fc5fc01bc 100644
+--- a/torchmdnet/models/torchmd_t.py
++++ b/torchmdnet/models/torchmd_t.py
+@@ -1,4 +1,5 @@
+-from torch import nn
++from typing import Optional, Tuple
++from torch import Tensor, nn
+ from torch_geometric.nn import MessagePassing
+ from torchmdnet.models.utils import (
+     NeighborEmbedding,
+@@ -137,7 +138,14 @@ def reset_parameters(self):
+             attn.reset_parameters()
+         self.out_norm.reset_parameters()
+ 
+-    def forward(self, z, pos, batch):
++    def forward(self,
++                z: Tensor,
++                pos: Tensor,
++                batch: Tensor,
++                s: Optional[Tensor] = None,
++                q: Optional[Tensor] = None
++                ) -> Tuple[Tensor, Optional[Tensor], Tensor, Tensor, Tensor]:
++
+         x = self.embedding(z)
+ 
+         edge_index, edge_weight, _ = self.distance(pos, batch)
+diff --git a/torchmdnet/module.py b/torchmdnet/module.py
+index 0b7bf715e..c8c4eac3b 100644
+--- a/torchmdnet/module.py
++++ b/torchmdnet/module.py
+@@ -10,6 +10,12 @@
+ class LNNP(LightningModule):
+     def __init__(self, hparams, prior_model=None, mean=None, std=None):
+         super(LNNP, self).__init__()
++
++        if "charge" not in hparams:
++            hparams["charge"] = False
++        if "spin" not in hparams:
++            hparams["spin"] = False
++
+         self.save_hyperparameters(hparams)
+ 
+         if self.hparams.load_model:
+@@ -46,8 +52,8 @@ def configure_optimizers(self):
+         }
+         return [optimizer], [lr_scheduler]
+ 
+-    def forward(self, z, pos, batch=None):
+-        return self.model(z, pos, batch=batch)
++    def forward(self, z, pos, batch=None, q=None, s=None):
++        return self.model(z, pos, batch=batch, q=q, s=s)
+ 
+     def training_step(self, batch, batch_idx):
+         return self.step(batch, mse_loss, "train")
+@@ -66,7 +72,9 @@ def step(self, batch, loss_fn, stage):
+         with torch.set_grad_enabled(stage == "train" or self.hparams.derivative):
+             # TODO: the model doesn't necessarily need to return a derivative once
+             # Union typing works under TorchScript (https://github.com/pytorch/pytorch/pull/53180)
+-            pred, deriv = self(batch.z, batch.pos, batch.batch)
++            pred, deriv = self(batch.z, batch.pos, batch=batch.batch,
++                               q=batch.q if self.hparams.charge else None,
++                               s=batch.s if self.hparams.spin else None)
+ 
+         loss_y, loss_dy = 0, 0
+         if self.hparams.derivative:
+diff --git a/torchmdnet/optimize.py b/torchmdnet/optimize.py
+index c5a36ee0a..757f2415d 100644
+--- a/torchmdnet/optimize.py
++++ b/torchmdnet/optimize.py
+@@ -1,3 +1,4 @@
++from typing import Optional, Tuple
+ import torch as pt
+ from NNPOps.CFConv import CFConv
+ from NNPOps.CFConvNeighbors import CFConvNeighbors
+@@ -41,7 +42,13 @@ def __init__(self, model):
+             for inter in self.model.interactions
+         ]
+ 
+-    def forward(self, z, pos, batch):
++    def forward(self,
++                z: pt.Tensor,
++                pos: pt.Tensor,
++                batch: pt.Tensor,
++                q: Optional[pt.Tensor] = None,
++                s: Optional[pt.Tensor] = None
++                ) -> Tuple[pt.Tensor, Optional[pt.Tensor], pt.Tensor, pt.Tensor, pt.Tensor]:
+ 
+         assert pt.all(batch == 0)
+ 

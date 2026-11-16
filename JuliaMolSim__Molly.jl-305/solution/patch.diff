@@ -1,0 +1,1172 @@
+diff --git a/docs/src/documentation.md b/docs/src/documentation.md
+index fd2854d4f..1a69c73ca 100644
+--- a/docs/src/documentation.md
++++ b/docs/src/documentation.md
+@@ -723,6 +723,17 @@ In this case, try using the same units throughout.
+ The float type of a [`System`](@ref) is read from the boundary by default and can be set with the `float_type` argument.
+ The coordinates, velocities and boundary should all use this float type; mixing `Float32` and `Float64` data silently loses the precision you asked for on CPU and can fail to compile on GPU, so it is reported according to `strictness`.
+ 
++A [`System`](@ref) can be converted to another float type, to unitless values or to another device by giving `float_type`, `units` or `array_type` to the copy constructor.
++For example, a system simulated with units in `Float32` on the GPU can be evaluated in `Float64` without units on the CPU, which is suitable for Enzyme:
++```julia
++sys_cpu = System(sys; float_type=Float64, units=false, array_type=Array, grad_safe=true)
++```
++The atoms, coordinates, velocities, boundary, interactions, constraints, virtual sites, neighbor finder and Boltzmann constant are converted, and loggers are dropped with a warning unless given with the `loggers` keyword argument.
++Units are stripped without conversion, so the numbers are in the units each value is stored with.
++Converting to a higher precision does not recover the precision lost when the original values were stored.
++Interaction types are rebuilt from their converted fields by calling the constructor of the same name with the fields in order.
++Custom types where this does not work, for example because they contain buffers, should define a method of `Molly.convert_component(conversion, x)`; see the existing methods in the Molly source for examples.
++
+ ## Atom types
+ 
+ Molly has a built-in [`Atom`](@ref) type with a few properties commonly used in molecular simulation defined.
+diff --git a/src/Molly.jl b/src/Molly.jl
+index f0e6ae27b..966bb354f 100644
+--- a/src/Molly.jl
++++ b/src/Molly.jl
+@@ -56,6 +56,7 @@ end
+ include("types.jl")
+ include("sparse_pairs.jl")
+ include("parameters.jl")
++include("conversion.jl")
+ include("units.jl")
+ include("cuda_config.jl")
+ include("spatial.jl")
+diff --git a/src/constraints/constraints.jl b/src/constraints/constraints.jl
+index c13f8a49f..2722ef894 100644
+--- a/src/constraints/constraints.jl
++++ b/src/constraints/constraints.jl
+@@ -673,3 +673,12 @@ function constraints_to_bonds(sys::System{<:Any, AT, T}, k_in) where {AT, T}
+         return InteractionList2Atoms(Any)
+     end
+ end
++
++# Conversion to another float type, units or device, see `System(sys; ...)`
++# AngleConstraint stores the third distance rather than the angle, so the angle is found
++#   from the converted distances
++function convert_component(c::SystemConversion, ac::AngleConstraint)
++    d_ij, d_jk, d_ik = convert_component.((c,), (ac.dist_ij, ac.dist_jk, ac.dist_ik))
++    angle_ijk = acos(clamp((d_ij^2 + d_jk^2 - d_ik^2) / (2 * d_ij * d_jk), -1, 1))
++    return AngleConstraint(ac.i, ac.j, ac.k, angle_ijk, d_ij, d_jk)
++end
+diff --git a/src/constraints/lincs.jl b/src/constraints/lincs.jl
+index 628a6f566..0cc079bb6 100644
+--- a/src/constraints/lincs.jl
++++ b/src/constraints/lincs.jl
+@@ -1420,3 +1420,27 @@ function move_constraints_to_device(lincs::LINCS, ::Type{AT}) where {AT <: Abstr
+                  lincs.angle_constraints, lincs.dist_tolerance, lincs.vel_tolerance,
+                  lincs.iter_vel_correction, lincs.gpu_block_size, delta_buf, ca_gpu)
+ end
++
++# Conversion to another float type, units or device, see `System(sys; ...)`
++function convert_component(c::SystemConversion, lincs::LINCS)
++    # The distance constraints from the angle constraints are added at the end
++    n_angle = (isnothing(lincs.angle_constraints) ? 0 : length(lincs.angle_constraints))
++    n_dist = length(lincs.dist_constraints) - 3 * n_angle
++    dist_constraints = [convert_component(c, dc) for dc in lincs.dist_constraints[1:n_dist]]
++    if n_angle > 0
++        angle_constraints = [convert_component(c, ac) for ac in lincs.angle_constraints]
++    else
++        angle_constraints = nothing
++    end
++    return LINCS(
++        masses=mass.(from_device(c.atoms)),
++        dist_tolerance=convert_component(c, lincs.dist_tolerance),
++        vel_tolerance=convert_component(c, lincs.vel_tolerance),
++        dist_constraints=dist_constraints,
++        angle_constraints=angle_constraints,
++        n_rec=lincs.lincs_data.n_rec,
++        n_iter=lincs.lincs_data.n_iter,
++        iter_vel_correction=lincs.iter_vel_correction,
++        gpu_block_size=lincs.gpu_block_size,
++    )
++end
+diff --git a/src/constraints/shake.jl b/src/constraints/shake.jl
+index e5d57d3b2..a0d0b5ff0 100644
+--- a/src/constraints/shake.jl
++++ b/src/constraints/shake.jl
+@@ -52,6 +52,21 @@ struct SHAKE_RATTLE{D, A, B, C, E, V}
+     max_iters::Int
+ end
+ 
++function check_shake_tolerances(dist_tolerance, vel_tolerance, strictness)
++    if typeof(ustrip(dist_tolerance)) == Float32 && ustrip(dist_tolerance) < Float32(1e-6)
++        err_str = "Using Float32 with a SHAKE dist_tolerance less than 1e-6, this may lead " *
++                  "to convergence issues"
++        report_issue(err_str, strictness)
++    end
++
++    if typeof(ustrip(vel_tolerance)) == Float32 && ustrip(vel_tolerance) < Float32(1e-6)
++        err_str = "Using Float32 with a RATTLE vel_tolerance less than 1e-6, this may lead " *
++                  "to convergence issues"
++        report_issue(err_str, strictness)
++    end
++    return nothing
++end
++
+ function SHAKE_RATTLE(; n_atoms,
+                       dist_tolerance=1e-8u"nm",
+                       vel_tolerance=1e-8u"nm^2 * ps^-1",
+@@ -71,17 +86,7 @@ function SHAKE_RATTLE(; n_atoms,
+                             "provided to SHAKE_RATTLE"))
+     end
+ 
+-    if typeof(ustrip(dist_tolerance)) == Float32 && ustrip(dist_tolerance) < Float32(1e-6)
+-        err_str = "Using Float32 with a SHAKE dist_tolerance less than 1e-6, this may lead " *
+-                  "to convergence issues"
+-        report_issue(err_str, strictness)
+-    end
+-
+-    if typeof(ustrip(vel_tolerance)) == Float32 && ustrip(vel_tolerance) < Float32(1e-6)
+-        err_str = "Using Float32 with a RATTLE vel_tolerance less than 1e-6, this may lead " *
+-                  "to convergence issues"
+-        report_issue(err_str, strictness)
+-    end
++    check_shake_tolerances(dist_tolerance, vel_tolerance, strictness)
+ 
+     if isa(dist_constraints, AbstractGPUArray) || isa(angle_constraints, AbstractGPUArray)
+         throw(ArgumentError("constraints should be passed to SHAKE_RATTLE on CPU, data will " *
+@@ -1399,3 +1404,21 @@ function check_velocity_constraints(sys::System{<:Any, <:Any, FT}, ca::SHAKE_RAT
+     KernelAbstractions.synchronize(backend)
+     return maximum(cluster_maxes) < ustrip(ca.vel_tolerance)
+ end
++
++# Conversion to another float type, units or device, see `System(sys; ...)`
++# Constraints are converted on the CPU, the System constructor moves them to the device
++function convert_component(c::SystemConversion, sr::SHAKE_RATTLE)
++    clusters = map((sr.clusters12, sr.clusters23, sr.clusters34, sr.angle_clusters)) do cl
++        cl_cpu = host_constraint_clusters(cl)
++        if length(cl_cpu) == 0
++            return cl_cpu
++        else
++            return StructArray([convert_component(c, cd) for cd in cl_cpu])
++        end
++    end
++    dist_tolerance = convert_component(c, sr.dist_tolerance)
++    vel_tolerance = convert_component(c, sr.vel_tolerance)
++    check_shake_tolerances(dist_tolerance, vel_tolerance, c.strictness)
++    return SHAKE_RATTLE(clusters..., dist_tolerance, vel_tolerance, sr.gpu_block_size,
++                        sr.max_iters)
++end
+diff --git a/src/conversion.jl b/src/conversion.jl
+new file mode 100644
+index 000000000..8183edad1
+--- /dev/null
++++ b/src/conversion.jl
+@@ -0,0 +1,180 @@
++# Conversion of a System to another float type, to unitless values or to another device,
++#   done by `System(sys; float_type, units, array_type)`. Methods for unit handling are in
++#   units.jl and methods for specific types are in the files defining them.
++
++#=
++    SystemConversion
++
++The target of a System conversion, passed to `convert_component`.
++
++The type parameters are the new float type, array type and `float_type_high`.
++`strip_units`, `grad_safe` and `strictness` are the settings of the new system, and
++`same_device` is whether it is on the same device as the original one.
++`atoms`, `coords` and `boundary` are the converted values, available when converting
++the parts of the system that depend on them such as the neighbor finder and PME.
++=#
++struct SystemConversion{T, AT, TH, A, C, B}
++    strip_units::Bool
++    grad_safe::Bool
++    same_device::Bool
++    atoms::A # Needed for PME constructors
++    coords::C # Needed for CellListMapNeighborFinder
++    boundary::B # For PME and CellListMapNeighborFinder
++    strictness::Symbol
++end
++
++function SystemConversion{T, AT, TH}(strip_units, grad_safe, same_device=true, atoms=nothing,
++                                     coords=nothing, boundary=nothing,
++                                     strictness=default_strictness()) where {T, AT, TH}
++    return SystemConversion{T, AT, TH, typeof(atoms), typeof(coords), typeof(boundary)}(
++                strip_units, grad_safe, same_device, atoms, coords, boundary, strictness)
++end
++
++#=
++    convert_component(conversion, x)
++
++Convert `x`, part of a System, to the float type, units and device given by a
++`SystemConversion`.
++
++This is used by `System(sys; float_type, units, array_type)`.
++Floats are converted to the new float type.
++Values with units are converted the same way and have their units stripped if required,
++in which case stored units become `NoUnits`.
++Integers, strings, symbols and functions are returned unchanged.
++Tuples, named tuples and static arrays are converted element-wise.
++Other arrays are converted element-wise on the CPU and moved to the new device if their
++elements are bits types.
++Other structs are rebuilt from their converted fields by calling the constructor of the same
++name with the fields in order, and an error is thrown if that fails or gives a struct with
++different field values.
++Custom types for which this does not work, for example because they hold buffers or have
++an inner constructor taking different arguments, should define a method of this function.
++=#
++convert_component(c::SystemConversion, x) = convert_struct(c, x)
++
++convert_component(::SystemConversion{T}, x::AbstractFloat) where {T} = T(x)
++convert_component(::SystemConversion{T}, x::Complex{<:AbstractFloat}) where {T} = Complex{T}(x)
++
++const UnconvertedComponent = Union{Number, AbstractString, Symbol, Nothing, Function, Type}
++
++convert_component(::SystemConversion, x::UnconvertedComponent) = x
++
++convert_component(c::SystemConversion, x::Union{Tuple, NamedTuple}) = map(y -> convert_component(c, y), x)
++convert_component(c::SystemConversion, x::StaticArray) = map(y -> convert_component(c, y), x)
++
++# Dictionaries are converted value by value and stay on the CPU
++function convert_component(c::SystemConversion, x::AbstractDict)
++    return Dict(k => convert_component(c, v) for (k, v) in x)
++end
++
++function convert_component(c::SystemConversion{<:Any, AT}, x::AbstractArray) where AT
++    y = map(el -> convert_component(c, el), from_device(x))
++    if AT <: AbstractGPUArray && isbitstype(eltype(y))
++        return to_device(y, AT)
++    else
++        return y
++    end
++end
++
++function convert_struct(c::SystemConversion, x::X) where X
++    n = fieldcount(X)
++    if !isstructtype(X) || n == 0
++        return x
++    end
++    fields = ntuple(i -> convert_component(c, getfield(x, i)), Val(n))
++    if all(i -> fields[i] === getfield(x, i), 1:n)
++        return x
++    end
++    W = X.name.wrapper
++    y = try
++        W(fields...)
++    catch e
++        e isa MethodError || rethrow()
++        throw_conversion_error(W)
++    end
++    # Catch constructors that take different arguments to the fields
++    if !(typeof(y).name.wrapper === W && all(i -> same_values(getfield(y, i), fields[i]), 1:n))
++        throw_conversion_error(W)
++    end
++    return y
++end
++
++# Arrays are compared on the CPU, as a constructor can store an array on another device, for
++#   example collective variables keep their atom indices on the CPU
++same_values(a::AbstractArray, b::AbstractArray) = isequal(from_device(a), from_device(b))
++same_values(a, b) = isequal(a, b)
++
++function throw_conversion_error(W)
++    throw(ArgumentError("$W can not be converted to another float type, unit setting or " *
++                        "device by rebuilding it from its converted fields, a method of " *
++                        "Molly.convert_component is required"))
++end
++
++# Build a struct like `x` with some fields replaced
++function replace_fields(x::X, new_fields::NamedTuple) where X
++    return X.name.wrapper((get(new_fields, f, getfield(x, f)) for f in fieldnames(X))...)
++end
++
++function convert_component(c::SystemConversion, at::Atom)
++    return Atom(at.index, at.atom_type, convert_component(c, at.mass),
++                convert_component(c, at.charge), convert_component(c, at.σ),
++                convert_component(c, at.ϵ), convert_component(c, at.λ), at.alch_role)
++end
++
++#=
++    convert_system(sys, args, float_type, float_type_high, array_type, units, data,
++                   grad_safe, strictness, launch_config)
++
++Build the system given by the copy constructor of `sys` with the keyword arguments `args`,
++converted to a new float type, array type and unit setting. Loggers are dropped, with a
++warning, unless they were given as an argument, since their histories and observables are
++tied to the original float type, units and device.
++=#
++function convert_system(sys, args, ::Type{T}, ::Type{TH}, ::Type{AT}, units::Bool, data,
++                        grad_safe::Bool, strictness, launch_config) where {T, TH, AT}
++    if units && sys.energy_units == NoUnits
++        throw(ArgumentError("units can not be added to a System without units"))
++    end
++    same_device = (AT === array_type(sys))
++    # Loggers are tied to the float type, units and device but not to grad_safe
++    retyped = (T !== float_type(sys) || !same_device || units != (sys.energy_units != NoUnits))
++    if retyped && args.loggers === sys.loggers && length(sys.loggers) > 0
++        report_issue("the loggers are dropped when converting a System to another float type, " *
++                     "unit setting or device, give new loggers with the loggers keyword " *
++                     "argument to keep them", strictness)
++        loggers = ()
++    else
++        loggers = args.loggers
++    end
++    c_atoms = SystemConversion{T, AT, TH}(!units, grad_safe, same_device, nothing, nothing,
++                                          nothing, strictness)
++    atoms = convert_component(c_atoms, args.atoms)
++    coords = convert_component(c_atoms, args.coords)
++    boundary = convert_component(c_atoms, args.boundary)
++    c = SystemConversion{T, AT, TH}(!units, grad_safe, same_device, atoms, coords, boundary,
++                                    strictness)
++    return System(
++        atoms=atoms,
++        coords=coords,
++        boundary=boundary,
++        velocities=convert_component(c, args.velocities),
++        atoms_data=args.atoms_data,
++        topology=args.topology,
++        pairwise_inters=convert_component(c, args.pairwise_inters),
++        specific_inter_lists=convert_component(c, args.specific_inter_lists),
++        general_inters=convert_component(c, args.general_inters),
++        constraints=convert_component(c, args.constraints),
++        virtual_sites=convert_component(c, args.virtual_sites),
++        neighbor_finder=convert_component(c, args.neighbor_finder),
++        loggers=loggers,
++        force_units=(units ? args.force_units : NoUnits),
++        energy_units=(units ? args.energy_units : NoUnits),
++        k=convert_component(c, args.k),
++        float_type=T,
++        float_type_high=TH,
++        data=data,
++        grad_safe=grad_safe,
++        strictness=strictness,
++        launch_config=launch_config,
++    )
++end
+diff --git a/src/interactions/ewald.jl b/src/interactions/ewald.jl
+index a0b1d8697..71fdf719a 100644
+--- a/src/interactions/ewald.jl
++++ b/src/interactions/ewald.jl
+@@ -2238,4 +2238,50 @@ function ewald_pe_forces!(Fs, vir, inter::PME_λ{T}, atoms, coords, boundary, fo
+         end
+     end
+     return nothing
+-end
+\ No newline at end of file
++end
++
++# Conversion to another float type, units or device, see `System(sys; ...)`
++# The number of threads a PME on CPU was set up for, which sets the size of its buffers
++pme_n_threads(pme) = (pme.recip_conv_buffer isa Vector ? length(pme.recip_conv_buffer) :
++                      Threads.nthreads())
++
++# PME is rebuilt through its constructor, which sets up the grids, buffers and FFT plans.
++#   α is kept from the original, as it is in CoulombEwald and EwaldExclusionData.
++function convert_component(c::SystemConversion{<:Any, <:Any, TH}, pme::PME) where TH
++    pme_new = PME(
++        convert_component(c, pme.dist_cutoff),
++        c.atoms,
++        c.boundary;
++        error_tol=convert_component(c, pme.error_tol),
++        order=pme.order,
++        ϵr=convert_component(c, pme.ϵr),
++        # The charge sums are not stored for gradient safe PME, so fixed charges are not
++        #   assumed in that case
++        fixed_charges=!isnothing(pme.pc_sum),
++        mesh_dims=pme.mesh_dims,
++        scheduler=convert_component(c, pme.scheduler),
++        float_type_high=TH,
++        grad_safe=c.grad_safe,
++        n_threads=pme_n_threads(pme),
++    )
++    return replace_fields(pme_new, (α=convert_component(c, pme.α),))
++end
++
++# The λ field holds the mesh weight rather than λ, so it is kept from the original
++function convert_component(c::SystemConversion, pme::PME_λ)
++    pme_new = PME_λ(
++        convert_component(c, pme.dist_cutoff),
++        c.atoms,
++        c.boundary;
++        error_tol=convert_component(c, pme.error_tol),
++        order=pme.order,
++        ϵr=convert_component(c, pme.ϵr),
++        fixed_charges=false,
++        mesh_dims=pme.mesh_dims,
++        scheduler=convert_component(c, pme.scheduler),
++        grad_safe=c.grad_safe,
++        n_threads=pme_n_threads(pme),
++    )
++    return replace_fields(pme_new, (α=convert_component(c, pme.α),
++                                    λ=convert_component(c, pme.λ)))
++end
+diff --git a/src/interactions/implicit_solvent.jl b/src/interactions/implicit_solvent.jl
+index f881483a8..d19c80473 100644
+--- a/src/interactions/implicit_solvent.jl
++++ b/src/interactions/implicit_solvent.jl
+@@ -1907,3 +1907,33 @@ function AtomsCalculators.potential_energy(sys::AtomsBase.AbstractSystem{3}, int
+     gbsa_setup!(inter, sys, Bs)
+     return gbsa_energy(sys, inter, Bs, inter.buffer_atom_charges, n_threads)
+ end
++
++# Conversion to another float type, units or device, see `System(sys; ...)`
++# Fields of implicit solvent holding the values it was set up from, which are kept as they are
++#   since setup takes them with units and in Float64 for any system
++const gbsa_setup_fields = (:element_to_radius, :element_to_screen, :element_to_screen_nucleic,
++                           :atom_params, :atom_params_nucleic, :data_d0, :data_m0)
++
++# The buffers of implicit solvent depend on the device and the number of threads, so they are
++#   set up again
++function convert_component(c::SystemConversion{T, AT}, inter::AbstractGBSA) where {T, AT}
++    params = NamedTuple(f => (f in gbsa_setup_fields ? getfield(inter, f) :
++                                                      convert_component(c, getfield(inter, f)))
++                        for f in fieldnames(typeof(inter)) if !startswith(String(f), "buffer_"))
++    # The number of threads of an implicit solvent interaction on CPU sets its force buffers
++    if inter.buffer_force_chunks isa AbstractVector
++        n_threads = length(inter.buffer_force_chunks)
++    else
++        n_threads = Threads.nthreads()
++    end
++    bufs = gbsa_buffers(AT, T, length(params.offset_radii), params.offset_radii,
++                        params.sa_factor, params.dist_cutoff, params.offset,
++                        params.factor_solute, n_threads)
++    buffers = (buffer_Bs=bufs.Bs, buffer_B_grads=bufs.B_grads,
++               buffer_atom_charges=bufs.atom_charges, buffer_born_forces=bufs.born_forces,
++               buffer_born_forces_scaled=bufs.born_forces_scaled,
++               buffer_born_forces_mod=bufs.born_forces_mod, buffer_Is_nounits=bufs.Is_nounits,
++               buffer_pes=bufs.pes, buffer_fs_mat=bufs.fs_mat,
++               buffer_force_chunks=bufs.force_chunks)
++    return replace_fields(inter, merge(params, buffers))
++end
+diff --git a/src/interactions/ml_potentials.jl b/src/interactions/ml_potentials.jl
+index 8c344f0f3..bcd73cc04 100644
+--- a/src/interactions/ml_potentials.jl
++++ b/src/interactions/ml_potentials.jl
+@@ -99,3 +99,10 @@ end
+ function compute_ani_forces_ka(args...; kwargs...)
+     error("compute_ani_forces_ka requires Lux and HDF5 to be loaded: `using Lux, HDF5`")
+ end
++
++# Conversion to another float type, units or device, see `System(sys; ...)`
++function convert_component(::SystemConversion, ::ANIPotential)
++    throw(ArgumentError("ANIPotential can not be converted to another float type, unit " *
++                        "setting or device, it should be given to the new system with the " *
++                        "general_inters keyword argument"))
++end
+diff --git a/src/neighbors.jl b/src/neighbors.jl
+index fd23fbfde..b26b61478 100644
+--- a/src/neighbors.jl
++++ b/src/neighbors.jl
+@@ -2458,3 +2458,61 @@ function Base.show(io::IO, neighbor_finder::Union{GPUNeighborFinder, DistanceNei
+     println(io, "  n_steps = " , neighbor_finder.n_steps)
+     print(  io, "  dist_cutoff = ", neighbor_finder.dist_cutoff)
+ end
++
++# Conversion to another float type, units or device, see `System(sys; ...)`
++# Neighbor finders are rebuilt from their eligible and special matrices, which are passed on
++#   as they are stored, sparse or dense. On the same device the type of neighbor finder is
++#   kept if it can be used by the new system. Otherwise the neighbor finder that system setup
++#   would choose for the new device, gradient safety and boundary is used, so that moving a
++#   system to another device and back gives the original type of neighbor finder.
++function convert_component(c::SystemConversion{<:Any, AT},
++                           nf::Union{DistanceNeighborFinder, TreeNeighborFinder,
++                                     CellListMapNeighborFinder, GPUNeighborFinder,
++                                     GPUCellListNeighborFinder}) where AT
++    dist_cutoff = convert_component(c, nf.dist_cutoff)
++    if isnothing(nf.eligible)
++        # The output modes of GPUCellListNeighborFinder that ignore the exceptions store no
++        #   matrices, which is the same as every pair being eligible and none special
++        matrices = (n_atoms=nf.n_atoms,)
++    else
++        matrices = (eligible=from_device(nf.eligible), special=from_device(nf.special))
++    end
++    on_gpu = AT <: AbstractGPUArray
++    gpu_nf_allowed = on_gpu && uses_gpu_neighbor_finder(AT) && !c.grad_safe
++    if c.same_device
++        if nf isa GPUNeighborFinder && gpu_nf_allowed
++            return GPUNeighborFinder(; matrices..., dist_cutoff=dist_cutoff,
++                                     n_steps=nf.n_steps, array_type=AT)
++        elseif nf isa GPUCellListNeighborFinder && on_gpu
++            return GPUCellListNeighborFinder(; matrices..., dist_cutoff=dist_cutoff,
++                                             n_steps=nf.n_steps, array_type=AT,
++                                             max_neighbors=nf.max_neighbors,
++                                             output=nf.output, ragged=nf.ragged)
++        elseif nf isa TreeNeighborFinder && !on_gpu
++            return TreeNeighborFinder(; matrices..., dist_cutoff=dist_cutoff,
++                                      n_steps=nf.n_steps)
++        elseif nf isa CellListMapNeighborFinder && !on_gpu
++            return CellListMapNeighborFinder(; matrices..., dist_cutoff=dist_cutoff,
++                                             n_steps=nf.n_steps, x0=c.coords,
++                                             boundary=c.boundary)
++        elseif nf isa DistanceNeighborFinder
++            return DistanceNeighborFinder(; matrices..., dist_cutoff=dist_cutoff,
++                                          n_steps=nf.n_steps, array_type=AT)
++        end
++    end
++    # The choice made by system setup
++    if gpu_nf_allowed
++        return GPUNeighborFinder(; matrices..., dist_cutoff=dist_cutoff, n_steps=nf.n_steps,
++                                 array_type=AT)
++    elseif on_gpu && gpu_cell_list_suitable(c.boundary, dist_cutoff)
++        return GPUCellListNeighborFinder(; matrices..., dist_cutoff=dist_cutoff,
++                                         n_steps=nf.n_steps, array_type=AT, ragged=false)
++    elseif !on_gpu && !has_infinite_boundary(c.boundary) &&
++                minimum(box_sides(c.boundary)) >= 2 * dist_cutoff
++        return CellListMapNeighborFinder(; matrices..., dist_cutoff=dist_cutoff,
++                                         n_steps=nf.n_steps, x0=c.coords,
++                                         boundary=c.boundary)
++    end
++    return DistanceNeighborFinder(; matrices..., dist_cutoff=dist_cutoff, n_steps=nf.n_steps,
++                                  array_type=AT)
++end
+diff --git a/src/spatial.jl b/src/spatial.jl
+index f9f08df84..6edd01226 100644
+--- a/src/spatial.jl
++++ b/src/spatial.jl
+@@ -1369,3 +1369,8 @@ Calculated as the sum of the coordinates multiplied by the partial charges,
+ Requires the charges on the atoms to be set.
+ """
+ dipole_moment(sys) = sum(sys.coords .* charges(sys))
++
++# Conversion to another float type, units or device, see `System(sys; ...)`
++function convert_component(c::SystemConversion, b::TriclinicBoundary{<:Any, <:Any, <:Any, A}) where A
++    return TriclinicBoundary(convert_component(c, b.basis_vectors); approx_images=A)
++end
+diff --git a/src/types.jl b/src/types.jl
+index d30ed966b..5db9daf1a 100644
+--- a/src/types.jl
++++ b/src/types.jl
+@@ -1030,6 +1030,12 @@ function default_float_type_high(::Type{AT}, ::Type{T}) where {AT <: AbstractGPU
+     return default_float_type_high(get_backend(AT{Float32}(undef, 0)), T)
+ end
+ 
++# The float type of a system with float type T moved to arrays of type AT, which is Float32
++#   instead of Float64 on backends that do not support Float64 such as Metal
++function default_float_type(::Type{AT}, ::Type{T}) where {AT, T}
++    return ((T == Float64 && default_float_type_high(AT, Float32) != Float64) ? Float32 : T)
++end
++
+ function check_n_dims(coords::AbstractVector{SVector{DC, C}},
+                       vels::AbstractVector{SVector{DV, V}},
+                       D) where {DC, C, DV, V}
+@@ -1463,8 +1469,21 @@ Convenience constructor for changing properties in a `System`.
+ 
+ The `System` is returned with the provided keyword arguments modified.
+ Give `deepcopy(sys)` as the argument to make a new copy of the system.
++
++Changing `float_type`, `units`, `array_type` or `grad_safe` converts the system, for example
++`System(sys; float_type=Float64, units=false, array_type=Array)` gives a unitless `Float64`
++copy on the CPU.
++On a device without Float64 support, such as Metal, `float_type` defaults to `Float32`.
++Everything except `atoms_data`, `topology` and `data` is converted, including values given
++as keyword arguments.
++Units are stripped without conversion and can not be added.
++When the float type, units or device change, loggers are dropped with a warning unless given
++with the `loggers` keyword argument.
++On a new device, or with `grad_safe=true`, the neighbor finder is the one setup would choose.
++Custom types that can not be rebuilt from their converted fields should define a method of
++`Molly.convert_component(conversion, x)`.
+ """
+-function System(sys::System{<:Any, <:Any, T, TH};
++function System(sys::System{<:Any, AT, T, TH};
+                 atoms=sys.atoms,
+                 coords=sys.coords,
+                 boundary=sys.boundary,
+@@ -1481,12 +1500,23 @@ function System(sys::System{<:Any, <:Any, T, TH};
+                 force_units=sys.force_units,
+                 energy_units=sys.energy_units,
+                 k=sys.k,
+-                float_type=T,
+-                float_type_high=TH,
++                array_type=AT,
++                float_type=(array_type === AT ? T : default_float_type(array_type, T)),
++                units::Bool=(sys.energy_units != NoUnits),
++                float_type_high=(array_type === AT ? promote_type(float_type, TH) :
++                                 default_float_type_high(array_type, float_type)),
+                 data=sys.data,
+                 grad_safe=sys.grad_safe,
+                 strictness=default_strictness(),
+-                launch_config=sys.launch_config) where {T, TH}
++                launch_config=sys.launch_config) where {AT, T, TH}
++    if float_type !== T || array_type !== AT || units != (sys.energy_units != NoUnits) ||
++            grad_safe != sys.grad_safe
++        args = (; atoms, coords, boundary, velocities, atoms_data, topology, pairwise_inters,
++                specific_inter_lists, general_inters, constraints, virtual_sites,
++                neighbor_finder, loggers, force_units, energy_units, k)
++        return convert_system(sys, args, float_type, float_type_high, array_type, units,
++                              data, grad_safe, strictness, launch_config)
++    end
+     return System(
+         atoms=atoms,
+         coords=coords,
+diff --git a/src/units.jl b/src/units.jl
+index c301d4e44..13bab937e 100644
+--- a/src/units.jl
++++ b/src/units.jl
+@@ -242,3 +242,14 @@ function convert_setup_quantity(x, units, T)
+         end
+     end
+ end
++
++# Unit handling when converting a System, see `System(sys; ...)`
++
++# Values with units have their units stripped if required
++function convert_component(c::SystemConversion, x::Unitful.Quantity)
++    val = convert_component(c, ustrip(x))
++    return (c.strip_units ? val : val * unit(x))
++end
++
++# Units stored in a struct, such as the force and energy units of `MullerBrown`
++convert_component(c::SystemConversion, x::Unitful.Units) = (c.strip_units ? NoUnits : x)
+diff --git a/test/conversion.jl b/test/conversion.jl
+new file mode 100644
+index 000000000..748119c79
+--- /dev/null
++++ b/test/conversion.jl
+@@ -0,0 +1,555 @@
++# Whether `b`, part of a converted system, holds the values of `a` converted to the float type
++#   `T`, with the units stripped if `strip_units`
++converted_equal(a::AbstractFloat, b, T, strip_units) = (b isa T && b == T(a))
++function converted_equal(a::Unitful.Quantity, b, T, strip_units)
++    if strip_units
++        return converted_equal(ustrip(a), b, T, strip_units)
++    end
++    return b isa Unitful.Quantity && unit(b) == unit(a) &&
++           converted_equal(ustrip(a), ustrip(b), T, strip_units)
++end
++converted_equal(a::Unitful.Units, b, T, strip_units) = (b == (strip_units ? NoUnits : a))
++function converted_equal(a::Union{Tuple, NamedTuple}, b, T, strip_units)
++    return length(a) == length(b) &&
++           all(map((x, y) -> converted_equal(x, y, T, strip_units), Tuple(a), Tuple(b)))
++end
++function converted_equal(a::AbstractArray, b, T, strip_units)
++    return size(a) == size(b) &&
++           all(map((x, y) -> converted_equal(x, y, T, strip_units), from_device(a),
++                   from_device(b)))
++end
++function converted_equal(a::Union{Integer, AbstractString, Symbol, Nothing, Function}, b, T,
++                         strip_units)
++    return isequal(a, b)
++end
++# The other fields of a TriclinicBoundary are calculated from the basis vectors
++function converted_equal(a::TriclinicBoundary, b, T, strip_units)
++    return b isa TriclinicBoundary &&
++           converted_equal(a.basis_vectors, b.basis_vectors, T, strip_units)
++end
++function converted_equal(a::A, b::B, T, strip_units) where {A, B}
++    return A.name.wrapper === B.name.wrapper &&
++           all(i -> converted_equal(getfield(a, i), getfield(b, i), T, strip_units),
++               1:fieldcount(A))
++end
++
++widened_equal(a, b) = converted_equal(a, b, Float64, true)
++
++max_force_diff(fs, fs_ref) = maximum(norm.(ustrip_vec.(from_device(fs)) .-
++                                           ustrip_vec.(from_device(fs_ref))))
++max_force(fs) = maximum(norm.(ustrip_vec.(from_device(fs))))
++nf_type(sys) = typeof(sys.neighbor_finder).name.wrapper
++nf_masks(sys) = Molly.neighbor_finder_masks(sys.neighbor_finder, length(sys))
++
++# An interaction whose constructor does not take its fields
++struct UnconvertibleInteraction{T} <: PairwiseInteraction
++    a::T
++    b::T
++
++    UnconvertibleInteraction(a) = new{typeof(a)}(a, 2a)
++end
++
++# A custom atom type, used with Buckingham
++struct ConversionBuckinghamAtom{M, TA, TB, TC}
++    mass::M
++    A::TA
++    B::TB
++    C::TC
++end
++
++@testset "System conversion" begin
++    ff_water = MolecularForceField(joinpath(ff_dir, "tip4pfb.xml"))
++    ff_tip3p = MolecularForceField(joinpath(ff_dir, "tip3p_standard.xml"))
++    ff_dexp = MolecularForceField(joinpath(ff_dir, "ethanol_garnet.xml"))
++    ff_protein = MolecularForceField(joinpath.(ff_dir, ["charmm36.xml", "charmm36_water.xml"])...;
++                                     strictness=:nowarn)
++    ff_implicit = MolecularForceField(joinpath(ff_dir, "ff99SBildn.xml"))
++    ff_benzene = MolecularForceField(joinpath.(ff_dir, ["tip3p_standard.xml", "benzene.xml"])...)
++
++    implicit_builder(solvent) = (FT, AT) -> System(
++        joinpath(data_dir, "6mrr_nowater.pdb"),
++        ff_implicit;
++        boundary=CubicBoundary(FT(100.0)u"nm"),
++        array_type=AT,
++        float_type=FT,
++        dist_cutoff=5.0u"nm",
++        nonbonded_method=DistanceCutoff(5.0u"nm"),
++        dispersion_correction=false,
++        implicit_solvent=solvent,
++        strictness=:nowarn,
++        n_threads=1,
++    )
++
++    # Systems covering the setup options: PME, Ewald and reaction field electrostatics,
++    #   virtual sites, LINCS and SHAKE constraints, CMAP, implicit solvent,
++    #   custom non-bonded interactions and a triclinic box
++    builders = (
++        ("water PME", (FT, AT) -> System(
++            joinpath(data_dir, "tip4pew.pdb"),
++            ff_water;
++            array_type=AT,
++            float_type=FT,
++            nonbonded_method=SetupPME(),
++            center_coords=false,
++        )),
++        ("DEXP reaction field", (FT, AT) -> System(
++            joinpath(data_dir, "ethanol_solv.pdb"),
++            ff_dexp;
++            array_type=AT,
++            float_type=FT,
++            nonbonded_method=SetupCoulombReactionField(),
++            dist_cutoff=1.0u"nm",
++        )),
++        ("protein PME with LINCS", (FT, AT) -> System(
++            joinpath(data_dir, "6mrr_equil.pdb"),
++            ff_protein;
++            array_type=AT,
++            float_type=FT,
++            nonbonded_method=SetupPME(),
++            center_coords=false,
++            constraints=:hbonds,
++            rigid_water=true,
++        )),
++        ("benzene Ewald with SHAKE", (FT, AT) -> System(
++            joinpath(data_dir, "benzene_solv.pdb"),
++            ff_benzene;
++            array_type=AT,
++            float_type=FT,
++            nonbonded_method=SetupEwald(),
++            dist_cutoff=1.0u"nm",
++            center_coords=false,
++            constraints=:hbonds,
++            constraint_algorithm=SetupSHAKE_RATTLE(),
++            rigid_water=true,
++        )),
++        ("protein GBN2", implicit_builder(SetupImplicitSolventGBN2(kappa=1.0u"nm^-1"))),
++        ("triclinic water", (FT, AT) -> System(
++            joinpath(data_dir, "water_3mol_triclinic.pdb"),
++            ff_tip3p;
++            array_type=AT,
++            float_type=FT,
++            nonbonded_method=SetupCoulombReactionField(),
++            dist_cutoff=0.5u"nm",
++            strictness=:nowarn,
++        )),
++    )
++
++    # Float32 energies are compared with this tolerance, set by the Float32 error of each system
++    rtols_float32 = Dict(
++        "DEXP reaction field"      => 1e-5,
++        "benzene Ewald with SHAKE" => 5e-4,
++        "triclinic water"          => 2e-5,
++        "protein GBN2"             => 1e-5,
++    )
++    rtol_float32(name) = get(rtols_float32, name, 1e-6)
++
++    @testset "Precision and units" begin
++        for (name, build) in builders
++            sys_64, sys_32 = build(Float64, Array), build(Float32, Array)
++
++            # Float64 with units to Float64 without units gives the same system, with the
++            #   neighbor finder keeping its type and the storage of its matrices
++            sys_conv = System(sys_64; units=false, grad_safe=true)
++            @test sys_conv.energy_units == NoUnits
++            @test sys_conv.df == sys_64.df
++            @test nf_type(sys_conv) === nf_type(sys_64)
++            @test typeof(sys_conv.neighbor_finder.eligible).name.wrapper ===
++                    typeof(sys_64.neighbor_finder.eligible).name.wrapper
++            E_64 = potential_energy(sys_64; n_threads=1)
++            fs_64 = forces(sys_64; n_threads=1)
++            @test isapprox(potential_energy(sys_conv; n_threads=1), ustrip(E_64); rtol=1e-12)
++            @test max_force_diff(forces(sys_conv; n_threads=1), fs_64) < 1e-10 * max_force(fs_64)
++
++            # Float32 to Float64 keeps the Float32 values exactly. The energy is compared to
++            #   the Float32 one, as the conversion can not recover the precision lost in the
++            #   original values.
++            sys_conv = System(sys_32; float_type=Float64, units=false)
++            E_32 = potential_energy(sys_32; n_threads=1)
++            fs_32 = forces(sys_32; n_threads=1)
++            @test isapprox(potential_energy(sys_conv; n_threads=1), ustrip(E_32);
++                           rtol=rtol_float32(name))
++            @test widened_equal(sys_32.atoms, sys_conv.atoms)
++            @test widened_equal(sys_32.coords, sys_conv.coords)
++            @test widened_equal(sys_32.boundary, sys_conv.boundary)
++            @test widened_equal(sys_32.k, sys_conv.k)
++            @test widened_equal(sys_32.pairwise_inters, sys_conv.pairwise_inters)
++            @test widened_equal(sys_32.specific_inter_lists, sys_conv.specific_inter_lists)
++            # Converting to Float64 and back gives the original energy and forces. Units are
++            #   kept as the unitless implicit solvent calculation takes a different Float32
++            #   path.
++            sys_back = System(System(sys_32; float_type=Float64); float_type=Float32)
++            @test isapprox(potential_energy(sys_back; n_threads=1), E_32; rtol=1e-8)
++            @test max_force_diff(forces(sys_back; n_threads=1), fs_32) < 1e-6 * max_force(fs_32)
++
++            # Float64 to Float32 rounds the values, giving the atoms of a system set up in
++            #   Float32. Parameters that setup derives in the float type, such as mixed 1-4
++            #   parameters, can differ from those in the last digit.
++            sys_down = System(sys_64; float_type=Float32)
++            @test sys_down.energy_units == sys_64.energy_units
++            @test converted_equal(sys_64.coords, sys_down.coords, Float32, false)
++            @test converted_equal(sys_64.pairwise_inters, sys_down.pairwise_inters, Float32,
++                                  false)
++            @test converted_equal(sys_64.specific_inter_lists, sys_down.specific_inter_lists,
++                                  Float32, false)
++            @test converted_equal(sys_32.atoms, sys_down.atoms, Float32, false)
++            @test isapprox(potential_energy(sys_down; n_threads=1), E_32;
++                           rtol=rtol_float32(name))
++        end
++    end
++
++    @testset "Devices" begin
++        for AT in array_list
++            AT == Array && continue
++            for (name, build) in builders
++                sys_gpu, sys_cpu = build(Float32, AT), build(Float32, Array)
++                E_gpu = potential_energy(sys_gpu)
++
++                # GPU to CPU, keeping the Float32 values
++                sys_conv = System(sys_gpu; float_type=Float64, units=false, array_type=Array,
++                                  grad_safe=true)
++                @test array_type(sys_conv) == Array
++                # The neighbor finder is the one that setup chooses on the new device
++                @test nf_type(sys_conv) === nf_type(sys_cpu)
++                @test nf_masks(sys_conv) == nf_masks(sys_gpu)
++                @test sys_conv.df == sys_gpu.df
++                @test widened_equal(sys_gpu.atoms, sys_conv.atoms)
++                @test widened_equal(sys_gpu.coords, sys_conv.coords)
++                @test widened_equal(sys_gpu.specific_inter_lists, sys_conv.specific_inter_lists)
++                @test isapprox(potential_energy(sys_conv), ustrip(E_gpu); rtol=rtol_float32(name))
++
++                # CPU to GPU gives the system that setup gives on the GPU
++                sys_moved = System(sys_cpu; array_type=AT)
++                @test array_type(sys_moved) == AT
++                @test Molly.float_type_high(sys_moved) == Molly.float_type_high(sys_gpu)
++                @test nf_type(sys_moved) === nf_type(sys_gpu)
++                @test nf_masks(sys_moved) == nf_masks(sys_gpu)
++                @test sys_moved.df == sys_gpu.df
++                @test isapprox(potential_energy(sys_moved), E_gpu; rtol=1e-6)
++
++                # Back to the GPU from the unitless Float64 CPU system
++                sys_back = System(sys_conv; float_type=Float32, array_type=AT, grad_safe=false)
++                @test nf_type(sys_back) === nf_type(sys_gpu)
++                @test isapprox(potential_energy(sys_back), ustrip(E_gpu); rtol=1e-5)
++            end
++
++            # Collective variables keep their atom indices on the CPU
++            sys = builders[2][2](Float64, Array)
++            bias = BiasPotential(CalcDist([1], [5]),
++                                 SquareBias(100.0u"kJ * mol^-1 * nm^-2", 0.5u"nm"))
++            sys = System(sys; general_inters=(bias,))
++            sys_gpu = System(sys; array_type=AT, float_type=Float32)
++            @test sys_gpu.general_inters[1].cv_type.atom_inds_1 isa Vector{Int}
++            @test isapprox(potential_energy(sys_gpu), potential_energy(sys);
++                           rtol=rtols_float32["DEXP reaction field"])
++        end
++    end
++
++    # Backends without Float64 support, such as Metal, give Float32 by default
++    for AT in array_list_metal
++        AT in array_list && continue
++        sys_moved = System(builders[2][2](Float64, Array); array_type=AT)
++        @test float_type(sys_moved) == Float32
++        @test Molly.float_type_high(sys_moved) == Float32
++    end
++
++    @testset "Neighbor finders" begin
++        build_dexp = builders[2][2]
++        # Each CPU neighbor finder is kept on the CPU
++        for nf_type_cpu in (DistanceNeighborFinder, TreeNeighborFinder, CellListMapNeighborFinder)
++            sys = System(joinpath(data_dir, "ethanol_solv.pdb"), ff_dexp; float_type=Float32,
++                         nonbonded_method=SetupCoulombReactionField(), dist_cutoff=1.0u"nm",
++                         neighbor_finder_type=nf_type_cpu)
++            sys_conv = System(sys; float_type=Float64, units=false, grad_safe=true)
++            @test sys_conv.neighbor_finder isa nf_type_cpu
++            @test nf_masks(sys_conv) == nf_masks(sys)
++            @test isapprox(potential_energy(sys_conv), ustrip(potential_energy(sys));
++                           rtol=rtols_float32["DEXP reaction field"])
++        end
++
++        for AT in array_list
++            AT == Array && continue
++            # A GPUNeighborFinder can not be used with grad_safe, so the one setup chooses for
++            #   a gradient safe system is used
++            sys = build_dexp(Float32, AT)
++            sys_gs = System(sys; grad_safe=true)
++            @test !(sys_gs.neighbor_finder isa GPUNeighborFinder)
++            @test nf_masks(sys_gs) == nf_masks(sys)
++            @test isapprox(potential_energy(sys_gs), potential_energy(sys);
++                           rtol=rtols_float32["DEXP reaction field"])
++
++            # GPUCellListNeighborFinder is kept on the same GPU and replaced on the CPU. The
++            #   water box is too small for a cell list.
++            sys = System(joinpath(data_dir, "ethanol_solv.pdb"), ff_dexp; array_type=AT,
++                         float_type=Float32, nonbonded_method=SetupCoulombReactionField(),
++                         dist_cutoff=1.0u"nm", neighbor_finder_type=GPUCellListNeighborFinder)
++            E = potential_energy(sys)
++            sys_64 = System(sys; float_type=Float64)
++            @test sys_64.neighbor_finder isa GPUCellListNeighborFinder
++            @test isapprox(potential_energy(sys_64), E; rtol=rtols_float32["DEXP reaction field"])
++            sys_cpu = System(sys; float_type=Float64, units=false, array_type=Array)
++            @test sys_cpu.neighbor_finder isa CellListMapNeighborFinder
++            @test nf_masks(sys_cpu) == nf_masks(sys)
++            @test isapprox(potential_energy(sys_cpu), ustrip(E);
++                           rtol=rtols_float32["DEXP reaction field"])
++        end
++    end
++
++    @testset "Simulation" begin
++        # A converted system follows the same trajectory, including virtual sites,
++        #   constraints and neighbor list updates
++        for (name, build) in builders[[1, 3]]
++            sys = build(Float64, Array)
++            sys = System(sys; velocities=random_velocities(sys, 300.0u"K"; rng=Xoshiro(10)))
++            sys_conv = System(sys; units=false)
++            simulate!(sys, VelocityVerlet(dt=0.001u"ps"), 20; n_threads=1)
++            simulate!(sys_conv, VelocityVerlet(dt=0.001), 20; n_threads=1)
++            @test maximum(norm.(ustrip_vec.(sys.coords) .- sys_conv.coords)) < 1e-10
++            @test maximum(norm.(ustrip_vec.(sys.velocities) .- sys_conv.velocities)) < 1e-8
++        end
++
++        # A system moved to the GPU follows the trajectory of one set up there, with
++        #   constraints and virtual sites
++        for AT in array_list
++            AT == Array && continue
++            for (name, build) in builders[[1, 4]]
++                sys_moved, sys_gpu = System(build(Float32, Array); array_type=AT), build(Float32, AT)
++                simulate!(sys_moved, VelocityVerlet(dt=0.001u"ps"), 20)
++                simulate!(sys_gpu, VelocityVerlet(dt=0.001u"ps"), 20)
++                @test maximum(norm.(from_device(sys_moved.coords) .-
++                                    from_device(sys_gpu.coords))) < 1e-4u"nm"
++            end
++        end
++    end
++
++    @testset "Systems set up by hand" begin
++        # Custom atom type, units with Å and eV, Float32 to Float64
++        n_atoms = 20
++        boundary = CubicBoundary(3.0f0u"nm")
++        coords = place_atoms(n_atoms, boundary; min_dist=0.3f0u"nm", rng=Xoshiro(1))
++        atoms = [ConversionBuckinghamAtom(10.0f0u"g/mol", 1400.0f0u"kJ * mol^-1",
++                                          28.0f0u"nm^-1", 0.0018f0u"kJ * mol^-1 * nm^6")
++                 for _ in 1:n_atoms]
++        bonds = InteractionList2Atoms(collect(Int32, 1:2:n_atoms), collect(Int32, 2:2:n_atoms),
++                    [HarmonicBond(k=1000.0f0u"kJ * mol^-1 * nm^-2", r0=0.4f0u"nm")
++                     for _ in 1:2:n_atoms])
++        for AT in array_list
++            sys = System(
++                atoms=to_device(atoms, AT),
++                coords=to_device(coords, AT),
++                boundary=boundary,
++                pairwise_inters=(Buckingham(cutoff=DistanceCutoff(1.0f0u"nm"),
++                                            use_neighbors=true),),
++                specific_inter_lists=(to_device(bonds, AT),),
++                neighbor_finder=DistanceNeighborFinder(n_atoms=n_atoms,
++                                    dist_cutoff=1.2f0u"nm", array_type=AT),
++            )
++            sys_conv = System(sys; float_type=Float64, units=false, array_type=Array)
++            @test eltype(sys_conv.atoms) <: ConversionBuckinghamAtom{Float64, Float64}
++            @test widened_equal(sys.atoms, sys_conv.atoms)
++            @test isapprox(potential_energy(sys_conv), ustrip(potential_energy(sys)); rtol=1e-6)
++        end
++
++        # 2D system with an infinite boundary and no neighbor finder
++        sys = System(
++            atoms=[Atom(mass=1.0u"g/mol", σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1") for _ in 1:2],
++            coords=[SVector(-0.5, 0.25)u"nm", SVector(0.6, 0.4)u"nm"],
++            boundary=RectangularBoundary(Inf*u"nm"),
++            general_inters=(MullerBrown(),),
++        )
++        sys_conv = System(sys; units=false)
++        @test sys_conv.general_inters[1].energy_units == NoUnits
++        @test isapprox(potential_energy(sys_conv), ustrip(potential_energy(sys)); rtol=1e-12)
++        @test max_force_diff(forces(sys_conv), forces(sys)) < 1e-10 * max_force(forces(sys))
++    end
++
++    @testset "Alchemical systems" begin
++        # The GROMACS scheduler gives PME_λ, along with soft core and λ bonded interactions
++        sys_solv = System(joinpath(data_dir, "benzene_solv.pdb"), ff_benzene;
++                          nonbonded_method=SetupPME(), dist_cutoff=1.0u"nm",
++                          center_coords=false)
++        sys = AbsoluteFESystem(sys_solv, 0.5, collect(1:12);
++                               scheduler=Molly.GROMACSLambdaABFEScheduler(dual=true))
++        sys_conv = System(sys; units=false)
++        @test isapprox(potential_energy(sys_conv; n_threads=1),
++                       ustrip(potential_energy(sys; n_threads=1)); rtol=1e-12)
++    end
++
++    @testset "Interaction types" begin
++        # Each interaction type converts, see the systems above for energies
++        T = Float32
++        c = Molly.SystemConversion{Float64, Array, Float64}(true, false)
++        atoms = [Atom(index=i, mass=T(10.0), charge=T(0.1), σ=T(0.3), ϵ=T(0.4)) for i in 1:4]
++        cutoff = DistanceCutoff(T(1.0))
++        cc = T(ustrip(Molly.coulomb_const))
++        λ_kwargs = (λ_mixing=Molly.MinimumMixing(), scheduler=Molly.DefaultLambdaScheduler())
++        inters = (
++            LennardJones(cutoff=cutoff, weight_special=T(0.5)),
++            Molly.LennardJonesScaled(cutoff=cutoff),
++            LennardJonesSoftCoreBeutler(α=T(0.5), cutoff=cutoff),
++            LennardJonesSoftCoreGapsys(α=T(0.85), cutoff=cutoff),
++            Molly.LennardJones14(T(0.3), T(0.4), T(0.5)),
++            Molly.LennardJones14Scaled(; σ14_mixed=T(0.3), ϵ14_mixed=T(0.4), weight_14=T(0.5),
++                                       λ_kwargs...),
++            Molly.LennardJones14SoftCoreBeutler(; σ14_mixed=T(0.3), ϵ14_mixed=T(0.4),
++                                                weight_14=T(0.5), α=T(0.5), λ_kwargs...),
++            Molly.LennardJones14SoftCoreGapsys(; σ14_mixed=T(0.3), ϵ14_mixed=T(0.4),
++                                               weight_14=T(0.5), α=T(0.85), λ_kwargs...),
++            AshbaughHatch(cutoff=cutoff),
++            SoftSphere(cutoff=cutoff),
++            Mie(m=T(6), n=T(12), cutoff=cutoff),
++            Buckingham(cutoff=cutoff),
++            DoubleExponential(α=T(16.766), β=T(4.427), cutoff=cutoff),
++            DoubleExponentialSoftCore(α=T(16.766), β=T(4.427), cutoff=cutoff),
++            Coulomb(cutoff=cutoff, coulomb_const=cc),
++            Molly.CoulombScaled(cutoff=cutoff, coulomb_const=cc),
++            CoulombSoftCoreBeutler(cutoff=cutoff, coulomb_const=cc),
++            CoulombSoftCoreGapsys(cutoff=cutoff, σQ=T(1.0), coulomb_const=cc),
++            CoulombReactionField(dist_cutoff=T(1.0), coulomb_const=cc),
++            Molly.CoulombReactionFieldScaled(dist_cutoff=T(1.0), coulomb_const=cc),
++            CoulombSoftCoreBeutlerReactionField(dist_cutoff=T(1.0), coulomb_const=cc),
++            CoulombSoftCoreGapsysReactionField(dist_cutoff=T(1.0), σQ=T(1.0), coulomb_const=cc),
++            CoulombEwald(dist_cutoff=T(1.0), coulomb_const=cc),
++            Molly.CoulombEwaldScaled(dist_cutoff=T(1.0), coulomb_const=cc),
++            CoulombSoftCoreBeutlerEwald(dist_cutoff=T(1.0), coulomb_const=cc),
++            CoulombSoftCoreGapsysEwald(dist_cutoff=T(1.0), σQ=T(1.0), coulomb_const=cc),
++            Yukawa(cutoff=cutoff, coulomb_const=cc, kappa=T(1.0)),
++            Gravity(G=T(1.0)),
++            DPDInteraction(a=T(25.0), γ=T(4.5), σ=T(3.0), r_c=T(1.0), dt=T(0.01),
++                           key=UInt64(1)),
++            HarmonicPositionRestraint(k=T(100.0), x0=SVector{3, T}(1.0, 1.0, 1.0)),
++            HarmonicBond(k=T(100.0), r0=T(0.5)),
++            Molly.HarmonicBondλ(; k=T(100.0), r0=T(0.5), λ_kwargs...),
++            MorseBond(D=T(100.0), a=T(2.0), r0=T(0.5)),
++            Molly.MorseBondλ(; D=T(100.0), a=T(2.0), r0=T(0.5), λ_kwargs...),
++            FENEBond(k=T(100.0), r0=T(1.4), σ=T(0.3), ϵ=T(0.4)),
++            HarmonicAngle(k=T(10.0), θ0=T(2.0)),
++            Molly.HarmonicAngleλ(; k=T(10.0), θ0=T(2.0), λ_kwargs...),
++            CosineAngle(k=T(10.0), θ0=T(2.0)),
++            Molly.CosineAngleλ(; k=T(10.0), θ0=T(2.0), λ_kwargs...),
++            UreyBradley(kangle=T(10.0), θ0=T(2.0), kbond=T(10.0), r0=T(1.0)),
++            Molly.UreyBradleyλ(; kangle=T(10.0), θ0=T(2.0), kbond=T(10.0), r0=T(1.0),
++                               λ_kwargs...),
++            PeriodicTorsion(periodicities=[1, 2], phases=T[1.0, 0.0], ks=T[10.0, 5.0],
++                            n_terms=2),
++            Molly.PeriodicTorsionλ(; periodicities=(1, 2), phases=(T(1.0), T(0.0)),
++                                   ks=(T(10.0), T(5.0)), proper=true, λ_kwargs...),
++            RBTorsion(c0=T(1.0), c1=T(2.0), c2=T(3.0), c3=T(4.0), c4=T(0.5), c5=T(0.25)),
++            Molly.RBTorsionλ(; c0=T(1.0), c1=T(2.0), c2=T(3.0), c3=T(4.0), c4=T(0.5),
++                             c5=T(0.25), λ_kwargs...),
++            HarmonicTorsion(k=T(10.0), θ0=T(2.0)),
++            Molly.HarmonicTorsionλ(; k=T(10.0), θ0=T(2.0), λ_kwargs...),
++            CMAPTorsion(1, 24),
++            Molly.CMAPTorsionλ(; index=1, size=24, λ_kwargs...),
++            EwaldExclusion(),
++            Molly.EwaldExclusionData(T(1.0)),
++            Ewald(T(1.0)),
++            LJDispersionCorrection(atoms, T(1.0)),
++            MullerBrown(),
++        )
++        for inter in inters
++            @test widened_equal(inter, Molly.convert_component(c, inter))
++        end
++
++        @test Molly.convert_component(c, Dict("C" => T(0.17)u"nm")) == Dict("C" => Float64(T(0.17)))
++
++        # A struct that can not be rebuilt from its fields gives an error naming it
++        @test_throws "UnconvertibleInteraction" Molly.convert_component(c,
++                                                    UnconvertibleInteraction(T(1.0)))
++        ani = ANIPotential(nothing, [], [], Dict{String, Int}(), (;), T[], T(5.2),
++                           Ref{Any}(nothing))
++        @test_throws "ANIPotential" Molly.convert_component(c, ani)
++    end
++
++    @testset "Keyword arguments" begin
++        sys = builders[2][2](Float32, Array)
++        sys_log = System(sys; loggers=(temp=TemperatureLogger(10),))
++        sys_nolog = @test_logs (:warn, r"loggers are dropped") match_mode=:any System(
++                        sys_log; float_type=Float64, strictness=:warn)
++        @test sys_nolog.loggers == ()
++        loggers = (temp=TemperatureLogger(Float64, 10),)
++        @test System(sys_log; float_type=Float64, loggers=loggers).loggers === loggers
++        # float_type_high keeps the higher precision on the same device
++        @test Molly.float_type_high(System(System(sys; float_type=Float64); float_type=Float32)) ==
++                Float64
++        # Keyword arguments given with a conversion are converted too
++        sys_kw = System(sys; float_type=Float64, units=false, coords=sys.coords .* 1.01f0)
++        @test widened_equal(sys.coords .* 1.01f0, sys_kw.coords)
++        # Without a conversion the copy constructor does not change the values
++        @test System(sys; coords=sys.coords).atoms === sys.atoms
++        # grad_safe alone sets up PME again for gradients and keeps the loggers
++        sys_pme = System(builders[1][2](Float64, Array); loggers=(temp=TemperatureLogger(10),))
++        sys_gs = @test_nowarn System(sys_pme; grad_safe=true, strictness=:warn)
++        @test sys_gs.general_inters[1].grad_safe
++        @test sys_gs.loggers === sys_pme.loggers
++        @test isapprox(potential_energy(sys_gs; n_threads=1),
++                       potential_energy(sys_pme; n_threads=1); rtol=1e-12)
++        # A SHAKE tolerance too small for Float32 gives the warning of the SHAKE constructor
++        sys_shake = System(joinpath(data_dir, "water_3mol_triclinic.pdb"), ff_tip3p;
++                           nonbonded_method=SetupCoulombReactionField(), dist_cutoff=0.5u"nm",
++                           constraints=:hbonds, rigid_water=true,
++                           constraint_algorithm=SetupSHAKE_RATTLE(dist_tolerance=1e-8u"nm",
++                                                vel_tolerance=1e-8u"nm^2 * ps^-1"),
++                           strictness=:nowarn)
++        @test_logs (:warn, r"SHAKE dist_tolerance") match_mode=:any System(sys_shake;
++                                                    float_type=Float32, strictness=:warn)
++        sys_nounits = System(sys; units=false)
++        @test_throws ArgumentError System(sys_nounits; units=true)
++    end
++
++    @testset "Gradients" begin
++        # Parameter gradients of a converted system
++        sys_vac = System(joinpath(data_dir, "ethanol_vac.pdb"), ff_dexp; float_type=Float32,
++                         nonbonded_method=SetupCoulombReactionField(), dist_cutoff=1.0u"nm",
++                         strictness=:nowarn)
++        sys_ref = System(sys_vac; float_type=Float64, units=false, grad_safe=true)
++        params_dic = extract_parameters(sys_ref)
++        plan = ParameterPlan(sys_ref, params_dic)
++        neighbors = find_neighbors(sys_ref; n_threads=1)
++        function pe_injected(params_dic, sys_ref, plan, coords, neighbors)
++            sys = inject_gradients(sys_ref, params_dic, plan, coords)
++            return potential_energy(sys, neighbors; n_threads=1)
++        end
++        grads = Dict(k => zero(v) for (k, v) in params_dic)
++        autodiff(
++            set_runtime_activity(Reverse),
++            Const(pe_injected),
++            Active,
++            Duplicated(params_dic, grads),
++            Const(sys_ref),
++            Const(plan),
++            Duplicated(copy(sys_ref.coords), zero(sys_ref.coords)),
++            Const(neighbors),
++        )
++        keys_checked = filter(k -> occursin("DEXP", k) || endswith(k, "_σ"),
++                              collect(keys(params_dic)))
++        @test !isempty(keys_checked)
++        for key in keys_checked
++            grad_fd = central_fdm(6, 1)(params_dic[key]) do val
++                dic = copy(params_dic)
++                dic[key] = val
++                pe_injected(dic, sys_ref, plan, copy(sys_ref.coords), neighbors)
++            end
++            @test isapprox(grads[key], grad_fd; rtol=1e-6, atol=1e-8)
++        end
++
++        # The PME of a gradient safe converted system can be differentiated
++        sys = System(builders[1][2](Float32, Array); float_type=Float64, units=false,
++                     grad_safe=true)
++        pme = sys.general_inters[1]
++        @test pme.grad_safe
++        fs = zero(sys.coords)
++        Molly.ewald_pe_forces!(fs, nothing, sys, pme, Val(false))
++        d_sys = zero(sys)
++        autodiff(
++            Reverse,
++            Molly.ewald_pe_forces!,
++            Active,
++            Const(zero(sys.coords)),
++            Const(nothing),
++            Duplicated(sys, d_sys),
++            Duplicated(pme, zero(pme)),
++            Const(Val(false)),
++        )
++        @test maximum(norm.(-d_sys.coords .- fs)) < 1e-8 * maximum(norm.(fs))
++    end
++end

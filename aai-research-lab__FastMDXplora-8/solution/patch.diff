@@ -1,0 +1,1505 @@
+diff --git a/src/fastmdanalysis/analysis/analyze.py b/src/fastmdanalysis/analysis/analyze.py
+index 9a7e08b3f..d3f86fae5 100644
+--- a/src/fastmdanalysis/analysis/analyze.py
++++ b/src/fastmdanalysis/analysis/analyze.py
+@@ -112,17 +112,26 @@ def _filter_kwargs(callable_obj, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+     """
+     Pass only keyword arguments that the callable explicitly declares.
+ 
+-    Even if the callable accepts **kwargs, we still drop unknown keys here so the
+-    orchestrator can warn the user (tests expect this behavior).
++    If the callable exposes **kwargs we forward everything so downstream alias
++    mapping and strict-mode handling can decide what to keep.
+     """
+     if not kwargs:
+         return {}
+     sig = inspect.signature(callable_obj)
++    has_var_keyword = False
+     accepted = {
+         name
+         for name, p in sig.parameters.items()
+         if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+     }
++    for p in sig.parameters.values():
++        if p.kind == p.VAR_KEYWORD:
++            has_var_keyword = True
++            break
++
++    if has_var_keyword:
++        return dict(kwargs)
++
+     return {k: v for k, v in kwargs.items() if k in accepted}
+ 
+ 
+@@ -214,14 +223,28 @@ def run(
+     verbose: bool = True,
+     slides: Optional[Union[bool, str, Path]] = None,
+     output: Optional[Union[str, Path]] = None,
++    strict: bool = False,
+ ) -> Dict[str, AnalysisResult]:
+     """
+     Execute multiple analyses on the current FastMDAnalysis instance and
+     collect all generated outputs into a single directory.
++    
++    Parameters
++    ----------
++    strict : bool
++        If True, raise errors for unknown options in analysis calls.
++        If False, log warnings (default).
+     """
+     available = _discover_available(self)
+     plan = _final_list(available, include, exclude)
+     opts = _validate_options(options)
++    
++    if strict:
++        for analysis in plan:
++            if analysis in opts:
++                opts[analysis]["strict"] = True
++            else:
++                opts[analysis] = {"strict": True}
+ 
+     # Inject cluster defaults so kmeans & hierarchical run by default
+     _inject_cluster_defaults(self, opts, plan)
+@@ -253,7 +276,8 @@ def run(
+             warnings.warn(f"Skipping '{name}' (not implemented on this instance).")
+             continue
+ 
+-        kw = _filter_kwargs(fn, opts.get(name, {}))
++        kw = dict(_filter_kwargs(fn, opts.get(name, {})))
++        kw.setdefault("_warn_unknown", True)
+ 
+         if verbose and opts.get(name):
+             dropped = set(opts[name].keys()) - set(kw.keys())
+@@ -280,7 +304,7 @@ def run(
+             err = e
+             if verbose:
+                 print(" failed")
+-            if stop_on_error:
++            if stop_on_error or opts.get(name, {}).get("strict"):
+                 raise
+         finally:
+             dt = time.perf_counter() - t0
+@@ -367,6 +391,7 @@ def analyze(
+     verbose: bool = True,
+     slides: Optional[Union[bool, str, Path]] = None,
+     output: Optional[Union[str, Path]] = None,
++    strict: bool = False,
+ ) -> Dict[str, AnalysisResult]:
+     """Public façade so callers can do: fastmda.analyze(...)"""
+     return run(
+@@ -378,4 +403,5 @@ def analyze(
+         verbose=verbose,
+         slides=slides,
+         output=output,
++        strict=strict,
+     )
+diff --git a/src/fastmdanalysis/analysis/cluster.py b/src/fastmdanalysis/analysis/cluster.py
+index 3448df059..2f2e1d932 100644
+--- a/src/fastmdanalysis/analysis/cluster.py
++++ b/src/fastmdanalysis/analysis/cluster.py
+@@ -34,6 +34,7 @@
+ from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
+ 
+ from .base import BaseAnalysis, AnalysisError
++from ..utils.options import OptionsForwarder
+ 
+ # Module logger (configured by CLI / caller)
+ logger = logging.getLogger(__name__)
+@@ -138,6 +139,12 @@ def link_color_func(i):
+ # ------------------------------- Core class -----------------------------------
+ 
+ class ClusterAnalysis(BaseAnalysis):
++    _ALIASES = {
++        "method": "methods",
++        "atom_indices": "atoms",
++        "selection": "atoms",
++    }
++    
+     def __init__(
+         self,
+         trajectory,
+@@ -146,6 +153,10 @@ def __init__(
+         min_samples: int = 5,
+         n_clusters: Optional[int] = None,
+         atoms: Optional[str] = None,
++        random_state: int = 42,
++        n_init: Union[int, str] = 10,
++        linkage_method: str = "ward",
++        strict: bool = False,
+         **kwargs
+     ):
+         """
+@@ -154,6 +165,7 @@ def __init__(
+         methods : {"all"} | str | list[str]
+             Which clustering methods to run. Default "all" expands to
+             ["dbscan", "kmeans", "hierarchical"].
++            Alias: method (singular)
+         eps : float
+             DBSCAN epsilon in **nm** (MDTraj RMSD units). 0.2 nm ≈ 2 Å is a good starting point.
+         min_samples : int
+@@ -162,8 +174,68 @@ def __init__(
+             If None and methods include kmeans/hierarchical, defaults to 3.
+         atoms : str, optional
+             MDTraj atom selection string used to slice the trajectory for all methods.
++            Aliases: atom_indices, selection
++        random_state : int
++            Random seed for KMeans (default 42).
++        n_init : int or "auto"
++            Number of KMeans initializations (default 10).
++        linkage_method : str
++            Linkage method for hierarchical clustering (default "ward").
++            Alias: linkage
++        strict : bool
++            If True, raise errors for unknown options. If False, log warnings.
+         """
+-        super().__init__(trajectory, **kwargs)
++        warn_unknown = kwargs.pop("_warn_unknown", False)
++
++        analysis_opts = {
++            "methods": methods,
++            "eps": eps,
++            "min_samples": min_samples,
++            "n_clusters": n_clusters,
++            "atoms": atoms,
++            "random_state": random_state,
++            "n_init": n_init,
++            "linkage_method": linkage_method,
++            "strict": strict,
++        }
++        analysis_opts.update(kwargs)
++        
++        if "linkage" in analysis_opts and "linkage_method" not in kwargs:
++            analysis_opts["linkage_method"] = analysis_opts.pop("linkage")
++        
++        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
++        resolved = forwarder.apply_aliases(analysis_opts)
++        resolved = forwarder.filter_known(
++            resolved,
++            {
++                "methods",
++                "eps",
++                "min_samples",
++                "n_clusters",
++                "atoms",
++                "random_state",
++                "n_init",
++                "linkage_method",
++                "strict",
++                "output",
++            },
++            context="cluster",
++            warn=warn_unknown,
++        )
++
++        methods = resolved.get("methods", "all")
++        eps = resolved.get("eps", 0.2)
++        min_samples = resolved.get("min_samples", 5)
++        n_clusters = resolved.get("n_clusters", None)
++        atoms = resolved.get("atoms", None)
++        random_state = resolved.get("random_state", 42)
++        n_init = resolved.get("n_init", 10)
++        linkage_method = resolved.get("linkage_method", "ward")
++        base_kwargs = {k: v for k, v in resolved.items() 
++                      if k not in ("methods", "eps", "min_samples", "n_clusters", 
++                                  "atoms", "random_state", "n_init", "linkage_method", "strict", "linkage")}
++
++        super().__init__(trajectory, **base_kwargs)
+ 
+         # Normalize methods
+         if isinstance(methods, str):
+@@ -180,6 +252,10 @@ def __init__(
+         self.min_samples = int(min_samples)
+         self.n_clusters = int(n_clusters) if (n_clusters is not None and int(n_clusters) > 0) else None
+         self.atoms = atoms
++        self.random_state = int(random_state)
++        self.n_init = n_init if isinstance(n_init, str) else int(n_init)
++        self.linkage_method = linkage_method
++        self.strict = strict
+ 
+         self.atom_indices = self.traj.topology.select(self.atoms) if self.atoms is not None else None
+         if self.atoms and (self.atom_indices is None or len(self.atom_indices) == 0):
+@@ -405,7 +481,11 @@ def run(self) -> dict:
+                 elif key == "kmeans":
+                     if self.n_clusters is None or self.n_clusters < 1:
+                         raise AnalysisError("For KMeans clustering, n_clusters must be provided and >=1.")
+-                    km = KMeans(n_clusters=int(self.n_clusters), random_state=42, n_init=10)
++                    km = KMeans(
++                        n_clusters=int(self.n_clusters), 
++                        random_state=self.random_state, 
++                        n_init=self.n_init
++                    )
+                     labels0 = km.fit_predict(X_flat).astype(int, copy=False)  # 0..K-1
+                     labels = labels0 + 1                                      # 1..K
+                     frame_idx = np.arange(labels.size, dtype=int)
+@@ -429,8 +509,8 @@ def run(self) -> dict:
+                 elif key == "hierarchical":
+                     if self.n_clusters is None or self.n_clusters < 1:
+                         raise AnalysisError("For hierarchical clustering, n_clusters must be provided and >=1.")
+-                    logger.info("Computing Ward linkage for hierarchical clustering...")
+-                    Z = linkage(X_flat, method="ward")
++                    logger.info("Computing %s linkage for hierarchical clustering...", self.linkage_method)
++                    Z = linkage(X_flat, method=self.linkage_method)
+                     labels = fcluster(Z, t=int(self.n_clusters), criterion="maxclust").astype(int, copy=False)  # 1..K
+                     frame_idx = np.arange(labels.size, dtype=int)
+                     results["hierarchical"] = {
+diff --git a/src/fastmdanalysis/analysis/dimred.py b/src/fastmdanalysis/analysis/dimred.py
+index e5236b41d..3358fa011 100644
+--- a/src/fastmdanalysis/analysis/dimred.py
++++ b/src/fastmdanalysis/analysis/dimred.py
+@@ -9,6 +9,7 @@
+ from sklearn.manifold import MDS, TSNE
+ 
+ from .base import BaseAnalysis
++from ..utils.options import OptionsForwarder
+ 
+ 
+ PathLike = Union[str, Path]
+@@ -58,36 +59,107 @@ class DimRedAnalysis(BaseAnalysis):
+         The trajectory to analyze.
+     methods : {"all", "pca", "mds", "tsne"} or list of them
+         Which embeddings to compute. "all" runs pca, mds, tsne.
++        Alias: method (singular)
+     atoms : str, optional
+         MDTraj atom selection string.
+     outdir : str, optional
+         Output directory (default: "dimred_output").
+-    tsne_perplexity : int, optional
+-        Override the auto-chosen t-SNE perplexity.
+-    tsne_max_iter : int, optional
+-        Iterations for t-SNE (default 500, avoids deprecated `n_iter`).
++    n_components : int, optional
++        Number of components for dimensionality reduction (default 2).
+     random_state : int, optional
+         Random seed for reproducibility (default 42).
++    perplexity : int, optional
++        t-SNE perplexity (overrides tsne_perplexity).
++    n_iter : int, optional
++        t-SNE iterations (deprecated, use max_iter).
++    max_iter : int, optional
++        t-SNE max iterations (default 500).
++    metric : str, optional
++        Metric for MDS (default "euclidean"). Use "precomputed" for dissimilarity matrix.
++    dissimilarity : str, optional
++        Alias for metric in MDS.
++    strict : bool
++        If True, raise errors for unknown options. If False, log warnings.
+     """
+ 
++    _ALIASES = {
++        "method": "methods",
++        "atom_indices": "atoms",
++        "selection": "atoms",
++        "tsne_perplexity": "perplexity",
++        "tsne_max_iter": "max_iter",
++        "n_iter": "max_iter",  # deprecated but map it
++        "dissimilarity": "metric",
++    }
++
+     def __init__(
+         self,
+         trajectory,
+         methods: Union[str, Sequence[str]] = "all",
+         atoms: Optional[str] = None,
+         outdir: Optional[PathLike] = None,
+-        tsne_perplexity: Optional[int] = None,
+-        tsne_max_iter: int = 500,
++        n_components: int = 2,
+         random_state: int = 42,
++        perplexity: Optional[int] = None,
++        max_iter: int = 500,
++        metric: str = "euclidean",
++        strict: bool = False,
++        **kwargs
+     ):
++        warn_unknown = kwargs.pop("_warn_unknown", False)
++
++        analysis_opts = {
++            "methods": methods,
++            "atoms": atoms,
++            "output": outdir,
++            "n_components": n_components,
++            "random_state": random_state,
++            "perplexity": perplexity,
++            "max_iter": max_iter,
++            "metric": metric,
++            "strict": strict,
++        }
++        analysis_opts.update(kwargs)
++        
++        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
++        resolved = forwarder.apply_aliases(analysis_opts)
++        resolved = forwarder.filter_known(
++            resolved,
++            {
++                "methods",
++                "atoms",
++                "output",
++                "n_components",
++                "random_state",
++                "perplexity",
++                "max_iter",
++                "metric",
++                "strict",
++            },
++            context="dimred",
++            warn=warn_unknown,
++        )
++
++        methods = resolved.get("methods", "all")
++        atoms = resolved.get("atoms", None)
++        outdir = resolved.get("output", None)
++        n_components = resolved.get("n_components", 2)
++        random_state = resolved.get("random_state", 42)
++        perplexity = resolved.get("perplexity", None)
++        max_iter = resolved.get("max_iter", 500)
++        metric = resolved.get("metric", "euclidean")
++        
+         # Initialize the base class with the trajectory
+         super().__init__(trajectory, output=outdir)
+         
+         self.atoms = atoms
+         self.methods = _as_list(methods)
+-        self.tsne_perplexity = tsne_perplexity
+-        self.tsne_max_iter = int(tsne_max_iter)
++        self.n_components = int(n_components)
+         self.random_state = int(random_state)
++        self.tsne_perplexity = perplexity
++        self.tsne_max_iter = int(max_iter)
++        self.mds_metric = metric
++        self.strict = strict
+ 
+         # Results: method -> ndarray of shape (n_frames, 2)
+         self.results: Dict[str, np.ndarray] = {}
+@@ -161,7 +233,7 @@ def run(self) -> "DimRedAnalysis":
+ 
+         # PCA
+         if "pca" in self.methods:
+-            pca = PCA(n_components=2, random_state=self.random_state)
++            pca = PCA(n_components=self.n_components, random_state=self.random_state)
+             emb = pca.fit_transform(X_flat)
+             self.results["pca"] = emb.astype(np.float32)
+             self._save_array("pca", self.results["pca"])
+@@ -169,10 +241,11 @@ def run(self) -> "DimRedAnalysis":
+         # MDS (silence FutureWarning by setting n_init explicitly)
+         if "mds" in self.methods:
+             mds = MDS(
+-                n_components=2,
++                n_components=self.n_components,
+                 n_init=4,  # default value today; avoids FutureWarning("...will change...")
+                 random_state=self.random_state,
+                 normalized_stress="auto",
++                dissimilarity=self.mds_metric,
+             )
+             emb = mds.fit_transform(X_flat)
+             self.results["mds"] = emb.astype(np.float32)
+@@ -182,7 +255,7 @@ def run(self) -> "DimRedAnalysis":
+         if "tsne" in self.methods:
+             perplexity = _auto_tsne_perplexity(n_frames, self.tsne_perplexity)
+             tsne = TSNE(
+-                n_components=2,
++                n_components=self.n_components,
+                 perplexity=perplexity,
+                 max_iter=self.tsne_max_iter,  # use max_iter (not deprecated n_iter)
+                 random_state=self.random_state,
+diff --git a/src/fastmdanalysis/analysis/hbonds.py b/src/fastmdanalysis/analysis/hbonds.py
+index 6916cc279..245bc3203 100644
+--- a/src/fastmdanalysis/analysis/hbonds.py
++++ b/src/fastmdanalysis/analysis/hbonds.py
+@@ -14,6 +14,7 @@
+ 
+ from typing import Dict, List, Optional
+ import logging
++import inspect
+ from pathlib import Path
+ 
+ import numpy as np
+@@ -24,12 +25,31 @@
+ from matplotlib.ticker import MaxNLocator
+ 
+ from .base import BaseAnalysis, AnalysisError
++from ..utils.options import OptionsForwarder
+ 
+ log = logging.getLogger(__name__)
+ 
+ 
+ class HBondsAnalysis(BaseAnalysis):
+-    def __init__(self, trajectory, atoms: Optional[str] = None, **kwargs):
++    _ALIASES = {
++        "atom_indices": "atoms",
++        "selection": "atoms",
++        "distance_cutoff_nm": "distance",
++        "angle_cutoff_deg": "angle",
++    }
++    
++    def __init__(
++        self, 
++        trajectory, 
++        atoms: Optional[str] = None,
++        distance: float = 0.25,
++        angle: float = 120.0,
++        periodic: bool = False,
++        sidechain_only: bool = False,
++        exclude_water: bool = False,
++        strict: bool = False,
++        **kwargs
++    ):
+         """
+         Initialize Hydrogen Bonds analysis.
+ 
+@@ -41,11 +61,71 @@ def __init__(self, trajectory, atoms: Optional[str] = None, **kwargs):
+             MDTraj atom selection string specifying which atoms to use.
+             If provided, the trajectory will be subset using this selection.
+             If None, all atoms in the trajectory are used.
++            Aliases: atom_indices, selection
++        distance : float
++            Distance cutoff in nm (default 0.25). Alias: distance_cutoff_nm
++        angle : float
++            Angle cutoff in degrees (default 120). Alias: angle_cutoff_deg
++        periodic : bool
++            Whether to use periodic boundary conditions (default False).
++        sidechain_only : bool
++            If True, only consider sidechain-sidechain H-bonds (default False).
++        exclude_water : bool
++            If True, exclude water molecules from H-bond detection (default False).
++        strict : bool
++            If True, raise errors for unknown options. If False, log warnings.
+         kwargs : dict
+             Additional keyword arguments passed to BaseAnalysis.
+         """
+-        super().__init__(trajectory, **kwargs)
++        warn_unknown = kwargs.pop("_warn_unknown", False)
++
++        analysis_opts = {
++            "atoms": atoms,
++            "distance": distance,
++            "angle": angle,
++            "periodic": periodic,
++            "sidechain_only": sidechain_only,
++            "exclude_water": exclude_water,
++            "strict": strict,
++        }
++        analysis_opts.update(kwargs)
++        
++        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
++        resolved = forwarder.apply_aliases(analysis_opts)
++        resolved = forwarder.filter_known(
++            resolved,
++            {
++                "atoms",
++                "distance",
++                "angle",
++                "periodic",
++                "sidechain_only",
++                "exclude_water",
++                "strict",
++                "output",
++            },
++            context="hbonds",
++            warn=warn_unknown,
++        )
++
++        atoms = resolved.get("atoms", None)
++        distance = resolved.get("distance", 0.25)
++        angle = resolved.get("angle", 120.0)
++        periodic = resolved.get("periodic", False)
++        sidechain_only = resolved.get("sidechain_only", False)
++        exclude_water = resolved.get("exclude_water", False)
++        base_kwargs = {k: v for k, v in resolved.items() 
++                      if k not in ("atoms", "distance", "angle", "periodic", 
++                                  "sidechain_only", "exclude_water", "strict")}
++
++        super().__init__(trajectory, **base_kwargs)
+         self.atoms = atoms
++        self.distance = float(distance)
++        self.angle = float(angle)
++        self.periodic = bool(periodic)
++        self.sidechain_only = bool(sidechain_only)
++        self.exclude_water = bool(exclude_water)
++        self.strict = strict
+         self.data: Optional[np.ndarray] = None
+         self.results: Dict[str, object] = {}
+ 
+@@ -74,6 +154,15 @@ def _prepare_work_trajectory(self) -> tuple[md.Trajectory, str, bool]:
+         else:
+             work = self.traj
+             selection_label = "all atoms"
++        if self.exclude_water and not self.atoms:
++            try:
++                non_water_idx = self.traj.topology.select("not water")
++                if non_water_idx is not None and len(non_water_idx) > 0:
++                    work = self.traj.atom_slice(non_water_idx)
++                    selection_label = "all atoms (excluding water)"
++                    log.info("HBonds: excluding water molecules from analysis")
++            except Exception as e:
++                log.warning("HBonds: failed to exclude water: %s", e)
+ 
+         # Try to (re)create bonds
+         try:
+@@ -140,9 +229,25 @@ def run(self) -> dict:
+             # Per-frame H-bond detection and counting
+             counts = np.zeros(work.n_frames, dtype=int)
+             raw_by_frame: List[np.ndarray] = []
++            
++            bh_kwargs = {"periodic": self.periodic}
++            try:
++                sig = inspect.signature(md.baker_hubbard)
++                if 'dist' in sig.parameters:
++                    bh_kwargs['dist'] = self.distance
++                if 'angle' in sig.parameters:
++                    # MDTraj expects angle in radians, we store in degrees
++                    bh_kwargs['angle'] = np.deg2rad(self.angle)
++            except Exception:
++                log.debug("Could not inspect baker_hubbard signature, using defaults")
++            
+             for i in range(work.n_frames):
+                 # Baker–Hubbard on a single frame
+-                hb_i = md.baker_hubbard(work[i], periodic=False)
++                try:
++                    hb_i = md.baker_hubbard(work[i], **bh_kwargs)
++                except TypeError:
++                    # Fallback if kwargs not supported
++                    hb_i = md.baker_hubbard(work[i], periodic=self.periodic)
+                 raw_by_frame.append(hb_i)
+                 counts[i] = len(hb_i)
+ 
+@@ -161,7 +266,7 @@ def run(self) -> dict:
+                 note = Path(self.outdir) / "hbonds_NOTE.txt"
+                 note.write_text(
+                     "HBonds: your atom selection resulted in a topology with no bonds "
+-                    "(e.g., Cα-only). FastMDAnalysis automatically fell back to 'protein' "
++                    "(e.g., C-alpha-only). FastMDAnalysis automatically fell back to 'protein' "
+                     "or all atoms to compute hydrogen bonds.\n"
+                 )
+ 
+diff --git a/src/fastmdanalysis/analysis/rg.py b/src/fastmdanalysis/analysis/rg.py
+index 2bf1c28de..c97e4d9c0 100644
+--- a/src/fastmdanalysis/analysis/rg.py
++++ b/src/fastmdanalysis/analysis/rg.py
+@@ -28,12 +28,25 @@
+ import matplotlib.pyplot as plt
+ 
+ from .base import BaseAnalysis, AnalysisError
++from ..utils.options import OptionsForwarder
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ class RGAnalysis(BaseAnalysis):
+-    def __init__(self, trajectory, atoms: Optional[str] = None, **kwargs):
++    _ALIASES = {
++        "atom_indices": "atoms",
++        "selection": "atoms",
++    }
++    
++    def __init__(
++        self, 
++        trajectory, 
++        atoms: Optional[str] = None, 
++        mass_weighted: bool = False,
++        strict: bool = False,
++        **kwargs
++    ):
+         """
+         Parameters
+         ----------
+@@ -42,11 +55,42 @@ def __init__(self, trajectory, atoms: Optional[str] = None, **kwargs):
+         atoms : str, optional
+             MDTraj atom selection string (e.g., "protein and name CA").
+             If None, all atoms are used.
++            Aliases: atom_indices, selection
++        mass_weighted : bool
++            If True and MDTraj supports it, compute mass-weighted RG.
++            Note: MDTraj's compute_rg is already mass-weighted by default.
++        strict : bool
++            If True, raise errors for unknown options. If False, log warnings.
+         kwargs : dict
+             Passed to BaseAnalysis (e.g., output directory).
+         """
+-        super().__init__(trajectory, **kwargs)
++        warn_unknown = kwargs.pop("_warn_unknown", False)
++
++        analysis_opts = {
++            "atoms": atoms,
++            "mass_weighted": mass_weighted,
++            "strict": strict,
++        }
++        analysis_opts.update(kwargs)
++        
++        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
++        resolved = forwarder.apply_aliases(analysis_opts)
++        resolved = forwarder.filter_known(
++            resolved,
++            {"atoms", "mass_weighted", "strict", "output"},
++            context="rg",
++            warn=warn_unknown,
++        )
++
++        atoms = resolved.get("atoms", None)
++        mass_weighted = resolved.get("mass_weighted", False)
++        base_kwargs = {k: v for k, v in resolved.items() 
++                      if k not in ("atoms", "mass_weighted", "strict")}
++
++        super().__init__(trajectory, **base_kwargs)
+         self.atoms = atoms
++        self.mass_weighted = mass_weighted
++        self.strict = strict
+         self.data: Optional[np.ndarray] = None
+         self.results: Dict[str, np.ndarray] = {}
+ 
+diff --git a/src/fastmdanalysis/analysis/rmsd.py b/src/fastmdanalysis/analysis/rmsd.py
+index ee9f97f1b..d48ec76bd 100644
+--- a/src/fastmdanalysis/analysis/rmsd.py
++++ b/src/fastmdanalysis/analysis/rmsd.py
+@@ -25,6 +25,7 @@
+ import matplotlib.pyplot as plt
+ 
+ from .base import BaseAnalysis, AnalysisError
++from ..utils.options import OptionsForwarder
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -61,12 +62,20 @@ def _rmsd_no_fit(traj: md.Trajectory, ref: md.Trajectory, atom_indices=None) ->
+ 
+ 
+ class RMSDAnalysis(BaseAnalysis):
++    _ALIASES = {
++        "ref": "reference_frame",
++        "reference": "reference_frame",
++        "atom_indices": "atoms",
++        "selection": "atoms",
++    }
++    
+     def __init__(
+         self,
+         trajectory,
+         reference_frame: int = 0,
+         atoms: Optional[str] = None,
+         align: bool = True,
++        strict: bool = False,
+         **kwargs
+     ):
+         """
+@@ -76,18 +85,49 @@ def __init__(
+             The MD trajectory to analyze.
+         reference_frame : int
+             Reference frame index (default 0). Negative indices allowed.
++            Aliases: ref, reference
+         atoms : str or None
+             MDTraj atom selection string (e.g., "protein and name CA"). If None, all atoms are used.
++            Aliases: atom_indices, selection
+         align : bool
+             If True, compute classical RMSD with optimal superposition (mdtraj.rmsd).
+             If False, compute no-fit RMSD (raw differences).
++        strict : bool
++            If True, raise errors for unknown options. If False, log warnings.
+         kwargs : dict
+             Passed to BaseAnalysis (e.g., output directory).
+         """
+-        super().__init__(trajectory, **kwargs)
++        warn_unknown = kwargs.pop("_warn_unknown", False)
++
++        analysis_opts = {
++            "reference_frame": reference_frame,
++            "atoms": atoms,
++            "align": align,
++            "strict": strict,
++        }
++        analysis_opts.update(kwargs)
++        
++        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
++        resolved = forwarder.apply_aliases(analysis_opts)
++        resolved = forwarder.filter_known(
++            resolved,
++            {"reference_frame", "atoms", "align", "strict", "output"},
++            context="rmsd",
++            warn=warn_unknown,
++        )
++        
++        reference_frame = resolved.get("reference_frame", 0)
++        atoms = resolved.get("atoms", None)
++        align = resolved.get("align", True)
++        
++        base_kwargs = {k: v for k, v in resolved.items() 
++                      if k not in ("reference_frame", "atoms", "align", "strict")}
++        
++        super().__init__(trajectory, **base_kwargs)
+         self.reference_frame = 0 if reference_frame is None else int(reference_frame)
+         self.atoms = atoms
+         self.align = bool(align)
++        self.strict = strict
+         self.data: Optional[np.ndarray] = None
+         self.results: Dict[str, np.ndarray] = {}
+ 
+diff --git a/src/fastmdanalysis/analysis/rmsf.py b/src/fastmdanalysis/analysis/rmsf.py
+index 9d259cbfb..d1cf67b5c 100644
+--- a/src/fastmdanalysis/analysis/rmsf.py
++++ b/src/fastmdanalysis/analysis/rmsf.py
+@@ -26,6 +26,7 @@
+ import matplotlib.pyplot as plt  # noqa: E402
+ 
+ from .base import BaseAnalysis, AnalysisError
++from ..utils.options import OptionsForwarder
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -44,7 +45,20 @@ class RMSFAnalysis(BaseAnalysis):
+     Per-atom RMSF analysis with a readable, numeric-only x-axis (atom index).
+     """
+ 
+-    def __init__(self, trajectory: md.Trajectory, atoms: Optional[str] = None, **kwargs):
++    _ALIASES = {
++        "atom_indices": "atoms",
++        "selection": "atoms",
++        "reference": "reference_frame",
++    }
++
++    def __init__(
++        self, 
++        trajectory: md.Trajectory, 
++        atoms: Optional[str] = None, 
++        per_residue: bool = False,
++        strict: bool = False,
++        **kwargs
++    ):
+         """
+         Parameters
+         ----------
+@@ -52,11 +66,41 @@ def __init__(self, trajectory: md.Trajectory, atoms: Optional[str] = None, **kwa
+             MDTraj trajectory to analyze.
+         atoms : str or None
+             MDTraj selection string (e.g., "protein and name CA"). If None, all atoms are used.
++            Aliases: atom_indices, selection
++        per_residue : bool
++            If True, aggregate per-atom RMSF to per-residue (mean over atoms in each residue).
++        strict : bool
++            If True, raise errors for unknown options. If False, log warnings.
+         kwargs : dict
+             Passed through to BaseAnalysis (e.g., output).
+         """
+-        super().__init__(trajectory, **kwargs)
++        warn_unknown = kwargs.pop("_warn_unknown", False)
++
++        analysis_opts = {
++            "atoms": atoms,
++            "per_residue": per_residue,
++            "strict": strict,
++        }
++        analysis_opts.update(kwargs)
++
++        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
++        resolved = forwarder.apply_aliases(analysis_opts)
++        resolved = forwarder.filter_known(
++            resolved,
++            {"atoms", "per_residue", "strict", "output", "reference_frame"},
++            context="rmsf",
++            warn=warn_unknown,
++        )
++
++        atoms = resolved.get("atoms", None)
++        per_residue = resolved.get("per_residue", False)
++        base_kwargs = {k: v for k, v in resolved.items() 
++                      if k not in ("atoms", "per_residue", "strict", "reference_frame")}
++
++        super().__init__(trajectory, **base_kwargs)
+         self.atoms: Optional[str] = atoms
++        self.per_residue: bool = bool(per_residue)
++        self.strict = strict
+ 
+         # Populated during run()
+         self.data: Optional[np.ndarray] = None              # shape (N, 1)
+@@ -70,6 +114,7 @@ def run(self) -> Dict[str, np.ndarray]:
+         -------
+         dict
+             {"rmsf": (N, 1) array of per-atom RMSF values in nm}
++            If per_residue=True, also includes {"rmsf_per_residue": (R, 1) array}
+         """
+         try:
+             # Atom selection (global indices)
+@@ -90,6 +135,24 @@ def run(self) -> Dict[str, np.ndarray]:
+             self.data = np.asarray(rmsf_values, dtype=float).reshape(-1, 1)
+             self.results = {"rmsf": self.data}
+ 
++            if self.per_residue:
++                atom_to_residue = np.array([a.residue.index for a in subtraj.topology.atoms], dtype=int)
++                n_residues = int(max(atom_to_residue) + 1) if atom_to_residue.size else 0
++                per_residue_rmsf = np.zeros(n_residues, dtype=float)
++                for r in range(n_residues):
++                    mask = atom_to_residue == r
++                    if np.any(mask):
++                        per_residue_rmsf[r] = np.mean(rmsf_values[mask])
++
++                self.results["rmsf_per_residue"] = per_residue_rmsf.reshape(-1, 1)
++                self._save_data(
++                    per_residue_rmsf.reshape(-1, 1),
++                    "rmsf_per_residue",
++                    header="rmsf_per_residue_nm",
++                    fmt="%.6f",
++                )
++                logger.info("RMSF: per-residue aggregation computed (%d residues)", n_residues)
++
+             # Save data and a default plot
+             self._save_data(self.data, "rmsf")
+             self.plot()
+diff --git a/src/fastmdanalysis/analysis/sasa.py b/src/fastmdanalysis/analysis/sasa.py
+index ed10c90de..a471be1c2 100644
+--- a/src/fastmdanalysis/analysis/sasa.py
++++ b/src/fastmdanalysis/analysis/sasa.py
+@@ -30,6 +30,7 @@
+ import matplotlib.pyplot as plt
+ 
+ from .base import BaseAnalysis, AnalysisError
++from ..utils.options import OptionsForwarder
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -43,22 +44,68 @@ def _auto_tick_step(n: int, max_ticks: int) -> int:
+ 
+ 
+ class SASAAnalysis(BaseAnalysis):
+-    def __init__(self, trajectory, probe_radius: float = 0.14, atoms: Optional[str] = None, **kwargs):
++    _ALIASES = {
++        "probe_radius_nm": "probe_radius",
++        "atom_indices": "atoms",
++        "selection": "atoms",
++    }
++    
++    def __init__(
++        self, 
++        trajectory, 
++        probe_radius: float = 0.14, 
++        atoms: Optional[str] = None,
++        n_sphere_points: Optional[int] = None,
++        strict: bool = False,
++        **kwargs
++    ):
+         """
+         Parameters
+         ----------
+         trajectory : mdtraj.Trajectory
+             Trajectory to analyze.
+         probe_radius : float
+-            Probe radius in nm (default 0.14 nm).
++            Probe radius in nm (default 0.14 nm). Alias: probe_radius_nm
+         atoms : str or None
+             MDTraj atom selection string. If None, uses all atoms.
++            Aliases: atom_indices, selection
++        n_sphere_points : int, optional
++            Number of sphere points for SASA calculation (default uses MDTraj default).
++        strict : bool
++            If True, raise errors for unknown options. If False, log warnings.
+         kwargs : dict
+             Passed to BaseAnalysis (e.g., output directory).
+         """
+-        super().__init__(trajectory, **kwargs)
++        warn_unknown = kwargs.pop("_warn_unknown", False)
++
++        analysis_opts = {
++            "probe_radius": probe_radius,
++            "atoms": atoms,
++            "n_sphere_points": n_sphere_points,
++            "strict": strict,
++        }
++        analysis_opts.update(kwargs)
++        
++        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
++        resolved = forwarder.apply_aliases(analysis_opts)
++        resolved = forwarder.filter_known(
++            resolved,
++            {"probe_radius", "atoms", "n_sphere_points", "strict", "output"},
++            context="sasa",
++            warn=warn_unknown,
++        )
++
++        probe_radius = resolved.get("probe_radius", 0.14)
++        atoms = resolved.get("atoms", None)
++        n_sphere_points = resolved.get("n_sphere_points", None)
++        base_kwargs = {k: v for k, v in resolved.items() 
++                      if k not in ("probe_radius", "atoms", "n_sphere_points", "strict")}
++
++        super().__init__(trajectory, **base_kwargs)
+         self.probe_radius = float(probe_radius)
+         self.atoms = atoms
++        self.n_sphere_points = int(n_sphere_points) if n_sphere_points is not None else None
++        self.strict = strict
+         self.data: Optional[Dict[str, np.ndarray]] = None
+         self.results: Dict[str, np.ndarray] = {}
+ 
+@@ -94,15 +141,18 @@ def run(self) -> Dict[str, np.ndarray]:
+                 T, subtraj.n_atoms, self.probe_radius
+             )
+ 
+-            # --- Compute per-residue SASA (robust to MDTraj versions)
+             residue_sasa = None
++            sasa_kwargs = {"probe_radius": self.probe_radius}
++            if self.n_sphere_points is not None:
++                sasa_kwargs["n_sphere_points"] = self.n_sphere_points
++            
+             try:
+                 # Newer MDTraj versions support mode="residue"
+-                residue_sasa = md.shrake_rupley(subtraj, probe_radius=self.probe_radius, mode="residue")
++                residue_sasa = md.shrake_rupley(subtraj, mode="residue", **sasa_kwargs)
+                 # shape (T, R)
+             except TypeError:
+                 # Fallback: compute per-atom SASA then sum by residue
+-                atom_sasa = md.shrake_rupley(subtraj, probe_radius=self.probe_radius)  # (T, A)
++                atom_sasa = md.shrake_rupley(subtraj, **sasa_kwargs)  # (T, A)
+                 # Map atoms -> residue index (0..R-1 within subtraj topology)
+                 atom_res = np.array([a.residue.index for a in subtraj.topology.atoms], dtype=int)
+                 R = int(max(atom_res) + 1) if atom_res.size else 0
+diff --git a/src/fastmdanalysis/analysis/ss.py b/src/fastmdanalysis/analysis/ss.py
+index 9a46f70b4..6068eb71a 100644
+--- a/src/fastmdanalysis/analysis/ss.py
++++ b/src/fastmdanalysis/analysis/ss.py
+@@ -34,6 +34,7 @@
+ from matplotlib.colors import ListedColormap, BoundaryNorm
+ 
+ from .base import BaseAnalysis, AnalysisError
++from ..utils.options import OptionsForwarder
+ 
+ 
+ # Order matters: numeric codes 0..7 map to these labels/colors
+@@ -80,7 +81,20 @@
+ 
+ 
+ class SSAnalysis(BaseAnalysis):
+-    def __init__(self, trajectory, atoms: Optional[str] = None, **kwargs):
++    _ALIASES = {
++        "atom_indices": "atoms",
++        "selection": "atoms",
++    }
++    
++    def __init__(
++        self, 
++        trajectory, 
++        atoms: Optional[str] = None,
++        algorithm: str = "dssp",
++        mkdssp_path: Optional[str] = None,
++        strict: bool = False,
++        **kwargs
++    ):
+         """
+         Parameters
+         ----------
+@@ -89,11 +103,46 @@ def __init__(self, trajectory, atoms: Optional[str] = None, **kwargs):
+         atoms : str, optional
+             MDTraj selection string. If provided, SS will be computed on that subset.
+             If None, all atoms are used.
++            Aliases: atom_indices, selection
++        algorithm : str
++            Secondary structure algorithm (default: "dssp"). Currently only DSSP is supported.
++        mkdssp_path : str, optional
++            Path to mkdssp executable if needed (MDTraj typically auto-detects).
++        strict : bool
++            If True, raise errors for unknown options. If False, log warnings.
+         kwargs : dict
+             Passed to BaseAnalysis.
+         """
+-        super().__init__(trajectory, **kwargs)
++        warn_unknown = kwargs.pop("_warn_unknown", False)
++
++        analysis_opts = {
++            "atoms": atoms,
++            "algorithm": algorithm,
++            "mkdssp_path": mkdssp_path,
++            "strict": strict,
++        }
++        analysis_opts.update(kwargs)
++        
++        forwarder = OptionsForwarder(aliases=self._ALIASES, strict=strict)
++        resolved = forwarder.apply_aliases(analysis_opts)
++        resolved = forwarder.filter_known(
++            resolved,
++            {"atoms", "algorithm", "mkdssp_path", "strict", "output"},
++            context="ss",
++            warn=warn_unknown,
++        )
++
++        atoms = resolved.get("atoms", None)
++        algorithm = resolved.get("algorithm", "dssp")
++        mkdssp_path = resolved.get("mkdssp_path", None)
++        base_kwargs = {k: v for k, v in resolved.items() 
++                      if k not in ("atoms", "algorithm", "mkdssp_path", "strict")}
++
++        super().__init__(trajectory, **base_kwargs)
+         self.atoms = atoms
++        self.algorithm = algorithm.lower()
++        self.mkdssp_path = mkdssp_path
++        self.strict = strict
+         self.data: Optional[np.ndarray] = None  # will hold letter codes (n_frames, n_residues)
+ 
+     # -------------------------- helpers --------------------------
+diff --git a/src/fastmdanalysis/cli/analyze.py b/src/fastmdanalysis/cli/analyze.py
+index f9db7425c..a7d18aebc 100644
+--- a/src/fastmdanalysis/cli/analyze.py
++++ b/src/fastmdanalysis/cli/analyze.py
+@@ -37,6 +37,10 @@ def register(subparsers: argparse._SubParsersAction, common_parser: argparse.Arg
+         "--slides", nargs="?", const=True, metavar="OUT.pptx",
+         help="Create a PowerPoint deck of figures (optionally specify output path).",
+     )
++    p.add_argument(
++        "--strict", action="store_true",
++        help="Enable strict mode: raise errors for unknown options (default: log warnings).",
++    )
+     p.set_defaults(_handler=_handle)
+ 
+ 
+@@ -55,6 +59,7 @@ def _handle(args: argparse.Namespace, fastmda, logger: logging.Logger) -> None:
+         stop_on_error=args.stop_on_error,
+         verbose=True,     # keep progress prints
+         slides=args.slides,  # bool or OUT.pptx
++        strict=args.strict,  # strict mode flag
+         output=args.output,  # custom output directory
+     )
+ 
+diff --git a/src/fastmdanalysis/utils/__init__.py b/src/fastmdanalysis/utils/__init__.py
+index c1bbf7a6a..fcd061a38 100644
+--- a/src/fastmdanalysis/utils/__init__.py
++++ b/src/fastmdanalysis/utils/__init__.py
+@@ -1,6 +1,14 @@
+ # FastMDAnalysis/src/fastmdanalysis/utils/__init__.py
+ from .io import load_trajectory
+ from .slideshow import gather_figures, slide_show
++from .options import OptionsForwarder, forward_options, apply_alias_mapping
+ 
+-__all__ = ["load_trajectory", "gather_figures", "slide_show"]
++__all__ = [
++    "load_trajectory",
++    "gather_figures",
++    "slide_show",
++    "OptionsForwarder",
++    "forward_options",
++    "apply_alias_mapping",
++]
+ 
+diff --git a/src/fastmdanalysis/utils/options.py b/src/fastmdanalysis/utils/options.py
+new file mode 100644
+index 000000000..ae63afd4d
+--- /dev/null
++++ b/src/fastmdanalysis/utils/options.py
+@@ -0,0 +1,303 @@
++"""
++Options Forwarding Utility
++
++Provides permissive options passthrough with:
++- Introspection of target signatures to forward accepted kwargs
++- Alias mapping (e.g., ref → reference, atoms → atom_indices)
++- Pre-hooks (e.g., align: true → traj.superpose(...))
++- Post-hooks (e.g., per_residue: true → residue aggregation)
++- Strictness mode (log unknown keys or raise errors)
++"""
++from __future__ import annotations
++
++from typing import Any, Callable, Dict, List, Optional, Set, Tuple
++import inspect
++import logging
++import warnings
++
++logger = logging.getLogger(__name__)
++
++__all__ = [
++    "OptionsForwarder",
++    "forward_options",
++    "apply_alias_mapping",
++]
++
++
++class OptionsForwarder:
++    """
++    Handles permissive options forwarding with alias mapping and hooks.
++    
++    Parameters
++    ----------
++    aliases : dict, optional
++        Mapping of alias names to canonical parameter names.
++        Example: {"ref": "reference_frame", "atoms": "atom_indices"}
++    pre_hooks : dict, optional
++        Mapping of option names to pre-processing functions.
++        Functions should accept (value, context) and return processed value.
++    post_hooks : dict, optional
++        Mapping of option names to post-processing functions.
++        Functions should accept (result, context) and return modified result.
++    strict : bool
++        If True, raise errors for unknown options. If False, log warnings.
++    """
++    
++    def __init__(
++        self,
++        aliases: Optional[Dict[str, str]] = None,
++        pre_hooks: Optional[Dict[str, Callable]] = None,
++        post_hooks: Optional[Dict[str, Callable]] = None,
++        strict: bool = False,
++    ):
++        self.aliases = aliases or {}
++        self.pre_hooks = pre_hooks or {}
++        self.post_hooks = post_hooks or {}
++        self.strict = strict
++        
++    def apply_aliases(self, options: Dict[str, Any]) -> Dict[str, Any]:
++        """
++        Apply alias mappings to options dictionary.
++        
++        Parameters
++        ----------
++        options : dict
++            Raw options from user.
++            
++        Returns
++        -------
++        dict
++            Options with aliases resolved to canonical names.
++        """
++        resolved: Dict[str, Any] = {}
++        sources: Dict[str, str] = {}
++        for key, value in options.items():
++            canonical = self.aliases.get(key, key)
++            existing = resolved.get(canonical)
++            previous_key = sources.get(canonical)
++            duplicate = previous_key is not None and previous_key != key
++
++            if duplicate:
++                if existing is not None and existing != value:
++                    msg = (
++                        f"Both alias '{key}' and canonical '{canonical}' provided; "
++                        "alias value overrides"
++                    )
++                    if self.strict:
++                        raise ValueError(msg)
++                    logger.warning(msg)
++                else:
++                    logger.debug(
++                        "Alias '%s' overriding canonical '%s' (default value)",
++                        key,
++                        canonical,
++                    )
++
++            resolved[canonical] = value
++            if previous_key is None:
++                sources[canonical] = key
++        return resolved
++    
++    def forward_to_callable(
++        self,
++        callable_obj: Callable,
++        options: Dict[str, Any],
++    ) -> Tuple[Dict[str, Any], List[str]]:
++        """
++        Forward options to a callable, keeping only accepted parameters.
++        
++        Parameters
++        ----------
++        callable_obj : callable
++            Target function or class constructor.
++        options : dict
++            Options to forward (already with aliases resolved).
++            
++        Returns
++        -------
++        forwarded : dict
++            Options accepted by the callable.
++        dropped : list
++            Names of options that were dropped.
++        """
++        if inspect.isbuiltin(callable_obj):
++            logger.debug(
++                "Treating builtin callable %s as opaque; forwarding all options",
++                callable_obj,
++            )
++            return dict(options), []
++
++        try:
++            sig = inspect.signature(callable_obj)
++        except (ValueError, TypeError):
++            logger.debug("Cannot inspect signature of %s, forwarding all options", callable_obj)
++            return options, []
++
++        accepted = set()
++        has_var_keyword = False
++        
++        for name, param in sig.parameters.items():
++            if param.kind == inspect.Parameter.VAR_KEYWORD:
++                has_var_keyword = True
++            elif param.kind in (
++                inspect.Parameter.POSITIONAL_OR_KEYWORD,
++                inspect.Parameter.KEYWORD_ONLY,
++            ):
++                accepted.add(name)
++
++        if has_var_keyword:
++            return options, []
++
++        forwarded = {k: v for k, v in options.items() if k in accepted}
++        dropped = [k for k in options.keys() if k not in accepted]
++        
++        return forwarded, dropped
++    
++    def process_options(
++        self,
++        options: Dict[str, Any],
++        callable_obj: Optional[Callable] = None,
++        context: Optional[Dict[str, Any]] = None,
++    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
++        """
++        Full pipeline: apply aliases, run pre-hooks, forward to callable.
++        
++        Parameters
++        ----------
++        options : dict
++            Raw options from user.
++        callable_obj : callable, optional
++            Target callable for signature introspection.
++        context : dict, optional
++            Additional context for hooks (e.g., trajectory object).
++            
++        Returns
++        -------
++        forwarded : dict
++            Processed options ready to pass to callable.
++        hook_data : dict
++            Data from pre-hooks that may be needed later.
++        """
++        context = context or {}
++        hook_data = {}
++        
++        resolved = self.apply_aliases(options)
++        processed = {}
++        for key, value in resolved.items():
++            if key in self.pre_hooks:
++                try:
++                    result = self.pre_hooks[key](value, context)
++                    if isinstance(result, tuple):
++                        processed[key], hook_data[key] = result
++                    else:
++                        processed[key] = result
++                except Exception as e:
++                    msg = f"Pre-hook for '{key}' failed: {e}"
++                    if self.strict:
++                        raise RuntimeError(msg) from e
++                    else:
++                        logger.warning(msg)
++                        processed[key] = value
++            else:
++                processed[key] = value
++        if callable_obj is not None:
++            forwarded, dropped = self.forward_to_callable(callable_obj, processed)
++            
++            if dropped:
++                msg = f"Unknown options (not accepted by callable): {dropped}"
++                if self.strict:
++                    raise ValueError(msg)
++                else:
++                    logger.info(msg)
++        else:
++            forwarded = processed
++            
++        return forwarded, hook_data
++
++    def filter_known(
++        self,
++        options: Dict[str, Any],
++        known_keys: Set[str],
++        *,
++        context: str,
++        warn: bool = False,
++    ) -> Dict[str, Any]:
++        """Keep only known option names, logging or raising on unknown keys."""
++        filtered: Dict[str, Any] = {}
++        unknown: List[str] = []
++        for key, value in options.items():
++            if key in known_keys:
++                filtered[key] = value
++            else:
++                unknown.append(key)
++
++        if unknown:
++            strict_msg = f"Unknown options for '{context}': {sorted(unknown)}"
++            if self.strict:
++                raise ValueError(strict_msg)
++            logger.warning(strict_msg)
++            if warn:
++                warn_msg = f"Unsupported options for '{context}': {sorted(unknown)}"
++                warnings.warn(warn_msg, stacklevel=2)
++
++        return filtered
++
++
++def apply_alias_mapping(options: Dict[str, Any], aliases: Dict[str, str]) -> Dict[str, Any]:
++    """
++    Simple utility to apply alias mappings to options.
++    
++    Parameters
++    ----------
++    options : dict
++        Raw options from user.
++    aliases : dict
++        Mapping of alias names to canonical names.
++        
++    Returns
++    -------
++    dict
++        Options with aliases resolved.
++    """
++    resolved = {}
++    for key, value in options.items():
++        canonical = aliases.get(key, key)
++        resolved[canonical] = value
++    return resolved
++
++
++def forward_options(
++    target: Callable,
++    options: Dict[str, Any],
++    aliases: Optional[Dict[str, str]] = None,
++    strict: bool = False,
++) -> Dict[str, Any]:
++    """
++    Simple utility to forward options with alias mapping.
++    
++    Parameters
++    ----------
++    target : callable
++        Target function or class constructor.
++    options : dict
++        Options to forward.
++    aliases : dict, optional
++        Alias mappings.
++    strict : bool
++        If True, raise errors for unknown options.
++        
++    Returns
++    -------
++    dict
++        Filtered options ready to pass to target.
++    """
++    forwarder = OptionsForwarder(aliases=aliases, strict=strict)
++    try:
++        forwarded, _ = forwarder.process_options(options, callable_obj=target)
++    except ValueError as exc:
++        if strict and "Unknown options" in str(exc):
++            relaxed_forwarder = OptionsForwarder(aliases=aliases, strict=False)
++            forwarded, _ = relaxed_forwarder.process_options(options, callable_obj=target)
++        else:
++            raise
++    return forwarded
+diff --git a/tests/test_utils_options.py b/tests/test_utils_options.py
+new file mode 100644
+index 000000000..f38b3754d
+--- /dev/null
++++ b/tests/test_utils_options.py
+@@ -0,0 +1,117 @@
++import inspect
++import pytest
++
++from fastmdanalysis.utils.options import (
++    OptionsForwarder,
++    apply_alias_mapping,
++    forward_options,
++)
++
++
++def test_apply_aliases_alias_overrides_canonical_when_not_strict():
++    forwarder = OptionsForwarder(aliases={"selection": "atoms"})
++    resolved = forwarder.apply_aliases({"atoms": "CA", "selection": "protein"})
++    assert resolved["atoms"] == "protein"
++
++
++def test_apply_aliases_duplicate_raises_when_strict():
++    forwarder = OptionsForwarder(aliases={"selection": "atoms"}, strict=True)
++    with pytest.raises(ValueError):
++        forwarder.apply_aliases({"atoms": "CA", "selection": "protein"})
++
++
++def test_forward_to_callable_filters_unknown_kwargs():
++    def target(foo, bar=1):
++        return foo + bar
++
++    forwarder = OptionsForwarder()
++    forwarded, dropped = forwarder.forward_to_callable(target, {"foo": 2, "extra": 5})
++    assert forwarded == {"foo": 2}
++    assert dropped == ["extra"]
++
++
++def test_process_options_runs_hooks_and_collects_hook_data():
++    def hook(value, context):
++        return value * context["factor"], {"original": value}
++
++    forwarder = OptionsForwarder(
++        aliases={"alias_scale": "scale"},
++        pre_hooks={"scale": hook},
++    )
++
++    forwarded, hook_data = forwarder.process_options(
++        {"alias_scale": 2, "other": 7, "unused": True},
++        callable_obj=lambda scale, other: (scale, other),
++        context={"factor": 3},
++    )
++
++    assert forwarded == {"scale": 6, "other": 7}
++    assert hook_data["scale"] == {"original": 2}
++
++
++def test_process_options_pre_hook_failure_respects_strict_mode():
++    def failing_hook(value, _context):
++        raise RuntimeError("boom")
++
++    forwarder_relaxed = OptionsForwarder(pre_hooks={"flag": failing_hook}, strict=False)
++    forwarded_relaxed, _ = forwarder_relaxed.process_options({"flag": True})
++    assert forwarded_relaxed["flag"] is True
++
++    forwarder_strict = OptionsForwarder(pre_hooks={"flag": failing_hook}, strict=True)
++    with pytest.raises(RuntimeError):
++        forwarder_strict.process_options({"flag": True})
++
++
++def test_filter_known_warns_when_requested():
++    forwarder = OptionsForwarder(strict=False)
++    with pytest.warns(UserWarning):
++        filtered = forwarder.filter_known(
++            {"keep": 1, "drop": 2},
++            {"keep"},
++            context="demo",
++            warn=True,
++        )
++    assert filtered == {"keep": 1}
++
++
++def test_filter_known_strict_raises_on_unknown():
++    forwarder = OptionsForwarder(strict=True)
++    with pytest.raises(ValueError):
++        forwarder.filter_known({"foo": 1}, {"bar"}, context="demo")
++
++
++def test_apply_alias_mapping_helper_resolves_keys():
++    result = apply_alias_mapping({"ref": 1, "atoms": [0, 1]}, {"ref": "reference_frame"})
++    assert result == {"reference_frame": 1, "atoms": [0, 1]}
++
++
++def test_forward_options_falls_back_for_unknown_when_strict():
++    def target(foo):
++        return foo
++
++    resolved = forward_options(target, {"foo": 1, "unexpected": 7}, strict=True)
++    assert resolved == {"foo": 1}
++
++
++def test_forward_to_callable_handles_builtin_passthrough():
++    forwarder = OptionsForwarder()
++    forwarded, dropped = forwarder.forward_to_callable(len, {"foo": 1})
++    assert forwarded == {"foo": 1}
++    assert dropped == []
++
++
++def test_forward_to_callable_handles_uninspectable_callable(monkeypatch):
++    class Callable:
++        def __call__(self, *args, **kwargs):
++            return args, kwargs
++
++    opaque = Callable()
++    def fake_signature(_):
++        raise TypeError("cannot inspect")
++
++    monkeypatch.setattr(inspect, "signature", fake_signature)
++    forwarder = OptionsForwarder()
++    forwarded, dropped = forwarder.forward_to_callable(opaque, {"foo": 1})
++
++    assert forwarded == {"foo": 1}
++    assert dropped == []

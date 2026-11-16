@@ -1,0 +1,321 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 8bd942be..5445b435 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -869,8 +869,12 @@ Settled rules, each learned from a live run or a review:
+   its task and context carry everything. The persistent specialists stay for
+   conversation, where accumulating context is the point — and two concurrent
+   `run_task` calls on one specialist would each report the other's output.
+-- **The coordinator is rules, not a model.** Admission by free memory, a
+-  capacity plan that refuses an item larger than the machine, a memory guard
++- **The coordinator is rules, not a model.** Admission by free memory (an
++  item is estimated by its LARGEST unit, nested data included — a series runs
++  its units one at a time, times the replay workers the agent itself resolves
++  plus the parent — and a raw-instrument file, by its own embedded contract or
++  its folder's, by its preparation, #724), a capacity plan that refuses an item larger than the
++  machine, a memory guard
+   that cancels the heaviest running item (never one running alone) and reruns
+   it alone once, a wall-clock budget per item, no item starting another. The
+   model decides between swarm runs and inside each item, never within a run.
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index 3333bd34..5e8ec1fd 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -82,20 +82,127 @@
+ _mem_running: dict = {}           # admitted branch key -> estimated bytes
+ 
+ 
++_BRANCH_PREP_FACTOR = 1.2        # raw stack (uncompressed) -> preparation peak
++_BRANCH_MAX_FILES = 5000          # walk at most this many data files
++#: What a branch's agents load: measurement files, not sidecars or reports.
++_DATA_SUFFIXES = frozenset({
++    ".npy", ".npz", ".h5", ".hdf5", ".nxs", ".emd", ".mat", ".mrc", ".dm3", ".dm4", ".ser", ".raw",
++    ".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp",
++    ".csv", ".txt", ".tsv", ".dat", ".xy", ".xye", ".spc", ".spe", ".chi", ".xrdml"})
++_HDF5_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs", ".emd"})
++
++
++def _in_memory_bytes(f: Path) -> float:
++    """What one data file occupies once loaded: an ``.npy`` from its header
++    (no data read); an HDF5 file from its LARGEST dataset's shape and dtype —
++    compression makes the file size understate it about twofold; anything
++    else, its size on disk."""
++    suffix = f.suffix.lower()
++    try:
++        if suffix == ".npy":
++            import numpy as _np
++            return float(_np.load(f, mmap_mode="r").nbytes)
++        if suffix in _HDF5_SUFFIXES:
++            import h5py
++            biggest = [0.0]
++
++            def _visit(_name, obj):
++                if isinstance(obj, h5py.Dataset) and obj.shape:
++                    biggest[0] = max(biggest[0], float(obj.size) * obj.dtype.itemsize)
++            with h5py.File(f, "r") as h:
++                h.visititems(_visit)
++            if biggest[0] > 0:
++                return biggest[0]
++    except Exception:  # noqa: BLE001 - unreadable header: fall back to the file size
++        pass
++    return float(f.stat().st_size)
++
++
++def _data_files(p: Path, pattern: Optional[str]) -> List[Path]:
++    """The data files a branch's agents load: ``p`` itself, or every data
++    file under it (recursively — a raw container keeps its stacks in a
++    subfolder), restricted by ``pattern``."""
++    if p.is_file():
++        return [p]
++    if not p.is_dir():
++        return []
++    out = []
++    for f in p.rglob(pattern or "*"):
++        if f.is_file() and f.suffix.lower() in _DATA_SUFFIXES:
++            out.append(f)
++            if len(out) >= _BRANCH_MAX_FILES:
++                break
++    return out
++
++
+ def _branch_mem_estimate(branch: dict) -> float:
+-    """Coarse peak-working-set estimate for a branch, from its input size."""
++    """Coarse peak-working-set estimate for a branch (#724).
++
++    From its LARGEST unit, not the sum of its files: a series analyses its
++    units one at a time (its replays fan out to ``series_workers``, each
++    holding one unit), so six cubes peak like one. Nested data is counted (a
++    raw container's stacks sit in a subfolder). A file inside a raw-instrument
++    folder — the branch's own folder or one nested in it, as a study bundle
++    holds one — is estimated by its preparation, which reconstructs one stack
++    at a time; everything else by analysis. At most ``_BRANCH_MAX_FILES`` data
++    files are walked, in walk order: past that, a larger unit can be missed.
++    The admission guard only DELAYS
++    work, so a bad estimate costs time, not results; it must also never
++    refuse what the machine can run."""
+     try:
+         p = Path(str(branch.get("data_path") or ""))
+-        nbytes = 0
+-        if p.is_file():
+-            nbytes = p.stat().st_size
+-        elif p.is_dir():
+-            pat = branch.get("pattern") or "*"
+-            nbytes = sum(f.stat().st_size for f in p.glob(pat) if f.is_file())
+-        est = max(nbytes * _BRANCH_MEM_FACTOR, _BRANCH_MEM_FLOOR)
+-        if nbytes > 1e8:   # big enough to invite a parallel per-pixel fit
+-            est += _BRANCH_POOL_OVERHEAD
+-        return est
++        files = _data_files(p, branch.get("pattern"))
++        try:
++            from ..exp_agents.data_preparation import detect_raw_instrument
++        except Exception:  # noqa: BLE001
++            detect_raw_instrument = None
++        raw_dirs: dict = {}
++
++        def _is_raw(f: Path) -> bool:
++            # the file itself first (an HDF5 can carry its contract inside,
++            # which the folder check never opens), then any folder from the
++            # file's own up to the branch root
++            if detect_raw_instrument is None:
++                return False
++            try:
++                if detect_raw_instrument(f):
++                    return True
++            except Exception:  # noqa: BLE001
++                pass
++            stop = p if p.is_dir() else p.parent
++            for d in [f.parent, *f.parent.parents]:
++                if d not in raw_dirs:
++                    try:
++                        raw_dirs[d] = bool(detect_raw_instrument(d))
++                    except Exception:  # noqa: BLE001
++                        raw_dirs[d] = False
++                if raw_dirs[d]:
++                    return True
++                if d == stop:
++                    return False
++            return False
++
++        largest_analysis = largest_raw = 0.0
++        n_analysis = 0
++        for f in files:
++            b = _in_memory_bytes(f)
++            if _is_raw(f):
++                largest_raw = max(largest_raw, b)
++            else:
++                largest_analysis = max(largest_analysis, b)
++                n_analysis += 1
++        # The replay workers the agent will actually run (its own resolver:
++        # SCILINK_HS_SERIES_WORKERS, else SCILINK_MAX_WORKERS, capped), never
++        # more than the units there are to replay; with workers, the parent
++        # still holds its anchor or refit beside them (replays are submitted
++        # the moment a regime locks).
++        workers = min(_resolve_workers(branch.get("series_workers"), "SCILINK_HS_SERIES_WORKERS", 1),
++                      max(n_analysis - 1, 1))
++        units = workers + 1 if workers > 1 else 1
++        analysis = largest_analysis * _BRANCH_MEM_FACTOR * units
++        if largest_analysis > 1e8:   # big enough to invite a parallel per-pixel fit
++            analysis += _BRANCH_POOL_OVERHEAD
++        return max(analysis, largest_raw * _BRANCH_PREP_FACTOR, _BRANCH_MEM_FLOOR)
+     except Exception:  # noqa: BLE001 - an estimate must never break a branch
+         return _BRANCH_MEM_FLOOR
+ 
+diff --git a/tests/test_mem_estimate.py b/tests/test_mem_estimate.py
+new file mode 100644
+index 00000000..7f13dc9c
+--- /dev/null
++++ b/tests/test_mem_estimate.py
+@@ -0,0 +1,153 @@
++"""The admission estimate follows the largest unit, and sees nested data (#724).
++
++``_branch_mem_estimate`` summed a NON-recursive glob of a folder x 6. A folder
++of six hyperspectral cubes (1.55 GB) was estimated at 13.3 GB though an item
++peaks at 4-8 GB however many cubes there are (units run one at a time), and a
++raw-instrument folder whose ~10 GB of stacks sit in a subfolder was estimated
++at the 0.5 GB floor. The estimate now walks recursively over data files,
++takes the LARGEST unit (in memory: an .npy from its header, an HDF5 from its
++largest dataset, uncompressed), multiplies by ``series_workers`` when replays
++fan out, and estimates a raw container by its preparation.
++
++  conda run -n scilink python -m pytest tests/test_mem_estimate.py -q
++"""
++import json
++
++import numpy as np
++import pytest
++
++from scilink.agents.meta_agent import fanout as fo
++from scilink.agents.meta_agent import swarm
++
++
++@pytest.fixture(autouse=True)
++def _no_worker_env(monkeypatch):
++    """The worker count comes from the agent's own resolver, which reads the
++    environment: a test sets what it needs, nothing leaks in from the shell."""
++    for k in ("SCILINK_HS_SERIES_WORKERS", "SCILINK_MAX_WORKERS"):
++        monkeypatch.delenv(k, raising=False)
++
++
++def _cubes(d, n, shape=(64, 64, 128)):
++    d.mkdir(parents=True, exist_ok=True)
++    for i in range(n):
++        np.save(d / f"cube_{i}.npy", np.zeros(shape, dtype=np.float32))
++        (d / f"cube_{i}.json").write_text(json.dumps({"index": i}))   # a sidecar is not data
++    return np.zeros(shape, dtype=np.float32).nbytes
++
++
++def test_a_series_folder_is_estimated_by_its_largest_unit(tmp_path):
++    one = _cubes(tmp_path / "six", 6, shape=(256, 256, 400))           # 105 MB each, 629 MB in all
++    est = fo._branch_mem_estimate({"data_path": str(tmp_path / "six")})
++    assert est == pytest.approx(one * fo._BRANCH_MEM_FACTOR + fo._BRANCH_POOL_OVERHEAD)
++    single = tmp_path / "one"
++    _cubes(single, 1, shape=(256, 256, 400))
++    assert fo._branch_mem_estimate({"data_path": str(single)}) == pytest.approx(est)   # one cube or six: the same
++    # replays fanned out to two workers hold two units, beside the parent's anchor or refit
++    est2 = fo._branch_mem_estimate({"data_path": str(tmp_path / "six"), "series_workers": 2})
++    assert est2 == pytest.approx(3 * one * fo._BRANCH_MEM_FACTOR + fo._BRANCH_POOL_OVERHEAD)
++
++
++def test_the_worker_count_is_the_agents_own(tmp_path, monkeypatch):
++    """The count the agent resolves (SCILINK_HS_SERIES_WORKERS, else
++    SCILINK_MAX_WORKERS, capped by it), never more than the units to replay."""
++    one = _cubes(tmp_path / "four", 4, shape=(256, 256, 400))
++    unit = one * fo._BRANCH_MEM_FACTOR
++    monkeypatch.setenv("SCILINK_MAX_WORKERS", "2")
++    monkeypatch.setenv("SCILINK_HS_SERIES_WORKERS", "8")                 # capped at 2 by the ceiling
++    assert fo._branch_mem_estimate({"data_path": str(tmp_path / "four")}) == pytest.approx(
++        3 * unit + fo._BRANCH_POOL_OVERHEAD)
++    monkeypatch.delenv("SCILINK_MAX_WORKERS")
++    monkeypatch.setenv("SCILINK_HS_SERIES_WORKERS", "16")                # never more than 3 replays of 4 units
++    assert fo._branch_mem_estimate({"data_path": str(tmp_path / "four")}) == pytest.approx(
++        4 * unit + fo._BRANCH_POOL_OVERHEAD)
++    single = tmp_path / "one"
++    _cubes(single, 1, shape=(256, 256, 400))
++    assert fo._branch_mem_estimate({"data_path": str(single)}) == pytest.approx(    # a single file: never multiplied
++        unit + fo._BRANCH_POOL_OVERHEAD)
++
++
++def test_nested_data_is_counted_and_a_pattern_still_restricts(tmp_path):
++    root = tmp_path / "bundle"
++    one = _cubes(root / "hsi" / "deep", 2, shape=(256, 256, 400))
++    (root / "README.md").write_text("x" * 10)
++    est = fo._branch_mem_estimate({"data_path": str(root)})
++    assert est == pytest.approx(one * fo._BRANCH_MEM_FACTOR + fo._BRANCH_POOL_OVERHEAD)   # the old glob saw 10 bytes
++    assert fo._branch_mem_estimate({"data_path": str(root), "pattern": "*.txt"}) == fo._BRANCH_MEM_FLOOR
++
++
++def test_hdf5_is_estimated_uncompressed(tmp_path):
++    h5py = pytest.importorskip("h5py")
++    f = tmp_path / "stack.h5"
++    with h5py.File(f, "w") as h:
++        h.create_dataset("data/frames", data=np.zeros((100, 512, 512), dtype=np.float32),
++                         compression="gzip")                            # compresses to almost nothing
++    uncompressed = 100 * 512 * 512 * 4
++    assert f.stat().st_size < uncompressed / 50
++    assert fo._in_memory_bytes(f) == uncompressed
++    est = fo._branch_mem_estimate({"data_path": str(f)})
++    assert est == pytest.approx(uncompressed * fo._BRANCH_MEM_FACTOR + fo._BRANCH_POOL_OVERHEAD)
++
++
++def test_a_raw_instrument_folder_is_estimated_by_its_preparation(tmp_path):
++    h5py = pytest.importorskip("h5py")
++    root = tmp_path / "raw"
++    (root / "stacks").mkdir(parents=True)
++    (root / "reconstruction_manifest.json").write_text(json.dumps(
++        {"generic_image_routing_permitted": False, "analysis_status": "ready_for_reconstruction"}))
++    for i in range(3):        # declared, never written: the file holds only the header
++        with h5py.File(root / "stacks" / f"run_{i}.h5", "w") as h:
++            h.create_dataset("holograms", shape=(1000, 512, 512), dtype=np.uint16, compression="gzip")
++    stack = 1000 * 512 * 512 * 2                                         # 524 MB per stack, uncompressed
++    est = fo._branch_mem_estimate({"data_path": str(root)})
++    assert est == pytest.approx(stack * fo._BRANCH_PREP_FACTOR)            # one stack at a time, not three
++    assert est > fo._BRANCH_MEM_FLOOR                                       # the old top-level glob gave the floor
++
++
++def test_the_capacity_plan_admits_together_what_fits(tmp_path):
++    """Two six-cube series items: the old sum-based estimate put each at six
++    cubes' worth; by their largest unit both fit on the machine together."""
++    for name in ("a", "b"):
++        _cubes(tmp_path / name, 6, shape=(256, 256, 400))
++    items = [{"label": n, "mode": "analysis", "data_path": str(tmp_path / n), "task": "t"} for n in ("a", "b")]
++    one = fo._branch_mem_estimate({"data_path": str(tmp_path / "a")})
++    mem = {"total": 2 * one + fo._BRANCH_MEM_MARGIN + 1e9, "available": 2 * one + fo._BRANCH_MEM_MARGIN + 1e8}
++    plan = swarm.capacity_plan(items, memory=mem)
++    assert not plan["refused"] and plan["together"] is True
++    assert plan["estimated_bytes"] == pytest.approx(2 * one)
++
++
++def test_a_bundle_with_a_nested_raw_folder_is_estimated_by_unit_kind(tmp_path):
++    """A study bundle (seen on a real one): analysis cubes beside a raw
++    container in its own subfolder. The bundle root is not itself raw, so a
++    rule read only at the root gave the raw stack the analysis factor (16.7
++    GB on the real bundle); each file is now estimated by what will load it."""
++    h5py = pytest.importorskip("h5py")
++    root = tmp_path / "bundle"
++    one = _cubes(root / "hsi", 3, shape=(256, 256, 400))
++    raw = root / "mmzi"
++    (raw / "raw_hdf5").mkdir(parents=True)
++    (raw / "reconstruction_manifest.json").write_text(json.dumps({"generic_image_routing_permitted": False}))
++    with h5py.File(raw / "raw_hdf5" / "run.h5", "w") as h:
++        h.create_dataset("holograms", shape=(1000, 512, 512), dtype=np.uint16, compression="gzip")
++    stack = 1000 * 512 * 512 * 2
++    est = fo._branch_mem_estimate({"data_path": str(root)})
++    assert est == pytest.approx(max(one * fo._BRANCH_MEM_FACTOR + fo._BRANCH_POOL_OVERHEAD,
++                                    stack * fo._BRANCH_PREP_FACTOR))
++    # the stack is not an analysis unit: the old root-only rule estimated it as one
++    assert est < stack * fo._BRANCH_MEM_FACTOR + fo._BRANCH_POOL_OVERHEAD
++
++
++
++def test_an_hdf5_carrying_its_contract_inside_is_estimated_by_preparation(tmp_path):
++    """The folder check reads manifests and JSON sidecars but never opens an
++    HDF5; a raw container whose contract is embedded in the file (one of the
++    three kinds of evidence routing uses) is asked about as a file first."""
++    h5py = pytest.importorskip("h5py")
++    root = tmp_path / "embedded"
++    root.mkdir()
++    with h5py.File(root / "holograms.h5", "w") as h:
++        h.attrs["measurement_type"] = "off_axis_hologram"
++        h.create_dataset("frames", shape=(1000, 512, 512), dtype=np.uint16, compression="gzip")
++    stack = 1000 * 512 * 512 * 2
++    assert fo._branch_mem_estimate({"data_path": str(root)}) == pytest.approx(stack * fo._BRANCH_PREP_FACTOR)

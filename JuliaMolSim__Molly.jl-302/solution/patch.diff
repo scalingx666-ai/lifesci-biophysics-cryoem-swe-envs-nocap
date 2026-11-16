@@ -1,0 +1,921 @@
+diff --git a/docs/src/free_energy.md b/docs/src/free_energy.md
+index b5e23813d..23571d3f6 100644
+--- a/docs/src/free_energy.md
++++ b/docs/src/free_energy.md
+@@ -2119,6 +2119,30 @@ Jackknife SE (kJ mol^-1):            0.176
+ 
+ The experimental hydration free energy of benzene is $-3.67 \pm 0.05$ kJ mol^-1 ([Kashefolgheta et al. 2020](https://pubs.acs.org/jctcce/article/16/12/7556/617259/Evaluating-Classical-Force-Fields-against)), 0.23 kJ mol^-1 above this result, or 1.3 jackknife standard errors.
+ 
++### Logging TSS samples
++
++System loggers see only the physical system. To record what TSS knows about each sample, pass sample loggers to [`TSSSimulation`](@ref): `sample_loggers` for one replica, or `replica_sample_loggers` with one collection per replica.
++[`log_tss_sample!`](@ref) is called with each logger for every collected sample, after each block of `n_md_steps` MD steps, in adaptive and frozen runs. Like the system loggers, the sample loggers also see the initial configuration of each replica, at the start step of the first [`simulate!`](@ref) call.
++The [`TSSSample`](@ref) it receives gives the absolute MD step, the replica, its active system, the active state and window, the window's state indices, the reduced potentials of the sampled coordinates in the window states, the log normalization `log_den` and the conditional state weights.
++For example, to store the window reduced potentials of every fifth sample:
++
++```julia
++sample_logger = TSSSampleLogger(Vector{FT}, 5 * N_MD_STEPS) do sample
++    return copy(sample.reduced_potentials)
++end
++
++tss_sim = TSSSimulation(
++    tss_state;
++    n_md_steps = N_MD_STEPS,
++    n_cycles = N_CYCLES,
++    sample_loggers = (reduced_potentials = sample_logger,),
++)
++simulate!(tss_sim)
++values(sample_logger)
++```
++
++The arrays in a sample, and the system, are reused by the simulation, so a logger must copy what it keeps. Custom loggers implement `log_tss_sample!(logger, sample)` and choose which samples to record, for example from `sample.step`. With `replica_parallel = :threads`, each replica calls its own loggers from its own task.
++
+ ## Free energies with REMD
+ 
+ ### Method overview
+diff --git a/src/free_energy/TSS.jl b/src/free_energy/TSS.jl
+index 4075f8837..0ce29176a 100644
+--- a/src/free_energy/TSS.jl
++++ b/src/free_energy/TSS.jl
+@@ -2,6 +2,9 @@ export
+     TSSHistoryForgetting,
+     TSSState,
+     TSSSimulation,
++    TSSSample,
++    TSSSampleLogger,
++    log_tss_sample!,
+     tss_grid_graph,
+     tss_free_energy_uncertainties,
+     tss_free_energies
+diff --git a/src/free_energy/TSS/single_window.jl b/src/free_energy/TSS/single_window.jl
+index 7a20c4cbd..1438225eb 100644
+--- a/src/free_energy/TSS/single_window.jl
++++ b/src/free_energy/TSS/single_window.jl
+@@ -225,58 +225,6 @@ function tss_global_index(state::TSSLocalEstimator, local_state::Int)
+     return state.state_indices[local_state]
+ end
+ 
+-function tss_sample_global_state(rng::AbstractRNG, state::TSSLocalEstimator)
+-    idx = sample_state(rng, state.weights)
+-    return tss_global_index(state, idx)
+-end
+-
+-function process_tss_sample!(state::TSSLocalEstimator, active_state::ActiveThermoState)
+-    coords = active_state.active_sys.coords
+-    boundary = active_state.active_sys.boundary
+-
+-    evaluate_energy_subset!(
+-        state.evaluation_energies,
+-        state.state_space.partition,
+-        coords,
+-        boundary,
+-        state.evaluation_state_indices,
+-    )
+-
+-    reduced_potentials!(
+-        state.evaluation_reduced_pot,
+-        state.evaluation_energies,
+-        state.state_space,
+-        boundary,
+-        state.evaluation_state_indices,
+-    )
+-    check_tss_finite!(state.evaluation_reduced_pot, "evaluation reduced potentials", state)
+-
+-    for (local_k, global_k) in enumerate(state.state_indices)
+-        eval_k = state.evaluation_local_index_by_state[global_k]
+-        state.energies[local_k] = state.evaluation_energies[eval_k]
+-        state.reduced_pot[local_k] = state.evaluation_reduced_pot[eval_k]
+-    end
+-
+-    check_tss_finite!(state.reduced_pot, "reduced potentials", state)
+-
+-    @. state.log_state_bias = state.f + state.log_dens
+-    check_tss_finite!(state.log_state_bias, "log state bias", state)
+-    conditional_state_weights!(
+-        state.weights,
+-        state.log_state_bias,
+-        state.reduced_pot,
+-        state.scratch
+-    )
+-    check_tss_probabilities!(state.weights, "conditional weights", state)
+-
+-    return state.weights
+-
+-end
+-
+-function process_tss_sample!(state::TSSLocalEstimator)
+-    return process_tss_sample!(state, state.active_state)
+-end
+-
+ function tss_log_den!(state::TSSLocalEstimator)
+     @. state.log_state_bias = state.f + state.log_dens
+     check_tss_finite!(state.log_state_bias, "log state bias", state)
+diff --git a/src/free_energy/TSS/windowed_simulation.jl b/src/free_energy/TSS/windowed_simulation.jl
+index 8dfafdbc7..6a8b711d4 100644
+--- a/src/free_energy/TSS/windowed_simulation.jl
++++ b/src/free_energy/TSS/windowed_simulation.jl
+@@ -42,9 +42,129 @@ function log_windowed_tss_stats!(
+     return stats
+ end
+ 
+-mutable struct WindowedTSSReplica{AS}
++"""
++    TSSSample
++
++One TSS sample, passed to the sample loggers of a [`TSSSimulation`](@ref) by
++[`log_tss_sample!`](@ref).
++
++A sample is collected after each block of `n_md_steps` molecular dynamics steps,
++from the coordinates at the end of the block, so a cycle collects
++`self_adjustment_steps` samples per replica. As the system loggers log the
++initial configuration at the start step of a new simulation, the initial
++configuration of each replica is also passed as a sample, at that step, in the
++first [`simulate!`](@ref) call; its weights and `log_den` use the window
++estimator before any update.
++
++# Fields
++- `step::Int`: the absolute MD step of the sample, on the same step count as
++    the system loggers.
++- `replica_index::Int`: the replica that produced the sample.
++- `system`: the replica's active [`System`](@ref), holding the sampled
++    coordinates, boundary and velocities.
++- `active_state::Int`: the global index of the thermodynamic state that
++    propagated the coordinates.
++- `active_window::Int`: the window of the cycle.
++- `state_indices`: the global state indices of the window.
++- `reduced_potentials`: the reduced potentials of the sampled coordinates in
++    the window states, in the order of `state_indices`.
++- `log_den`: the log normalization `logsumexp(f .+ log_dens .- reduced_potentials)`,
++    with the window estimator's free energies `f` and log sampling densities
++    `log_dens` at the time of the sample.
++- `weights`: the conditional probabilities of the window states given the
++    sampled coordinates, from which the next active state is drawn.
++
++`system`, `state_indices`, `reduced_potentials` and `weights` reference the
++simulation's own arrays, which are reused, so they are valid only during the
++call to [`log_tss_sample!`](@ref) and must not be modified. A logger that keeps
++data must copy it. Nothing is copied off the device for the logger: for a GPU
++system, `system.coords` is a device array.
++"""
++struct TSSSample{S, I, V, T}
++    step::Int
++    replica_index::Int
++    system::S
++    active_state::Int
++    active_window::Int
++    state_indices::I
++    reduced_potentials::V
++    log_den::T
++    weights::V
++end
++
++"""
++    log_tss_sample!(logger, sample::TSSSample)
++
++Record a TSS sample. Called by [`TSSSimulation`](@ref) once per collected sample,
++and for the initial configuration, for each logger in `sample_loggers` or
++`replica_sample_loggers`.
++
++Custom sample loggers should implement this function. As for system loggers,
++the logger decides which samples to record, for example from `sample.step`;
++see [`TSSSampleLogger`](@ref) for a logger with a step interval.
++"""
++function log_tss_sample! end
++
++"""
++    TSSSampleLogger(observable::Function, T, n_steps)
++
++A TSS sample logger that stores `observable(sample)::T` for each
++[`TSSSample`](@ref) whose step is a multiple of `n_steps`.
++
++Samples are collected every `n_md_steps` MD steps, so with `n_steps` a multiple
++of `n_md_steps` it records every `n_steps ÷ n_md_steps`-th sample of each
++replica, at the same steps as a system logger with the same `n_steps`,
++including the initial configuration when the start step is a multiple of
++`n_steps`.
++The observable must copy any array it keeps from the sample.
++Access the stored values with `values(logger)`.
++"""
++struct TSSSampleLogger{T, F}
++    observable::F
++    n_steps::Int
++    history::Vector{T}
++end
++
++function TSSSampleLogger(observable::Function, T::DataType, n_steps::Integer)
++    n_steps > 0 || throw(ArgumentError("TSSSampleLogger n_steps must be positive."))
++    return TSSSampleLogger{T, typeof(observable)}(observable, n_steps, T[])
++end
++
++Base.values(logger::TSSSampleLogger) = logger.history
++
++function log_tss_sample!(logger::TSSSampleLogger, sample::TSSSample)
++    if (sample.step % logger.n_steps) == 0
++        push!(logger.history, logger.observable(sample))
++    end
++    return logger
++end
++
++function Base.show(io::IO, logger::TSSSampleLogger)
++    print(io, "TSSSampleLogger with n_steps ", logger.n_steps, ", ",
++          length(logger.history), " values recorded")
++end
++
++Base.show(io::IO, ::MIME"text/plain", logger::TSSSampleLogger) = show(io, logger)
++
++function log_tss_samples!(sample_loggers, sample::TSSSample)
++    for logger in sample_loggers
++        log_tss_sample!(logger, sample)
++    end
++    return sample_loggers
++end
++
++# Prepares the initial configuration as `simulate!` does before it runs the
++# system loggers at the start step
++function prepare_tss_initial_sample!(sys::System, n_threads::Integer)
++    sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
++    place_virtual_sites!(sys; n_threads=n_threads)
++    return sys
++end
++
++mutable struct WindowedTSSReplica{AS, SL}
+     active_state::AS
+     active_window::Int
++    sample_loggers::SL
+ end
+ 
+ function Base.show(io::IO, replica::WindowedTSSReplica)
+@@ -54,6 +174,25 @@ end
+ 
+ Base.show(io::IO, ::MIME"text/plain", replica::WindowedTSSReplica) = show(io, replica)
+ 
++function log_tss_replica_sample!(replica::WindowedTSSReplica,
++                                 estimator::TSSLocalEstimator,
++                                 sample,
++                                 step::Int,
++                                 replica_index::Int,
++                                 cycle_window::Int)
++    return log_tss_samples!(replica.sample_loggers, TSSSample(
++        step,
++        replica_index,
++        replica.active_state.active_sys,
++        replica.active_state.active_idx,
++        cycle_window,
++        estimator.state_indices,
++        sample.reduced_pot,
++        sample.log_den,
++        sample.weights,
++    ))
++end
++
+ struct WindowedTSSObservation{T, V, PS}
+     replica_index::Int
+     update_window::Int
+@@ -81,8 +220,9 @@ end
+                   self_adjustment_steps=1, log_freq=1000,
+                   n_replicas=nothing, first_states=nothing,
+                   first_windows=nothing, replica_active_states=nothing,
+-                  loggers=(), replica_loggers=nothing, pmf=nothing,
+-                  frozen=false, initial_step=0)
++                  loggers=(), replica_loggers=nothing,
++                  sample_loggers=(), replica_sample_loggers=nothing,
++                  pmf=nothing, frozen=false, initial_step=0)
+ 
+ A windowed TSS simulation driver.
+ 
+@@ -93,6 +233,16 @@ dynamics steps, collects TSS samples, updates window estimators unless
+ `loggers` supplies the logger collection for a single-replica simulation.
+ For multi-replica TSS, use `replica_loggers` to supply one logger collection
+ per newly constructed replica active system.
++
++`sample_loggers` supplies a collection of TSS sample loggers for a
++single-replica simulation, and `replica_sample_loggers` one collection per
++replica for multi-replica TSS, with distinct logger objects for each replica.
++[`log_tss_sample!`](@ref) is called with each logger for every collected
++[`TSSSample`](@ref), in adaptive and frozen runs, and for the initial
++configuration at the steps where the system loggers log it. A replica's sample loggers
++are called by the task that runs that replica, in sample order, so with
++`replica_parallel=:threads` the replicas call their own loggers concurrently.
++Without sample loggers, no sample is constructed.
+ Pass `replica_rngs` to [`simulate!`](@ref) to supply one RNG stream per replica;
+ otherwise, each replica RNG is reseeded from the top-level `rng`.
+ """
+@@ -132,6 +282,8 @@ function TSSSimulation(state::TSSState;
+                                replica_active_states = nothing,
+                                loggers = (),
+                                replica_loggers = nothing,
++                               sample_loggers = (),
++                               replica_sample_loggers = nothing,
+                                pmf = nothing,
+                                frozen::Bool = false,
+                                initial_step::Integer = 0)
+@@ -153,6 +305,8 @@ function TSSSimulation(state::TSSState;
+         replica_active_states = replica_active_states,
+         loggers = loggers,
+         replica_loggers = replica_loggers,
++        sample_loggers = sample_loggers,
++        replica_sample_loggers = replica_sample_loggers,
+     )
+     frozen || validate_windowed_tss_replica_history_support(state, replicas)
+     if !isnothing(pmf) && !(pmf isa PMFDeconvolution{<:TSSPMFDeconvolutionBackend})
+@@ -261,6 +415,47 @@ function normalize_tss_replica_loggers(loggers, replica_loggers, n_replicas::Int
+     return [() for _ in 1:n_replicas]
+ end
+ 
++function validate_tss_sample_logger_collection(sample_loggers, name::AbstractString)
++    if !(sample_loggers isa Union{Tuple, NamedTuple})
++        throw(ArgumentError("$(name) must be a Tuple or NamedTuple of TSS sample loggers."))
++    end
++    return sample_loggers
++end
++
++function normalize_tss_replica_sample_loggers(sample_loggers,
++                                              replica_sample_loggers,
++                                              n_replicas::Int)
++    validate_tss_sample_logger_collection(sample_loggers, "sample_loggers")
++    if !isnothing(replica_sample_loggers)
++        isempty(sample_loggers) ||
++            throw(ArgumentError("pass either sample_loggers or replica_sample_loggers " *
++                                "to TSSSimulation, not both."))
++        normalized = collect(replica_sample_loggers)
++        if length(normalized) != n_replicas
++            throw(ArgumentError("replica_sample_loggers must have length $(n_replicas)."))
++        end
++        for logger_set in normalized
++            validate_tss_sample_logger_collection(logger_set, "replica_sample_loggers entries")
++        end
++        first_type = typeof(first(normalized))
++        if !all(logger_set -> typeof(logger_set) == first_type, normalized)
++            throw(ArgumentError("all TSS replica_sample_loggers entries must have the same type"))
++        end
++        validate_replica_loggers(normalized; name = "replica_sample_loggers")
++        return normalized
++    end
++
++    if n_replicas == 1
++        return [sample_loggers]
++    end
++
++    if !isempty(sample_loggers)
++        throw(ArgumentError("TSSSimulation sample_loggers can only be used with one replica; " *
++                            "pass replica_sample_loggers for multi-replica TSS."))
++    end
++    return [() for _ in 1:n_replicas]
++end
++
+ function default_tss_replica_windows(state::TSSState,
+                                       first_states::AbstractVector{Int})
+     return [first(windows_for_state(state, first_state)) for first_state in first_states]
+@@ -288,7 +483,9 @@ function make_windowed_tss_replicas(state::TSSState;
+                                      first_windows,
+                                      replica_active_states,
+                                      loggers,
+-                                     replica_loggers)
++                                     replica_loggers,
++                                     sample_loggers,
++                                     replica_sample_loggers)
+     n_rep = replica_count(n_replicas, replica_active_states)
+     if n_rep <= 0
+         throw(ArgumentError("n_replicas must be positive."))
+@@ -344,6 +541,12 @@ function make_windowed_tss_replicas(state::TSSState;
+                             "with the desired first_window instead."))
+     end
+ 
++    replica_sample_loggers_normalized = normalize_tss_replica_sample_loggers(
++        sample_loggers,
++        replica_sample_loggers,
++        n_rep,
++    )
++
+     for replica_i in 1:n_rep
+         validate_tss_replica_window(
+             state,
+@@ -354,7 +557,11 @@ function make_windowed_tss_replicas(state::TSSState;
+     end
+ 
+     return [
+-        WindowedTSSReplica(active_states[replica_i], first_window_values[replica_i])
++        WindowedTSSReplica(
++            active_states[replica_i],
++            first_window_values[replica_i],
++            replica_sample_loggers_normalized[replica_i],
++        )
+         for replica_i in 1:n_rep
+     ]
+ end
+@@ -379,36 +586,6 @@ function windowed_tss_cycle_error(state::TSSState,
+     )
+ end
+ 
+-function check_windowed_tss_cycle_state!(state::TSSState,
+-                                          cycle_window::Int,
+-                                          state_idx::Int,
+-                                          substep::Int,
+-                                          label::AbstractString)
+-    if !window_contains_state(state.windows[cycle_window], state_idx)
+-        throw(windowed_tss_cycle_error(
+-            state,
+-            "$(label) state $(state_idx) is not contained in fixed cycle window $(cycle_window)",
+-            cycle_window,
+-            substep,
+-        ))
+-    end
+-    return state
+-end
+-
+-function check_windowed_tss_cycle_window!(state::TSSState,
+-                                           cycle_window::Int,
+-                                           substep::Int)
+-    if state.active_window != cycle_window
+-        throw(windowed_tss_cycle_error(
+-            state,
+-            "active window $(state.active_window) changed during the cycle",
+-            cycle_window,
+-            substep,
+-        ))
+-    end
+-    return state
+-end
+-
+ function drop_old_windowed_tss_histories!(state::TSSState, history_time::Int)
+     for estimator in state.estimators
+         isnothing(estimator.history) && continue
+@@ -571,6 +748,13 @@ function collect_windowed_tss_observation!(state::TSSState{FT},
+             "visited",
+         )
+ 
++        if log_initial_state && substep == 1 && !isempty(replica.sample_loggers)
++            prepare_tss_initial_sample!(replica.active_state.active_sys, n_threads)
++            initial_sample = process_tss_sample!(workspace, estimator, replica.active_state)
++            log_tss_replica_sample!(replica, estimator, initial_sample, initial_step,
++                                    replica_index, cycle_window)
++        end
++
+         simulate!(
+             replica.active_state.active_sys,
+             replica.active_state.active_integrator,
+@@ -582,6 +766,11 @@ function collect_windowed_tss_observation!(state::TSSState{FT},
+         )
+ 
+         sample = process_tss_sample!(workspace, estimator, replica.active_state)
++        if !isempty(replica.sample_loggers)
++            log_tss_replica_sample!(replica, estimator, sample,
++                                    initial_step + substep * n_md_steps,
++                                    replica_index, cycle_window)
++        end
+         final_log_den = sample.log_den
+         window_offset = isnothing(state.coupling) ? zero(FT) :
+                         state.coupling.window_offsets[cycle_window]
+@@ -843,95 +1032,6 @@ function sync_windowed_tss_state_to_replica!(state::TSSState,
+     return state
+ end
+ 
+-function run_windowed_tss_cycle!(state::TSSState,
+-                                  n_md_steps::Int,
+-                                  self_adjustment_steps::Int,
+-                                  n_threads::Int,
+-                                  rng,
+-                                  initial_step::Int,
+-                                  log_initial_state::Bool)
+-    check_windowed_tss_invariant(state)
+-
+-    entry_state = state.active_state.active_idx
+-    switch_active_window!(state; current_state = entry_state)
+-    cycle_window = state.active_window
+-    estimator = active_tss_estimator(state)
+-    check_windowed_tss_cycle_state!(
+-        state,
+-        cycle_window,
+-        entry_state,
+-        0,
+-        "entry",
+-    )
+-
+-    final_visited_state = entry_state
+-    final_next_state = entry_state
+-
+-    for substep in 1:self_adjustment_steps
+-        visited_state = state.active_state.active_idx
+-        check_windowed_tss_cycle_state!(
+-            state,
+-            cycle_window,
+-            visited_state,
+-            substep,
+-            "visited",
+-        )
+-
+-        simulate!(
+-            state.active_state.active_sys,
+-            state.active_state.active_integrator,
+-            n_md_steps;
+-            n_threads = n_threads,
+-            rng = rng,
+-            init_step = initial_step + (substep - 1) * n_md_steps,
+-            run_loggers = (log_initial_state && substep == 1 ? true : :skipstart)
+-        )
+-
+-        check_windowed_tss_cycle_window!(state, cycle_window, substep)
+-
+-        process_tss_sample!(estimator)
+-        next_state = tss_sample_global_state(rng, estimator)
+-        check_windowed_tss_cycle_state!(
+-            state,
+-            cycle_window,
+-            next_state,
+-            substep,
+-            "sampled next",
+-        )
+-
+-        final_visited_state = visited_state
+-        final_next_state = next_state
+-
+-        if substep < self_adjustment_steps
+-            set_active_state!(state.active_state, state.state_space, next_state)
+-            check_windowed_tss_invariant(state)
+-        end
+-    end
+-
+-    history_time = state.iteration + 1
+-    max_df = update_tss_estimates!(
+-        estimator;
+-        visited_state = final_visited_state,
+-        history_time = history_time,
+-        update_adaptive_gamma = false,
+-    )
+-    state.window_update_counts[cycle_window] += 1
+-    state.iteration += 1
+-    drop_old_windowed_tss_histories!(state, state.iteration)
+-    update_windowed_tss_adaptive_gamma!(state)
+-    update_windowed_tss_coupling!(state)
+-
+-    set_active_state!(state.active_state, state.state_space, final_next_state)
+-    check_windowed_tss_invariant(state)
+-
+-    return (
+-        update_window = cycle_window,
+-        visited_state = final_visited_state,
+-        next_state = final_next_state,
+-        max_delta_f = max_df,
+-    )
+-end
+-
+ function simulate!(sim::TSSSimulation;
+                    rng = Random.default_rng(),
+                    n_threads::Integer = Threads.nthreads(),
+@@ -946,61 +1046,16 @@ function simulate!(sim::TSSSimulation;
+ 
+     parallel_mode = resolve_tss_replica_parallel(sim, replica_parallel, Int(n_threads))
+     thread_div = equal_parts(Int(n_threads), length(sim.replicas))
+-    legacy_single_path = length(sim.replicas) == 1 &&
+-                         sim.replicas[1].active_state === state.active_state &&
+-                         sim.replicas[1].active_window == state.active_window &&
+-                         isnothing(sim.pmf) &&
+-                         !sim.frozen
+     if isnothing(replica_rngs)
+-        legacy_single_path || seed_windowed_tss_replica_rngs!(sim, rng)
+-        cycle_rng = rng
++        seed_windowed_tss_replica_rngs!(sim, rng)
+     else
+         seed_windowed_tss_replica_rngs!(sim, replica_rngs)
+-        cycle_rng = legacy_single_path ? only(sim.replica_workspaces).rng : rng
+     end
+ 
+     progress = setup_progress(sim.n_cycles, show_progress)
+     for cycle in 1:sim.n_cycles
+         cycle_start_step = sim.current_step
+         log_initial_state = sim.initial_log_pending
+-        if legacy_single_path
+-            result = run_windowed_tss_cycle!(
+-                state,
+-                sim.n_md_steps,
+-                sim.self_adjustment_steps,
+-                Int(n_threads),
+-                cycle_rng,
+-                cycle_start_step,
+-                log_initial_state,
+-            )
+-            sim.replicas[1].active_window = state.active_window
+-            estimator = state.estimators[result.update_window]
+-
+-            if should_log_tss(estimator.iteration, sim.log_freq)
+-                log_tss_stats!(
+-                    estimator.stats,
+-                    estimator,
+-                    result.visited_state,
+-                    result.next_state,
+-                    result.max_delta_f,
+-                )
+-            end
+-            if should_log_tss(state.iteration, sim.log_freq)
+-                log_windowed_tss_stats!(
+-                    state.stats,
+-                    state,
+-                    result.update_window,
+-                    result.visited_state,
+-                    result.next_state,
+-                    result.max_delta_f,
+-                )
+-            end
+-            sim.current_step += sim.self_adjustment_steps * sim.n_md_steps
+-            sim.initial_log_pending = false
+-            next_nograd!(progress)
+-            continue
+-        end
+-
+         observations = if parallel_mode == :threads
+             collect_windowed_tss_observations_threaded!(
+                 sim,
+diff --git a/src/free_energy/TSS/windows.jl b/src/free_energy/TSS/windows.jl
+index 49994c639..c2ceb4300 100644
+--- a/src/free_energy/TSS/windows.jl
++++ b/src/free_energy/TSS/windows.jl
+@@ -932,11 +932,6 @@ function other_window_for_state(state::TSSState, global_state::Integer)
+     return other_window_for_state(state, state.active_window, global_state)
+ end
+ 
+-function switch_active_window!(state::TSSState; current_state::Integer = state.active_state.active_idx)
+-    state.active_window = other_window_for_state(state, current_state)
+-    return state
+-end
+-
+ function check_windowed_tss_invariant(state::TSSState)
+     active_window = state.windows[state.active_window]
+     if !window_contains_state(active_window, state.active_state.active_idx)
+diff --git a/src/loggers.jl b/src/loggers.jl
+index aa66e9ee8..c312e10df 100644
+--- a/src/loggers.jl
++++ b/src/loggers.jl
+@@ -936,7 +936,7 @@ function log_property!(logger::TrajectoryWriter, sys::System, neighbors=nothing,
+     end
+ end
+ 
+-function validate_replica_loggers(replica_loggers)
++function validate_replica_loggers(replica_loggers; name::AbstractString="replica_loggers")
+     seen_loggers = Tuple{Any, Int}[]
+     seen_paths = Dict{String, Int}()
+     for (replica_i, loggers) in pairs(replica_loggers)
+@@ -944,7 +944,7 @@ function validate_replica_loggers(replica_loggers)
+             if !isbitstype(typeof(logger))
+                 for (seen_logger, prev_i) in seen_loggers
+                     if logger === seen_logger && prev_i != replica_i
+-                        throw(ArgumentError("replica_loggers cannot reuse the same " *
++                        throw(ArgumentError("$(name) cannot reuse the same " *
+                                             "stateful logger object across replicas"))
+                     end
+                 end
+@@ -954,7 +954,7 @@ function validate_replica_loggers(replica_loggers)
+                 filepath = abspath(logger.filepath)
+                 prev_i = get(seen_paths, filepath, nothing)
+                 if !isnothing(prev_i) && prev_i != replica_i
+-                    throw(ArgumentError("replica_loggers cannot contain multiple " *
++                    throw(ArgumentError("$(name) cannot contain multiple " *
+                                         "TrajectoryWriters with the same filepath ($filepath)"))
+                 end
+                 seen_paths[filepath] = replica_i
+diff --git a/test/tss.jl b/test/tss.jl
+index 253fdc6d8..b3150936d 100644
+--- a/test/tss.jl
++++ b/test/tss.jl
+@@ -78,6 +78,46 @@ function make_tss_pmf_thermo_states(; n_atoms=4, n_states=4)
+     ]
+ end
+ 
++mutable struct TSSSampleCounter
++    n::Int
++end
++
++Molly.log_tss_sample!(counter::TSSSampleCounter, sample::TSSSample) = (counter.n += 1; counter)
++
++function tss_sample_record(sample)
++    return (
++        step=sample.step,
++        replica_index=sample.replica_index,
++        coords=copy(sample.system.coords),
++        boundary=sample.system.boundary,
++        active_state=sample.active_state,
++        active_window=sample.active_window,
++        state_indices=copy(sample.state_indices),
++        reduced_potentials=copy(sample.reduced_potentials),
++        log_den=sample.log_den,
++        weights=copy(sample.weights),
++    )
++end
++
++function tss_sample_loggers(n_steps)
++    return (
++        count=TSSSampleCounter(0),
++        all=TSSSampleLogger(tss_sample_record, Any, 1),
++        strided=TSSSampleLogger(tss_sample_record, Any, n_steps),
++    )
++end
++
++# Reduced potentials of a recorded sample, evaluated independently on each
++# window state's own system
++function tss_reference_reduced_potentials(thermo_states, record)
++    return map(record.state_indices) do state_i
++        sys = System(thermo_states[state_i].system;
++                     coords=copy(record.coords), boundary=record.boundary)
++        energy = potential_energy(sys, find_neighbors(sys))
++        return Molly.reduced_potential(thermo_states[state_i], energy, record.boundary)
++    end
++end
++
+ @testset "Times Square Sampling (TSS)" begin
+     thermo_states = make_tss_thermo_states()
+ 
+@@ -370,6 +410,195 @@ end
+         )
+     end
+ 
++    @testset "sample loggers" begin
++        n_md_steps, n_cycles, self_adjustment_steps = 2, 3, 2
++        n_samples = n_cycles * self_adjustment_steps
++        # The initial configuration at step 0, then one sample per MD block
++        sample_steps = collect(0:n_md_steps:(n_samples * n_md_steps))
++        strided_steps = filter(step -> step % 4 == 0, sample_steps)
++        @test strided_steps == [0, 4, 8, 12]
++
++        function check_reduced_potentials(thermo_states, records)
++            for record in records
++                @test record.reduced_potentials ≈
++                      tss_reference_reduced_potentials(thermo_states, record) rtol=1e-8
++            end
++        end
++
++        # Single replica, adaptive and frozen
++        single_states = make_tss_thermo_states()
++        function run_single(; frozen=false, sample_loggers=())
++            state = Molly.TSSState(single_states; first_state=1, ETA=1.0, dens_reg=1e-4)
++            sim = Molly.TSSSimulation(state;
++                n_md_steps=n_md_steps,
++                n_cycles=n_cycles,
++                self_adjustment_steps=self_adjustment_steps,
++                log_freq=1,
++                frozen=frozen,
++                sample_loggers=sample_loggers,
++            )
++            Molly.simulate!(sim; rng=MersenneTwister(21), show_progress=false)
++            return state, sim
++        end
++
++        let
++            loggers = tss_sample_loggers(4)
++            state, sim = run_single(sample_loggers=loggers)
++            records = values(loggers.all)
++            @test loggers.count.n == n_samples + 1
++            @test [record.step for record in records] == sample_steps
++            @test [record.step for record in values(loggers.strided)] == strided_steps
++            @test all(record -> record.replica_index == 1, records)
++            @test all(record -> record.state_indices == [1, 2, 3], records)
++            @test first(records).active_state == 1
++            # The statistics record the last sample of each cycle
++            last_records = records[(1 + self_adjustment_steps):self_adjustment_steps:end]
++            @test [record.active_state for record in last_records] == state.stats.visited_state
++            @test [record.active_window for record in last_records] == state.stats.update_window
++            @test all(record -> sum(record.weights) ≈ 1, records)
++            check_reduced_potentials(single_states, records)
++
++            reference_state, reference_sim = run_single()
++            @test reference_state.estimators[1].f == state.estimators[1].f
++            @test reference_state.stats.visited_state == state.stats.visited_state
++            @test reference_sim.replicas[1].active_state.active_sys.coords ==
++                  sim.replicas[1].active_state.active_sys.coords
++
++            # As for the system loggers, a resumed run does not log its start again
++            Molly.simulate!(sim; rng=MersenneTwister(22), show_progress=false)
++            @test loggers.count.n == 2 * n_samples + 1
++            @test [record.step for record in values(loggers.all)] ==
++                  collect(0:n_md_steps:(2 * n_samples * n_md_steps))
++        end
++
++        # Single replica, frozen
++        frozen_loggers = tss_sample_loggers(4)
++        frozen_state, _ = run_single(frozen=true, sample_loggers=frozen_loggers)
++        frozen_records = values(frozen_loggers.all)
++        @test frozen_loggers.count.n == n_samples + 1
++        @test [record.step for record in frozen_records] == sample_steps
++        check_reduced_potentials(single_states, frozen_records)
++        for record in frozen_records
++            estimator = frozen_state.estimators[record.active_window]
++            log_bias = estimator.f .+ estimator.log_dens .- record.reduced_potentials
++            @test record.log_den ≈ Molly.logsumexp(log_bias)
++            @test record.weights ≈ exp.(log_bias .- record.log_den)
++        end
++
++        # Multiple replicas, adaptive and frozen, serial and threaded
++        multi_states = make_tss_thermo_states(n_states=4)
++        graph4 = Molly.tss_grid_graph((4,); window_size=(2,), periodic=false)
++        function run_multi(parallel; frozen=false, with_loggers=true)
++            state = Molly.TSSState(multi_states;
++                graph=graph4,
++                first_state=1,
++                first_window=1,
++                ETA=1.0,
++                dens_reg=1e-4,
++                history_forgetting=Molly.TSSHistoryForgetting(alpha=0.0, phi=1.2),
++            )
++            replica_sample_loggers = [tss_sample_loggers(4), tss_sample_loggers(4)]
++            sim = Molly.TSSSimulation(state;
++                n_md_steps=n_md_steps,
++                n_cycles=n_cycles,
++                self_adjustment_steps=self_adjustment_steps,
++                log_freq=1,
++                n_replicas=2,
++                first_states=[1, 3],
++                frozen=frozen,
++                replica_sample_loggers=(with_loggers ? replica_sample_loggers : nothing),
++            )
++            Molly.simulate!(sim;
++                replica_rngs=[MersenneTwister(31), MersenneTwister(32)],
++                n_threads=2,
++                replica_parallel=parallel,
++                show_progress=false,
++            )
++            return state, sim, replica_sample_loggers
++        end
++
++        for frozen in (false, true)
++            state, sim, replica_loggers = run_multi(:serial; frozen=frozen)
++            for (replica_i, loggers) in enumerate(replica_loggers)
++                records = values(loggers.all)
++                @test loggers.count.n == n_samples + 1
++                @test [record.step for record in records] == sample_steps
++                @test [record.step for record in values(loggers.strided)] == strided_steps
++                @test all(record -> record.replica_index == replica_i, records)
++                @test all(record -> record.state_indices ==
++                                    state.windows[record.active_window].state_indices,
++                          records)
++                @test all(record -> record.active_state in record.state_indices, records)
++                @test first(records).active_state == [1, 3][replica_i]
++                # The initial configuration is reported in the window of the first cycle
++                @test records[1].active_window == records[2].active_window
++                for cycle in 1:n_cycles
++                    cycle_records = records[(1 + (cycle - 1) * self_adjustment_steps + 1):(1 + cycle * self_adjustment_steps)]
++                    @test allequal(record.active_window for record in cycle_records)
++                    if !frozen
++                        @test last(cycle_records).active_state ==
++                              state.stats.replica_visited_states[cycle][replica_i]
++                        @test last(cycle_records).active_window ==
++                              state.stats.replica_update_windows[cycle][replica_i]
++                    end
++                end
++                check_reduced_potentials(multi_states, records)
++            end
++
++            reference_state, reference_sim, _ = run_multi(:serial; frozen=frozen, with_loggers=false)
++            @test [est.f for est in reference_state.estimators] == [est.f for est in state.estimators]
++            @test all(
++                reference_sim.replicas[i].active_state.active_sys.coords ==
++                sim.replicas[i].active_state.active_sys.coords
++                for i in 1:2
++            )
++
++            if Threads.nthreads() > 1
++                _, _, threaded_loggers = run_multi(:threads; frozen=frozen)
++                for (serial, threaded) in zip(replica_loggers, threaded_loggers)
++                    @test threaded.count.n == serial.count.n
++                    @test values(threaded.all) == values(serial.all)
++                end
++            end
++        end
++
++        @test_throws ArgumentError TSSSampleLogger(tss_sample_record, Any, 0)
++        @test_throws ArgumentError Molly.TSSSimulation(
++            Molly.TSSState(single_states; first_state=1, ETA=1.0, dens_reg=1e-4);
++            n_md_steps=1,
++            n_cycles=1,
++            sample_loggers=[TSSSampleCounter(0)],
++        )
++        multi_state = Molly.TSSState(multi_states;
++            graph=graph4,
++            first_state=1,
++            first_window=1,
++            ETA=1.0,
++            dens_reg=1e-4,
++            history_forgetting=Molly.TSSHistoryForgetting(alpha=0.0, phi=1.2),
++        )
++        @test_throws ArgumentError Molly.TSSSimulation(multi_state;
++            n_md_steps=1, n_cycles=1, n_replicas=2, first_states=[1, 3],
++            sample_loggers=(count=TSSSampleCounter(0),),
++        )
++        @test_throws ArgumentError Molly.TSSSimulation(multi_state;
++            n_md_steps=1, n_cycles=1, n_replicas=2, first_states=[1, 3],
++            replica_sample_loggers=[(count=TSSSampleCounter(0),)],
++        )
++        shared_counter = TSSSampleCounter(0)
++        @test_throws ArgumentError Molly.TSSSimulation(multi_state;
++            n_md_steps=1, n_cycles=1, n_replicas=2, first_states=[1, 3],
++            replica_sample_loggers=[(count=shared_counter,), (count=shared_counter,)],
++        )
++        @test_throws ArgumentError Molly.TSSSimulation(
++            Molly.TSSState(single_states; first_state=1, ETA=1.0, dens_reg=1e-4);
++            n_md_steps=1,
++            n_cycles=1,
++            sample_loggers=(count=TSSSampleCounter(0),),
++            replica_sample_loggers=[(count=TSSSampleCounter(0),)],
++        )
++    end
++
+     @testset "windowed jackknife uncertainty" begin
+         thermo_states4 = make_tss_thermo_states(n_states=4)
+         graph4 = Molly.tss_grid_graph((4,); window_size=(2,), periodic=false)

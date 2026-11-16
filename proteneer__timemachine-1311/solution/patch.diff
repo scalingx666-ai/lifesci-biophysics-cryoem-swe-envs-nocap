@@ -1,0 +1,95 @@
+diff --git a/tests/data/water_sampling_bug.pkl b/tests/data/water_sampling_bug.pkl
+new file mode 100644
+index 0000000000..9ce26950da
+Binary files /dev/null and b/tests/data/water_sampling_bug.pkl differ
+diff --git a/tests/test_cuda_targeted_insertion_mover.py b/tests/test_cuda_targeted_insertion_mover.py
+index 3c0b909fe0..ae7bf039db 100644
+--- a/tests/test_cuda_targeted_insertion_mover.py
++++ b/tests/test_cuda_targeted_insertion_mover.py
+@@ -1,5 +1,7 @@
++import pickle
+ from dataclasses import replace
+ from importlib import resources
++from pathlib import Path
+ from typing import List
+ 
+ import numpy as np
+@@ -1067,3 +1069,11 @@ def test_targeted_moves_with_complex_and_ligand_in_brd4(
+             # If an unexpect error was raised, re-raise the error
+             raise
+     assert False, f"No moves were made after {iterations}"
++
++
++@pytest.mark.memcheck
++def test_targeted_insertion_invalid_sample_bug():
++    with open(Path(__file__).parent / "data" / "water_sampling_bug.pkl", "rb") as ifs:
++        state, md_params = pickle.load(ifs)
++    md_params = replace(md_params, n_eq_steps=2_000, steps_per_frame=10)
++    sample(state, md_params, 100)
+diff --git a/timemachine/cpp/src/kernels/k_exchange.cu b/timemachine/cpp/src/kernels/k_exchange.cu
+index dacc9c4dd3..f5637f9450 100644
+--- a/timemachine/cpp/src/kernels/k_exchange.cu
++++ b/timemachine/cpp/src/kernels/k_exchange.cu
+@@ -747,16 +747,22 @@ template void __global__ k_setup_destination_weights_for_targeted<double>(
+ );
+ 
+ void __global__ k_adjust_sample_idxs(
++    const int total_proposals,
+     const int batch_size,
++    const int *__restrict__ noise_offset,           // [1]
+     const int *__restrict__ targeting_inner_volume, // [batch_size]
+     const int *__restrict__ inner_count,            // [1]
+-    const int *__restrict__ partitioned_indices,    // [inner_count]
++    const int *__restrict__ partitioned_indices,    // [num_mols] Total number of molecules being sampled
+     int *__restrict__ sample_idxs                   // [batch_size]
+ ) {
+-    const int local_inner_count = inner_count[0];
++    const int num_prev_proposals = *noise_offset;
++    const int local_inner_count = *inner_count;
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+ 
+-    while (idx < batch_size) {
++    // Only evaluate up to idx + num_prev_proposals < total proposals. The samples beyond this point
++    // contain stale data due to k_decide_targeted_moves not constructing them. All downstream kernels will
++    // use stale samples, but no proposals past the total number proposals will be evaluated in k_accept_first_valid_move_targeted
++    while (idx < batch_size && idx + num_prev_proposals < total_proposals) {
+         const int target_inner = targeting_inner_volume[idx];
+         const int offset = target_inner == 1 ? local_inner_count : 0;
+         const int before = sample_idxs[idx];
+diff --git a/timemachine/cpp/src/kernels/k_exchange.cuh b/timemachine/cpp/src/kernels/k_exchange.cuh
+index 29269e4c89..5e9fbb43db 100644
+--- a/timemachine/cpp/src/kernels/k_exchange.cuh
++++ b/timemachine/cpp/src/kernels/k_exchange.cuh
+@@ -200,11 +200,17 @@ void __global__ k_setup_destination_weights_for_targeted(
+     const RealType *__restrict__ weights,           // [num_target_mols]
+     RealType *__restrict__ output_weights);
+ 
++// k_adjust_sample_idxs is to to handle that in the TIBD exchange move the initial samples
++// are selected from either the inner or outer volume. So the indices will go from 0 -> len(inner) or len(outer)
++// depending on the region being sampled. All of the downstream code expect the sample idxs to be from 0 -> num_mols
++// This kernel simple adjusts the sample idxs to match that expectation.
+ void __global__ k_adjust_sample_idxs(
++    const int total_proposals,
+     const int batch_size,
++    const int *__restrict__ noise_offset,           // [1]
+     const int *__restrict__ targeting_inner_volume, // [batch_size]
+     const int *__restrict__ inner_count,            // [1]
+-    const int *__restrict__ partitioned_indices,    // [inner_count]
++    const int *__restrict__ partitioned_indices,    // [num_mols]
+     int *__restrict__ sample_idxs                   // [batch_size]
+ );
+ 
+diff --git a/timemachine/cpp/src/tibd_exchange_move.cu b/timemachine/cpp/src/tibd_exchange_move.cu
+index b1637dcbaa..3f77c8d3db 100644
+--- a/timemachine/cpp/src/tibd_exchange_move.cu
++++ b/timemachine/cpp/src/tibd_exchange_move.cu
+@@ -293,7 +293,9 @@ void TIBDExchangeMove<RealType>::move(
+ 
+         // Selected an index from the src weights, need to remap the samples idx to the mol indices
+         k_adjust_sample_idxs<<<sample_blocks, tpb, 0, stream>>>(
++            this->num_proposals_per_move_,
+             this->batch_size_,
++            this->d_noise_offset_.data,
+             d_targeting_inner_vol_.data,
+             d_inner_mols_count_.data,
+             d_partitioned_indices_.data,

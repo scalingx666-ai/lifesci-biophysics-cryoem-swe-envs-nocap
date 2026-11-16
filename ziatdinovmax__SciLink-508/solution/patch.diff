@@ -1,0 +1,392 @@
+diff --git a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+index f0e59d587..fe5d9d692 100644
+--- a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
++++ b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+@@ -15,7 +15,8 @@
+ from ....skills.hyperspectral.eels import eels as tools
+ from ....skills._shared.image_processor import load_image
+ from ..preprocess import HyperspectralPreprocessingAgent
+-from ..metadata_converter import resolve_axis_spec, describe_axes_for_prompt
++from ..metadata_converter import (resolve_axis_spec, describe_axes_for_prompt,
++                                  signal_axis_values)
+ from ..instruct import (
+     COMPONENT_INITIAL_ESTIMATION_INSTRUCTIONS,
+     COMPONENT_SELECTION_WITH_ELBOW_INSTRUCTIONS,
+@@ -2782,7 +2783,10 @@ def execute(self, state: dict) -> dict:
+         axis_units = axis_2.get("units", "arbitrary units")
+ 
+         if "energy_axis" not in state:
+-            if "start" in axis_2 and "end" in axis_2:
++            _samples = signal_axis_values(axis_2, e, logger=self.logger)
++            if _samples is not None:
++                state["energy_axis"] = _samples
++            elif "start" in axis_2 and "end" in axis_2:
+                 state["energy_axis"] = np.linspace(axis_2["start"], axis_2["end"], e)
+             else:
+                 state["energy_axis"] = np.arange(e)
+diff --git a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+index 05120da67..7a6644ac0 100644
+--- a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
++++ b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+@@ -708,7 +708,7 @@ def _maybe_bank_scripts(self, records: list, skill_state: dict,
+             if not bankable:
+                 return []
+ 
+-            from .metadata_converter import resolve_axis_spec
++            from .metadata_converter import resolve_axis_spec, signal_axis_values
+ 
+             si = self._handle_system_info(system_info)
+             active_skills = [
+@@ -721,7 +721,10 @@ def _maybe_bank_scripts(self, records: list, skill_state: dict,
+                 cube = self._load_hyperspectral_data(data_path)
+                 axis_2 = resolve_axis_spec(si)["axis_2"]
+                 e = cube.shape[-1]
+-                if "start" in axis_2 and "end" in axis_2:
++                axis = signal_axis_values(axis_2, e, logger=self.logger)
++                if axis is not None:
++                    axis_units = axis_2.get("units", "arbitrary units")
++                elif "start" in axis_2 and "end" in axis_2:
+                     axis = np.linspace(axis_2["start"], axis_2["end"], e)
+                     axis_units = axis_2.get("units", "arbitrary units")
+                 else:
+diff --git a/scilink/agents/exp_agents/metadata_converter.py b/scilink/agents/exp_agents/metadata_converter.py
+index 7586af443..ec8861070 100644
+--- a/scilink/agents/exp_agents/metadata_converter.py
++++ b/scilink/agents/exp_agents/metadata_converter.py
+@@ -1,5 +1,6 @@
+ import json
+ import logging
++import math
+ import os
+ 
+ from ...wrappers.openai_wrapper import OpenAIAsGenerativeModel
+@@ -267,17 +268,23 @@ def _describes_spectral_imaging(metadata: dict) -> bool:
+ 
+ 
+ def _has_resolvable_energy_axis(metadata: dict) -> bool:
+-    """True when an energy/signal axis with both endpoints can be resolved —
+-    either legacy ``energy_range`` or ``axis_spec.axis_2`` carries start+end."""
++    """True when an energy/signal axis can be resolved — legacy
++    ``energy_range`` or ``axis_spec.axis_2`` with start+end, or an explicit
++    per-channel sample vector (``axis_spec.axis_2.samples`` or a recognized
++    top-level vector such as ``wavelengths_nm``)."""
+     er = metadata.get("energy_range")
+     if isinstance(er, dict) and er.get("start") is not None and er.get("end") is not None:
+         return True
+     ax = metadata.get("axis_spec")
+     if isinstance(ax, dict):
+         a2 = ax.get("axis_2")
+-        if isinstance(a2, dict) and a2.get("start") is not None and a2.get("end") is not None:
+-            return True
+-    return False
++        if isinstance(a2, dict):
++            if a2.get("start") is not None and a2.get("end") is not None:
++                return True
++            if _coerce_samples(a2.get("samples")) is not None:
++                return True
++    return any(_coerce_samples(metadata.get(k)) is not None
++               for k in _SIGNAL_SAMPLE_KEYS)
+ 
+ 
+ def check_schema_conformance(metadata: dict) -> tuple[bool, list[str]]:
+@@ -459,6 +466,50 @@ def normalize_metadata_dict(metadata: dict) -> tuple[dict, bool]:
+ _AXIS_SIGNAL_DEFAULT = {"name": "energy", "units": "eV", "kind": "signal"}
+ 
+ 
++# Recognized top-level metadata keys carrying the exact per-channel sample
++# positions of the signal axis (instrument-preserved, generally NON-uniform —
++# e.g. a spectrometer's true wavelength table). When present they beat a
++# linspace(start, end, n) reconstruction, which can be several nm off
++# mid-spectrum for a nonuniformly sampled axis.
++_SIGNAL_SAMPLE_KEYS = ("wavelengths_nm", "wavelengths", "energies")
++
++
++def _coerce_samples(value) -> list | None:
++    """Interpret *value* as an explicit per-channel axis vector.
++
++    Returns a list of floats (len >= 2, all finite) or None when the value is
++    not a usable numeric sequence."""
++    if value is None or isinstance(value, (str, bytes, dict)):
++        return None
++    try:
++        seq = [float(v) for v in value]
++    except (TypeError, ValueError):
++        return None
++    if len(seq) < 2 or not all(math.isfinite(v) for v in seq):
++        return None
++    return seq
++
++
++def signal_axis_values(axis_info: dict | None, n_channels: int, logger=None):
++    """Exact per-channel axis vector from ``axis_info['samples']``, or None.
++
++    Returns a float ndarray when the resolved axis carries explicit samples
++    matching *n_channels*; None otherwise (callers keep their existing
++    linspace(start, end) / channel-index fallbacks). A length mismatch is
++    warned about and ignored — never fatal."""
++    import numpy as _np
++    samples = _coerce_samples((axis_info or {}).get("samples"))
++    if samples is None:
++        return None
++    if len(samples) != int(n_channels):
++        if logger is not None:
++            logger.warning(
++                f"axis samples length {len(samples)} != data channels "
++                f"{n_channels}; falling back to start/end axis construction")
++        return None
++    return _np.asarray(samples, dtype=float)
++
++
+ def resolve_axis_spec(system_info: dict | None) -> dict:
+     """Return a fully-populated axis_spec for a 3D hyperspectral dataset.
+ 
+@@ -472,6 +523,10 @@ def resolve_axis_spec(system_info: dict | None) -> dict:
+     ``signal_is_nonnegative`` (bool). The signal-like axis additionally
+     carries ``start`` and ``end`` when known; downstream callers raise if
+     they need those values and they are absent — same behavior as today.
++    ``axis_2`` also carries ``samples`` (the exact per-channel positions)
++    when the metadata provides them — via ``axis_spec.axis_2.samples`` or a
++    recognized top-level vector (``wavelengths_nm``, ...); ``start``/``end``
++    default to the first/last sample so range-only consumers keep working.
+     """
+     system_info = system_info or {}
+     provided = system_info.get("axis_spec") or {}
+@@ -502,8 +557,22 @@ def resolve_axis_spec(system_info: dict | None) -> dict:
+         "units": user_axis_2.get("units", energy_range.get("units") or _AXIS_SIGNAL_DEFAULT["units"]),
+         "kind": user_axis_2.get("kind", _AXIS_SIGNAL_DEFAULT["kind"]),
+     }
++    # Exact per-channel samples: axis_spec.axis_2.samples wins; else adopt a
++    # recognized top-level vector (the instrument's preserved axis table).
++    samples = _coerce_samples(user_axis_2.get("samples"))
++    if samples is None:
++        for _k in _SIGNAL_SAMPLE_KEYS:
++            samples = _coerce_samples(system_info.get(_k))
++            if samples is not None:
++                break
++    if samples is not None:
++        axis_2["samples"] = samples
+     start = user_axis_2.get("start", energy_range.get("start"))
+     end = user_axis_2.get("end", energy_range.get("end"))
++    if start is None and samples is not None:
++        start = samples[0]
++    if end is None and samples is not None:
++        end = samples[-1]
+     if start is not None:
+         axis_2["start"] = start
+     if end is not None:
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index 1abd14b8b..e0194798b 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -2045,6 +2045,14 @@ def fuse_delegations(orch, indices: List[int], focus: Optional[str] = None) -> s
+     # synthesis call runs.
+     with orch._fanout_lock:
+         fusion_n = sum(1 for e in ledger if e.get("mode") == "fusion") + 1
++        # Collision guard: the ledger count alone is not a safe allocator —
++        # a restored session whose checkpoint predates a fusion entry (or any
++        # counter drift) would re-allocate an existing dir and silently
++        # OVERWRITE the earlier fusion_report.html/json (found live on a
++        # restore_checkpoint=True second fan-out). Advance past whatever
++        # already exists on disk.
++        while (orch.fusion_dir / f"{fusion_n:02d}").exists():
++            fusion_n += 1
+     out_dir = orch.fusion_dir / f"{fusion_n:02d}"
+     out_dir.mkdir(parents=True, exist_ok=True)
+ 
+@@ -2270,6 +2278,15 @@ def fuse_delegations(orch, indices: List[int], focus: Optional[str] = None) -> s
+             "warnings": ([ungated_warning] if ungated_warning else []),
+             "error": None,
+         })
++    # Persist the fusion entry the way _close_delegation persists analysis
++    # entries: without this, a resumed session restores a ledger with no
++    # mode="fusion" entries — losing fusion history and resetting the
++    # fusion-dir counter (the overwrite the collision guard above defends
++    # against).
++    try:
++        orch._auto_checkpoint()
++    except Exception as e:  # noqa: BLE001 - checkpointing must not fail the fusion
++        logger.warning(f"could not checkpoint after fusion: {e}")
+ 
+     return json.dumps({
+         "status": "success",
+diff --git a/scilink/skills/hyperspectral/eels/eels.py b/scilink/skills/hyperspectral/eels/eels.py
+index 032daf5ff..353f18691 100644
+--- a/scilink/skills/hyperspectral/eels/eels.py
++++ b/scilink/skills/hyperspectral/eels/eels.py
+@@ -176,6 +176,16 @@ def create_axis(
+     name = axis_info.get("name", "axis")
+     units = axis_info.get("units", "a.u.")
+ 
++    # Exact per-channel samples (instrument-preserved, generally nonuniform)
++    # beat a linspace reconstruction, which can be several nm/eV off
++    # mid-spectrum. Falls through on absence or a length mismatch.
++    from ....agents.exp_agents.metadata_converter import signal_axis_values
++    _samples = signal_axis_values(axis_info, n_channels,
++                                  logger=logging.getLogger(__name__))
++    if _samples is not None:
++        label_name = name[:1].upper() + name[1:] if name else "Axis"
++        return _samples, f"{label_name} ({units})", True
++
+     if "start" not in axis_info or "end" not in axis_info:
+         # Preserve the legacy error message for the common energy case so that
+         # existing call sites and user-facing messaging are unchanged.
+diff --git a/tests/test_meta_fanout_robustness.py b/tests/test_meta_fanout_robustness.py
+index 0d6755473..8772a1625 100644
+--- a/tests/test_meta_fanout_robustness.py
++++ b/tests/test_meta_fanout_robustness.py
+@@ -143,6 +143,31 @@ def main():
+     check("fusion recorded as ledger entry mode=fusion",
+           any(e.get("mode") == "fusion" for e in ag._delegation_ledger))
+ 
++    # 3b) Fusion persistence + dir-collision guard (found live on a
++    #     restore_checkpoint=True second fan-out): the fusion ledger entry
++    #     must reach the checkpoint, and a session whose restored ledger
++    #     lacks fusion entries must NOT re-allocate (and overwrite) an
++    #     existing fusion output dir.
++    print("3b) fusion checkpoint + dir-collision guard:")
++    with open(ag.checkpoint_path) as fh:
++        ckpt = json.load(fh)
++    check("fusion entry persisted to checkpoint",
++          any(e.get("mode") == "fusion"
++              for e in ckpt.get("delegation_ledger", [])))
++    rpt1 = f3["report_path"]
++    with open(rpt1, "rb") as fh:
++        rpt1_bytes = fh.read()
++    # Simulate the pre-fix stale restore: a ledger missing the fusion entry.
++    ag._delegation_ledger = [e for e in ag._delegation_ledger
++                             if e.get("mode") != "fusion"]
++    f3b = json.loads(ag._fuse_delegations(good_idxs))
++    check("second fuse (stale ledger) still succeeds",
++          f3b["status"] == "success")
++    check("second fuse allocated a NEW dir (no collision)",
++          os.path.dirname(f3b["report_path"]) != os.path.dirname(rpt1))
++    with open(rpt1, "rb") as fh:
++        check("first fusion report not overwritten", fh.read() == rpt1_bytes)
++
+     # 4) Concurrency + ledger integrity at N=4 (slow children must overlap).
+     ag, A, B, C = _agent()
+     Dp = os.path.join(os.path.dirname(A), "D.npy"); np.save(Dp, np.full((8, 8), 3.0))
+diff --git a/tests/test_signal_axis_vector.py b/tests/test_signal_axis_vector.py
+new file mode 100644
+index 000000000..f0074ecca
+--- /dev/null
++++ b/tests/test_signal_axis_vector.py
+@@ -0,0 +1,118 @@
++"""Offline regression tests: exact per-channel signal-axis vectors.
++
++Hyperspectral axes used to be reconstructed as ``linspace(start, end, n)``
++even when the metadata preserved the instrument's exact (nonuniform) sample
++positions — on a real spectrometer wavelength table that is up to ~6 nm off
++mid-spectrum, which shifted every reported band center. These tests pin the
++new behavior: ``axis_spec.axis_2.samples`` (or a recognized top-level vector
++such as ``wavelengths_nm``) is passed through ``resolve_axis_spec`` and used
++verbatim by ``create_axis`` / ``signal_axis_values``, with the historical
++linspace path untouched as the fallback.
++
++  conda run -n scilink python -m pytest tests/test_signal_axis_vector.py -q
++"""
++import numpy as np
++
++from scilink.agents.exp_agents.metadata_converter import (
++    check_schema_conformance,
++    resolve_axis_spec,
++    signal_axis_values,
++)
++from scilink.skills.hyperspectral.eels.eels import create_axis
++
++# A nonuniformly spaced axis (growing step), like a real wavelength table.
++WL = [400.0 + 2.0 * i + 0.02 * i * i for i in range(10)]
++
++
++def _spectral_meta(**extra):
++    meta = {
++        "experiment_type": "Spectroscopy",
++        "experiment": {"technique": "Hyperspectral imaging"},
++        "sample": {"material": "test"},
++    }
++    meta.update(extra)
++    return meta
++
++
++def test_axis2_samples_passed_through_and_endpoints_derived():
++    spec = resolve_axis_spec({"axis_spec": {"axis_2": {
++        "name": "wavelength", "units": "nm", "kind": "signal", "samples": WL}}})
++    a2 = spec["axis_2"]
++    assert a2["samples"] == WL
++    assert a2["start"] == WL[0] and a2["end"] == WL[-1]
++
++
++def test_toplevel_wavelengths_nm_adopted():
++    spec = resolve_axis_spec({
++        "axis_spec": {"axis_2": {"name": "wavelength", "units": "nm",
++                                 "kind": "signal",
++                                 "start": WL[0], "end": WL[-1]}},
++        "wavelengths_nm": WL,
++    })
++    assert spec["axis_2"]["samples"] == WL
++    # explicit start/end are NOT overridden by the vector
++    assert spec["axis_2"]["start"] == WL[0]
++
++
++def test_explicit_axis2_samples_beat_toplevel_vector():
++    other = [float(v) for v in range(10)]
++    spec = resolve_axis_spec({
++        "axis_spec": {"axis_2": {"kind": "signal", "samples": WL}},
++        "wavelengths_nm": other,
++    })
++    assert spec["axis_2"]["samples"] == WL
++
++
++def test_signal_axis_values_exact_and_mismatch():
++    a2 = {"samples": WL}
++    v = signal_axis_values(a2, len(WL))
++    assert isinstance(v, np.ndarray) and np.allclose(v, WL)
++    assert signal_axis_values(a2, len(WL) + 1) is None          # length mismatch
++    assert signal_axis_values({"start": 1, "end": 2}, 5) is None  # no samples
++    assert signal_axis_values({"samples": "not-a-vector"}, 5) is None
++    assert signal_axis_values(None, 5) is None
++
++
++def test_create_axis_uses_exact_vector_not_linspace():
++    axis, xlabel, ok = create_axis(len(WL), {
++        "axis_spec": {"axis_2": {"name": "wavelength", "units": "nm",
++                                 "kind": "signal", "samples": WL}}})
++    assert ok and np.allclose(axis, WL)
++    assert xlabel == "Wavelength (nm)"
++    # The nonuniform vector genuinely differs from the endpoint linspace.
++    assert not np.allclose(axis, np.linspace(WL[0], WL[-1], len(WL)))
++
++
++def test_create_axis_length_mismatch_falls_back_to_linspace():
++    axis, _, ok = create_axis(len(WL) + 3, {
++        "axis_spec": {"axis_2": {"name": "wavelength", "units": "nm",
++                                 "kind": "signal", "samples": WL}}})
++    # start/end were derived from the samples, so the fallback still works.
++    assert ok and np.allclose(axis, np.linspace(WL[0], WL[-1], len(WL) + 3))
++
++
++def test_legacy_linspace_path_byte_identical_without_samples():
++    axis, xlabel, ok = create_axis(7, {
++        "axis_spec": {"axis_2": {"name": "energy", "units": "eV",
++                                 "kind": "signal", "start": 450, "end": 550}}})
++    assert ok and np.allclose(axis, np.linspace(450, 550, 7))
++    assert xlabel == "Energy (eV)"
++
++
++def test_conformance_accepts_sample_vectors():
++    # samples inside axis_spec, no start/end anywhere
++    ok, issues = check_schema_conformance(_spectral_meta(
++        axis_spec={"axis_2": {"kind": "signal", "samples": WL}}))
++    assert ok, issues
++    # recognized top-level vector, no axis_spec/energy_range
++    ok, issues = check_schema_conformance(_spectral_meta(wavelengths_nm=WL))
++    assert ok, issues
++    # still non-conformant with no axis information at all
++    ok, _ = check_schema_conformance(_spectral_meta())
++    assert ok is False
++
++
++if __name__ == "__main__":
++    import sys
++    import pytest
++    sys.exit(pytest.main([__file__, "-q"]))

@@ -1,0 +1,147 @@
+diff --git a/scilink/agents/planning_agents/planning_orchestrator.py b/scilink/agents/planning_agents/planning_orchestrator.py
+index 2ef7ae9f..596dcb8a 100644
+--- a/scilink/agents/planning_agents/planning_orchestrator.py
++++ b/scilink/agents/planning_agents/planning_orchestrator.py
+@@ -1363,6 +1363,35 @@ def _trim_history(self, history: List[Dict], max_messages: int = None) -> List[D
+         
+         return trimmed
+ 
++    def _refresh_store_kb(self) -> bool:
++        """Re-copy an attached store KB when it was published again since
++        this session copied it (a ``scilink kb add`` from another process,
++        another session's addition). Checked at the start of every turn;
++        costs a manifest read when nothing changed.
++
++        Documents this session embedded into its own copy are dropped by the
++        refresh; the planner re-embeds any it is given again (it embeds what
++        its KB lacks), so nothing is lost but the time.
++        """
++        if self._kb_store_manifest is None or not self.knowledge_dir:
++            return False
++        from ...knowledge.kb_store import read_manifest, snapshot_is_current, snapshot_kb
++        cache = self.base_dir / "kb_cache"
++        if snapshot_is_current(self.knowledge_dir, cache):
++            return False
++        try:
++            snapshot_kb(self.knowledge_dir, cache)
++        except (FileNotFoundError, RuntimeError) as exc:
++            logging.warning(f"Knowledge base changed but could not be re-copied ({exc}); "
++                            "keeping this session's copy.")
++            return False
++        self._kb_store_manifest = read_manifest(self.knowledge_dir) or self._kb_store_manifest
++        self.planner.rebind_kb(str(cache / "default_kb"))
++        n = len((self._kb_store_manifest or {}).get("sources") or [])
++        print(f"  📚 Knowledge base '{self.knowledge_dir.name}' was updated since this session "
++              f"copied it; refreshed ({n} sources).")
++        return True
++
+     def chat(self, user_input: str) -> str:
+         """Main chat interface with robust function calling support."""
+         # Bind this turn's human-feedback prompts to the session's
+@@ -1376,6 +1405,7 @@ def chat(self, user_input: str) -> str:
+         self.message_count += 1
+         self._last_chat_hit_iter_cap = False
+         self._last_chat_error = None
++        self._refresh_store_kb()
+ 
+         # AUTO-CHECKPOINT: Every 10 messages
+         if self.message_count - self.last_checkpoint_message_count >= 10:
+diff --git a/scilink/knowledge/kb_store.py b/scilink/knowledge/kb_store.py
+index b9a095d5..f4186715 100644
+--- a/scilink/knowledge/kb_store.py
++++ b/scilink/knowledge/kb_store.py
+@@ -99,6 +99,35 @@ def _kb_generation(kb_dir: Path):
+     return (st.st_ino, st.st_dev, mf.read_bytes() if mf.exists() else b"")
+ 
+ 
++_SNAPSHOT_MARK = ".snapshot_of.json"
++
++
++def snapshot_is_current(kb_dir: Path, dest: Path) -> bool:
++    """Whether the copy in ``dest`` is of the store KB's latest publish.
++
++    A session copies a store KB once; a ``scilink kb add`` from another
++    process then leaves it answering that the KB "does not contain" a
++    document the store has. Unknown (no marker, no manifest) counts as
++    current, so an old cache is not re-copied on every turn."""
++    try:
++        seen = json.loads((Path(dest) / _SNAPSHOT_MARK).read_text()).get("manifest")
++    except (OSError, ValueError):
++        return True
++    mf = Path(kb_dir) / MANIFEST_NAME
++    try:
++        latest = _manifest_digest(mf.read_bytes())
++    except OSError:
++        return True
++    return seen is None or latest == seen
++
++
++def _manifest_digest(manifest_bytes: bytes) -> str:
++    """The manifest changes on every publish (sources, counts, updated_at);
++    its digest names the publish more finely than updated_at's seconds."""
++    import hashlib
++    return hashlib.sha1(manifest_bytes).hexdigest()
++
++
+ def snapshot_kb(kb_dir: Path, dest: Path, *, attempts: int = 8) -> Path:
+     """Copy a KB's ``default_kb_*`` files into ``dest`` as ONE generation.
+ 
+@@ -135,6 +164,10 @@ def snapshot_kb(kb_dir: Path, dest: Path, *, attempts: int = 8) -> Path:
+                 if _kb_generation(kb_dir) == before:
+                     for n in names:
+                         os.replace(tmp / n, dest / n)
++                    # Which publish this copy is, so a session can tell when
++                    # the store has moved on (snapshot_is_current).
++                    atomic_write_text(dest / _SNAPSHOT_MARK,
++                                      json.dumps({"manifest": _manifest_digest(before[2])}))
+                     # A file the source lacks (another KB's code index, from
+                     # an earlier attach) must not load beside this one.
+                     for stale in dest.glob("default_kb_*"):
+diff --git a/tests/test_kb_store_concurrency.py b/tests/test_kb_store_concurrency.py
+index 1b30888c..dfa8c832 100644
+--- a/tests/test_kb_store_concurrency.py
++++ b/tests/test_kb_store_concurrency.py
+@@ -316,3 +316,43 @@ def test_a_failed_attach_leaves_the_meta_and_its_planner_on_the_old_kb(store, tm
+     with pytest.raises(FileNotFoundError):
+         m.attach_knowledge_dir("broken")
+     assert m.knowledge_dir == old and child.knowledge_dir == old and rebinds == []
++
++
++# ── a session's copy follows the store ────────────────────────────────────
++
++def test_a_snapshot_knows_when_the_store_has_moved_on(store, tmp_path, monkeypatch):
++    kb_store.create_kb("live", [_doc(tmp_path, "a.md")])
++    cache = tmp_path / "cache"
++    kb_store.snapshot_kb(kb_store.kb_path("live"), cache)
++    assert kb_store.snapshot_is_current(kb_store.kb_path("live"), cache)
++    monkeypatch.setattr(kb_store, "_append_index_into", lambda t, n, *a, **k: (1, 1))
++    kb_store.add_to_kb("live", [_doc(tmp_path, "b.md")])                # another process, say
++    assert not kb_store.snapshot_is_current(kb_store.kb_path("live"), cache)
++    assert kb_store.snapshot_is_current(kb_store.kb_path("live"), tmp_path / "no_marker_here")
++
++
++def test_a_planning_session_refreshes_its_copy_after_a_store_update(store, tmp_path, monkeypatch):
++    from types import SimpleNamespace
++    from scilink.agents.planning_agents.planning_orchestrator import PlanningOrchestratorAgent
++    kb_store.create_kb("live", [_doc(tmp_path, "a.md")])
++    o = PlanningOrchestratorAgent.__new__(PlanningOrchestratorAgent)
++    o.base_dir = tmp_path / "planning"
++    o.knowledge_dir = kb_store.kb_path("live")
++    o._kb_store_manifest = kb_store.read_manifest(o.knowledge_dir)
++    rebinds = []
++    o.planner = SimpleNamespace(rebind_kb=rebinds.append)
++    kb_store.snapshot_kb(o.knowledge_dir, o.base_dir / "kb_cache")    # the constructor's seed
++    assert o._refresh_store_kb() is False and rebinds == []
++    monkeypatch.setattr(kb_store, "_append_index_into", lambda t, n, *a, **k: (1, 1))
++    kb_store.add_to_kb("live", [_doc(tmp_path, "b.md")])
++    assert o._refresh_store_kb() is True
++    assert rebinds == [str(o.base_dir / "kb_cache" / "default_kb")]
++    assert "b.md" in o._kb_store_manifest["sources"]
++    assert o._refresh_store_kb() is False                              # once per publish
++
++
++def test_every_planning_turn_checks_the_store_first():
++    import inspect
++    from scilink.agents.planning_agents.planning_orchestrator import PlanningOrchestratorAgent
++    src = inspect.getsource(PlanningOrchestratorAgent.chat)
++    assert src.index("self._refresh_store_kb()") < src.index("_handle_litellm_chat")

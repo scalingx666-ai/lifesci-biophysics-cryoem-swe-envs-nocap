@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Rename Modules
+
+## Description
+
+Based on our recent discussions, I renamed 3 of the module names in `iodata/formats/` to better reflect their scope. Please feel free to let me know if anything needs to change.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `09c894ccd85d`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

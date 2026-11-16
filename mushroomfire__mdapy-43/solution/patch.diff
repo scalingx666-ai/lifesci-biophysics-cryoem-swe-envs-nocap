@@ -1,0 +1,513 @@
+diff --git a/docs/about/release-notes.md b/docs/about/release-notes.md
+index 4456ea4f..9bd55a70 100644
+--- a/docs/about/release-notes.md
++++ b/docs/about/release-notes.md
+@@ -17,6 +17,12 @@
+   [Elastic constants](../user-guide/simulation/elastic-constants.md#along-directions) and
+   the example [Elastic anisotropy of copper and titanium](../examples/elastic-anisotropy.md).
+ - `plot.panel_label` labels axes in 3D too; it raised `TypeError` there.
++- `DislocationAnalysis`: a line traced in a sliver of crystal, such as the layer of
++  crystal inside an extrinsic fault, gets its Burgers vector in the largest crystal
++  cluster related to it, whose frame is fitted to many atoms; its spatial vector was off
++  by up to 0.5 Å. Where one cluster holds two grains, the spatial Burgers vector of a
++  line follows the lattice about it, not the mean orientation of the cluster; it was
++  off by half the angle between the grains. Elsewhere the results are unchanged.
+ - `DislocationAnalysis` and `SurfaceMesh` analyze every crystal: perfect fcc, hcp and
+   diamond crystals from some 15 000 atoms on, built systems and hot crystals were refused
+   at random, more often the larger they were, with a message to replicate the system. The
+diff --git a/docs/user-guide/analysis/dislocations.md b/docs/user-guide/analysis/dislocations.md
+index ab2d0f28..ce795c1b 100644
+--- a/docs/user-guide/analysis/dislocations.md
++++ b/docs/user-guide/analysis/dislocations.md
+@@ -173,7 +173,7 @@ A `DislocationLine`:
+ |---|---|---|
+ | `points` | (P, 3) float64 | the points along the line in Å, unwrapped: consecutive points are close also across a periodic boundary |
+ | `burgers` | (3,) float64 | the Burgers vector in the lattice frame of its crystal cluster, in units of the lattice constant |
+-| `spatial_burgers` | (3,) float64 | the Burgers vector in Å along the axes of the box, as the crystal cluster is turned and stretched |
++| `spatial_burgers` | (3,) float64 | the Burgers vector in Å along the axes of the box, as the crystal cluster is turned and stretched; where the lattice about the line, within 7 Å, is turned from the cluster by more than 3°, as when one cluster holds two grains, as that lattice is turned |
+ | `cluster` | int32 | the crystal cluster of the lattice frame |
+ | `family` | str | the family of the Burgers vector, or `other` |
+ | `length` | float64 | the length in Å |
+@@ -235,7 +235,7 @@ everywhere:
+ | single loops, a loop on a twin boundary, a stacking-fault tetrahedron | the same lines and Burgers vectors, lengths within 3 % |
+ | lines that meet: crossing loops, networks | where two lines meet, a short junction line in one and a node of four lines in the other may come out; the same Burgers vectors, total lengths within about 5 % |
+ | strongly disordered crystal: large thermal displacements, many vacancies | lines through such regions may end or run otherwise; lengths may differ by up to 20 % |
+-| polycrystals | lines and the defect mesh at the grain boundaries may differ by 5 to 10 % |
++| polycrystals | lines and the defect mesh at the grain boundaries may differ by 5 to 20 % |
+ 
+ Where they differ, and why:
+ 
+@@ -256,9 +256,17 @@ Where they differ, and why:
+   cluster the one closest to the axes of the box. When two are as close,
+   they may take different ones: the lattice Burgers vectors then differ by
+   a rotation of the lattice, the spatial ones do not. The Burgers vector
+-  of a line is given in the frame of a cluster its first circuit touches;
+-  in a distorted crystal two such clusters are turned slightly apart, and
+-  the spatial Burgers vectors can differ by up to 0.1 Å.
++  of a line is given in the frame of a cluster its first circuit touches,
++  or of the largest cluster related to it when that one is a sliver of
++  fewer than 100 atoms, such as the layer of crystal inside an extrinsic
++  fault. In a distorted crystal two such clusters are turned slightly
++  apart, and the spatial Burgers vectors can differ by up to 0.1 Å.
++- Both programs may join two grains into one cluster across a boundary
++  whose atoms bridge them, and relate two clusters of unrelated grains by
++  a symmetry of the lattice. MDAPY gives a line in such a cluster the
++  spatial Burgers vector of the lattice about it; at junctions of lines in
++  different grains the spatial vectors need not add up to zero, by up to
++  1 Å.
+ 
+ OVITO's options to analyze the selected atoms only and to mark the atoms of
+ the cores, and its export to CA files, are not here.
+diff --git a/src/cpp/analysis/dislocations.cpp b/src/cpp/analysis/dislocations.cpp
+index 8bd3fa7e..f3282ae1 100644
+--- a/src/cpp/analysis/dislocations.cpp
++++ b/src/cpp/analysis/dislocations.cpp
+@@ -7,18 +7,215 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdint>
+ #include <cstddef>
+ #include <stdexcept>
++#include <utility>
+ #include <vector>
+ 
+ #include "analysis/dxa_mapping.h"
+ #include "analysis/dxa_mesh.h"
+ #include "analysis/tessellation.h"
+ #include "analysis/voronoi.h"
++#include "neighbor/cell_list.h"
+ 
+ namespace mdapy::analysis {
+ namespace {
+ 
++// Clusters of the crystal's structure smaller than this are slivers, such as
++// the one layer of crystal inside an extrinsic stacking fault: their frame
++// rests on a few atoms.
++constexpr std::int64_t kSliver = 100;
++
++// About a line, the atoms of its cluster closer than this (Å) to a point of
++// it fit the lattice there; turned from the frame of the cluster by more
++// than kTurned, with at least kFewest atoms, the lattice there gives the
++// spatial Burgers vector instead of the cluster's mean orientation, as when
++// one cluster holds two grains.
++constexpr double kAbout = 7.0;
++constexpr double kTurned = 3.0 * 3.14159265358979323846 / 180.0;
++constexpr std::int64_t kFewest = 10;
++
++// The rotation of the polar decomposition of m, by Newton's iteration.
++dxa::Mat rotation_of(dxa::Mat r) {
++    for (int step = 0; step < 100; ++step) {
++        const auto inverse = dxa::inverse(r);
++        if (!inverse) {
++            break;
++        }
++        const dxa::Mat back = dxa::transpose(*inverse);
++        double change = 0.0;
++        for (std::size_t k = 0; k < 9; ++k) {
++            const double next = 0.5 * (r[k] + back[k]);
++            change = std::max(change, std::abs(next - r[k]));
++            r[k] = next;
++        }
++        if (change < 1e-15) {
++            break;
++        }
++    }
++    return r;
++}
++
++// The vector from atom a to atom b, the nearest image along periodic axes.
++dxa::Vec bond(const dxa::ClusterInput& input, std::int64_t a, std::int64_t b) {
++    const double* x = input.positions;
++    double f[3];
++    for (int e = 0; e < 3; ++e) {
++        f[e] = 0.0;
++        for (int k = 0; k < 3; ++k) {
++            f[e] += (x[3 * b + k] - x[3 * a + k]) * input.inverse[3 * k + e];
++        }
++        if (input.pbc[e]) {
++            f[e] -= std::round(f[e]);
++        }
++    }
++    dxa::Vec d{};
++    for (int k = 0; k < 3; ++k) {
++        d[static_cast<std::size_t>(k)] =
++            f[0] * input.matrix[k] + f[1] * input.matrix[3 + k] + f[2] * input.matrix[6 + k];
++    }
++    return d;
++}
++
++// The spatial Burgers vector of each line (3 each): its vector turned by the
++// orientation of its cluster, or, where the lattice about the line is turned
++// from the cluster's frame, by that rotation times the stretch of the cluster.
++std::vector<double> spatial_burgers(const dxa::Network& network, const dxa::Clusters& clusters,
++                                    const dxa::ClusterInput& input, const double* origin,
++                                    const bool* pbc) {
++    const std::int64_t n = input.n;
++    const auto& segments = network.segments;
++    // the points of the lines, put into the box, after the atoms
++    std::vector<double> places(input.positions, input.positions + 3 * n);
++    std::vector<std::int64_t> owner;
++    for (std::size_t s = 0; s < segments.size(); ++s) {
++        const std::vector<double>& points = segments[s].points;
++        for (std::size_t q = 0; q + 2 < points.size(); q += 3) {
++            double f[3];
++            for (int e = 0; e < 3; ++e) {
++                f[e] = 0.0;
++                for (int k = 0; k < 3; ++k) {
++                    f[e] += (points[q + static_cast<std::size_t>(k)] - origin[k]) *
++                            input.inverse[3 * k + e];
++                }
++                if (pbc[e]) {
++                    f[e] -= std::floor(f[e]);
++                }
++            }
++            for (int k = 0; k < 3; ++k) {
++                places.push_back(origin[k] + f[0] * input.matrix[k] + f[1] * input.matrix[3 + k] +
++                                 f[2] * input.matrix[6 + k]);
++            }
++            owner.push_back(static_cast<std::int64_t>(s));
++        }
++    }
++    std::vector<std::pair<std::int64_t, std::int64_t>> near;  // (line, atom)
++    if (!owner.empty() && n > 0) {
++        const auto total = n + static_cast<std::int64_t>(owner.size());
++        const neighbor::CellGrid grid(places.data(), total, input.matrix, origin, pbc, kAbout);
++        for (std::int64_t t = 0; t < total; ++t) {
++            const auto i = static_cast<std::int64_t>(grid.atom(t));
++            if (i < n) {
++                continue;
++            }
++            const std::int64_t s = owner[static_cast<std::size_t>(i - n)];
++            const std::int64_t c = segments[static_cast<std::size_t>(s)].cluster;
++            grid.visit(t, [&](index_t j, const std::int32_t*, double) {
++                if (j < n && c >= 0 && clusters.cluster[static_cast<std::size_t>(j)] == c) {
++                    near.emplace_back(s, static_cast<std::int64_t>(j));
++                }
++            });
++        }
++        std::sort(near.begin(), near.end());
++        near.erase(std::unique(near.begin(), near.end()), near.end());
++    }
++    // the sums of the fits of the lattice about each line
++    std::vector<dxa::Mat> real(segments.size(), dxa::Mat{}), ideal(segments.size(), dxa::Mat{});
++    std::vector<std::int64_t> count(segments.size(), 0);
++    for (const auto& [s, a] : near) {
++        const dxa::Lattice* l = dxa::lattice(input.structure[a]);
++        if (l == nullptr) {
++            continue;
++        }
++        const dxa::Mat& turn = l->group[static_cast<std::size_t>(clusters.rotation[static_cast<std::size_t>(a)])];
++        dxa::Mat& r = real[static_cast<std::size_t>(s)];
++        dxa::Mat& v2 = ideal[static_cast<std::size_t>(s)];
++        for (int k = 0; k < l->neighbors; ++k) {
++            const auto j = static_cast<std::int64_t>(input.neighbors[16 * a + k]);
++            if (j < 0) {
++                continue;
++            }
++            const dxa::Vec v = dxa::turn(turn, l->vectors[static_cast<std::size_t>(k)]);
++            const dxa::Vec d = bond(input, a, j);
++            for (std::size_t p = 0; p < 3; ++p) {
++                for (std::size_t q = 0; q < 3; ++q) {
++                    r[3 * p + q] += d[p] * v[q];
++                    v2[3 * p + q] += v[p] * v[q];
++                }
++            }
++        }
++        ++count[static_cast<std::size_t>(s)];
++    }
++    std::vector<double> out;
++    out.reserve(3 * segments.size());
++    for (std::size_t s = 0; s < segments.size(); ++s) {
++        const dxa::Segment& segment = segments[s];
++        dxa::Mat orientation{};
++        if (segment.cluster >= 0) {
++            std::copy_n(clusters.orientation.begin() + 9 * segment.cluster, 9, orientation.begin());
++        }
++        dxa::Vec spatial = dxa::turn(orientation, segment.burgers);
++        const auto fitted = dxa::inverse(ideal[s]);
++        if (segment.cluster >= 0 && count[s] >= kFewest && fitted) {
++            const dxa::Mat here = rotation_of(dxa::multiply(real[s], *fitted));
++            const dxa::Mat mean = rotation_of(orientation);
++            const dxa::Mat between = dxa::multiply(here, dxa::transpose(mean));
++            const double cosine =
++                std::clamp(0.5 * (between[0] + between[4] + between[8] - 1.0), -1.0, 1.0);
++            if (std::acos(cosine) > kTurned) {
++                const dxa::Mat stretch = dxa::multiply(dxa::transpose(mean), orientation);
++                spatial = dxa::turn(dxa::multiply(here, stretch), segment.burgers);
++            }
++        }
++        out.insert(out.end(), spatial.begin(), spatial.end());
++    }
++    return out;
++}
++
++// A line traced in a sliver of the crystal gets its Burgers vector in the
++// frame of the largest cluster of the crystal related to the sliver, through
++// one cluster at most; the frame of a sliver is fitted to a few atoms only.
++void out_of_slivers(dxa::Network& network, const dxa::Clusters& clusters,
++                    const dxa::Mapping& mapping, int crystal) {
++    const auto count = static_cast<std::int64_t>(clusters.structure.size());
++    for (dxa::Segment& segment : network.segments) {
++        const std::int64_t c = segment.cluster;
++        if (c < 0 || clusters.structure[static_cast<std::size_t>(c)] != crystal ||
++            clusters.size[static_cast<std::size_t>(c)] >= kSliver) {
++            continue;
++        }
++        std::int64_t best = -1;
++        dxa::Mat into{};
++        for (std::int64_t k = 0; k < count; ++k) {
++            const auto size = clusters.size[static_cast<std::size_t>(k)];
++            if (k == c || clusters.structure[static_cast<std::size_t>(k)] != crystal ||
++                size <= clusters.size[static_cast<std::size_t>(c)] ||
++                (best >= 0 && size <= clusters.size[static_cast<std::size_t>(best)])) {
++                continue;
++            }
++            if (const auto m = mapping.transition(c, k)) {
++                best = k;
++                into = *m;
++            }
++        }
++        if (best >= 0) {
++            segment.burgers = dxa::turn(into, segment.burgers);
++            segment.cluster = best;
++        }
++    }
++}
++
+ // The mesh of the triangles faces of the interface mesh and of caps, the
+ // corners of each triangle images of its vertices, the vertices those it
+ // uses.
+@@ -188,7 +385,9 @@ Dislocations dislocation_analysis(const double* positions, const double* jittere
+         dxa::interface_mesh(input, mapping, tetrahedra, good, jittered, alpha);
+     out.network = dxa::trace_dislocations(mesh, input, out.clusters, options.max_circuit,
+                                           options.stretch, stage(control, 4, kStages));
++    out_of_slivers(out.network, out.clusters, mapping, options.crystal);
+     dxa::smooth_lines(out.network, options.separation, options.smoothing);
++    out.spatial = spatial_burgers(out.network, out.clusters, input, origin, pbc);
+     out.defects =
+         triangles(mesh, out.network.faces, out.network.caps, matrix, inverse, origin, pbc);
+     smooth_mesh(out.defects, matrix, options.mesh_smoothing);
+diff --git a/src/cpp/analysis/dislocations.h b/src/cpp/analysis/dislocations.h
+index d646f988..b7151b25 100644
+--- a/src/cpp/analysis/dislocations.h
++++ b/src/cpp/analysis/dislocations.h
+@@ -41,6 +41,7 @@ struct Dislocations {
+     dxa::Structures structures;
+     dxa::Clusters clusters;
+     dxa::Network network;
++    std::vector<double> spatial;  // the spatial Burgers vector of each line, 3 each
+     SurfaceMesh defects;
+     SurfaceMesh interface;
+ };
+diff --git a/src/cpp/bindings/analysis.cpp b/src/cpp/bindings/analysis.cpp
+index 043453ec..b739dda0 100644
+--- a/src/cpp/bindings/analysis.cpp
++++ b/src/cpp/bindings/analysis.cpp
+@@ -352,7 +352,7 @@ nb::tuple dislocation_analysis(Positions3 positions, Positions3 jittered, Matrix
+         as_array(std::move(found.defects.faces)), as_array(std::move(found.defects.shifts)),
+         as_array(std::move(found.interface.atoms)), as_array(std::move(found.interface.vertices)),
+         as_array(std::move(found.interface.faces)),
+-        as_array(std::move(found.interface.shifts)));
++        as_array(std::move(found.interface.shifts)), as_array(std::move(found.spatial)));
+ }
+ 
+ nb::object soap(Types species, int species_count, Vectors positions, Matrix3 matrix,
+diff --git a/src/mdapy/analysis/_dislocations.py b/src/mdapy/analysis/_dislocations.py
+index e2bfb19e..99433959 100644
+--- a/src/mdapy/analysis/_dislocations.py
++++ b/src/mdapy/analysis/_dislocations.py
+@@ -432,6 +432,7 @@ def compute(
+             interface_vertices,
+             interface_faces,
+             interface_shifts,
++            spatial_burgers,
+         ) = found
+         # the PTM types as indices into NAMES
+         index = np.zeros(8, dtype=np.int8)
+@@ -447,7 +448,7 @@ def compute(
+             p = points[offsets[s] : offsets[s + 1]]
+             p.flags.writeable = False
+             b = burgers[s].copy()
+-            spatial = orientation[line_cluster[s]] @ b
++            spatial = spatial_burgers[3 * s : 3 * s + 3].copy()
+             b.flags.writeable = spatial.flags.writeable = False
+             loop = bool(closed[s])
+             for end, at in zip(ends[s], (p[0], p[-1])):
+diff --git a/tests/analysis/test_dislocations.py b/tests/analysis/test_dislocations.py
+index 4a393662..a4e73793 100644
+--- a/tests/analysis/test_dislocations.py
++++ b/tests/analysis/test_dislocations.py
+@@ -421,3 +421,68 @@ def test_errors():
+             DislocationAnalysis("bcc").compute(system)
+     with pytest.raises(InvalidParameter, match="replicate"):
+         DislocationAnalysis("fcc").compute(build_crystal("fcc", 3.615, elements="Cu"))
++
++
++def test_the_lines_of_a_lock_add_up_in_space():
++    """Two dislocations relaxed into a lock and its partials: every line in
++    the frame of a crystal of the matrix, none in the few atoms of crystal
++    inside a fault, and their spatial Burgers vectors adding up to those put
++    in."""
++    from dislocation_models import lock
++
++    system, total, axes = lock()
++    result = DislocationAnalysis("fcc").compute(system)
++    assert len(result.lines) >= 3
++    assert all(result.clusters.sizes[line.cluster] >= 100 for line in result.lines)
++    found = sum(line.spatial_burgers for line in result.lines)
++    np.testing.assert_allclose(axes @ found, axes @ total, atol=0.03)
++
++
++def test_a_line_in_one_grain_of_a_cluster_of_two():
++    """Two grains 10 degrees apart make one cluster, whose orientation is
++    their mean; the spatial Burgers vector of a dislocation in one of them
++    follows the lattice about it, not the mean, 5 degrees away."""
++    from dislocation_models import bicrystal, inclined_dislocation
++
++    system, left = bicrystal(5.0)
++    b = left @ (np.array([1.0, 1.0, 0.0]) * 3.615 / 2)
++    result = DislocationAnalysis("fcc").compute(
++        inclined_dislocation(system, b, [30.13, 50.07, 0.0], b)
++    )
++    (line,) = [
++        line
++        for line in result.lines
++        if np.linalg.norm(line.points.mean(0)[:2] - [30, 50]) < 3
++    ]
++    assert result.clusters.sizes[line.cluster] > 0.8 * len(system)  # both grains
++    cosine = (
++        line.spatial_burgers
++        @ b
++        / np.linalg.norm(line.spatial_burgers)
++        / np.linalg.norm(b)
++    )
++    assert np.degrees(np.arccos(min(cosine, 1.0))) < 0.3
++    # the mean orientation is 5 degrees away
++    mean = result.clusters.orientation[line.cluster] @ line.burgers
++    cosine = mean @ b / np.linalg.norm(mean) / np.linalg.norm(b)
++    assert np.degrees(np.arccos(min(cosine, 1.0))) > 4
++
++
++def test_a_single_crystal_keeps_the_mean_orientation():
++    """Where the lattice about a line is turned from its cluster by little,
++    the spatial vector is the orientation of the cluster times the lattice
++    vector, exactly."""
++    from mdapy.build import dislocation_quadrupole
++
++    from dislocation_models import CU
++
++    quadrupole = dislocation_quadrupole(
++        "fcc edge", 3.615, CU, (28, 16, 4), elements="Cu", dissociation=10
++    )
++    result = DislocationAnalysis("fcc").compute(quadrupole)
++    assert len(result.lines) == 4
++    for line in result.lines:
++        expected = result.clusters.orientation[line.cluster] @ line.burgers
++        np.testing.assert_allclose(
++            line.spatial_burgers, expected, rtol=1e-14, atol=1e-14
++        )
+diff --git a/tests/dislocation_models.py b/tests/dislocation_models.py
+index 5d871e6b..e562e7c1 100644
+--- a/tests/dislocation_models.py
++++ b/tests/dislocation_models.py
+@@ -151,3 +151,99 @@ def hexagonal(structure, a, element, kind):
+     return insert_dislocation(
+         cell, burgers, center=cell.box.matrix.diagonal() / 2 + [0.3, 0.2, 0]
+     )
++
++
++def inclined_dislocation(system, burgers, center, cut, poisson=0.33):
++    """A straight dislocation along z whose plane of cut runs from the core
++    along the unit vector cut in the xy plane, the glide plane of burgers:
++    the isotropic field of a screw and an edge part, with OVITO's sign."""
++    b = -np.asarray(burgers, float)
++    cut = np.asarray(cut, float)[:2] / np.linalg.norm(np.asarray(cut, float)[:2])
++    ex = -cut
++    ey = np.array([-ex[1], ex[0]])
++    p = system["positions"]
++    d = p[:, :2] - np.asarray(center)[:2]
++    angle = np.arctan2(d @ ey, d @ ex)
++    r2 = np.einsum("ij,ij->i", d, d)
++    u = np.zeros_like(p)
++    u[:, 2] = b[2] * angle / (2 * np.pi)
++    edge = np.hypot(b[0], b[1])
++    if edge > 1e-12:
++        e1 = b[:2] / edge
++        e2 = np.array([-e1[1], e1[0]])
++        turn = np.arctan2(d @ e2, d @ e1)
++        nu = poisson
++        u1 = edge / (2 * np.pi) * (angle + np.sin(2 * turn) / (4 * (1 - nu)))
++        u2 = (
++            -edge
++            / (2 * np.pi)
++            * (
++                (1 - 2 * nu) / (4 * (1 - nu)) * np.log(r2)
++                + np.cos(2 * turn) / (4 * (1 - nu))
++            )
++        )
++        u[:, :2] += np.outer(u1, e1) + np.outer(u2, e2)
++    return system.with_columns(positions=p + u)
++
++
++def lock(first=(-1, 0, -1), second=(0, -1, 1)):
++    """Two a/2<110> dislocations of copper on (111) and (11-1), along [1-10],
++    driven together in a relaxation with the Zhou potential: the system, the
++    sum of their Burgers vectors in Å, and the axes of the crystal in the box."""
++    from mdapy.calculators import EAM
++    from mdapy.simulation import minimize
++
++    a = 3.615
++    orientation = [(1, 1, 0), (0, 0, 1), (1, -1, 0)]
++    axes = np.array(orientation, float)
++    axes /= np.linalg.norm(axes, axis=1)[:, None]
++    crystal = build_crystal(
++        "fcc", a, elements="Cu", orientation=orientation, repeat=(30, 20, 3)
++    )
++    crystal = crystal.with_box(
++        mdapy.Box(
++            crystal.box.matrix, origin=crystal.box.origin, pbc=(False, False, True)
++        )
++    )
++    middle = crystal.box.matrix.diagonal() / 2 + [0.3, 0.45, 0]
++    system = crystal
++    total = np.zeros(3)
++    for b, normal in ((first, (1, 1, 2.0)), (second, (1, 1, -2.0))):
++        burgers = a / 2 * axes @ np.array(b, float)
++        cut = axes @ np.array(normal)
++        cut = np.sign(cut[0]) * cut / np.linalg.norm(cut)
++        system = inclined_dislocation(system, burgers, middle + 10 * cut, cut)
++        total += burgers
++    p = system["positions"]
++    inner = np.ones(len(p), bool)
++    for k in range(2):
++        inner &= (p[:, k] > p[:, k].min() + 7) & (p[:, k] < p[:, k].max() - 7)
++    system = system.with_columns(movable=np.repeat(inner[:, None], 3, axis=1))
++    relaxed = minimize(system, EAM.zhou(["Cu"]), max_force=5e-3, max_steps=6000)
++    assert relaxed.converged
++    return relaxed.system, total, axes
++
++
++def bicrystal(half_angle=5.0, a=3.615):
++    """Two grains of fcc copper turned by +half_angle and -half_angle degrees
++    about z, left and right of x = 50 Å, open in x and y; and the rotation of
++    the left grain."""
++
++    def turn(degrees):
++        t = np.radians(degrees)
++        return np.array(
++            [[np.cos(t), -np.sin(t), 0], [np.sin(t), np.cos(t), 0], [0, 0, 1]]
++        )
++
++    base = build_crystal("fcc", a, elements="Cu", repeat=(30, 30, 3))
++    lengths = base.box.matrix.diagonal()
++    parts = []
++    for sign in (1, -1):
++        p = (base["positions"] - lengths / 2) @ turn(sign * half_angle).T
++        keep = (p[:, 0] * sign < 0) & (np.abs(p[:, 0]) < 40) & (np.abs(p[:, 1]) < 40)
++        parts.append(p[keep])
++    box = mdapy.Box(np.diag([100.0, 100.0, lengths[2]]), pbc=(False, False, True))
++    system = mdapy.System(np.vstack(parts) + [50.0, 50.0, 0.0], box, elements="Cu")
++    pairs = mdapy.NeighborList.build(system, 1.8)
++    crowded = np.unique(np.maximum(pairs.i, pairs.j))
++    return system.filter(~np.isin(np.arange(len(system)), crowded)), turn(half_angle)

@@ -1,0 +1,3519 @@
+diff --git a/docs/releasehistory.rst b/docs/releasehistory.rst
+index f1721ec43..cdcc9f8c5 100644
+--- a/docs/releasehistory.rst
++++ b/docs/releasehistory.rst
+@@ -6,6 +6,9 @@ Development snapshot
+ New features
+ ------------
+ - Add a ``WaterCluster`` testsystem (`#322 <https://github.com/choderalab/openmmtools/pull/322>`_)
++- Add exact treatment of PME electrostatics in `alchemy.AbsoluteAlchemicalFactory`. (`#320 <https://github.com/choderalab/openmmtools/pull/320>`_)
++- Add method in ``ThermodynamicState`` for the efficient computation of the reduced potential at a list of states. (`#320 <https://github.com/choderalab/openmmtools/pull/320>`_)
++- When a ``SamplerState`` is applied to many ``Context``s, the units are stripped only once for optimization. (`#320 <https://github.com/choderalab/openmmtools/pull/320>`_)
+ 
+ 
+ 0.13.4 - Barostat/External Force Bugfix, Restart Robustness
+@@ -248,4 +251,4 @@ Updates to openmmtools.alchemy.AlchemicalFactory
+ New ``openmmtools.testsystems`` classes
+ ---------------------------------------
+ 
+-- AlchemicalWaterBox was added, which has the first water molecule in the system alchemically modified
+\ No newline at end of file
++- AlchemicalWaterBox was added, which has the first water molecule in the system alchemically modified
+diff --git a/openmmtools/alchemy.py b/openmmtools/alchemy.py
+index 8cd1ac737..b91f38600 100644
+--- a/openmmtools/alchemy.py
++++ b/openmmtools/alchemy.py
+@@ -48,6 +48,14 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++# =============================================================================
++# INTERNAL-USAGE CONSTANTS
++# =============================================================================
++
++_UPDATE_ALCHEMICAL_CHARGES_PARAMETER = '_update_alchemical_charges'
++_UPDATE_ALCHEMICAL_CHARGES_PARAMETER_IDX = 1
++
++
+ # =============================================================================
+ # ALCHEMICAL STATE
+ # =============================================================================
+@@ -108,6 +116,11 @@ class AlchemicalState(object):
+         Scaling factor for alchemically-softened angles (default is 1.0).
+     lambda_torsions : float, optional
+         Scaling factor for alchemically-softened torsions (default is 1.0).
++    update_alchemical_charges : bool, optional
++        If True, ``lambda_electrostatics`` changes in alchemical systems
++        that use exact treatment of PME electrostatics will be considered
++        incompatible. This means that a new ``Context`` will be required
++        for each `lambda_electrostatics`` state.
+ 
+     Attributes
+     ----------
+@@ -116,6 +129,7 @@ class AlchemicalState(object):
+     lambda_bonds
+     lambda_angles
+     lambda_torsions
++    update_alchemical_charges
+ 
+     Examples
+     --------
+@@ -221,7 +235,8 @@ def from_system(cls, system):
+ 
+         """
+         alchemical_parameters = {}
+-        for force, parameter_name, parameter_id in cls._get_system_lambda_parameters(system):
++        for force, parameter_name, parameter_id in cls._get_system_lambda_parameters(
++                system, other_parameters={_UPDATE_ALCHEMICAL_CHARGES_PARAMETER}):
+             parameter_value = force.getGlobalParameterDefaultValue(parameter_id)
+ 
+             # Check that we haven't already found
+@@ -235,12 +250,17 @@ def from_system(cls, system):
+             else:
+                 alchemical_parameters[parameter_name] = parameter_value
+ 
++        # Handle the update parameters flag.
++        update_alchemical_charges = bool(alchemical_parameters.pop(_UPDATE_ALCHEMICAL_CHARGES_PARAMETER,
++                                                                   cls._UPDATE_ALCHEMICAL_CHARGES_DEFAULT))
++
+         # Check that the system is alchemical.
+         if len(alchemical_parameters) == 0:
+             raise AlchemicalStateError('System has no lambda parameters.')
+ 
+         # Create and return the AlchemicalState.
+-        return AlchemicalState(**alchemical_parameters)
++        return AlchemicalState(update_alchemical_charges=update_alchemical_charges,
++                               **alchemical_parameters)
+ 
+     # -------------------------------------------------------------------------
+     # Lambda properties
+@@ -286,9 +306,7 @@ def set_alchemical_parameters(self, new_value):
+             The new value for all defined parameters.
+ 
+         """
+-        for parameter_name in self._parameters:
+-            if self._parameters[parameter_name] is not None:
+-                setattr(self, parameter_name, new_value)
++        self._set_alchemical_parameters(new_value, exclusions=frozenset())
+ 
+     # -------------------------------------------------------------------------
+     # Alchemical variables
+@@ -325,7 +343,9 @@ def set_alchemical_variable(self, variable_name, new_value):
+             The new value for the variable.
+ 
+         """
+-        if variable_name in self._parameters:
++        forbidden_variable_names = set(self._parameters)
++        forbidden_variable_names.add(_UPDATE_ALCHEMICAL_CHARGES_PARAMETER)
++        if variable_name in forbidden_variable_names:
+             raise AlchemicalStateError('Cannot have an alchemical variable with the same name '
+                                        'of the predefined alchemical parameter {}.'.format(variable_name))
+         self._alchemical_variables[variable_name] = new_value
+@@ -351,7 +371,11 @@ def __str__(self):
+ 
+     def __getstate__(self):
+         """Return a dictionary representation of the state."""
+-        serialization = dict(parameters={}, alchemical_variables={})
++        serialization = dict(
++            parameters={},
++            alchemical_variables={},
++            update_alchemical_charges=self.update_alchemical_charges
++        )
+ 
+         # Copy parameters and convert AlchemicalFunctions to string expressions.
+         for parameter_class in ['parameters', 'alchemical_variables']:
+@@ -367,6 +391,7 @@ def __setstate__(self, serialization):
+         """Set the state from a dictionary representation."""
+         parameters = serialization['parameters']
+         alchemical_variables = serialization['alchemical_variables']
++        update_alchemical_charges = serialization.get('update_alchemical_charges', True)
+         alchemical_functions = dict()
+ 
+         # Temporarily store alchemical functions.
+@@ -376,7 +401,8 @@ def __setstate__(self, serialization):
+                 parameters[parameter_name] = None
+ 
+         # Initialize parameters and add all alchemical variables.
+-        self._initialize(**parameters)
++        self._initialize(update_alchemical_charges=update_alchemical_charges,
++                         **parameters)
+         for variable_name, value in alchemical_variables.items():
+             self.set_alchemical_variable(variable_name, value)
+ 
+@@ -402,25 +428,10 @@ def apply_to_system(self, system):
+             If the system does not have the required lambda global variables.
+ 
+         """
+-        parameters_applied = set()
+-        for force, parameter_name, parameter_id in self._get_system_lambda_parameters(system):
+-            parameter_value = getattr(self, parameter_name)
+-            if parameter_value is None:
+-                err_msg = 'The system parameter {} is not defined in this state.'
+-                raise AlchemicalStateError(err_msg.format(parameter_name))
+-            else:
+-                parameters_applied.add(parameter_name)
+-                force.setGlobalParameterDefaultValue(parameter_id, parameter_value)
+-
+-        # Check that we set all the defined parameters.
+-        for parameter_name in self._get_supported_parameters():
+-            if (self._parameters[parameter_name] is not None and
+-                    parameter_name not in parameters_applied):
+-                err_msg = 'Could not find parameter {} in the system'
+-                raise AlchemicalStateError(err_msg.format(parameter_name))
++        self._apply_to_system(system, set_update_charges_flag=True)
+ 
+     def check_system_consistency(self, system):
+-        """Check if the system is consistent with the alchemical state.
++        """Check if the system is in this alchemical state.
+ 
+         It raises a AlchemicalStateError if the system is not consistent
+         with the alchemical state.
+@@ -459,9 +470,10 @@ def apply_to_context(self, context):
+             If the context does not have the required lambda global variables.
+ 
+         """
++        has_lambda_electrostatics_changed = False
+         context_parameters = context.getParameters()
+ 
+-        # Set parameters in Context.
++        # Set lambda parameters in Context.
+         for parameter_name in self._parameters:
+             parameter_value = getattr(self, parameter_name)
+             if parameter_value is None:
+@@ -471,13 +483,39 @@ def apply_to_context(self, context):
+                     raise AlchemicalStateError(err_msg.format(parameter_name))
+                 continue
+             try:
++                # If lambda_electrostatics, first check if we're changing it for later.
++                # This avoids us to loop through the System forces if we don't need to
++                # set the NonbondedForce charges.
++                if parameter_name == 'lambda_electrostatics':
++                    old_parameter_value = context_parameters[parameter_name]
++                    has_lambda_electrostatics_changed = (has_lambda_electrostatics_changed or
++                                                         parameter_value != old_parameter_value)
+                 context.setParameter(parameter_name, parameter_value)
+             except Exception:
+                 err_msg = 'Could not find parameter {} in context'
+                 raise AlchemicalStateError(err_msg.format(parameter_name))
+ 
+-    @classmethod
+-    def _standardize_system(cls, system):
++        # Handle lambda_electrostatics changes with exact PME electrostatic treatment.
++        # If the context doesn't use exact PME electrostatics, or if lambda_electrostatics
++        # hasn't changed, we don't need to do anything.
++        if (_UPDATE_ALCHEMICAL_CHARGES_PARAMETER not in context_parameters or
++                not has_lambda_electrostatics_changed):
++            return
++
++        # Find exact PME treatment key force objects.
++        original_charges_force, nonbonded_force = self._find_exact_pme_forces(context.getSystem())
++
++        # Quick checks for compatibility.
++        context_charge_update = bool(context_parameters[_UPDATE_ALCHEMICAL_CHARGES_PARAMETER])
++        if not (context_charge_update and self.update_alchemical_charges):
++            err_msg = 'Attempted to set the alchemical state of an incompatible Context.'
++            raise AlchemicalStateError(err_msg)
++
++        # Write NonbondedForce charges
++        self._set_exact_pme_charges(original_charges_force, nonbonded_force)
++        nonbonded_force.updateParametersInContext(context)
++
++    def _standardize_system(self, system, set_lambda_electrostatics=False):
+         """Standardize the given system.
+ 
+         Set all global lambda parameters of the system to 1.0.
+@@ -486,6 +524,8 @@ def _standardize_system(cls, system):
+         ----------
+         system : simtk.openmm.System
+             The system to standardize.
++        set_lambda_electrostatics : bool, optional
++            Whether to set the lambda electrostatics of this system or not.
+ 
+         Raises
+         ------
+@@ -494,16 +534,121 @@ def _standardize_system(cls, system):
+ 
+         """
+         alchemical_state = AlchemicalState.from_system(system)
+-        alchemical_state.set_alchemical_parameters(1.0)
+-        alchemical_state.apply_to_system(system)
++        # If this system uses exact PME treatment and update_alchemical_charges
++        # is enabled, we don't want to set lambda_electrostatics.
++        if self.update_alchemical_charges:
++            exclusions = frozenset()
++        else:
++            original_charges_force = alchemical_state._find_exact_pme_forces(system, original_charges_only=True)
++            if original_charges_force is not None:
++                exclusions = {'lambda_electrostatics'}
++            else:
++                exclusions = frozenset()
++        alchemical_state._set_alchemical_parameters(1.0, exclusions=exclusions)
++
++        if set_lambda_electrostatics:
++            alchemical_state.lambda_electrostatics = self.lambda_electrostatics
++
++        # We don't want to overwrite the update_alchemical_charges flag as
++        # states with different settings must be incompatible.
++        alchemical_state._apply_to_system(system, set_update_charges_flag=False)
++
++    def _on_setattr(self, standard_system, attribute_name):
++        """Check if the standard system needs changes after a state attribute is set.
++
++        Parameters
++        ----------
++        standard_system : simtk.openmm.System
++            The standard system before setting the attribute.
++        attribute_name : str
++            The name of the attribute that has just been set or retrieved.
++
++        Returns
++        -------
++        need_changes : bool
++            True if the standard system has to be updated, False if no change
++            occurred.
++
++        """
++        need_changes = False
++
++        # The standard_system changes with update_alchemical_charges
++        # if the system uses exact PME treatment.
++        if attribute_name == 'update_alchemical_charges':
++            original_charges_force = self._find_exact_pme_forces(standard_system, original_charges_only=True)
++            if original_charges_force is not None:
++                old_update_charge_parameter = bool(original_charges_force.getGlobalParameterDefaultValue(
++                    _UPDATE_ALCHEMICAL_CHARGES_PARAMETER_IDX))
++                need_changes = old_update_charge_parameter != self.update_alchemical_charges
++
++        # If we are not allowed to update_alchemical_charges is off and
++        # we change lambda_electrostatics we also change the compatibility.
++        elif self.update_alchemical_charges is False and attribute_name == 'lambda_electrostatics':
++            # Look for old value of lambda_electrostatics.
++            for force, parameter_name, parameter_idx in self._get_system_lambda_parameters(standard_system):
++                if parameter_name == 'lambda_electrostatics':
++                    break
++            old_lambda_electrostatics = force.getGlobalParameterDefaultValue(parameter_idx)
++            need_changes = old_lambda_electrostatics != self.lambda_electrostatics
++
++        return need_changes
++
++    def _find_force_groups_to_update(self, context, current_context_state, memo):
++        """Find the force groups whose energy must be recomputed after applying self.
++
++        Parameters
++        ----------
++        context : Context
++            The context, currently in `current_context_state`, that will
++            be moved to this state.
++        current_context_state : ThermodynamicState
++            The full thermodynamic state of the given context. This is
++            guaranteed to be compatible with self.
++        memo : dict
++            A dictionary that can be used by the state for memoization
++            to speed up consecutive calls on the same context.
++
++        Returns
++        -------
++        force_groups_to_update : set of int
++            The indices of the force groups whose energy must be computed
++            again after applying this state, assuming the context to be in
++            `current_context_state`.
++        """
++        # Cache information about system force groups.
++        if len(memo) == 0:
++            parameters_found = set()
++            system = context.getSystem()
++            for force, parameter_name, _ in self._get_system_lambda_parameters(system):
++                if parameter_name not in parameters_found:
++                    parameters_found.add(parameter_name)
++                    # Keep track of valid lambdas only.
++                    if self._parameters[parameter_name] is not None:
++                        memo[parameter_name] = force.getForceGroup()
++                    # Break the loop if we have found all the parameters.
++                    if len(parameters_found) == len(self._parameters):
++                        break
++
++        # Find lambda parameters that will change.
++        force_groups_to_update = set()
++        for parameter_name, force_group in memo.items():
++            self_parameter_value = getattr(self, parameter_name)
++            current_parameter_value = getattr(current_context_state, parameter_name)
++            if self_parameter_value != current_parameter_value:
++                force_groups_to_update.add(force_group)
++        return force_groups_to_update
+ 
+     # -------------------------------------------------------------------------
+     # Internal-usage
+     # -------------------------------------------------------------------------
+ 
+-    def _initialize(self, **kwargs):
++    _UPDATE_ALCHEMICAL_CHARGES_DEFAULT = True
++
++    def _initialize(self, update_alchemical_charges=_UPDATE_ALCHEMICAL_CHARGES_DEFAULT,
++                    **kwargs):
+         """Initialize the alchemical state."""
+         self._alchemical_variables = {}
++        self.update_alchemical_charges = update_alchemical_charges
+ 
+         # Get supported parameters from properties introspection.
+         supported_parameters = self._get_supported_parameters()
+@@ -522,6 +667,66 @@ def _initialize(self, **kwargs):
+         for parameter_name, value in kwargs.items():
+             setattr(self, parameter_name, value)
+ 
++    def _apply_to_system(self, system, set_update_charges_flag):
++        """Set the alchemical state of the system to this.
++
++        Raises
++        ------
++        AlchemicalStateError
++            If the system does not have the required lambda global variables.
++
++        """
++        has_lambda_electrostatics_changed = False
++        parameters_applied = set()
++        for force, parameter_name, parameter_id in self._get_system_lambda_parameters(system):
++            parameter_value = getattr(self, parameter_name)
++            if parameter_value is None:
++                err_msg = 'The system parameter {} is not defined in this state.'
++                raise AlchemicalStateError(err_msg.format(parameter_name))
++            else:
++                # If lambda_electrostatics, first check if we're changing it for later.
++                # This avoids us to loop through the System forces if we don't need to
++                # set the NonbondedForce charges.
++                if parameter_name == 'lambda_electrostatics':
++                    old_parameter_value = force.getGlobalParameterDefaultValue(parameter_id)
++                    has_lambda_electrostatics_changed = (has_lambda_electrostatics_changed or
++                                                         parameter_value != old_parameter_value)
++                parameters_applied.add(parameter_name)
++                force.setGlobalParameterDefaultValue(parameter_id, parameter_value)
++
++        # Check that we set all the defined parameters.
++        for parameter_name in self._get_supported_parameters():
++            if (self._parameters[parameter_name] is not None and
++                    parameter_name not in parameters_applied):
++                err_msg = 'Could not find parameter {} in the system'
++                raise AlchemicalStateError(err_msg.format(parameter_name))
++
++        # Nothing else to do if we don't need to modify the exact PME forces.
++        if not (has_lambda_electrostatics_changed or set_update_charges_flag):
++            return
++
++        # Loop through system and retrieve exact PME forces.
++        original_charges_force, nonbonded_force = self._find_exact_pme_forces(system)
++
++        # Write NonbondedForce charges if PME is treated exactly.
++        if has_lambda_electrostatics_changed:
++            self._set_exact_pme_charges(original_charges_force, nonbonded_force)
++
++        # Flag if updateParametersInContext is allowed.
++        if set_update_charges_flag:
++            self._set_force_update_charge_parameter(original_charges_force)
++
++    def _set_force_update_charge_parameter(self, original_charges_force):
++        """Set the global parameter that controls the charges updates."""
++        if original_charges_force is None:
++            return
++
++        parameter_idx = _UPDATE_ALCHEMICAL_CHARGES_PARAMETER_IDX  # Shortcut.
++        if self.update_alchemical_charges:
++            original_charges_force.setGlobalParameterDefaultValue(parameter_idx, 1)
++        else:
++            original_charges_force.setGlobalParameterDefaultValue(parameter_idx, 0)
++
+     @classmethod
+     def _get_supported_parameters(cls):
+         """Return a set of the supported alchemical parameters.
+@@ -537,7 +742,7 @@ def _get_supported_parameters(cls):
+         return supported_parameters
+ 
+     @classmethod
+-    def _get_system_lambda_parameters(cls, system):
++    def _get_system_lambda_parameters(cls, system, other_parameters=frozenset()):
+         """Yields the supported lambda parameters in the system.
+ 
+         Yields
+@@ -547,6 +752,7 @@ def _get_system_lambda_parameters(cls, system):
+ 
+         """
+         supported_parameters = cls._get_supported_parameters()
++        searched_parameters = supported_parameters.union(other_parameters)
+ 
+         # Retrieve all the forces with global supported parameters.
+         for force_index in range(system.getNumForces()):
+@@ -557,9 +763,65 @@ def _get_system_lambda_parameters(cls, system):
+                 continue
+             for parameter_id in range(n_global_parameters):
+                 parameter_name = force.getGlobalParameterName(parameter_id)
+-                if parameter_name in supported_parameters:
++                if parameter_name in searched_parameters:
+                     yield force, parameter_name, parameter_id
+ 
++    def _set_alchemical_parameters(self, new_value, exclusions):
++        """Set all defined parameters to the given value.
++
++        The undefined parameters (i.e. those being set to None) remain
++        undefined.
++
++        Parameters
++        ----------
++        new_value : float
++            The new value for all defined parameters.
++        exclusions : set
++            The lambda parameters not to set.
++
++        """
++        for parameter_name in self._parameters:
++            if parameter_name not in exclusions and self._parameters[parameter_name] is not None:
++                setattr(self, parameter_name, new_value)
++
++    @classmethod
++    def _find_exact_pme_forces(cls, system, original_charges_only=False):
++        """Return the NonbondedForce and the CustomNonbondedForce with the original charges."""
++        original_charges_force = None
++        nonbonded_force = None
++        n_found = 0
++        for force_idx, force in enumerate(system.getForces()):
++            if (isinstance(force, openmm.CustomNonbondedForce) and
++                        force.getEnergyFunction() == '0.0;' and
++                        force.getGlobalParameterName(0) == 'lambda_electrostatics'):
++                original_charges_force = force
++                if original_charges_only:
++                    break
++                n_found += 1
++            elif isinstance(force, openmm.NonbondedForce):
++                nonbonded_force = force
++                n_found += 1
++            if n_found == 2:
++                break
++        if original_charges_only:
++            return original_charges_force
++        return original_charges_force, nonbonded_force
++
++    def _set_exact_pme_charges(self, original_charges_force, nonbonded_force):
++        """Set the NonbondedForce charges from the original value and lambda_electrostatics."""
++        # If we don't treat PME exactly, we don't need to set the charges.
++        if original_charges_force is None:
++            return
++
++        # Set alchemical atoms charges.
++        lambda_electrostatics = self.lambda_electrostatics
++        _, alchemical_atoms = original_charges_force.getInteractionGroupParameters(0)
++        for atom_idx in alchemical_atoms:
++            charge, sigma, epsilon = nonbonded_force.getParticleParameters(atom_idx)
++            original_charge = original_charges_force.getParticleParameters(atom_idx)[0]
++            charge = lambda_electrostatics * original_charge
++            nonbonded_force.setParticleParameters(atom_idx, charge, sigma, epsilon)
++
+ 
+ # =============================================================================
+ # ALCHEMICAL REGION
+@@ -668,9 +930,15 @@ class AbsoluteAlchemicalFactory(object):
+         used in alchemical interactions only.
+     alchemical_pme_treatment : str, optional, default = 'direct-space'
+         Controls how alchemical region electrostatics are treated when PME is used.
+-        Options are ['direct-space', 'coulomb'].
+-        'direct-space' only models the direct space contribution
+-        'coulomb' includes switched Coulomb interaction
++        Options are ['direct-space', 'coulomb', 'exact'].
++        - 'direct-space' only models the direct space contribution
++        - 'coulomb' includes switched Coulomb interaction
++        - 'exact' includes also the reciprocal space contribution, but it's
++           only possible to annihilate the charges and the softcore parameters
++           controlling the electrostatics are deactivated. Also, with this
++           method, modifying the global variable `lambda_electrostatics` is
++           not sufficient to control the charges. The recommended way to change
++           them is through the `AlchemicalState` class.
+     alchemical_rf_treatment : str, optional, default = 'switched'
+         Controls how alchemical region electrostatics are treated when RF is used
+         Options are ['switched', 'shifted']
+@@ -681,7 +949,12 @@ class AbsoluteAlchemicalFactory(object):
+         region to avoid the need to recompute the correction (a CPU operation that takes ~ 0.5 s)
+         every time 'lambda_sterics' is changed. If using nonequilibrium protocols, it is recommended
+         that this be set to True since this can lead to enormous (100x) slowdowns if the correction
+-        must be recomputed every timestep.
++        must be recomputed every time step.
++    split_alchemical_forces : bool, optional, default=True
++        If True, forces that are altered to different alchemical variables
++        will be split in different force groups. All non-alchemical forces
++        will maintain their original force group. If more than 32 force
++        groups are required, an error is thrown.
+ 
+     Examples
+     --------
+@@ -763,13 +1036,14 @@ class AbsoluteAlchemicalFactory(object):
+ 
+     def __init__(self, consistent_exceptions=False, switch_width=1.0*unit.angstroms,
+                  alchemical_pme_treatment='direct-space', alchemical_rf_treatment='switched',
+-                 disable_alchemical_dispersion_correction=False):
++                 disable_alchemical_dispersion_correction=False, split_alchemical_forces=True):
+ 
+         self.consistent_exceptions = consistent_exceptions
+         self.switch_width = switch_width
+         self.alchemical_pme_treatment = alchemical_pme_treatment
+         self.alchemical_rf_treatment = alchemical_rf_treatment
+         self.disable_alchemical_dispersion_correction = disable_alchemical_dispersion_correction
++        self.split_alchemical_forces = split_alchemical_forces
+ 
+     def create_alchemical_system(self, reference_system, alchemical_regions):
+         """Create an alchemically modified version of the reference system.
+@@ -816,6 +1090,7 @@ def create_alchemical_system(self, reference_system, alchemical_regions):
+         # Modify forces as appropriate. We delete the forces that
+         # have been processed modified at the end of the for loop.
+         forces_to_remove = []
++        alchemical_forces_by_lambda = {}
+         for force_index, reference_force in enumerate(reference_system.getForces()):
+             # TODO switch to functools.singledispatch when we drop Python2 support
+             reference_force_name = reference_force.__class__.__name__
+@@ -825,15 +1100,23 @@ def create_alchemical_system(self, reference_system, alchemical_regions):
+             except AttributeError:
+                 pass
+             else:
++                # The reference system force will be deleted.
+                 forces_to_remove.append(force_index)
++                # Collect all the Force objects modeling the reference force.
+                 alchemical_forces = alchemical_force_creator_func(reference_force, alchemical_region)
+-                for alchemical_force in alchemical_forces:
+-                    alchemical_system.addForce(alchemical_force)
++                for lambda_variable_name, lambda_forces in alchemical_forces.items():
++                    try:
++                        alchemical_forces_by_lambda[lambda_variable_name].extend(lambda_forces)
++                    except KeyError:
++                        alchemical_forces_by_lambda[lambda_variable_name] = lambda_forces
+ 
+         # Remove original forces that have been alchemically modified.
+         for force_index in reversed(forces_to_remove):
+             alchemical_system.removeForce(force_index)
+ 
++        # Add forces and split groups if necessary.
++        self._add_alchemical_forces(alchemical_system, alchemical_forces_by_lambda)
++
+         # Record timing statistics.
+         timer.stop('Create alchemically modified system')
+         timer.report_timing()
+@@ -1143,6 +1426,39 @@ def _build_alchemical_bond_list(alchemical_atoms, reference_forces, system):
+     # Internal usage: Alchemical forces
+     # -------------------------------------------------------------------------
+ 
++    def _add_alchemical_forces(self, alchemical_system, alchemical_forces_by_lambda):
++        """Add the forces to the alchemical system and eventually split the force groups."""
++        # OpenMM can have a maximum of 32 groups.
++        available_force_groups = set(range(32))
++
++        # Add non-alchemical groups. New forces will have force group 0, and we don't
++        # want to modify the force group of forces that have been copied from the reference.
++        non_alchemical_forces = alchemical_forces_by_lambda.pop('', [])
++        for non_alchemical_force in non_alchemical_forces:
++            alchemical_system.addForce(non_alchemical_force)
++
++        # Find which force groups are still available for alchemical forces.
++        for force in alchemical_system.getForces():
++            available_force_groups.discard(force.getForceGroup())
++
++        # Check if there are enough force groups to split alchemical forces.
++        if (self.split_alchemical_forces and
++                    len(available_force_groups) < len(alchemical_forces_by_lambda)):
++            raise RuntimeError('There are not enough force groups to split alchemical forces.\n'
++                               'Consider merging some non-alchemical forces in a single group '
++                               'or set split_alchemical_forces to False.')
++
++        # Add the alchemical forces in a deterministic way (just to be safe).
++        for lambda_variable in sorted(alchemical_forces_by_lambda):
++            if self.split_alchemical_forces:
++                # Assign to these forces the smallest force group index available.
++                force_group = min(available_force_groups)
++                available_force_groups.remove(force_group)
++            for force in alchemical_forces_by_lambda[lambda_variable]:
++                if self.split_alchemical_forces:
++                    force.setForceGroup(force_group)
++                alchemical_system.addForce(force)
++
+     @staticmethod
+     def _alchemically_modify_PeriodicTorsionForce(reference_force, alchemical_region):
+         """Create alchemically-modified version of PeriodicTorsionForce.
+@@ -1167,10 +1483,11 @@ def _alchemically_modify_PeriodicTorsionForce(reference_force, alchemical_region
+         """
+         # Don't create a force if there are no alchemical torsions.
+         if len(alchemical_region.alchemical_torsions) == 0:
+-            return [copy.deepcopy(reference_force)]
++            return {'': [copy.deepcopy(reference_force)]}
+ 
+         # Create PeriodicTorsionForce to handle unmodified torsions.
+         force = openmm.PeriodicTorsionForce()
++        force.setForceGroup(reference_force.getForceGroup())
+ 
+         # Create CustomTorsionForce to handle alchemically modified torsions.
+         energy_function = "lambda_torsions*k*(1+cos(periodicity*theta-phase))"
+@@ -1191,7 +1508,7 @@ def _alchemically_modify_PeriodicTorsionForce(reference_force, alchemical_region
+                 # Standard torsion.
+                 force.addTorsion(particle1, particle2, particle3, particle4, periodicity, phase, k)
+ 
+-        return [force, custom_force]
++        return {'': [force], 'lambda_torsions': [custom_force]}
+ 
+     @staticmethod
+     def _alchemically_modify_HarmonicAngleForce(reference_force, alchemical_region):
+@@ -1217,10 +1534,11 @@ def _alchemically_modify_HarmonicAngleForce(reference_force, alchemical_region):
+         """
+         # Don't create a force if there are no alchemical angles.
+         if len(alchemical_region.alchemical_angles) == 0:
+-            return [copy.deepcopy(reference_force)]
++            return {'': [copy.deepcopy(reference_force)]}
+ 
+         # Create standard HarmonicAngleForce to handle unmodified angles.
+         force = openmm.HarmonicAngleForce()
++        force.setForceGroup(reference_force.getForceGroup())
+ 
+         # Create CustomAngleForce to handle alchemically modified angles.
+         energy_function = "lambda_angles*(K/2)*(theta-theta0)^2;"
+@@ -1239,7 +1557,7 @@ def _alchemically_modify_HarmonicAngleForce(reference_force, alchemical_region):
+                 # Standard angle.
+                 force.addAngle(particle1, particle2, particle3, theta0, K)
+ 
+-        return [force, custom_force]
++        return {'': [force], 'lambda_angles': [custom_force]}
+ 
+     @staticmethod
+     def _alchemically_modify_HarmonicBondForce(reference_force, alchemical_region):
+@@ -1265,10 +1583,11 @@ def _alchemically_modify_HarmonicBondForce(reference_force, alchemical_region):
+         """
+         # Don't create a force if there are no alchemical bonds.
+         if len(alchemical_region.alchemical_bonds) == 0:
+-            return [copy.deepcopy(reference_force)]
++            return {'': [copy.deepcopy(reference_force)]}
+ 
+         # Create standard HarmonicBondForce to handle unmodified bonds.
+         force = openmm.HarmonicBondForce()
++        force.setForceGroup(reference_force.getForceGroup())
+ 
+         # Create CustomBondForce to handle alchemically modified bonds.
+         energy_function = "lambda_bonds*(K/2)*(r-r0)^2;"
+@@ -1287,7 +1606,140 @@ def _alchemically_modify_HarmonicBondForce(reference_force, alchemical_region):
+                 # Standard bond.
+                 force.addBond(particle1, particle2, theta0, K)
+ 
+-        return [force, custom_force]
++        return {'': [force], 'lambda_bonds': [custom_force]}
++
++    def _get_electrostatics_energy_expressions(self, reference_force):
++        """Return the energy expressions for electrostatics."""
++
++        # The final expression will be prefix + method + suffix.
++        electrostatics_prefix = ('U_electrostatics;'
++                                 'U_electrostatics=(lambda_electrostatics^softcore_d)*ONE_4PI_EPS0*chargeprod')
++
++        # Effective softcore distance for electrostatics (common to all methods).
++        electrostatics_suffix = ('reff_electrostatics = sigma*((softcore_beta*(1.0-lambda_electrostatics)^softcore_e + (r/sigma)^softcore_f))^(1/softcore_f);'
++                                 'ONE_4PI_EPS0 = {};').format(ONE_4PI_EPS0)  # Already in OpenMM units.
++
++        # Define mixing rules.
++        electrostatics_mixing_rules = ('chargeprod = charge1*charge2;'  # Mixing rule for charges.
++                                       'sigma = 0.5*(sigma1 + sigma2);')  # Mixing rule for sigma.
++
++        # Standard Coulomb expression with softened core. This is used
++        #   - When the nonbonded method of the reference force is NoCutoff.
++        #   - When alchemical_pme_treatment is set to 'coulomb'.
++        #   - With 1-4 exceptions, unless self.consistent_exceptions is True.
++        coulomb_expression = '/reff_electrostatics;'
++
++        # Select electrostatics functional form based on nonbonded method.
++        nonbonded_method = reference_force.getNonbondedMethod()
++        is_ewald_method = nonbonded_method in [openmm.NonbondedForce.PME, openmm.NonbondedForce.Ewald]
++
++        # With exact treatment, the energy expression is irrelevant as CustomNonbondedForces
++        # only keep the original charges, but they don't contribute to the energy of the system.
++        if is_ewald_method and self.alchemical_pme_treatment == 'exact':
++            electrostatics_energy_expression = '0.0;'
++            exceptions_electrostatics_energy_expression = (electrostatics_prefix + coulomb_expression +
++                                                           electrostatics_suffix)
++            return electrostatics_energy_expression, exceptions_electrostatics_energy_expression
++
++        # Soft-core Coulomb.
++        if nonbonded_method in [openmm.NonbondedForce.NoCutoff]:
++            electrostatics_method_expression = coulomb_expression
++        # Reaction-field electrostatics.
++        elif nonbonded_method in [openmm.NonbondedForce.CutoffPeriodic, openmm.NonbondedForce.CutoffNonPeriodic]:
++            electrostatics_method_expression = self._get_reaction_field_unique_expression(reference_force)
++        # PME electrostatics.
++        elif nonbonded_method in [openmm.NonbondedForce.PME, openmm.NonbondedForce.Ewald]:
++            # Ewald direct-space electrostatics.
++            if self.alchemical_pme_treatment == 'direct-space':
++                electrostatics_method_expression = self._get_pme_direct_space_unique_expression(reference_force)
++            # Use switched standard Coulomb potential, following MTS scheme described in
++            # http://dx.doi.org/10.1063/1.1385159
++            elif self.alchemical_pme_treatment == 'coulomb':
++                electrostatics_method_expression = coulomb_expression
++            else:
++                raise ValueError("Unknown alchemical_pme_treatment scheme '{}'".format(self.alchemical_pme_treatment))
++        else:
++            raise ValueError("Nonbonded method {} not supported yet.".format(nonbonded_method))
++
++        # Define energy expression for 1,4 electrostatic exceptions.
++        exceptions_electrostatics_energy_expression = electrostatics_prefix
++        if self.consistent_exceptions:
++            exceptions_electrostatics_energy_expression += electrostatics_method_expression
++        else:
++            exceptions_electrostatics_energy_expression += coulomb_expression
++        exceptions_electrostatics_energy_expression += electrostatics_suffix
++
++        # Define energy expression for electrostatics.
++        electrostatics_energy_expression = (electrostatics_prefix + electrostatics_method_expression +
++                                            electrostatics_suffix + electrostatics_mixing_rules)
++
++        return electrostatics_energy_expression, exceptions_electrostatics_energy_expression
++
++    def _get_reaction_field_unique_expression(self, reference_force):
++        """Unique part of the expression for reaction-field electrostatics.
++
++        Parameters
++        ----------
++        reference_force : openmm.NonbondedForce
++            The reference force including the reaction-field parameters.
++
++        Returns
++        -------
++        rf_expression : str
++            The unique expression for reaction-field electrostatics.
++
++        See Also
++        --------
++        _get_nonbonded_energy_expressions
++        """
++        epsilon_solvent = reference_force.getReactionFieldDielectric()
++        r_cutoff = reference_force.getCutoffDistance()
++
++        # Determine reaction fields parameters.
++        k_rf = r_cutoff**(-3) * ((epsilon_solvent - 1) / (2*epsilon_solvent + 1))
++        if self.alchemical_rf_treatment == 'switched':
++            c_rf = 0.0 / unit.nanometers
++        elif self.alchemical_rf_treatment == 'shifted':
++            # WARNING: Setting c_rf != 0 can cause large errors in DeltaG for hydration free energies
++            c_rf = r_cutoff**(-1) * ((3*epsilon_solvent) / (2*epsilon_solvent + 1))
++        else:
++            raise ValueError("Unknown alchemical_rf_treatment scheme '{}'".format(self.alchemical_rf_treatment))
++
++        k_rf = k_rf.value_in_unit_system(unit.md_unit_system)
++        c_rf = c_rf.value_in_unit_system(unit.md_unit_system)
++        rf_expression = ('*(reff_electrostatics^(-1) + k_rf*reff_electrostatics^2 - c_rf);'
++                         'k_rf = {k_rf};'
++                         'c_rf = {c_rf};').format(k_rf=k_rf, c_rf=c_rf)
++        return rf_expression
++
++    def _get_pme_direct_space_unique_expression(self, reference_force):
++        """Unique part of the expression for Ewald direct-space electrostatics.
++
++        Parameters
++        ----------
++        reference_force : openmm.NonbondedForce
++            The reference force including the Ewald parameters.
++
++        Returns
++        -------
++        rf_expression : str
++            The unique expression for Ewald direct-space electrostatics.
++
++        See Also
++        --------
++        _get_nonbonded_energy_expressions
++        """
++        # Determine PME parameters.
++        [alpha_ewald, nx, ny, nz] = reference_force.getPMEParameters()
++        if (alpha_ewald/alpha_ewald.unit) == 0.0:
++            # If alpha is 0.0, alpha_ewald is computed by OpenMM from from the error tolerance.
++            tol = reference_force.getEwaldErrorTolerance()
++            alpha_ewald = (1.0/reference_force.getCutoffDistance()) * np.sqrt(-np.log(2.0*tol))
++
++        alpha_ewald = alpha_ewald.value_in_unit_system(unit.md_unit_system)
++        pme_expression = ("*erfc(alpha_ewald*reff_electrostatics)/reff_electrostatics;"
++                          "alpha_ewald = {};").format(alpha_ewald)
++        return pme_expression
+ 
+     def _alchemically_modify_NonbondedForce(self, reference_force, alchemical_region):
+         """Create alchemically-modified version of NonbondedForce.
+@@ -1337,98 +1789,59 @@ def _alchemically_modify_NonbondedForce(self, reference_force, alchemical_region
+ 
+         # Don't create a force if there are no alchemical atoms.
+         if len(alchemical_region.alchemical_atoms) == 0:
+-            return [copy.deepcopy(reference_force)]
+-
+-        nonbonded_method = reference_force.getNonbondedMethod()
+-
+-        # Warn about reaction field.
+-        if nonbonded_method == openmm.NonbondedForce.CutoffPeriodic:
+-            logger.warning('Reaction field support is still experimental. For free energy '
+-                           'calculations in explicit solvent, we suggest using PME for now.')
++            return {'': [copy.deepcopy(reference_force)]}
+ 
+         # --------------------------------------------------
+         # Determine energy expression for all custom forces
+         # --------------------------------------------------
+ 
+-        # Soft-core Lennard-Jones
+-        sterics_energy_expression = "U_sterics = (lambda_sterics^softcore_a)*4*epsilon*x*(x-1.0); x = (sigma/reff_sterics)^6;"
+-
+-        # Electrostatics energy expression for NoCutoff nonbonded method
+-        nocutoff_electrostatics_energy_expression = "U_electrostatics = (lambda_electrostatics^softcore_d)*ONE_4PI_EPS0*chargeprod/reff_electrostatics;"
++        # Sterics mixing rules.
++        sterics_mixing_rules = ('epsilon = sqrt(epsilon1*epsilon2);'  # Mixing rule for epsilon.
++                                'sigma = 0.5*(sigma1 + sigma2);')  # Mixing rule for sigma.
+ 
+-        # Electrostatics energy expression will change according to the nonbonded method.
+-        electrostatics_energy_expression = ""
++        # Soft-core Lennard-Jones.
++        exceptions_sterics_energy_expression = ('U_sterics;'
++                                                'U_sterics = (lambda_sterics^softcore_a)*4*epsilon*x*(x-1.0);'
++                                                'x = (sigma/reff_sterics)^6;'
++                                                # Effective softcore distance for sterics.
++                                                'reff_sterics = sigma*((softcore_alpha*(1.0-lambda_sterics)^softcore_b + (r/sigma)^softcore_c))^(1/softcore_c);')
+ 
+-        # Energy expression for 1,4 electrostatics exceptions can be either electrostatics_energy_expression
+-        # or nocutoff_electrostatics_energy_expression if self.consistent_exceptions is True or False respectively
+-        exceptions_electrostatics_energy_expression = ""
++        # Define energy expression for sterics.
++        sterics_energy_expression = exceptions_sterics_energy_expression + sterics_mixing_rules
+ 
+-        # Select electrostatics functional form based on nonbonded method.
+-        if nonbonded_method in [openmm.NonbondedForce.NoCutoff]:
+-            # soft-core Coulomb
+-            electrostatics_energy_expression += nocutoff_electrostatics_energy_expression
+-        elif nonbonded_method in [openmm.NonbondedForce.CutoffPeriodic, openmm.NonbondedForce.CutoffNonPeriodic]:
+-            # reaction-field electrostatics
+-            epsilon_solvent = reference_force.getReactionFieldDielectric()
+-            r_cutoff = reference_force.getCutoffDistance()
+-            electrostatics_energy_expression += "U_electrostatics = (lambda_electrostatics^softcore_d)*ONE_4PI_EPS0*chargeprod*(reff_electrostatics^(-1) + k_rf*reff_electrostatics^2 - c_rf);"
+-            k_rf = r_cutoff**(-3) * ((epsilon_solvent - 1) / (2*epsilon_solvent + 1))
+-            if self.alchemical_rf_treatment == 'switched':
+-                c_rf = 0.0 / unit.nanometers
+-            elif self.alchemical_rf_treatment == 'shifted':
+-                # WARNING: Setting c_rf != 0 can cause large errors in DeltaG for hydration free energies
+-                c_rf = r_cutoff**(-1) * ((3*epsilon_solvent) / (2*epsilon_solvent + 1))
+-            else:
+-                raise Exception("Unknown alchemical_rf_treatment scheme '%s'" % self.alchemical_rf_treatment)
+-            electrostatics_energy_expression += "k_rf = %f;" % (k_rf.value_in_unit_system(unit.md_unit_system))
+-            electrostatics_energy_expression += "c_rf = %f;" % (c_rf.value_in_unit_system(unit.md_unit_system))
+-        elif nonbonded_method in [openmm.NonbondedForce.PME, openmm.NonbondedForce.Ewald]:
+-            if self.alchemical_pme_treatment == 'direct-space':
+-                # Ewald direct-space electrostatics
+-                [alpha_ewald, nx, ny, nz] = reference_force.getPMEParameters()
+-                if (alpha_ewald/alpha_ewald.unit) == 0.0:
+-                    # If alpha is 0.0, alpha_ewald is computed by OpenMM from from the error tolerance.
+-                    tol = reference_force.getEwaldErrorTolerance()
+-                    alpha_ewald = (1.0/reference_force.getCutoffDistance()) * np.sqrt(-np.log(2.0*tol))
+-                electrostatics_energy_expression += "U_electrostatics = (lambda_electrostatics^softcore_d)*ONE_4PI_EPS0*chargeprod*erfc(alpha_ewald*reff_electrostatics)/reff_electrostatics;"
+-                electrostatics_energy_expression += "alpha_ewald = %f;" % (alpha_ewald.value_in_unit_system(unit.md_unit_system))
+-                # TODO: Handle reciprocal-space electrostatics for alchemically-modified particles.  These are otherwise neglected.
+-                # NOTE: There is currently no way to do this in OpenMM.
+-            elif self.alchemical_pme_treatment == 'coulomb':
+-                # Use switched standard Coulomb potential, following MTS scheme described in
+-                # http://dx.doi.org/10.1063/1.1385159
+-                electrostatics_energy_expression += nocutoff_electrostatics_energy_expression
+-            else:
+-                raise Exception("Unknown alchemical_pme_treatment scheme '%s'" % self.alchemical_pme_treatment)
+-        else:
+-            raise Exception("Nonbonded method %s not supported yet." % str(nonbonded_method))
++        # Define energy expression for electrostatics based on nonbonded method.
++        nonbonded_method = reference_force.getNonbondedMethod()
++        is_ewald_method = nonbonded_method in [openmm.NonbondedForce.Ewald,
++                                               openmm.NonbondedForce.PME]
++        is_rf_method = nonbonded_method in [openmm.NonbondedForce.CutoffPeriodic,
++                                            openmm.NonbondedForce.CutoffNonPeriodic]
++        is_periodic_method = is_ewald_method or nonbonded_method == openmm.NonbondedForce.CutoffPeriodic
++        use_exact_pme_treatment = is_ewald_method and self.alchemical_pme_treatment == 'exact'
+ 
+-        # Add additional definitions common to all methods.
+-        sterics_energy_expression += "reff_sterics = sigma*((softcore_alpha*(1.0-lambda_sterics)^softcore_b + (r/sigma)^softcore_c))^(1/softcore_c);" # effective softcore distance for sterics
+-        reff_electrostatics_expression = "reff_electrostatics = sigma*((softcore_beta*(1.0-lambda_electrostatics)^softcore_e + (r/sigma)^softcore_f))^(1/softcore_f);" # effective softcore distance for electrostatics
+-        reff_electrostatics_expression += "ONE_4PI_EPS0 = %f;" % ONE_4PI_EPS0 # already in OpenMM units
+-        electrostatics_energy_expression += reff_electrostatics_expression
++        # Warn about reaction field.
++        if is_rf_method:
++            logger.warning('Reaction field support is still experimental. For free energy '
++                           'calculations in explicit solvent, we suggest using PME for now.')
+ 
+-        # Define functional form of 1,4 electrostatic exceptions
+-        if self.consistent_exceptions:
+-            exceptions_electrostatics_energy_expression += electrostatics_energy_expression
+-        else:
+-            exceptions_electrostatics_energy_expression += nocutoff_electrostatics_energy_expression
+-            exceptions_electrostatics_energy_expression += reff_electrostatics_expression
++        # Check that PME treatment is supported with the region's parameters.
++        if use_exact_pme_treatment:
++            err_msg = ' not supported with exact treatment of Ewald electrostatics.'
++            if not alchemical_region.annihilate_electrostatics:
++                raise ValueError('Decoupled electrostatics is' + err_msg)
++            if self.consistent_exceptions:
++                raise ValueError('Consistent exceptions are' + err_msg)
++            if (alchemical_region.softcore_beta, alchemical_region.softcore_d, alchemical_region.softcore_e) != (0, 1, 1):
++                raise ValueError('Softcore electrostatics is' + err_msg)
+ 
+-        # Define mixing rules.
+-        sterics_mixing_rules = ""
+-        sterics_mixing_rules += "epsilon = sqrt(epsilon1*epsilon2);" # mixing rule for epsilon
+-        sterics_mixing_rules += "sigma = 0.5*(sigma1 + sigma2);" # mixing rule for sigma
+-        electrostatics_mixing_rules = ""
+-        electrostatics_mixing_rules += "chargeprod = charge1*charge2;" # mixing rule for charges
+-        electrostatics_mixing_rules += "sigma = 0.5*(sigma1 + sigma2);" # mixing rule for sigma
++        energy_expressions = self._get_electrostatics_energy_expressions(reference_force)
++        (electrostatics_energy_expression,
++         exceptions_electrostatics_energy_expression) = energy_expressions  # Unpack tuple.
+ 
+         # ------------------------------------------------------------
+         # Create and configure all forces to add to alchemical system
+         # ------------------------------------------------------------
+ 
+-        # Interactions and exceptions will be distributed according to the following table
++        # Interactions and exceptions will be distributed according to the following table.
+ 
+         # --------------------------------------------------------------------------------------------------
+         # FORCE                                    | INTERACTION GROUP                                     |
+@@ -1439,10 +1852,12 @@ def _alchemically_modify_NonbondedForce(self, reference_force, alchemical_region
+         # aa_sterics_custom_nonbonded_force        | sterics interactions alchemical/alchemical            |
+         # --------------------------------------------------------------------------------------------------
+         # aa_electrostatics_custom_nonbonded_force | electrostatics interactions alchemical/alchemical     |
++        #                                          | (only without exact PME treatment)                    |
+         # --------------------------------------------------------------------------------------------------
+         # na_sterics_custom_nonbonded_force        | sterics interactions non-alchemical/alchemical        |
+         # --------------------------------------------------------------------------------------------------
+         # na_electrostatics_custom_nonbonded_force | electrostatics interactions non-alchemical/alchemical |
++        #                                          | (only without exact PME treatment)                    |
+         # --------------------------------------------------------------------------------------------------
+         # aa_sterics_custom_bond_force             | sterics exceptions alchemical/alchemical              |
+         # --------------------------------------------------------------------------------------------------
+@@ -1457,25 +1872,27 @@ def _alchemically_modify_NonbondedForce(self, reference_force, alchemical_region
+         # 1,4 exceptions between non-alchemical/non-alchemical atoms (nn).
+         nonbonded_force = copy.deepcopy(reference_force)
+ 
++        def create_force(force_cls, energy_expression, lambda_variable_name, is_lambda_controlled):
++            """Shortcut to create a lambda-controlled custom forces."""
++            if is_lambda_controlled:
++                force = force_cls(energy_expression)
++                force.addGlobalParameter(lambda_variable_name, 1.0)
++            else:  # fix lambda variable to 1.0
++                energy_expression = energy_expression + lambda_variable_name + '=1.0;'
++                force = force_cls(energy_expression)
++            return force
++
+         # Create CustomNonbondedForces to handle sterics particle interactions between
+         # non-alchemical/alchemical atoms (na) and alchemical/alchemical atoms (aa). Fix lambda
+-        # to 1.0 for decoupled interactions
+-        basic_sterics_expression = "U_sterics;" + sterics_energy_expression + sterics_mixing_rules
+-
+-        na_sterics_custom_nonbonded_force = openmm.CustomNonbondedForce(basic_sterics_expression)
+-        na_sterics_custom_nonbonded_force.addGlobalParameter("lambda_sterics", 1.0)
+-        if alchemical_region.annihilate_sterics:
+-            aa_sterics_custom_nonbonded_force = openmm.CustomNonbondedForce(basic_sterics_expression)
+-            aa_sterics_custom_nonbonded_force.addGlobalParameter("lambda_sterics", 1.0)
+-        else:  # for decoupling fix lambda_sterics to 1.0
+-            aa_sterics_custom_nonbonded_force = openmm.CustomNonbondedForce(basic_sterics_expression +
+-                                                                            'lambda_sterics=1.0;')
++        # to 1.0 for decoupled interactions in alchemical/alchemical force.
++        na_sterics_custom_nonbonded_force = create_force(openmm.CustomNonbondedForce, sterics_energy_expression,
++                                                         'lambda_sterics', is_lambda_controlled=True)
++        aa_sterics_custom_nonbonded_force = create_force(openmm.CustomNonbondedForce, sterics_energy_expression,
++                                                         'lambda_sterics', alchemical_region.annihilate_sterics)
++        all_sterics_custom_nonbonded_forces = [na_sterics_custom_nonbonded_force, aa_sterics_custom_nonbonded_force]
+ 
+         # Add parameters and configure CustomNonbondedForces to match reference force
+-        is_method_periodic = nonbonded_method in [openmm.NonbondedForce.Ewald, openmm.NonbondedForce.PME,
+-                                                  openmm.NonbondedForce.CutoffPeriodic]
+-
+-        for force in [na_sterics_custom_nonbonded_force, aa_sterics_custom_nonbonded_force]:
++        for force in all_sterics_custom_nonbonded_forces:
+             force.addPerParticleParameter("sigma")  # Lennard-Jones sigma
+             force.addPerParticleParameter("epsilon")  # Lennard-Jones epsilon
+             force.setUseSwitchingFunction(nonbonded_force.getUseSwitchingFunction())
+@@ -1486,79 +1903,79 @@ def _alchemically_modify_NonbondedForce(self, reference_force, alchemical_region
+             else:
+                 force.setUseLongRangeCorrection(nonbonded_force.getUseDispersionCorrection())
+ 
+-            if is_method_periodic:
++            if is_periodic_method:
+                 force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+             else:
+                 force.setNonbondedMethod(nonbonded_force.getNonbondedMethod())
+ 
+-        # Create CustomNonbondedForces to handle electrostatics particle interactions between
+-        # non-alchemical/alchemical atoms (na) and alchemical/alchemical atoms (aa). Fix lambda
+-        # to 1.0 for decoupled interactions
+-        basic_electrostatics_expression = "U_electrostatics;" + electrostatics_energy_expression +\
+-                                          electrostatics_mixing_rules
+-
+-        na_electrostatics_custom_nonbonded_force = openmm.CustomNonbondedForce(basic_electrostatics_expression)
+-        na_electrostatics_custom_nonbonded_force.addGlobalParameter("lambda_electrostatics", 1.0)
+-        if alchemical_region.annihilate_electrostatics:
+-            aa_electrostatics_custom_nonbonded_force = openmm.CustomNonbondedForce(basic_electrostatics_expression)
+-            aa_electrostatics_custom_nonbonded_force.addGlobalParameter("lambda_electrostatics", 1.0)
+-        else:  # for decoupling fix lambda_electrostatics to 1.0
+-            aa_electrostatics_custom_nonbonded_force = openmm.CustomNonbondedForce(basic_electrostatics_expression +
+-                                                                                   'lambda_electrostatics=1.0;')
+-
+-        # Add parameters and configure CustomNonbondedForces to match reference force
+-        for force in [na_electrostatics_custom_nonbonded_force, aa_electrostatics_custom_nonbonded_force]:
++        # With exact PME treatment, we create a single CustomNonbondedForce
++        # to store the original alchemically-modified charges.
++        if use_exact_pme_treatment:
++            # We add the lambda_electrostatics global variable even
++            # if it doesn't affect the force to make sure we have
++            # a very quick way to check the status of the charges.
++            original_charges_custom_nonbonded_force = create_force(openmm.CustomNonbondedForce, electrostatics_energy_expression,
++                                                                   'lambda_electrostatics', is_lambda_controlled=True)
++            # Keep an extra global parameter to flag whether changes in
++            # electrostatics through updateParametersInContext are allowed.
++            original_charges_custom_nonbonded_force.addGlobalParameter(_UPDATE_ALCHEMICAL_CHARGES_PARAMETER, 1)
++            all_electrostatics_custom_nonbonded_forces = [original_charges_custom_nonbonded_force]
++        else:
++            # Create CustomNonbondedForces to handle electrostatics particle interactions between
++            # non-alchemical/alchemical atoms (na) and alchemical/alchemical atoms (aa). Fix lambda
++            # to 1.0 for decoupled interactions in alchemical/alchemical force.
++            na_electrostatics_custom_nonbonded_force = create_force(openmm.CustomNonbondedForce, electrostatics_energy_expression,
++                                                                    'lambda_electrostatics', is_lambda_controlled=True)
++            aa_electrostatics_custom_nonbonded_force = create_force(openmm.CustomNonbondedForce, electrostatics_energy_expression,
++                                                                    'lambda_electrostatics', alchemical_region.annihilate_electrostatics)
++            all_electrostatics_custom_nonbonded_forces = [na_electrostatics_custom_nonbonded_force,
++                                                          aa_electrostatics_custom_nonbonded_force]
++
++        # Common parameters and configuration for electrostatics CustomNonbondedForces.
++        for force in all_electrostatics_custom_nonbonded_forces:
+             force.addPerParticleParameter("charge")  # partial charge
+-            force.addPerParticleParameter("sigma")  # Lennard-Jones sigma
+-            if (nonbonded_method in [openmm.NonbondedForce.PME, openmm.NonbondedForce.Ewald] and self.alchemical_pme_treatment == 'coulomb') or (nonbonded_method in [openmm.NonbondedForce.CutoffPeriodic] and self.alchemical_rf_treatment == 'switched'):
+-                force.setUseSwitchingFunction(True)  # use switching function for alchemical electrostatics to ensure force continuity at cutoff
++            # The sigma parameter is necessary only if we don't treat PME exactly.
++            if not use_exact_pme_treatment:
++                force.addPerParticleParameter("sigma")  # Lennard-Jones sigma
++            if ((is_ewald_method and self.alchemical_pme_treatment == 'coulomb') or
++                    (is_rf_method and self.alchemical_rf_treatment == 'switched')):
++                # Use switching function for alchemical electrostatics to ensure force continuity at cutoff.
++                force.setUseSwitchingFunction(True)
+             else:
+                 force.setUseSwitchingFunction(False)
+             force.setSwitchingDistance(nonbonded_force.getCutoffDistance() - self.switch_width)
+             force.setCutoffDistance(nonbonded_force.getCutoffDistance())
+             force.setUseLongRangeCorrection(False)  # long-range dispersion correction is meaningless for electrostatics
+ 
+-            if is_method_periodic:
++            if is_periodic_method:
+                 force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+             else:
+                 force.setNonbondedMethod(nonbonded_force.getNonbondedMethod())
+ 
+         # Create CustomBondForces to handle sterics 1,4 exceptions interactions between
+         # non-alchemical/alchemical atoms (na) and alchemical/alchemical atoms (aa). Fix lambda
+-        # to 1.0 for decoupled interactions
+-        basic_sterics_expression = "U_sterics;" + sterics_energy_expression
+-
+-        na_sterics_custom_bond_force = openmm.CustomBondForce(basic_sterics_expression)
+-        na_sterics_custom_bond_force.addGlobalParameter("lambda_sterics", 1.0)
+-        if alchemical_region.annihilate_sterics:
+-            aa_sterics_custom_bond_force = openmm.CustomBondForce(basic_sterics_expression)
+-            aa_sterics_custom_bond_force.addGlobalParameter("lambda_sterics", 1.0)
+-        else:  # for decoupling fix lambda_sterics to 1.0
+-            aa_sterics_custom_bond_force = openmm.CustomBondForce(basic_sterics_expression + 'lambda_sterics=1.0;')
+-
+-        for force in [na_sterics_custom_bond_force, aa_sterics_custom_bond_force]:
++        # to 1.0 for decoupled interactions in alchemical/alchemical force.
++        na_sterics_custom_bond_force = create_force(openmm.CustomBondForce, exceptions_sterics_energy_expression,
++                                                    'lambda_sterics', is_lambda_controlled=True)
++        aa_sterics_custom_bond_force = create_force(openmm.CustomBondForce, exceptions_sterics_energy_expression,
++                                                    'lambda_sterics', alchemical_region.annihilate_sterics)
++        all_sterics_custom_bond_forces = [na_sterics_custom_bond_force, aa_sterics_custom_bond_force]
++
++        for force in all_sterics_custom_bond_forces:
+             force.addPerBondParameter("sigma")  # Lennard-Jones effective sigma
+             force.addPerBondParameter("epsilon")  # Lennard-Jones effective epsilon
+ 
+         # Create CustomBondForces to handle electrostatics 1,4 exceptions interactions between
+         # non-alchemical/alchemical atoms (na) and alchemical/alchemical atoms (aa). Fix lambda
+-        # to 1.0 for decoupled interactions
+-        if self.consistent_exceptions:
+-            basic_electrostatics_expression = "U_electrostatics;" + electrostatics_energy_expression
+-        else:
+-            basic_electrostatics_expression = "U_electrostatics;" + exceptions_electrostatics_energy_expression
+-
+-        na_electrostatics_custom_bond_force = openmm.CustomBondForce(basic_electrostatics_expression)
+-        na_electrostatics_custom_bond_force.addGlobalParameter("lambda_electrostatics", 1.0)
+-        if alchemical_region.annihilate_electrostatics:
+-            aa_electrostatics_custom_bond_force = openmm.CustomBondForce(basic_electrostatics_expression)
+-            aa_electrostatics_custom_bond_force.addGlobalParameter("lambda_electrostatics", 1.0)
+-        else:  # for decoupling fix lambda_electrostatics to 1.0
+-            aa_electrostatics_custom_bond_force = openmm.CustomBondForce(basic_electrostatics_expression +
+-                                                                         'lambda_electrostatics=1.0;')
++        # to 1.0 for decoupled interactions in alchemical/alchemical force.
++        na_electrostatics_custom_bond_force = create_force(openmm.CustomBondForce, exceptions_electrostatics_energy_expression,
++                                                           'lambda_electrostatics', is_lambda_controlled=True)
++        aa_electrostatics_custom_bond_force = create_force(openmm.CustomBondForce, exceptions_electrostatics_energy_expression,
++                                                           'lambda_electrostatics', alchemical_region.annihilate_electrostatics)
++        all_electrostatics_custom_bond_forces = [na_electrostatics_custom_bond_force, aa_electrostatics_custom_bond_force]
+ 
+         # Create CustomBondForce to handle exceptions for electrostatics
+-        for force in [na_electrostatics_custom_bond_force, aa_electrostatics_custom_bond_force]:
++        for force in all_electrostatics_custom_bond_forces:
+             force.addPerBondParameter("chargeprod")  # charge product
+             force.addPerBondParameter("sigma")  # Lennard-Jones effective sigma
+ 
+@@ -1566,6 +1983,11 @@ def _alchemically_modify_NonbondedForce(self, reference_force, alchemical_region
+         # Distribute particle interactions contributions in appropriate nonbonded forces
+         # -------------------------------------------------------------------------------
+ 
++        # Create atom groups.
++        alchemical_atomset = alchemical_region.alchemical_atoms
++        all_atomset = set(range(reference_force.getNumParticles()))  # all atoms, including alchemical region
++        nonalchemical_atomset = all_atomset.difference(alchemical_atomset)
++
+         # Fix any NonbondedForce issues with Lennard-Jones sigma = 0 (epsilon = 0), which should have sigma > 0.
+         for particle_index in range(nonbonded_force.getNumParticles()):
+             # Retrieve parameters.
+@@ -1593,34 +2015,47 @@ def _alchemically_modify_NonbondedForce(self, reference_force, alchemical_region
+             [charge, sigma, epsilon] = nonbonded_force.getParticleParameters(particle_index)
+             if (sigma / unit.angstroms) == 0.0:
+                 raise Exception('sigma is %s for particle %d; sigma must be positive' % (str(sigma), particle_index))
+-            na_sterics_custom_nonbonded_force.addParticle([sigma, epsilon])
+-            aa_sterics_custom_nonbonded_force.addParticle([sigma, epsilon])
+-            na_electrostatics_custom_nonbonded_force.addParticle([charge, sigma])
+-            aa_electrostatics_custom_nonbonded_force.addParticle([charge, sigma])
+-
+-        # Create atom groups.
+-        alchemical_atomset = alchemical_region.alchemical_atoms
+-        all_atomset = set(range(reference_force.getNumParticles()))  # all atoms, including alchemical region
+-        nonalchemical_atomset = all_atomset.difference(alchemical_atomset)
++            # Set sterics parameters to custom forces.
++            for force in all_sterics_custom_nonbonded_forces:
++                force.addParticle([sigma, epsilon])
++            # Set electrostatics parameters to custom forces.
++            if use_exact_pme_treatment:
++                if particle_index in alchemical_atomset:
++                    electrostatics_parameters = [charge]
++                else:
++                    electrostatics_parameters = [abs(0.0*charge)]
++            else:
++                electrostatics_parameters = [charge, sigma]
++            for force in all_electrostatics_custom_nonbonded_forces:
++                force.addParticle(electrostatics_parameters)
+ 
+         # Turn off interactions contribution from alchemically-modified particles in unmodified
+         # NonbondedForce that will be handled by all other forces
+         for particle_index in range(nonbonded_force.getNumParticles()):
+             # Retrieve parameters.
+             [charge, sigma, epsilon] = nonbonded_force.getParticleParameters(particle_index)
++            # Wit exact treatment of the PME electrostatics, the NonbondedForce handles the electrostatics.
++            if not use_exact_pme_treatment:
++                charge = abs(0.0*charge)
+             if particle_index in alchemical_atomset:
+-                nonbonded_force.setParticleParameters(particle_index, abs(0*charge), sigma, abs(0*epsilon))
++                nonbonded_force.setParticleParameters(particle_index, charge, sigma, abs(0*epsilon))
+ 
+         # Restrict interaction evaluation of CustomNonbondedForces to their respective atom groups.
+         na_sterics_custom_nonbonded_force.addInteractionGroup(nonalchemical_atomset, alchemical_atomset)
+-        na_electrostatics_custom_nonbonded_force.addInteractionGroup(nonalchemical_atomset, alchemical_atomset)
+         aa_sterics_custom_nonbonded_force.addInteractionGroup(alchemical_atomset, alchemical_atomset)
+-        aa_electrostatics_custom_nonbonded_force.addInteractionGroup(alchemical_atomset, alchemical_atomset)
++        if use_exact_pme_treatment:
++            # The custom force only holds the original charges. It doesn't contribute to the energy.
++            original_charges_custom_nonbonded_force.addInteractionGroup({}, alchemical_atomset)
++        else:
++            na_electrostatics_custom_nonbonded_force.addInteractionGroup(nonalchemical_atomset, alchemical_atomset)
++            aa_electrostatics_custom_nonbonded_force.addInteractionGroup(alchemical_atomset, alchemical_atomset)
+ 
+         # ---------------------------------------------------------------
+         # Distribute exceptions contributions in appropriate bond forces
+         # ---------------------------------------------------------------
+ 
++        all_custom_nonbonded_forces = all_sterics_custom_nonbonded_forces + all_electrostatics_custom_nonbonded_forces
++
+         # Move all NonbondedForce exception terms for alchemically-modified particles to CustomBondForces.
+         for exception_index in range(nonbonded_force.getNumExceptions()):
+             # Retrieve parameters.
+@@ -1628,10 +2063,8 @@ def _alchemically_modify_NonbondedForce(self, reference_force, alchemical_region
+ 
+             # Exclude this atom pair in CustomNonbondedForces. All nonbonded forces
+             # must have the same number of exceptions/exclusions on CUDA platform.
+-            na_sterics_custom_nonbonded_force.addExclusion(iatom, jatom)
+-            aa_sterics_custom_nonbonded_force.addExclusion(iatom, jatom)
+-            na_electrostatics_custom_nonbonded_force.addExclusion(iatom, jatom)
+-            aa_electrostatics_custom_nonbonded_force.addExclusion(iatom, jatom)
++            for force in all_custom_nonbonded_forces:
++                force.addExclusion(iatom, jatom)
+ 
+             # Check how many alchemical atoms we have
+             both_alchemical = iatom in alchemical_atomset and jatom in alchemical_atomset
+@@ -1674,14 +2107,23 @@ def add_global_parameters(force):
+             force.addGlobalParameter('softcore_e', alchemical_region.softcore_e)
+             force.addGlobalParameter('softcore_f', alchemical_region.softcore_f)
+ 
+-        all_custom_forces = [na_sterics_custom_nonbonded_force, na_electrostatics_custom_nonbonded_force,
+-                             aa_sterics_custom_nonbonded_force, aa_electrostatics_custom_nonbonded_force,
+-                             na_sterics_custom_bond_force, na_electrostatics_custom_bond_force,
+-                             aa_sterics_custom_bond_force, aa_electrostatics_custom_bond_force]
++        all_custom_forces = (all_custom_nonbonded_forces +
++                             all_sterics_custom_bond_forces +
++                             all_electrostatics_custom_bond_forces)
+         for force in all_custom_forces:
+             add_global_parameters(force)
+ 
+-        return [nonbonded_force] + all_custom_forces
++        # With exact treatment of PME electrostatics, the NonbondedForce
++        # is affected by lambda electrostatics as well.
++        forces_by_lambda = {
++            'lambda_electrostatics': all_electrostatics_custom_nonbonded_forces + all_electrostatics_custom_bond_forces,
++            'lambda_sterics': all_sterics_custom_nonbonded_forces + all_sterics_custom_bond_forces,
++        }
++        if use_exact_pme_treatment:
++            forces_by_lambda['lambda_electrostatics'].append(nonbonded_force)
++        else:
++            forces_by_lambda[''] = [nonbonded_force]
++        return forces_by_lambda
+ 
+     def _alchemically_modify_AmoebaMultipoleForce(self, reference_force, alchemical_region):
+         raise Exception("Not implemented; needs CustomMultipleForce")
+@@ -1820,7 +2262,7 @@ def _alchemically_modify_GBSAOBCForce(reference_force, alchemical_region, sasa_m
+                 parameters = [charge, radius, scaling_factor, 0.0]
+             custom_force.addParticle(parameters)
+ 
+-        return [custom_force]
++        return {'lambda_electrostatics': [custom_force]}
+ 
+     def _alchemically_modify_CustomGBForce(self, reference_force, alchemical_region):
+         """Create alchemically-modified version of CustomGBForce.
+@@ -1934,7 +2376,7 @@ def _alchemically_modify_CustomGBForce(self, reference_force, alchemical_region)
+             [particle1, particle2] = reference_force.getExclusionParticles(exclusion_index)
+             custom_force.addExclusion(particle1, particle2)
+ 
+-        return [custom_force]
++        return {'lambda_electrostatics': [custom_force]}
+ 
+     # -------------------------------------------------------------------------
+     # Internal usage: Infer force labels
+@@ -1990,6 +2432,9 @@ def check_energy_expression(custom_force, parameter):
+                     sterics_bond_forces.append([force_index, force])
+                 else:
+                     electro_bond_forces.append([force_index, force])
++            elif (isinstance(force, openmm.CustomNonbondedForce) and force.getEnergyFunction() == '0.0;' and
++                          force.getGlobalParameterName(0) == 'lambda_electrostatics'):
++                add_label('CustomNonbondedForce holding alchemical atoms unmodified charges', force_index)
+             elif isinstance(force, openmm.CustomNonbondedForce) and check_energy_expression(force, 'lambda'):
+                 if check_energy_expression(force, 'lambda_sterics'):
+                     nonbonded_forces.append(['sterics', force_index, force])
+@@ -2045,6 +2490,7 @@ def check_energy_expression(custom_force, parameter):
+ 
+         return force_labels
+ 
++
+ if __name__ == '__main__':
+     import doctest
+     doctest.testmod()
+diff --git a/openmmtools/states.py b/openmmtools/states.py
+index c185e12fc..c646070c3 100644
+--- a/openmmtools/states.py
++++ b/openmmtools/states.py
+@@ -30,6 +30,40 @@
+ # MODULE FUNCTIONS
+ # =============================================================================
+ 
++def group_by_compatibility(thermodynamic_states):
++    """Utility function to split the thermodynamic states by compatibility.
++
++    Parameters
++    ----------
++    thermodynamic_states : list of ThermodynamicState
++        The thermodynamic state to group by compatibility.
++
++    Returns
++    -------
++    compatible_groups : list of list of ThermodynamicState
++        The states grouped by compatibility.
++    original_indices: list of list of int
++        The indices of the ThermodynamicStates in theoriginal list.
++
++    """
++    compatible_groups = []
++    original_indices = []
++    for state_idx, state in enumerate(thermodynamic_states):
++        # Search for compatible group.
++        found_compatible = False
++        for group, indices in zip(compatible_groups, original_indices):
++            if state.is_state_compatible(group[0]):
++                found_compatible = True
++                group.append(state)
++                indices.append(state_idx)
++
++        # Create new one.
++        if not found_compatible:
++            compatible_groups.append([state])
++            original_indices.append([state_idx])
++    return compatible_groups, original_indices
++
++
+ def _box_vectors_volume(box_vectors):
+     """Return the volume of the box vectors.
+ 
+@@ -632,13 +666,87 @@ def reduced_potential(self, context_state):
+         if n_particles != self.n_particles:
+             raise ThermodynamicsError(ThermodynamicsError.INCOMPATIBLE_SAMPLER_STATE)
+ 
+-        beta = 1.0 / (unit.BOLTZMANN_CONSTANT_kB * self.temperature)
+-        reduced_potential = potential_energy
+-        reduced_potential = reduced_potential / unit.AVOGADRO_CONSTANT_NA
+-        pressure = self.pressure
+-        if pressure is not None:
+-            reduced_potential += pressure * volume
+-        return beta * reduced_potential
++        return self._compute_reduced_potential(potential_energy, self.temperature,
++                                               volume, self.pressure)
++
++    @classmethod
++    def reduced_potential_at_states(cls, context, thermodynamic_states):
++        """Efficiently compute the reduced potential for a list of compatible states.
++
++        The user is responsible to ensure that the given context is compatible
++        with the thermodynamic states.
++
++        Parameters
++        ----------
++        context : openmm.Context
++            The OpenMM `Context` object with box vectors and positions set.
++        thermodynamic_states : list of ThermodynamicState
++            The list of thermodynamic states at which to compute the reduced
++            potential.
++
++        Returns
++        -------
++        reduced_potentials : list of float
++            The unit-less reduced potentials, which can be considered
++            to have units of kT.
++
++        Raises
++        ------
++        ValueError
++            If the thermodynamic states are not compatible to each other.
++
++        """
++        # Isolate first thermodynamic state.
++        if len(thermodynamic_states) == 1:
++            thermodynamic_states[0].apply_to_context(context)
++            return [thermodynamic_states[0].reduced_potential(context)]
++
++        # Check that the states are compatible.
++        for state_idx, state in enumerate(thermodynamic_states[:-1]):
++            if not state.is_state_compatible(thermodynamic_states[state_idx + 1]):
++                raise ValueError('State {} is not compatible.')
++
++        # In NPT, we'll need also the volume.
++        is_npt = thermodynamic_states[0].pressure is not None
++        volume = None
++
++        energy_by_force_group = {force.getForceGroup(): 0.0*unit.kilocalories_per_mole
++                                 for force in context.getSystem().getForces()}
++
++        # Create new cache for memoization.
++        memo = {}
++
++        # Go through thermodynamic states and compute only the energy of the
++        # force groups that changed. Compute all the groups the first pass.
++        force_groups_to_compute = set(energy_by_force_group)
++        reduced_potentials = [0.0 for _ in range(len(thermodynamic_states))]
++        for state_idx, state in enumerate(thermodynamic_states):
++            if state_idx == 0:
++                state.apply_to_context(context)
++            else:
++                state._apply_to_context_in_state(context, thermodynamic_states[state_idx - 1])
++
++            # Compute the energy of all the groups to update.
++            for force_group_idx in force_groups_to_compute:
++                openmm_state = context.getState(getEnergy=True, groups=2**force_group_idx)
++                energy_by_force_group[force_group_idx] = openmm_state.getPotentialEnergy()
++
++            # Compute volume if this is the first time we obtain a state.
++            if is_npt and volume is None:
++                volume = openmm_state.getPeriodicBoxVolume()
++
++            # Compute the new total reduced potential.
++            potential_energy = unit.sum(list(energy_by_force_group.values()))
++            reduced_potential = cls._compute_reduced_potential(potential_energy, state.temperature,
++                                                               volume, state.pressure)
++            reduced_potentials[state_idx] = reduced_potential
++
++            # Update groups to compute for next states.
++            if state_idx < len(thermodynamic_states) - 1:
++                next_state = thermodynamic_states[state_idx + 1]
++                force_groups_to_compute = next_state._find_force_groups_to_update(context, state, memo)
++
++        return reduced_potentials
+ 
+     def is_state_compatible(self, thermodynamic_state):
+         """Check compatibility between ThermodynamicStates.
+@@ -735,7 +843,8 @@ def is_context_compatible(self, context):
+             context_system.addForce(copy.deepcopy(thermostat))
+ 
+         # Compute and compare standard system hash.
+-        context_system_hash = self._standardize_and_hash(context_system)
++        self._standardize_system(context_system)
++        context_system_hash = self._compute_standard_system_hash(context_system)
+         is_compatible = self._standard_system_hash == context_system_hash
+         return is_compatible
+ 
+@@ -862,42 +971,8 @@ def apply_to_context(self, context):
+         310.0
+ 
+         """
+-        system = context.getSystem()
+-
+-        # Apply pressure and temperature to barostat.
+-        barostat = self._find_barostat(system)
+-        if barostat is not None:
+-            if self._pressure is None:
+-                # The context is NPT but this is NVT.
+-                raise ThermodynamicsError(ThermodynamicsError.INCOMPATIBLE_ENSEMBLE)
+-
+-            has_changed = self._set_barostat_pressure(barostat, self.pressure)
+-            if has_changed:
+-                context.setParameter(barostat.Pressure(), self.pressure)
+-            has_changed = self._set_barostat_temperature(barostat, self.temperature)
+-            if has_changed:
+-                # TODO remove try except when drop openmm7.0 support
+-                try:
+-                    context.setParameter(barostat.Temperature(), self.temperature)
+-                except AttributeError:  # OpenMM < 7.1
+-                    openmm_state = context.getState(getPositions=True, getVelocities=True,
+-                                                    getParameters=True)
+-                    context.reinitialize()
+-                    context.setState(openmm_state)
+-        elif self._pressure is not None:
+-            # The context is NVT but this is NPT.
+-            raise ThermodynamicsError(ThermodynamicsError.INCOMPATIBLE_ENSEMBLE)
+-
+-        # Apply temperature to thermostat or integrator.
+-        thermostat = self._find_thermostat(system)
+-        if thermostat is not None:
+-            if not utils.is_quantity_close(thermostat.getDefaultTemperature(),
+-                                           self.temperature):
+-                thermostat.setDefaultTemperature(self.temperature)
+-                context.setParameter(thermostat.Temperature(), self.temperature)
+-        else:
+-            integrator = context.getIntegrator()
+-            self._set_integrator_temperature(integrator)
++        self._set_context_barostat(context, update_pressure=True, update_temperature=True)
++        self._set_context_thermostat(context)
+ 
+     # -------------------------------------------------------------------------
+     # Magic methods
+@@ -1043,15 +1118,9 @@ def _unsafe_set_system(self, system, fix_state):
+             # and pressure of the system are correct.
+             self._check_system_consistency(system)
+ 
+-        # Standardize system and compute hash.
+-        self._standard_system_hash = self._standardize_and_hash(system)
+-
+-        # Check if the standard system is already in the weakref cache.
+-        try:
+-            self._standard_system = self._standard_system_cache[self._standard_system_hash]
+-        except KeyError:
+-            self._standard_system_cache[self._standard_system_hash] = system
+-            self._standard_system = system
++        # Update standard system.
++        self._standardize_system(system)
++        self._update_standard_system(system)
+ 
+     def _check_system_consistency(self, system):
+         """Check system consistency with this ThermodynamicState.
+@@ -1147,12 +1216,84 @@ def _standardize_system(self, system):
+             barostat.setDefaultPressure(self._STANDARD_PRESSURE)
+             system.addForce(barostat)
+ 
+-    def _standardize_and_hash(self, system):
+-        """Standardize the system and return its hash."""
+-        self._standardize_system(system)
+-        system_serialization = openmm.XmlSerializer.serialize(system)
++    def _compute_standard_system_hash(self, standard_system):
++        """Compute the standard system hash."""
++        system_serialization = openmm.XmlSerializer.serialize(standard_system)
+         return system_serialization.__hash__()
+ 
++    def _update_standard_system(self, standard_system):
++        """Update the standard system, its hash and the standard system cache."""
++        self._standard_system_hash = self._compute_standard_system_hash(standard_system)
++        try:
++            self._standard_system = self._standard_system_cache[self._standard_system_hash]
++        except KeyError:
++            self._standard_system_cache[self._standard_system_hash] = standard_system
++            self._standard_system = standard_system
++
++    # -------------------------------------------------------------------------
++    # Internal-usage: context handling
++    # -------------------------------------------------------------------------
++
++    def _set_context_barostat(self, context, update_pressure, update_temperature):
++        """Set the barostat parameters in the Context."""
++        barostat = self._find_barostat(context.getSystem())
++
++        # Check if we are in the same ensemble.
++        if (barostat is None) != (self._pressure is None):
++            raise ThermodynamicsError(ThermodynamicsError.INCOMPATIBLE_ENSEMBLE)
++
++        # No need to set the barostat if we are in NVT.
++        if self._pressure is None:
++            return
++
++        # Apply pressure and temperature to barostat.
++        if update_pressure:
++            self._set_barostat_pressure(barostat, self.pressure)
++            context.setParameter(barostat.Pressure(), self.pressure)
++        if update_temperature:
++            self._set_barostat_temperature(barostat, self.temperature)
++            # TODO remove try except when drop openmm7.0 support
++            try:
++                context.setParameter(barostat.Temperature(), self.temperature)
++            except AttributeError:  # OpenMM < 7.1
++                openmm_state = context.getState(getPositions=True, getVelocities=True,
++                                                getParameters=True)
++                context.reinitialize()
++                context.setState(openmm_state)
++
++    def _set_context_thermostat(self, context):
++        """Set the thermostat parameters in the Context."""
++        # First try to set the integrator (most common case).
++        # If this fails retrieve the Andersen thermostat.
++        is_thermostated = self._set_integrator_temperature(context.getIntegrator())
++        if not is_thermostated:
++            thermostat = self._find_thermostat(context.getSystem())
++            thermostat.setDefaultTemperature(self.temperature)
++            context.setParameter(thermostat.Temperature(), self.temperature)
++
++    def _apply_to_context_in_state(self, context, thermodynamic_state):
++        """Apply this ThermodynamicState to the context.
++
++        When we know the thermodynamic state of the context, this is much faster
++        then apply_to_context(). The given thermodynamic state is assumed to be
++        compatible.
++
++        Parameters
++        ----------
++        context : simtk.openmm.Context
++            The OpenMM Context to be set to this ThermodynamicState.
++        thermodynamic_state : ThermodynamicState
++            The ThermodynamicState of this context.
++
++        """
++        update_pressure = self.pressure != thermodynamic_state.pressure
++        update_temperature = self.temperature != thermodynamic_state.temperature
++
++        if update_pressure or update_temperature:
++            self._set_context_barostat(context, update_pressure, update_temperature)
++        if update_temperature:
++            self._set_context_thermostat(context)
++
+     # -------------------------------------------------------------------------
+     # Internal-usage: integrator handling
+     # -------------------------------------------------------------------------
+@@ -1207,18 +1348,24 @@ def _set_integrator_temperature(self, integrator):
+         If integrator is a CompoundIntegrator, it sets the temperature
+         of every sub-integrator.
+ 
++        Returns
++        -------
++        is_thermostated : bool
++            True if the integrator is thermostated.
++
+         """
+         def set_temp(_integrator):
+             try:
+-                if not utils.is_quantity_close(_integrator.getTemperature(),
+-                                               self.temperature):
+-                    _integrator.setTemperature(self.temperature)
++                _integrator.setTemperature(self.temperature)
++                return True
+             except AttributeError:
+-                pass
++                return False
+ 
+         # Loop over integrators to handle CompoundIntegrators.
++        is_thermostated = False
+         for _integrator in self._loop_over_integrators(integrator):
+-            set_temp(_integrator)
++            is_thermostated = is_thermostated or set_temp(_integrator)
++        return is_thermostated
+ 
+     # -------------------------------------------------------------------------
+     # Internal-usage: barostat handling
+@@ -1340,43 +1487,13 @@ def _set_system_pressure(self, system, pressure):
+ 
+     @staticmethod
+     def _set_barostat_pressure(barostat, pressure):
+-        """Set barostat pressure.
+-
+-        Returns
+-        -------
+-        has_changed : bool
+-            True if the barostat has changed, False if it was already
+-            configured with the correct pressure.
+-
+-        """
+-        if not utils.is_quantity_close(barostat.getDefaultPressure(), pressure):
+-            barostat.setDefaultPressure(pressure)
+-            return True
+-        return False
++        """Set barostat pressure."""
++        barostat.setDefaultPressure(pressure)
+ 
+     @staticmethod
+     def _set_barostat_temperature(barostat, temperature):
+-        """Set barostat temperature.
+-
+-        Returns
+-        -------
+-        has_changed : bool
+-            True if the barostat has changed, False if it was already
+-            configured with the correct temperature.
+-
+-        """
+-        has_changed = False
+-        # TODO remove this when we OpenMM 7.0 drop support
+-        try:
+-            if not utils.is_quantity_close(barostat.getDefaultTemperature(),
+-                                           temperature):
+-                barostat.setDefaultTemperature(temperature)
+-                has_changed = True
+-        except AttributeError:  # versions previous to OpenMM 7.1
+-            if not utils.is_quantity_close(barostat.getTemperature(), temperature):
+-                barostat.setTemperature(temperature)
+-                has_changed = True
+-        return has_changed
++        """Set barostat temperature."""
++        barostat.setDefaultTemperature(temperature)
+ 
+     # -------------------------------------------------------------------------
+     # Internal-usage: thermostat handling
+@@ -1447,6 +1564,28 @@ def _set_system_temperature(cls, system, temperature):
+         if barostat is not None:
+             cls._set_barostat_temperature(barostat, temperature)
+ 
++    # -------------------------------------------------------------------------
++    # Internal-usage: initialization
++    # -------------------------------------------------------------------------
++
++    @staticmethod
++    def _compute_reduced_potential(potential_energy, temperature, volume, pressure):
++        """Convert potential energy into reduced potential."""
++        beta = 1.0 / (unit.BOLTZMANN_CONSTANT_kB * temperature)
++        reduced_potential = potential_energy / unit.AVOGADRO_CONSTANT_NA
++        if pressure is not None:
++            reduced_potential += pressure * volume
++        return beta * reduced_potential
++
++    def _find_force_groups_to_update(self, context, thermodynamic_state, memo):
++        """Find the force groups to be recomputed when moving to the given state.
++
++        With the current implementation of ThermodynamicState, no force group has
++        to be recomputed as only temperature and pressure change between compatible
++        states, but this method becomes essential in CompoundThermodynamicState.
++        """
++        return set()
++
+ 
+ # =============================================================================
+ # SAMPLER STATE
+@@ -1478,10 +1617,8 @@ class SamplerState(object):
+     velocities
+     box_vectors : 3x3 simtk.unit.Quantity.
+         Current box vectors (length units).
+-    potential_energy : simtk.unit.Quantity or None
+-        Potential energy of this configuration.
+-    kinetic_energy : simtk.unit.Quantity
+-        Kinetic energy of this configuration.
++    potential_energy
++    kinetic_energy
+     total_energy
+     volume
+     n_particles
+@@ -1543,7 +1680,7 @@ class SamplerState(object):
+     # -------------------------------------------------------------------------
+ 
+     def __init__(self, positions, velocities=None, box_vectors=None):
+-        self._initialize(positions, velocities, box_vectors)
++        self._initialize(copy.deepcopy(positions), copy.deepcopy(velocities), copy.deepcopy(box_vectors))
+ 
+     @classmethod
+     def from_context(cls, context_state):
+@@ -1588,12 +1725,7 @@ def positions(self):
+ 
+     @positions.setter
+     def positions(self, value):
+-        if value is None or len(value) != self.n_particles:
+-            raise SamplerStateError(SamplerStateError.INCONSISTENT_POSITIONS)
+-        self._positions = value
+-
+-        # Potential energy changes with different positions.
+-        self.potential_energy = None
++        self._set_positions(value, from_context=False, check_consistency=True)
+ 
+     @property
+     def velocities(self):
+@@ -1613,12 +1745,7 @@ def velocities(self):
+ 
+     @velocities.setter
+     def velocities(self, value):
+-        if value is not None and self.n_particles != len(value):
+-            raise SamplerStateError(SamplerStateError.INCONSISTENT_VELOCITIES)
+-        self._velocities = value
+-
+-        # Kinetic energy changes with different velocities.
+-        self.kinetic_energy = None
++        self._set_velocities(value, from_context=False)
+ 
+     @property
+     def box_vectors(self):
+@@ -1637,6 +1764,28 @@ def box_vectors(self, value):
+             value = unit.Quantity(value)
+         self._box_vectors = value
+ 
++    @property
++    def potential_energy(self):
++        """simtk.unit.Quantity or None: Potential energy of this configuration."""
++        if self.positions is None or self.positions.has_changed:
++            return None
++        return self._potential_energy
++
++    @potential_energy.setter
++    def potential_energy(self, new_value):
++        self._potential_energy = new_value
++
++    @property
++    def kinetic_energy(self):
++        """simtk.unit.Quantity or None: Kinetic energy of this configuration."""
++        if self.velocities is None or self.velocities.has_changed:
++            return None
++        return self._kinetic_energy
++
++    @kinetic_energy.setter
++    def kinetic_energy(self, new_value):
++        self._kinetic_energy = new_value
++
+     @property
+     def total_energy(self):
+         """The sum of potential and kinetic energy (read-only)."""
+@@ -1717,9 +1866,9 @@ def apply_to_context(self, context, ignore_velocities=False):
+         # NOTE: Box vectors MUST be updated before positions are set.
+         if self.box_vectors is not None:
+             context.setPeriodicBoxVectors(*self.box_vectors)
+-        context.setPositions(self._positions)
++        context.setPositions(self._unitless_positions)
+         if self._velocities is not None and not ignore_velocities:
+-            context.setVelocities(self._velocities)
++            context.setVelocities(self._unitless_velocities)
+ 
+     def has_nan(self):
+         """Check that energies and positions are finite.
+@@ -1744,17 +1893,19 @@ def __getitem__(self, item):
+         if np.issubdtype(type(item), np.integer):
+             # Here we don't need to copy since we instantiate a new array.
+             pos_value = self._positions[item].value_in_unit(self._positions.unit)
+-            sampler_state._positions = unit.Quantity(np.array([pos_value]),
+-                                                     self._positions.unit)
++            new_positions = unit.Quantity(np.array([pos_value]), self._positions.unit)
++            sampler_state._set_positions(new_positions, from_context=False, check_consistency=False)
+             if self._velocities is not None:
+                 vel_value = self._velocities[item].value_in_unit(self._velocities.unit)
+-                sampler_state._velocities = unit.Quantity(np.array([vel_value]),
+-                                                          self._velocities.unit)
++                new_velocities = unit.Quantity(np.array([vel_value]), self._velocities.unit)
++                sampler_state._set_velocities(new_velocities, from_context=False)
+         else:  # Assume slice or sequence.
+             # Copy original values to avoid side effects.
+-            sampler_state._positions = copy.deepcopy(self._positions[item])
++            sampler_state._set_positions(copy.deepcopy(self._positions[item]),
++                                         from_context=False, check_consistency=False)
+             if self._velocities is not None:
+-                sampler_state._velocities = copy.deepcopy(self._velocities[item].copy())
++                sampler_state._set_velocities(copy.deepcopy(self._velocities[item].copy()),
++                                              from_context=False)
+ 
+         # Copy box vectors.
+         sampler_state.box_vectors = copy.deepcopy(self.box_vectors)
+@@ -1784,14 +1935,67 @@ def __setstate__(self, serialization):
+     def _initialize(self, positions, velocities, box_vectors,
+                     potential_energy=None, kinetic_energy=None):
+         """Initialize the sampler state."""
+-        self._positions = positions
+-        self._velocities = None
++        self._set_positions(positions, from_context=False, check_consistency=False)
+         self.velocities = velocities  # Checks consistency and units.
+-        self._box_vectors = None
+         self.box_vectors = box_vectors  # Make sure box vectors is Quantity.
+         self.potential_energy = potential_energy
+         self.kinetic_energy = kinetic_energy
+ 
++    def _set_positions(self, new_positions, from_context, check_consistency):
++        """Set the positions without checking for consistency."""
++        if check_consistency and (new_positions is None or len(new_positions) != self.n_particles):
++            raise SamplerStateError(SamplerStateError.INCONSISTENT_POSITIONS)
++
++        if from_context:
++            self._unitless_positions_cache = new_positions._value
++            assert new_positions.unit == unit.nanometer
++        else:
++            self._unitless_positions_cache = None
++
++        self._positions = utils.TrackedQuantity(new_positions)
++
++        # The potential energy changes with different positions.
++        self.potential_energy = None
++
++    def _set_velocities(self, new_velocities, from_context):
++        """Set the velocities."""
++        if from_context:
++            self._unitless_velocities_cache = new_velocities._value
++            assert new_velocities.unit == unit.nanometer/unit.picoseconds
++        else:
++            if new_velocities is not None and self.n_particles != len(new_velocities):
++                raise SamplerStateError(SamplerStateError.INCONSISTENT_VELOCITIES)
++            self._unitless_velocities_cache = None
++
++        if new_velocities is not None:
++            new_velocities = utils.TrackedQuantity(new_velocities)
++        self._velocities = new_velocities
++
++        # The kinetic energy changes with different positions.
++        self.kinetic_energy = None
++
++    @property
++    def _unitless_positions(self):
++        """Keeps a cache of unitless positions."""
++        if self._unitless_positions_cache is None or self._positions.has_changed:
++            self._unitless_positions_cache = self.positions.value_in_unit_system(unit.md_unit_system)
++        if self._positions.has_changed:
++            self._positions.has_changed = False
++            self.potential_energy = None
++        return self._unitless_positions_cache
++
++    @property
++    def _unitless_velocities(self):
++        """Keeps a cache of unitless velocities."""
++        if self._velocities is None:
++            return None
++        if self._unitless_velocities_cache is None or self._velocities.has_changed:
++            self._unitless_velocities_cache = self._velocities.value_in_unit_system(unit.md_unit_system)
++        if self._velocities.has_changed:
++            self._velocities.has_changed = False
++            self.kinetic_energy = None
++        return self._unitless_velocities_cache
++
+     def _read_context_state(self, context_state, check_consistency):
+         """Read the Context state.
+ 
+@@ -1817,16 +2021,16 @@ def _read_context_state(self, context_state, check_consistency):
+         else:
+             openmm_state = context_state
+ 
++        positions = openmm_state.getPositions(asNumpy=True)
++        velocities = openmm_state.getVelocities(asNumpy=True)
++
+         # We assign positions first, since the velocities
+         # property will check its length for consistency.
+-        if check_consistency:
+-            self.positions = openmm_state.getPositions(asNumpy=True)
+-        else:
+-            # The positions in md units cache is updated below.
+-            self._positions = openmm_state.getPositions(asNumpy=True)
+-
+-        self.velocities = openmm_state.getVelocities(asNumpy=True)
++        self._set_positions(positions, from_context=True, check_consistency=check_consistency)
++        self._set_velocities(velocities, from_context=True)
+         self.box_vectors = openmm_state.getPeriodicBoxVectors(asNumpy=True)
++        # Potential energy and kinetic energy must be updated
++        # after positions and velocities or they'll be reset.
+         self.potential_energy = openmm_state.getPotentialEnergy()
+         self.kinetic_energy = openmm_state.getKineticEnergy()
+ 
+@@ -1854,15 +2058,15 @@ class IComposableState(utils.SubhookedABCMeta):
+ 
+     @abc.abstractmethod
+     def apply_to_system(self, system):
+-        """Change the system properties to be consistent with this state.
+-
+-        This method is called on CompoundThermodynamicState init to update
+-        the system stored in the main ThermodynamicState, and every time
+-        an attribute/property of the composable state is set or a setter
+-        method (i.e. a method that starts with 'set_') is called.
++        """Set the system to be in this state.
+ 
+-        This is the system that will be used during context creation, so
+-        it is important that it is up-to-date.
++        This method is called in three situations:
++        1) On initialization, before standardizing the system.
++        2) When a new system is set and the argument ``fix_state`` is
++           set to ``True``.
++        3) When the system is retrieved to convert the standard system
++           into a system in the correct thermodynamic state for the
++           simulation.
+ 
+         Parameters
+         ----------
+@@ -1879,11 +2083,11 @@ def apply_to_system(self, system):
+ 
+     @abc.abstractmethod
+     def check_system_consistency(self, system):
+-        """Check if the system is consistent with the state.
++        """Check if the system is in this state.
+ 
+-        It raises a ComposableStateError if the system is not consistent
+-        with the state. This is called when the ThermodynamicState's
+-        system is set.
++        It raises a ComposableStateError if the system is not in
++        this state. This is called when the ThermodynamicState's
++        system is set with the ``fix_state`` argument set to False.
+ 
+         Parameters
+         ----------
+@@ -1900,7 +2104,7 @@ def check_system_consistency(self, system):
+ 
+     @abc.abstractmethod
+     def apply_to_context(self, context):
+-        """Apply changes to the context to be consistent with the state.
++        """Set the context to be in this state.
+ 
+         Parameters
+         ----------
+@@ -1915,9 +2119,8 @@ def apply_to_context(self, context):
+         """
+         pass
+ 
+-    @classmethod
+     @abc.abstractmethod
+-    def _standardize_system(cls, system):
++    def _standardize_system(self, system):
+         """Standardize the given system.
+ 
+         ThermodynamicState relies on this method to create a standard
+@@ -1941,6 +2144,60 @@ def _standardize_system(cls, system):
+         """
+         pass
+ 
++    @abc.abstractmethod
++    def _on_setattr(self, standard_system, attribute_name):
++        """Check if standard system needs to be updated after a state attribute is set.
++
++        This callback function is called after an attribute is set (i.e.
++        after __setattr__ is called on this state) or if an attribute whose
++        name starts with "set_" is requested (i.e. if a setter is retrieved
++        from this state through __getattr__).
++
++        Parameters
++        ----------
++        standard_system : simtk.openmm.System
++            The standard system before setting the attribute.
++        attribute_name : str
++            The name of the attribute that has just been set or retrieved.
++
++        Returns
++        -------
++        need_changes : bool
++            True if the standard system has to be updated, False if no change
++            occurred.
++
++        """
++        pass
++
++    @abc.abstractmethod
++    def _find_force_groups_to_update(self, context, current_context_state, memo):
++        """Find the force groups whose energy must be recomputed after applying self.
++
++        This is used to compute efficiently the potential energy of the
++        same configuration in multiple thermodynamic states to minimize
++        the number of force evaluations.
++
++        Parameters
++        ----------
++        context : Context
++            The context, currently in `current_context_state`, that will
++            be moved to this state.
++        current_context_state : ThermodynamicState
++            The full thermodynamic state of the given context. This is
++            guaranteed to be compatible with self.
++        memo : dict
++            A dictionary that can be used by the state for memoization
++            to speed up consecutive calls on the same context.
++
++        Returns
++        -------
++        force_groups_to_update : set of int
++            The indices of the force groups whose energy must be computed
++            again after applying this state, assuming the context to be in
++            `current_context_state`.
++        """
++        pass
++
+ 
+ class CompoundThermodynamicState(ThermodynamicState):
+     """Thermodynamic state composed by multiple states.
+@@ -2070,10 +2327,13 @@ def set_system(self, system, fix_state=False):
+         ThermodynamicState.set_system
+ 
+         """
+-        if fix_state is False:
+-            for s in self._composable_states:
++        system = copy.deepcopy(system)
++        for s in self._composable_states:
++            if fix_state:
++                s.apply_to_system(system)
++            else:
+                 s.check_system_consistency(system)
+-        super(CompoundThermodynamicState, self).set_system(system, fix_state)
++        super(CompoundThermodynamicState, self)._unsafe_set_system(system, fix_state)
+ 
+     def is_context_compatible(self, context):
+         """Check compatibility of the given context.
+@@ -2114,13 +2374,25 @@ def apply_to_context(self, context):
+             s.apply_to_context(context)
+ 
+     def __getattr__(self, name):
++        def setter_decorator(func, composable_state):
++            def _setter_decorator(*args, **kwargs):
++                func(*args, **kwargs)
++                self._on_setattr_callback(composable_state, name)
++            return _setter_decorator
++
+         # Called only if the attribute couldn't be found in __dict__.
+         # In this case we fall back to composable state, in the given order.
+         for s in self._composable_states:
+             try:
+-                return getattr(s, name)
++                attr = getattr(s, name)
+             except AttributeError:
+                 pass
++            else:
++                if name.startswith('set_'):
++                    # Decorate the setter so that _on_setattr is called
++                    # after the attribute is modified.
++                    attr = setter_decorator(attr, s)
++                return attr
+ 
+         # Attribute not found, fall back to normal behavior.
+         return super(CompoundThermodynamicState, self).__getattribute__(name)
+@@ -2131,14 +2403,20 @@ def __setattr__(self, name, value):
+             super(CompoundThermodynamicState, self).__setattr__(name, value)
+ 
+         # Update existing ThermodynamicState attribute (check ancestors).
++        # We can't use hasattr here because it calls __getattr__, which
++        # search in all composable states as well. This means that this
++        # will catch only properties and methods.
+         elif any(name in C.__dict__ for C in self.__class__.__mro__):
+             super(CompoundThermodynamicState, self).__setattr__(name, value)
+ 
+         # Update composable states attributes (check ancestors).
++        # We can't use hasattr here because it calls __getattr__,
++        # which search in all composable states as well.
+         else:
+             for s in self._composable_states:
+-                if any(name in C.__dict__ for C in s.__class__.__mro__):
++                if hasattr(s, name):
+                     s.__setattr__(name, value)
++                    self._on_setattr_callback(s, name)
+                     return
+ 
+             # No attribute found. This is monkey patching.
+@@ -2181,11 +2459,13 @@ def _initialize(self, thermodynamic_state, composable_states):
+             assert isinstance(composable_state, IComposableState)
+ 
+         # Copy internal attributes of thermodynamic state.
++        thermodynamic_state = copy.deepcopy(thermodynamic_state)
+         self.__dict__ = thermodynamic_state.__dict__
+ 
+         # Setting self._composable_states signals __setattr__ to start
+         # searching in composable states as well, so this must be the
+         # last new attribute set in the constructor.
++        composable_states = copy.deepcopy(composable_states)
+         self._composable_states = composable_states
+ 
+         # This call causes the thermodynamic state standard system
+@@ -2209,8 +2489,39 @@ def _standardize_system(self, system):
+ 
+         """
+         super(CompoundThermodynamicState, self)._standardize_system(system)
+-        for composable_cls in self._composable_states:
+-            composable_cls._standardize_system(system)
++        for composable_state in self._composable_states:
++            composable_state._standardize_system(system)
++
++    def _on_setattr_callback(self, composable_state, attribute_name):
++        """Updates the standard system (and hash) after __setattr__."""
++        if composable_state._on_setattr(self._standard_system, attribute_name):
++            new_standard_system = copy.deepcopy(self._standard_system)
++            composable_state.apply_to_system(new_standard_system)
++            composable_state._standardize_system(new_standard_system)
++            self._update_standard_system(new_standard_system)
++
++    def _apply_to_context_in_state(self, context, thermodynamic_state):
++        super(CompoundThermodynamicState, self)._apply_to_context_in_state(context, thermodynamic_state)
++        for s in self._composable_states:
++            s.apply_to_context(context)
++
++    def _find_force_groups_to_update(self, context, current_context_state, memo):
++        """Find the force groups to be recomputed when moving to the given state.
++
++        Override ThermodynamicState._find_force_groups_to_update to find
++        groups to update for changes of composable states.
++        """
++        # Initialize memo: create new cache for each composable state.
++        if len(memo) == 0:
++            memo.update({i: {} for i in range(len(self._composable_states))})
++        # Find force group to update for parent class.
++        force_groups = super(CompoundThermodynamicState, self)._find_force_groups_to_update(
++            context, current_context_state, memo)
++        # Find force group to update for composable states.
++        for composable_state_idx, composable_state in enumerate(self._composable_states):
++            force_groups.update(composable_state._find_force_groups_to_update(
++                context, current_context_state, memo[composable_state_idx]))
++        return force_groups
+ 
+ 
+ if __name__ == '__main__':
+diff --git a/openmmtools/tests/test_alchemy.py b/openmmtools/tests/test_alchemy.py
+index 66dfb37d1..ea9b657a0 100644
+--- a/openmmtools/tests/test_alchemy.py
++++ b/openmmtools/tests/test_alchemy.py
+@@ -143,6 +143,48 @@ def assert_almost_equal(energy1, energy2, err_msg):
+     assert abs(delta) < MAX_DELTA, err_msg
+ 
+ 
++def turn_off_nonbonded(system, sterics=False, electrostatics=False,
++                       exceptions=False, only_atoms=frozenset()):
++    """Turn off sterics and/or electrostatics interactions.
++
++    This affects only NonbondedForce and non-alchemical CustomNonbondedForces.
++
++    If `exceptions` is True, only the exceptions are turned off.
++    Support also system that have gone through replace_reaction_field.
++    The `system` must have only nonbonded forces.
++    If `only_atoms` is specified, only the those atoms will be turned off.
++
++    """
++    if len(only_atoms) == 0:  # if empty, turn off all particles
++        only_atoms = set(range(system.getNumParticles()))
++    epsilon_coeff = 0.0 if sterics else 1.0
++    charge_coeff = 0.0 if electrostatics else 1.0
++
++    if exceptions:  # Turn off exceptions
++        nonbonded_force = forces.find_nonbonded_force(system)
++        for exception_index in range(nonbonded_force.getNumExceptions()):
++            iatom, jatom, charge, sigma, epsilon = nonbonded_force.getExceptionParameters(exception_index)
++            if iatom in only_atoms or jatom in only_atoms:
++                nonbonded_force.setExceptionParameters(exception_index, iatom, jatom,
++                                                       charge_coeff*charge, sigma, epsilon_coeff*epsilon)
++    else:  # Turn off particle interactions
++        for force in system.getForces():
++            # Handle only a Nonbonded and a CustomNonbonded (for RF).
++            if not (isinstance(force, openmm.CustomNonbondedForce) and 'lambda' not in force.getEnergyFunction() or
++                        isinstance(force, openmm.NonbondedForce)):
++                continue
++            for particle_index in range(force.getNumParticles()):
++                if particle_index in only_atoms:
++                    # Convert tuple parameters to list to allow changes.
++                    parameters = list(force.getParticleParameters(particle_index))
++                    parameters[0] *= charge_coeff  # charge
++                    try:  # CustomNonbondedForce
++                        force.setParticleParameters(particle_index, parameters)
++                    except TypeError:  # NonbondedForce
++                        parameters[2] *= epsilon_coeff  # epsilon
++                        force.setParticleParameters(particle_index, *parameters)
++
++
+ def dissect_nonbonded_energy(reference_system, positions, alchemical_atoms):
+     """Dissect the nonbonded energy contributions of the reference system
+     by atom group and sterics/electrostatics.
+@@ -180,43 +222,6 @@ def dissect_nonbonded_energy(reference_system, positions, alchemical_atoms):
+         na_reciprocal_energy: electrostatics of reciprocal space between nonalchemical-alchemical atoms
+ 
+     """
+-
+-    def turn_off(system, sterics=False, electrostatics=False,
+-                 exceptions=False, only_atoms=frozenset()):
+-        """Turn off sterics and/or electrostatics interactions.
+-
+-        If `exceptions` is True, only the exceptions are turned off.
+-        Support also system that have gone through replace_reaction_field.
+-        The `system` must have only nonbonded forces.
+-        If `only_atoms` is specified, only the those atoms will be turned off.
+-
+-        """
+-        if len(only_atoms) == 0:  # if empty, turn off all particles
+-            only_atoms = set(range(system.getNumParticles()))
+-        epsilon_coeff = 0.0 if sterics else 1.0
+-        charge_coeff = 0.0 if electrostatics else 1.0
+-
+-        # Only a Nonbonded and a CustomNonbonded (for RF) force should be here.
+-        if exceptions:  # Turn off exceptions
+-            nonbonded_force = system.getForces()[0]  # NonbondedForce
+-            for exception_index in range(nonbonded_force.getNumExceptions()):
+-                iatom, jatom, charge, sigma, epsilon = nonbonded_force.getExceptionParameters(exception_index)
+-                if iatom in only_atoms or jatom in only_atoms:
+-                    nonbonded_force.setExceptionParameters(exception_index, iatom, jatom,
+-                                                           charge_coeff*charge, sigma, epsilon_coeff*epsilon)
+-        else:  # Turn off particle interactions
+-            for force in system.getForces():
+-                for particle_index in range(force.getNumParticles()):
+-                    if particle_index in only_atoms:
+-                        # Convert tuple parameters to list to allow changes.
+-                        parameters = list(force.getParticleParameters(particle_index))
+-                        parameters[0] *= charge_coeff  # charge
+-                        try:  # CustomNonbondedForce
+-                            force.setParticleParameters(particle_index, parameters)
+-                        except TypeError:  # NonbondedForce
+-                            parameters[2] *= epsilon_coeff  # epsilon
+-                            force.setParticleParameters(particle_index, *parameters)
+-
+     nonalchemical_atoms = set(range(reference_system.getNumParticles())).difference(alchemical_atoms)
+ 
+     # Remove all forces but NonbondedForce and eventually the
+@@ -245,12 +250,12 @@ def turn_off(system, sterics=False, electrostatics=False,
+     tot_reciprocal_energy = compute_energy(system, positions, force_group={30})
+ 
+     # Compute contributions from particle sterics
+-    turn_off(system, sterics=True, only_atoms=alchemical_atoms)
++    turn_off_nonbonded(system, sterics=True, only_atoms=alchemical_atoms)
+     tot_energy_no_alchem_particle_sterics = compute_energy(system, positions)
+     system = copy.deepcopy(reference_system)  # Restore alchemical sterics
+-    turn_off(system, sterics=True, only_atoms=nonalchemical_atoms)
++    turn_off_nonbonded(system, sterics=True, only_atoms=nonalchemical_atoms)
+     tot_energy_no_nonalchem_particle_sterics = compute_energy(system, positions)
+-    turn_off(system, sterics=True)
++    turn_off_nonbonded(system, sterics=True)
+     tot_energy_no_particle_sterics = compute_energy(system, positions)
+ 
+     tot_particle_sterics = tot_energy - tot_energy_no_particle_sterics
+@@ -260,14 +265,14 @@ def turn_off(system, sterics=False, electrostatics=False,
+ 
+     # Compute contributions from particle electrostatics
+     system = copy.deepcopy(reference_system)  # Restore sterics
+-    turn_off(system, electrostatics=True, only_atoms=alchemical_atoms)
++    turn_off_nonbonded(system, electrostatics=True, only_atoms=alchemical_atoms)
+     tot_energy_no_alchem_particle_electro = compute_energy(system, positions)
+     nn_reciprocal_energy = compute_energy(system, positions, force_group={30})
+     system = copy.deepcopy(reference_system)  # Restore alchemical electrostatics
+-    turn_off(system, electrostatics=True, only_atoms=nonalchemical_atoms)
++    turn_off_nonbonded(system, electrostatics=True, only_atoms=nonalchemical_atoms)
+     tot_energy_no_nonalchem_particle_electro = compute_energy(system, positions)
+     aa_reciprocal_energy = compute_energy(system, positions, force_group={30})
+-    turn_off(system, electrostatics=True)
++    turn_off_nonbonded(system, electrostatics=True)
+     tot_energy_no_particle_electro = compute_energy(system, positions)
+ 
+     na_reciprocal_energy = tot_reciprocal_energy - nn_reciprocal_energy - aa_reciprocal_energy
+@@ -285,12 +290,12 @@ def turn_off(system, sterics=False, electrostatics=False,
+ 
+     # Compute contributions from exceptions sterics
+     system = copy.deepcopy(reference_system)  # Restore particle interactions
+-    turn_off(system, sterics=True, exceptions=True, only_atoms=alchemical_atoms)
++    turn_off_nonbonded(system, sterics=True, exceptions=True, only_atoms=alchemical_atoms)
+     tot_energy_no_alchem_exception_sterics = compute_energy(system, positions)
+     system = copy.deepcopy(reference_system)  # Restore alchemical sterics
+-    turn_off(system, sterics=True, exceptions=True, only_atoms=nonalchemical_atoms)
++    turn_off_nonbonded(system, sterics=True, exceptions=True, only_atoms=nonalchemical_atoms)
+     tot_energy_no_nonalchem_exception_sterics = compute_energy(system, positions)
+-    turn_off(system, sterics=True, exceptions=True)
++    turn_off_nonbonded(system, sterics=True, exceptions=True)
+     tot_energy_no_exception_sterics = compute_energy(system, positions)
+ 
+     tot_exception_sterics = tot_energy - tot_energy_no_exception_sterics
+@@ -300,12 +305,12 @@ def turn_off(system, sterics=False, electrostatics=False,
+ 
+     # Compute contributions from exceptions electrostatics
+     system = copy.deepcopy(reference_system)  # Restore exceptions sterics
+-    turn_off(system, electrostatics=True, exceptions=True, only_atoms=alchemical_atoms)
++    turn_off_nonbonded(system, electrostatics=True, exceptions=True, only_atoms=alchemical_atoms)
+     tot_energy_no_alchem_exception_electro = compute_energy(system, positions)
+     system = copy.deepcopy(reference_system)  # Restore alchemical electrostatics
+-    turn_off(system, electrostatics=True, exceptions=True, only_atoms=nonalchemical_atoms)
++    turn_off_nonbonded(system, electrostatics=True, exceptions=True, only_atoms=nonalchemical_atoms)
+     tot_energy_no_nonalchem_exception_electro = compute_energy(system, positions)
+-    turn_off(system, electrostatics=True, exceptions=True)
++    turn_off_nonbonded(system, electrostatics=True, exceptions=True)
+     tot_energy_no_exception_electro = compute_energy(system, positions)
+ 
+     tot_exception_electro = tot_energy - tot_energy_no_exception_electro
+@@ -394,6 +399,18 @@ def compute_direct_space_correction(nonbonded_force, alchemical_atoms, positions
+     return aa_correction * energy_unit, na_correction * energy_unit
+ 
+ 
++def is_alchemical_pme_treatment_exact(alchemical_system):
++    """Return True if the given alchemical system models PME exactly."""
++    # If exact PME is here, there is a CustomNonbondedForce storing
++    # the original charges that does not contribute to the energy.
++    for force in alchemical_system.getForces():
++        if (isinstance(force, openmm.CustomNonbondedForce) and
++                    force.getEnergyFunction() == '0.0;' and
++                    force.getGlobalParameterName(0) == 'lambda_electrostatics'):
++            return True
++    return False
++
++
+ # =============================================================================
+ # SUBROUTINES FOR TESTING
+ # =============================================================================
+@@ -408,18 +425,14 @@ def compare_system_energies(reference_system, alchemical_system, alchemical_regi
+     force_group = -1  # Default we compare the energy of all groups.
+ 
+     # Check nonbonded method. Comparing with PME is more complicated
+-    # because the alchemical system does not take into account the
+-    # reciprocal space.
+-    # TODO remove this when PME will include reciprocal space fixed.
+-    ewald_force = None
+-    for force in reference_system.getForces():
+-        if isinstance(force, openmm.NonbondedForce):
+-            nonbonded_method = force.getNonbondedMethod()
+-            if nonbonded_method == openmm.NonbondedForce.PME or nonbonded_method == openmm.NonbondedForce.Ewald:
+-                ewald_force = force
+-                break
+-
+-    if ewald_force is not None:
++    # because the alchemical system with direct-space treatment of PME
++    # does not take into account the reciprocal space.
++    nonbonded_force = forces.find_nonbonded_force(reference_system)
++    nonbonded_method = nonbonded_force.getNonbondedMethod()
++    is_direct_space_pme = (nonbonded_method in [openmm.NonbondedForce.PME, openmm.NonbondedForce.Ewald] and
++                           not is_alchemical_pme_treatment_exact(alchemical_system))
++
++    if is_direct_space_pme:
+         # Separate the reciprocal space force in a different group.
+         reference_system = copy.deepcopy(reference_system)
+         alchemical_system = copy.deepcopy(alchemical_system)
+@@ -435,14 +448,14 @@ def compare_system_energies(reference_system, alchemical_system, alchemical_regi
+         # Compute the reciprocal space correction added to the direct space
+         # energy due to the exceptions of the alchemical atoms.
+         alchemical_atoms = alchemical_regions.alchemical_atoms
+-        aa_correction, na_correction = compute_direct_space_correction(ewald_force, alchemical_atoms, positions)
++        aa_correction, na_correction = compute_direct_space_correction(nonbonded_force, alchemical_atoms, positions)
+ 
+     # Compute potential of the direct space.
+     potentials = [compute_energy(system, positions, force_group=force_group)
+                   for system in [reference_system, alchemical_system]]
+ 
+     # Add the direct space correction.
+-    if ewald_force is not None:
++    if is_direct_space_pme:
+         potentials.append(aa_correction + na_correction)
+     else:
+         potentials.append(0.0 * GLOBAL_ENERGY_UNIT)
+@@ -473,9 +486,10 @@ def check_interacting_energy_components(reference_system, alchemical_system, alc
+         The positions to test (units of length).
+ 
+     """
+-
++    energy_unit = unit.kilojoule_per_mole
+     reference_system = copy.deepcopy(reference_system)
+     alchemical_system = copy.deepcopy(alchemical_system)
++    is_exact_pme = is_alchemical_pme_treatment_exact(alchemical_system)
+ 
+     # Find nonbonded method
+     for nonbonded_force in reference_system.getForces():
+@@ -511,8 +525,11 @@ def check_interacting_energy_components(reference_system, alchemical_system, alc
+                                                                         positions, platform=GLOBAL_ALCHEMY_PLATFORM)
+     na_custom_particle_sterics = energy_components['alchemically modified NonbondedForce for non-alchemical/alchemical sterics']
+     aa_custom_particle_sterics = energy_components['alchemically modified NonbondedForce for alchemical/alchemical sterics']
+-    na_custom_particle_electro = energy_components['alchemically modified NonbondedForce for non-alchemical/alchemical electrostatics']
+-    aa_custom_particle_electro = energy_components['alchemically modified NonbondedForce for alchemical/alchemical electrostatics']
++    try:
++        na_custom_particle_electro = energy_components['alchemically modified NonbondedForce for non-alchemical/alchemical electrostatics']
++        aa_custom_particle_electro = energy_components['alchemically modified NonbondedForce for alchemical/alchemical electrostatics']
++    except KeyError:
++        assert is_exact_pme
+     na_custom_exception_sterics = energy_components['alchemically modified BondForce for non-alchemical/alchemical sterics exceptions']
+     aa_custom_exception_sterics = energy_components['alchemically modified BondForce for alchemical/alchemical sterics exceptions']
+     na_custom_exception_electro = energy_components['alchemically modified BondForce for non-alchemical/alchemical electrostatics exceptions']
+@@ -522,18 +539,19 @@ def check_interacting_energy_components(reference_system, alchemical_system, alc
+     # -------------------------------------------------
+ 
+     # All contributions from alchemical atoms in unmodified nonbonded force are turned off
+-    energy_unit = unit.kilojoule_per_mole
+     err_msg = 'Non-zero contribution from unmodified NonbondedForce alchemical atoms: '
+     assert_almost_equal(unmod_aa_particle_sterics, 0.0 * energy_unit, err_msg)
+     assert_almost_equal(unmod_na_particle_sterics, 0.0 * energy_unit, err_msg)
+     assert_almost_equal(unmod_aa_exception_sterics, 0.0 * energy_unit, err_msg)
+     assert_almost_equal(unmod_na_exception_sterics, 0.0 * energy_unit, err_msg)
+-    assert_almost_equal(unmod_aa_particle_electro, 0.0 * energy_unit, err_msg)
+-    assert_almost_equal(unmod_na_particle_electro, 0.0 * energy_unit, err_msg)
++    if not is_exact_pme:
++        # With exact PME treatment these are tested below.
++        assert_almost_equal(unmod_aa_particle_electro, 0.0 * energy_unit, err_msg)
++        assert_almost_equal(unmod_na_particle_electro, 0.0 * energy_unit, err_msg)
++        assert_almost_equal(unmod_aa_reciprocal_energy, 0.0 * energy_unit, err_msg)
++        assert_almost_equal(unmod_na_reciprocal_energy, 0.0 * energy_unit, err_msg)
+     assert_almost_equal(unmod_aa_exception_electro, 0.0 * energy_unit, err_msg)
+     assert_almost_equal(unmod_na_exception_electro, 0.0 * energy_unit, err_msg)
+-    assert_almost_equal(unmod_aa_reciprocal_energy, 0.0 * energy_unit, err_msg)
+-    assert_almost_equal(unmod_na_reciprocal_energy, 0.0 * energy_unit, err_msg)
+ 
+     # Check sterics interactions match
+     assert_almost_equal(nn_particle_sterics, unmod_nn_particle_sterics,
+@@ -554,25 +572,35 @@ def check_interacting_energy_components(reference_system, alchemical_system, alc
+                         'Non-alchemical/non-alchemical atoms particle electrostatics')
+     assert_almost_equal(nn_exception_electro, unmod_nn_exception_electro,
+                         'Non-alchemical/non-alchemical atoms exceptions electrostatics')
+-    if nonbonded_method == openmm.NonbondedForce.PME or nonbonded_method == openmm.NonbondedForce.Ewald:
+-        # TODO check ALL reciprocal energies if/when they'll be implemented
+-        # assert_almost_equal(aa_reciprocal_energy, unmod_aa_reciprocal_energy)
+-        # assert_almost_equal(na_reciprocal_energy, unmod_na_reciprocal_energy)
++    if nonbonded_method in [openmm.NonbondedForce.PME, openmm.NonbondedForce.Ewald]:
++        # Reciprocal space.
++        if is_exact_pme:
++            assert_almost_equal(aa_reciprocal_energy, unmod_aa_reciprocal_energy,
++                                'Alchemical/alchemical atoms reciprocal space energy')
++            assert_almost_equal(na_reciprocal_energy, unmod_na_reciprocal_energy,
++                                'Non-alchemical/alchemical atoms reciprocal space energy')
+         assert_almost_equal(nn_reciprocal_energy, unmod_nn_reciprocal_energy,
+                             'Non-alchemical/non-alchemical atoms reciprocal space energy')
+ 
+-        # Get direct space correction due to reciprocal space exceptions
+-        aa_correction, na_correction = compute_direct_space_correction(nonbonded_force,
+-                                                                       alchemical_regions.alchemical_atoms,
+-                                                                       positions)
+-        aa_particle_electro += aa_correction
+-        na_particle_electro += na_correction
+-
+-        # Check direct space energy
+-        assert_almost_equal(aa_particle_electro, aa_custom_particle_electro,
+-                            'Alchemical/alchemical atoms particle electrostatics')
+-        assert_almost_equal(na_particle_electro, na_custom_particle_electro,
+-                            'Non-alchemical/alchemical atoms particle electrostatics')
++        # Direct space.
++        if is_exact_pme:
++            assert_almost_equal(unmod_aa_particle_electro, aa_particle_electro,
++                                'Alchemical/alchemical atoms particle electrostatics')
++            assert_almost_equal(unmod_na_particle_electro, na_particle_electro,
++                                'Non-alchemical/alchemical atoms particle electrostatics')
++        else:
++            # Get direct space correction due to reciprocal space exceptions
++            aa_correction, na_correction = compute_direct_space_correction(nonbonded_force,
++                                                                           alchemical_regions.alchemical_atoms,
++                                                                           positions)
++            aa_particle_electro += aa_correction
++            na_particle_electro += na_correction
++
++            # Check direct space energy
++            assert_almost_equal(aa_particle_electro, aa_custom_particle_electro,
++                                'Alchemical/alchemical atoms particle electrostatics')
++            assert_almost_equal(na_particle_electro, na_custom_particle_electro,
++                                'Non-alchemical/alchemical atoms particle electrostatics')
+     else:
+         # Reciprocal space energy should be null in this case
+         assert nn_reciprocal_energy == unmod_nn_reciprocal_energy == 0.0 * energy_unit
+@@ -625,6 +653,7 @@ def check_noninteracting_energy_components(reference_system, alchemical_system,
+ 
+     """
+     alchemical_system = copy.deepcopy(alchemical_system)
++    is_exact_pme = is_alchemical_pme_treatment_exact(alchemical_system)
+ 
+     # Set state to non-interacting.
+     alchemical_state = AlchemicalState.from_system(alchemical_system)
+@@ -639,17 +668,24 @@ def assert_zero_energy(label):
+                                                         " state, but energy is {}").format(label, str(value))
+ 
+     # Check that non-alchemical/alchemical particle interactions and 1,4 exceptions have been annihilated
+-    assert_zero_energy('alchemically modified NonbondedForce for non-alchemical/alchemical sterics')
+-    assert_zero_energy('alchemically modified NonbondedForce for non-alchemical/alchemical electrostatics')
+     assert_zero_energy('alchemically modified BondForce for non-alchemical/alchemical sterics exceptions')
+     assert_zero_energy('alchemically modified BondForce for non-alchemical/alchemical electrostatics exceptions')
++    assert_zero_energy('alchemically modified NonbondedForce for non-alchemical/alchemical sterics')
++    try:
++        assert_zero_energy('alchemically modified NonbondedForce for non-alchemical/alchemical electrostatics')
++    except KeyError:
++        assert_zero_energy('CustomNonbondedForce holding alchemical atoms unmodified charges')
++        assert is_exact_pme
+ 
+     # Check that alchemical/alchemical particle interactions and 1,4 exceptions have been annihilated
+     if alchemical_regions.annihilate_sterics:
+         assert_zero_energy('alchemically modified NonbondedForce for alchemical/alchemical sterics')
+         assert_zero_energy('alchemically modified BondForce for alchemical/alchemical sterics exceptions')
+     if alchemical_regions.annihilate_electrostatics:
+-        assert_zero_energy('alchemically modified NonbondedForce for alchemical/alchemical electrostatics')
++        try:
++            assert_zero_energy('alchemically modified NonbondedForce for alchemical/alchemical electrostatics')
++        except KeyError:
++            assert is_exact_pme
+         assert_zero_energy('alchemically modified BondForce for alchemical/alchemical electrostatics exceptions')
+ 
+     # Check valence terms
+@@ -734,6 +770,45 @@ def assert_zero_energy(label):
+                             'reference {}, alchemical {}'.format(reference_force_energy, alchemical_energy))
+ 
+ 
++def check_split_force_groups(system):
++    """Check that force groups are split correctly."""
++    force_groups_by_lambda = {}
++    lambdas_by_force_group = {}
++
++    # Separate forces groups by lambda parameters that AlchemicalState supports.
++    for force, lambda_name, _ in AlchemicalState._get_system_lambda_parameters(system):
++        force_group = force.getForceGroup()
++        try:
++            force_groups_by_lambda[lambda_name].add(force_group)
++        except KeyError:
++            force_groups_by_lambda[lambda_name] = {force_group}
++        try:
++            lambdas_by_force_group[force_group].add(lambda_name)
++        except KeyError:
++            lambdas_by_force_group[force_group] = {lambda_name}
++
++    # Check that force group 0 doesn't hold alchemical forces.
++    assert 0 not in force_groups_by_lambda
++
++    # There are as many alchemical force groups as not-None lambda variables.
++    alchemical_state = AlchemicalState.from_system(system)
++    valid_lambdas = {lambda_name for lambda_name in alchemical_state._get_supported_parameters()
++                     if getattr(alchemical_state, lambda_name) is not None}
++    assert valid_lambdas == set(force_groups_by_lambda.keys())
++
++    # Check that force groups and lambda variables are in 1-to-1 correspondence.
++    assert len(force_groups_by_lambda) == len(lambdas_by_force_group)
++    for d in [force_groups_by_lambda, lambdas_by_force_group]:
++        for value in d.values():
++            assert len(value) == 1
++
++    # With exact treatment of PME, the NonbondedForce must
++    # be in the lambda_electrostatics force group.
++    if is_alchemical_pme_treatment_exact(system):
++        nonbonded_force = forces.find_nonbonded_force(system)
++        assert force_groups_by_lambda['lambda_electrostatics'] == {nonbonded_force.getForceGroup()}
++
++
+ # =============================================================================
+ # BENCHMARKING AND DEBUG FUNCTIONS
+ # =============================================================================
+@@ -864,7 +939,7 @@ def overlap_check(reference_system, alchemical_system, positions, nsteps=50, nsa
+     cached_trajectory_filename : str, optional, default=None
+         If not None, this file will be used to cache intermediate results with pickle.
+     name : str, optional, default=None
+-        Name of test system being evaluaed
++        Name of test system being evaluated.
+ 
+     """
+     temperature = 300.0 * unit.kelvin
+@@ -1162,6 +1237,7 @@ def generate_cases(cls):
+         """Generate all test cases in cls.test_cases combinatorially."""
+         cls.test_cases = dict()
+         factory = AbsoluteAlchemicalFactory(alchemical_rf_treatment='switched')
++        exact_pme_factory = AbsoluteAlchemicalFactory(alchemical_pme_treatment='exact')
+ 
+         # We generate all possible combinations of annihilate_sterics/electrostatics
+         # for each test system. We also annihilate bonds, angles and torsions every
+@@ -1176,10 +1252,15 @@ def generate_cases(cls):
+                     break
+             assert region_name in test_system_name
+ 
++            # Find nonbonded method.
++            nonbonded_force = forces.find_nonbonded_force(test_system.system)
++            nonbonded_method = nonbonded_force.getNonbondedMethod()
++
+             # Create all combinations of annihilate_sterics/electrostatics.
+             for annihilate_sterics, annihilate_electrostatics in itertools.product((True, False), repeat=2):
+-                region = region._replace(annihilate_sterics=annihilate_sterics,
+-                                         annihilate_electrostatics=annihilate_electrostatics)
++                # Create new region that we can modify.
++                test_region = region._replace(annihilate_sterics=annihilate_sterics,
++                                              annihilate_electrostatics=annihilate_electrostatics)
+ 
+                 # Create test name.
+                 test_case_name = test_system_name[:]
+@@ -1190,30 +1271,62 @@ def generate_cases(cls):
+ 
+                 # Annihilate bonds and angles every three test_cases.
+                 if n_test_cases % 3 == 0:
+-                    region = region._replace(alchemical_bonds=True, alchemical_angles=True,
+-                                             alchemical_torsions=True)
++                    test_region = test_region._replace(alchemical_bonds=True, alchemical_angles=True,
++                                                       alchemical_torsions=True)
+                     test_case_name += ', annihilated bonds, angles and torsions'
+ 
+                 # Add different softcore parameters every five test_cases.
+                 if n_test_cases % 5 == 0:
+-                    region = region._replace(softcore_alpha=1.0, softcore_beta=1.0, softcore_a=1.0, softcore_b=1.0,
+-                                             softcore_c=1.0, softcore_d=1.0, softcore_e=1.0, softcore_f=1.0)
++                    test_region = test_region._replace(softcore_alpha=1.0, softcore_beta=1.0, softcore_a=1.0, softcore_b=1.0,
++                                                       softcore_c=1.0, softcore_d=1.0, softcore_e=1.0, softcore_f=1.0)
+                     test_case_name += ', modified softcore parameters'
+ 
+                 # Pre-generate alchemical system.
+-                alchemical_system = factory.create_alchemical_system(test_system.system, region)
++                alchemical_system = factory.create_alchemical_system(test_system.system, test_region)
+ 
+                 # Add test case.
+-                cls.test_cases[test_case_name] = (test_system, alchemical_system, region)
++                cls.test_cases[test_case_name] = (test_system, alchemical_system, test_region)
+                 n_test_cases += 1
+ 
++                # If we don't use softcore electrostatics and we annihilate charges
++                # we can test also exact PME treatment. We don't increase n_test_cases
++                # purposely to keep track of which tests are added above.
++                if (test_region.softcore_beta == 0.0 and annihilate_electrostatics and
++                            nonbonded_method in [openmm.NonbondedForce.PME, openmm.NonbondedForce.Ewald]):
++                    alchemical_system = exact_pme_factory.create_alchemical_system(test_system.system, test_region)
++                    test_case_name += ', exact PME'
++                    cls.test_cases[test_case_name] = (test_system, alchemical_system, test_region)
++
+             # If the test system uses reaction field replace reaction field
+             # of the reference system to allow comparisons.
+-            nonbonded_force = forces.find_nonbonded_force(test_system.system)
+-            if nonbonded_force.getNonbondedMethod() == openmm.NonbondedForce.CutoffPeriodic:
++            if nonbonded_method == openmm.NonbondedForce.CutoffPeriodic:
+                 forcefactories.replace_reaction_field(test_system.system, return_copy=False,
+                                                       switch_width=factory.switch_width)
+ 
++    def filter_cases(self, condition_func, max_number=None):
++        """Return the list of test cases that satisfy condition_func(test_case_name)."""
++        if max_number is None:
++            max_number = len(self.test_cases)
++
++        test_cases = {}
++        for test_name, test_case in self.test_cases.items():
++            if condition_func(test_name):
++                test_cases[test_name] = test_case
++            if len(test_cases) >= max_number:
++                break
++        return test_cases
++
++    def test_split_force_groups(self):
++        """Forces having different lambda variables should have a different force group."""
++        # Select 1 implicit, 1 explicit, and 1 exact PME explicit test case randomly.
++        test_cases = self.filter_cases(lambda x: 'Implicit' in x, max_number=1)
++        test_cases.update(self.filter_cases(lambda x: 'Explicit ' in x and 'exact PME' in x, max_number=1))
++        test_cases.update(self.filter_cases(lambda x: 'Explicit ' in x and 'exact PME' not in x, max_number=1))
++        for test_name, (test_system, alchemical_system, alchemical_region) in test_cases.items():
++            f = partial(check_split_force_groups, alchemical_system)
++            f.description = "Testing force splitting among groups of {}".format(test_name)
++            yield f
++
+     def test_fully_interacting_energy(self):
+         """Compare the energies of reference and fully interacting alchemical system."""
+         for test_name, (test_system, alchemical_system, alchemical_region) in self.test_cases.items():
+@@ -1235,10 +1348,8 @@ def test_fully_interacting_energy_components(self):
+         """Test interacting state energy by force component."""
+         # This is a very expensive but very informative test. We can
+         # run this locally when test_fully_interacting_energies() fails.
+-        test_cases_names = [test_name for test_name in self.test_cases
+-                            if 'Explicit' in test_name]
+-        for test_name in test_cases_names:
+-            test_system, alchemical_system, alchemical_region = self.test_cases[test_name]
++        test_cases = self.filter_cases(lambda x: 'Explicit' in x)
++        for test_name, (test_system, alchemical_system, alchemical_region) in test_cases.items():
+             f = partial(check_interacting_energy_components, test_system.system, alchemical_system,
+                         alchemical_region, test_system.positions)
+             f.description = "Testing energy components of %s..." % test_name
+@@ -1408,17 +1519,30 @@ class TestAlchemicalState(object):
+     def setup_class(cls):
+         """Create test systems and shared objects."""
+         alanine_vacuum = testsystems.AlanineDipeptideVacuum()
++        alanine_explicit = testsystems.AlanineDipeptideExplicit()
+         factory = AbsoluteAlchemicalFactory()
++        factory_exact_pme = AbsoluteAlchemicalFactory(alchemical_pme_treatment='exact')
++
++        cls.alanine_alchemical_atoms = list(range(22))
++        cls.alanine_test_system = alanine_explicit
+ 
+         # System with only lambda_sterics and lambda_electrostatics.
+-        alchemical_region = AlchemicalRegion(alchemical_atoms=range(22))
++        alchemical_region = AlchemicalRegion(alchemical_atoms=cls.alanine_alchemical_atoms)
+         alchemical_alanine_system = factory.create_alchemical_system(alanine_vacuum.system, alchemical_region)
+         cls.alanine_state = states.ThermodynamicState(alchemical_alanine_system,
+                                                       temperature=300*unit.kelvin)
+ 
++        # System with lambda_sterics and lambda_electrostatics and exact PME treatment.
++        alchemical_alanine_system_exact_pme = factory_exact_pme.create_alchemical_system(alanine_explicit.system,
++                                                                                         alchemical_region)
++        cls.alanine_state_exact_pme = states.ThermodynamicState(alchemical_alanine_system_exact_pme,
++                                                                temperature=300*unit.kelvin,
++                                                                pressure=1.0*unit.atmosphere)
++
+         # System with all lambdas.
+-        alchemical_region = AlchemicalRegion(alchemical_atoms=range(22), alchemical_torsions=True,
+-                                             alchemical_angles=True, alchemical_bonds=True)
++        alchemical_region = AlchemicalRegion(alchemical_atoms=cls.alanine_alchemical_atoms,
++                                             alchemical_torsions=True, alchemical_angles=True,
++                                             alchemical_bonds=True)
+         fully_alchemical_alanine_system = factory.create_alchemical_system(alanine_vacuum.system, alchemical_region)
+         cls.full_alanine_state = states.ThermodynamicState(fully_alchemical_alanine_system,
+                                                            temperature=300*unit.kelvin)
+@@ -1426,10 +1550,21 @@ def setup_class(cls):
+         # Test case: (ThermodynamicState, defined_lambda_parameters)
+         cls.test_cases = [
+             (cls.alanine_state, {'lambda_sterics', 'lambda_electrostatics'}),
++            (cls.alanine_state_exact_pme, {'lambda_sterics', 'lambda_electrostatics'}),
+             (cls.full_alanine_state, {'lambda_sterics', 'lambda_electrostatics', 'lambda_bonds',
+                                       'lambda_angles', 'lambda_torsions'})
+         ]
+ 
++    def _check_exact_pme_charges(self, alchemical_system, lambda_electrostatics):
++        """Check that the NonbondedForce charges are correct."""
++        original_charges_force, nonbonded_force = AlchemicalState._find_exact_pme_forces(alchemical_system)
++        _, alchemical_atoms = original_charges_force.getInteractionGroupParameters(0)
++        for atom_idx in alchemical_atoms:
++            charge, _, _= nonbonded_force.getParticleParameters(atom_idx)
++            original_charge = original_charges_force.getParticleParameters(atom_idx)[0] * unit.elementary_charge
++            err_msg = '{}, {}'.format(charge, original_charge * lambda_electrostatics)
++            assert charge == original_charge * lambda_electrostatics, err_msg
++
+     @staticmethod
+     def test_constructor():
+         """Test AlchemicalState constructor behave as expected."""
+@@ -1517,6 +1652,21 @@ def test_apply_to_system(self):
+             with nose.tools.assert_raises(AlchemicalStateError):
+                 alchemical_state.apply_to_system(state.system)
+ 
++    def test_apply_to_system_exact_pme(self):
++        """Test that NonbondedForce charges are set correctly by apply_to_system."""
++        # Do not modify cached test cases.
++        test_system = copy.deepcopy(self.alanine_state_exact_pme).system
++        alchemical_state = AlchemicalState.from_system(test_system)
++
++        # The default lambda electrostatics should be 1.0
++        self._check_exact_pme_charges(test_system, lambda_electrostatics=1.0)
++
++        # Change the value.
++        for lambda_electrostatics in [0.5, 0.0]:
++            alchemical_state.lambda_electrostatics = lambda_electrostatics
++            alchemical_state.apply_to_system(test_system)
++            self._check_exact_pme_charges(test_system, lambda_electrostatics)
++
+     def test_check_system_consistency(self):
+         """Test method AlchemicalState.check_system_consistency()."""
+         # A system is consistent with itself.
+@@ -1561,22 +1711,98 @@ def test_apply_to_context(self):
+         for parameter_name, parameter_value in context.getParameters().items():
+             if parameter_name in alchemical_state._parameters:
+                 assert parameter_value == 0.5
++        del context
++
++        def compute_electrostatic_energy(lambda_electrostatics, context):
++            alchemical_state.lambda_electrostatics = lambda_electrostatics
++            alchemical_state.apply_to_context(context)
++            return context.getState(getEnergy=True).getPotentialEnergy()
++
++        # For exact treatment of PME electrostatics, check that
++        # the charges of the Context's System are correctly set.
++        alchemical_state = AlchemicalState.from_system(self.alanine_state_exact_pme.system)
++        context = self.alanine_state_exact_pme.create_context(copy.deepcopy(integrator))
++        alchemical_state.lambda_electrostatics = 0.5
++        alchemical_state.apply_to_context(context)
++        self._check_exact_pme_charges(context.getSystem(), lambda_electrostatics=0.5)
++
++        # The only way to check that the charges of the NonbondedForce
++        # have been updated is to compare the energies.
++        positions = self.alanine_test_system.positions
++        reference_system = copy.deepcopy(self.alanine_test_system.system)
++        context.setPositions(positions)
++        alchemical_energy_1 = compute_electrostatic_energy(1.0, context)
++        alchemical_energy_0 = compute_electrostatic_energy(0.0, context)
++        del context
++
++        reference_energy_1 = compute_energy(reference_system, positions)
++        turn_off_nonbonded(reference_system, electrostatics=True,
++                           only_atoms=self.alanine_alchemical_atoms)
++        turn_off_nonbonded(reference_system, electrostatics=True, exceptions=True,
++                           only_atoms=self.alanine_alchemical_atoms)
++        reference_energy_0 = compute_energy(reference_system, positions)
++        assert_almost_equal(reference_energy_1 - reference_energy_0,
++                            alchemical_energy_1 - alchemical_energy_0,
++                            'Exact PME treatment electrostatics')
+ 
+     def test_standardize_system(self):
+         """Test method AlchemicalState.standardize_system."""
+-        # First create a non-standard system.
+-        system = copy.deepcopy(self.full_alanine_state.system)
+-        alchemical_state = AlchemicalState.from_system(system)
+-        alchemical_state.set_alchemical_parameters(0.5)
+-        alchemical_state.apply_to_system(system)
++        test_cases = [(self.full_alanine_state, False),
++                      (self.alanine_state_exact_pme, True)]
++
++        for state, check_charges in test_cases:
++            # First create a non-standard system.
++            system = copy.deepcopy(state.system)
++            alchemical_state = AlchemicalState.from_system(system)
++            alchemical_state.set_alchemical_parameters(0.5)
++            alchemical_state.apply_to_system(system)
+ 
+-        # Check that _standardize_system() sets all parameters back to 1.0.
+-        AlchemicalState._standardize_system(system)
+-        standard_alchemical_state = AlchemicalState.from_system(system)
+-        assert alchemical_state != standard_alchemical_state
+-        for parameter_name, value in alchemical_state._parameters.items():
+-            standard_value = getattr(standard_alchemical_state, parameter_name)
+-            assert (value is None and standard_value is None) or (standard_value == 1.0)
++            # Test pre-condition: The state of the System has been changed.
++            assert AlchemicalState.from_system(system).lambda_electrostatics == 0.5
++            if check_charges:
++                self._check_exact_pme_charges(system, lambda_electrostatics=0.5)
++
++            # Check that _standardize_system() sets all parameters back to 1.0.
++            alchemical_state._standardize_system(system)
++            standard_alchemical_state = AlchemicalState.from_system(system)
++            assert alchemical_state != standard_alchemical_state
++            for parameter_name, value in alchemical_state._parameters.items():
++                standard_value = getattr(standard_alchemical_state, parameter_name)
++                assert (value is None and standard_value is None) or (standard_value == 1.0)
++
++    def test_find_force_groups_to_update(self):
++        """Test method AlchemicalState._find_force_groups_to_update."""
++        test_cases = [self.full_alanine_state, self.alanine_state_exact_pme]
++
++        for thermodynamic_state in test_cases:
++            system = copy.deepcopy(thermodynamic_state.system)
++            alchemical_state = AlchemicalState.from_system(system)
++            alchemical_state2 = copy.deepcopy(alchemical_state)
++
++            # Each lambda should be separated in its own force group.
++            expected_force_groups = {}
++            for force, lambda_name, _ in AlchemicalState._get_system_lambda_parameters(system):
++                expected_force_groups[lambda_name] = force.getForceGroup()
++
++            integrator = openmm.VerletIntegrator(2.0*unit.femtoseconds)
++            context = create_context(system, integrator)
++
++            # No force group should be updated if we don't move.
++            assert alchemical_state._find_force_groups_to_update(context, alchemical_state2, memo={}) == set()
++
++            # Change the lambdas one by one and check that the method
++            # recognize that the force group energy must be updated.
++            for lambda_name in AlchemicalState._get_supported_parameters():
++                # Check that the system defines the global variable.
++                if getattr(alchemical_state, lambda_name) is None:
++                    continue
++
++                # Change the current state.
++                setattr(alchemical_state2, lambda_name, 0.0)
++                force_group = expected_force_groups[lambda_name]
++                assert alchemical_state._find_force_groups_to_update(context, alchemical_state2, memo={}) == {force_group}
++                setattr(alchemical_state2, lambda_name, 1.0)  # Reset current state.
++            del context
+ 
+     def test_alchemical_functions(self):
+         """Test alchemical variables and functions work correctly."""
+@@ -1603,6 +1829,10 @@ def test_alchemical_functions(self):
+         alchemical_state.set_alchemical_variable('lambda2', 0)
+         assert alchemical_state.lambda_electrostatics == 0.5
+ 
++    # ---------------------------------------------------
++    # Integration tests with CompoundThermodynamicStates
++    # ---------------------------------------------------
++
+     def test_constructor_compound_state(self):
+         """The AlchemicalState is set on construction of the CompoundState."""
+         test_cases = copy.deepcopy(self.test_cases)
+@@ -1682,16 +1912,7 @@ def test_set_system_compound_state(self):
+ 
+     def test_method_compatibility_compound_state(self):
+         """Compatibility between states is handled correctly in compound state."""
+-        alanine_state = copy.deepcopy(self.alanine_state)
+-        alchemical_state = AlchemicalState.from_system(alanine_state.system)
+-        compound_state = states.CompoundThermodynamicState(alanine_state, [alchemical_state])
+-
+-        # A compatible state has the same defined lambda parameters,
+-        # but their values can be different.
+-        alchemical_state_compatible = copy.deepcopy(alchemical_state)
+-        alchemical_state_compatible.lambda_electrostatics = 0.5
+-        compound_state_compatible = states.CompoundThermodynamicState(copy.deepcopy(alanine_state),
+-                                                                      [alchemical_state_compatible])
++        test_cases = [self.alanine_state, self.alanine_state_exact_pme]
+ 
+         # An incompatible state has a different set of defined lambdas.
+         full_alanine_state = copy.deepcopy(self.full_alanine_state)
+@@ -1699,23 +1920,159 @@ def test_method_compatibility_compound_state(self):
+         compound_state_incompatible = states.CompoundThermodynamicState(full_alanine_state,
+                                                                         [alchemical_state_incompatible])
+ 
+-        # Test states compatibility.
+-        assert compound_state.is_state_compatible(compound_state_compatible)
+-        assert not compound_state.is_state_compatible(compound_state_incompatible)
++        for state in test_cases:
++            state = copy.deepcopy(state)
++            alchemical_state = AlchemicalState.from_system(state.system)
++            compound_state = states.CompoundThermodynamicState(state, [alchemical_state])
++
++            # A compatible state has the same defined lambda parameters,
++            # but their values can be different.
++            alchemical_state_compatible = copy.deepcopy(alchemical_state)
++            assert alchemical_state.lambda_electrostatics != 0.5  # Test pre-condition.
++            alchemical_state_compatible.lambda_electrostatics = 0.5
++            compound_state_compatible = states.CompoundThermodynamicState(copy.deepcopy(state),
++                                                                          [alchemical_state_compatible])
+ 
+-        # Test context compatibility.
++            # Test states compatibility.
++            assert compound_state.is_state_compatible(compound_state_compatible)
++            assert not compound_state.is_state_compatible(compound_state_incompatible)
++
++            # Test context compatibility.
++            integrator = openmm.VerletIntegrator(1.0*unit.femtosecond)
++            context = compound_state_compatible.create_context(copy.deepcopy(integrator))
++            assert compound_state.is_context_compatible(context)
++
++            context = compound_state_incompatible.create_context(copy.deepcopy(integrator))
++            assert not compound_state.is_context_compatible(context)
++
++    @staticmethod
++    def _check_compatibility(state1, state2, context_state1, is_compatible):
++        """Check the compatibility of states and contexts between 2 states."""
++        # Compatibility should be commutative
++        assert state1.is_state_compatible(state2) is is_compatible
++        assert state2.is_state_compatible(state1) is is_compatible
++
++        # Test context incompatibility is commutative.
++        context_state2 = state2.create_context(openmm.VerletIntegrator(1.0*unit.femtosecond))
++        assert state2.is_context_compatible(context_state1) is is_compatible
++        assert state1.is_context_compatible(context_state2) is is_compatible
++        del context_state2
++
++    def test_incompatibility_nonbonded_force(self):
++        """Test the optional electrostatics incompatibility with exact PME."""
++        alanine_state = copy.deepcopy(self.alanine_state)
++        alanine_state_exact_pme = copy.deepcopy(self.alanine_state_exact_pme)
++        alchemical_state = AlchemicalState.from_system(alanine_state_exact_pme.system)
++        alchemical_state.update_alchemical_charges = False
++        compound_state = states.CompoundThermodynamicState(copy.deepcopy(alanine_state_exact_pme),
++                                                           [alchemical_state])
+         integrator = openmm.VerletIntegrator(1.0*unit.femtosecond)
+-        context = compound_state_compatible.create_context(copy.deepcopy(integrator))
+-        assert compound_state.is_context_compatible(context)
++        context = compound_state.create_context(copy.deepcopy(integrator))
++
++        # Test incompatibility.
++        # ----------------------
++
++        # Check that changes in lambda_electrostatics are not compatible.
++        compound_state_incompatible1 = copy.deepcopy(compound_state)
++        compound_state_incompatible1.lambda_electrostatics = 0.0
++
++        # States with non-exact PME treatment are incompatible
++        # even with same lambda_electrostatics.
++        compound_state_incompatible2 = states.CompoundThermodynamicState(
++            thermodynamic_state=copy.deepcopy(alanine_state),
++            composable_states=[AlchemicalState.from_system(alanine_state.system)]
++        )
++        # States with exact PME treatment but with
++        # update_alchemical_charges=True are incompatible.
++        compound_state_incompatible3 = states.CompoundThermodynamicState(
++            thermodynamic_state=copy.deepcopy(alanine_state_exact_pme),
++            composable_states=[AlchemicalState.from_system(alanine_state_exact_pme.system)]
++        )
++        # Switching update_alchemical_charges in the
++        # compound state works correctly.
++        compound_state_incompatible4 = copy.deepcopy(compound_state)
++        compound_state_incompatible4.update_alchemical_charges = True
++
++        compound_state_incompatible5 = copy.deepcopy(compound_state)
++        compound_state_incompatible5.update_alchemical_charges = True
++        compound_state_incompatible5.lambda_electrostatics = 0.5
++        compound_state_incompatible5.update_alchemical_charges = False
++
++        for incompatible_state in [compound_state_incompatible1, compound_state_incompatible2,
++                                   compound_state_incompatible3, compound_state_incompatible4,
++                                   compound_state_incompatible5]:
++            self._check_compatibility(compound_state, incompatible_state, context, is_compatible=False)
++
++        # Test compatibility.
++        # ----------------------
++
++        # Check that states with lambda_electrostatics are
++        # compatible even if other lambda variables change.
++        alchemical_state_compatible = copy.deepcopy(alchemical_state)
++        alchemical_state_compatible.lambda_sterics = 0.0
++        compound_state_compatible = states.CompoundThermodynamicState(copy.deepcopy(alanine_state_exact_pme),
++                                                                      [alchemical_state_compatible])
++        self._check_compatibility(compound_state, compound_state_compatible, context, is_compatible=True)
+ 
+-        context = compound_state_incompatible.create_context(copy.deepcopy(integrator))
+-        assert not compound_state.is_context_compatible(context)
++
++    def test_method_reduced_potential_compound_state(self):
++        """Test CompoundThermodynamicState.reduced_potential_at_states() method.
++
++        Computing the reduced potential singularly and with the class
++        method should give the same result.
++        """
++        # Build a mixed collection of compatible and incompatible thermodynamic states.
++        thermodynamic_states = [
++            copy.deepcopy(self.alanine_state),
++            copy.deepcopy(self.alanine_state_exact_pme)
++        ]
++
++        alchemical_states = [
++            AlchemicalState(lambda_electrostatics=1.0, lambda_sterics=1.0),
++            AlchemicalState(lambda_electrostatics=0.5, lambda_sterics=1.0),
++            AlchemicalState(lambda_electrostatics=0.5, lambda_sterics=0.0),
++            AlchemicalState(lambda_electrostatics=1.0, lambda_sterics=1.0)
++        ]
++
++        compound_states = []
++        for thermo_state in thermodynamic_states:
++            for alchemical_state in alchemical_states:
++                compound_states.append(states.CompoundThermodynamicState(
++                    copy.deepcopy(thermo_state), [copy.deepcopy(alchemical_state)]))
++
++        # Group thermodynamic states by compatibility.
++        compatible_groups, _ = states.group_by_compatibility(compound_states)
++        assert len(compatible_groups) == 2
++
++        # Compute the reduced potentials.
++        expected_energies = []
++        obtained_energies = []
++        for compatible_group in compatible_groups:
++            # Create context.
++            integrator = openmm.VerletIntegrator(2.0*unit.femtoseconds)
++            context = compatible_group[0].create_context(integrator)
++            context.setPositions(self.alanine_test_system.positions[:compatible_group[0].n_particles])
++
++            # Compute with single-state method.
++            for state in compatible_group:
++                state.apply_to_context(context)
++                expected_energies.append(state.reduced_potential(context))
++
++            # Compute with multi-state method.
++            compatible_energies = states.ThermodynamicState.reduced_potential_at_states(context, compatible_group)
++
++            # The first and the last state must be equal.
++            assert np.isclose(compatible_energies[0], compatible_energies[-1])
++            obtained_energies.extend(compatible_energies)
++
++        assert np.allclose(np.array(expected_energies), np.array(obtained_energies))
+ 
+     def test_serialization(self):
+         """Test AlchemicalState serialization alone and in a compound state."""
+         alchemical_state = AlchemicalState(lambda_electrostatics=0.5, lambda_angles=None)
+         alchemical_state.set_alchemical_variable('lambda', 0.0)
+         alchemical_state.lambda_sterics = AlchemicalFunction('lambda')
++        alchemical_state.update_alchemical_charges = not AlchemicalState._UPDATE_ALCHEMICAL_CHARGES_DEFAULT
+ 
+         # Test serialization/deserialization of AlchemicalState.
+         serialization = utils.serialize(alchemical_state)
+@@ -1725,20 +2082,21 @@ def test_serialization(self):
+         assert original_pickle == deserialized_pickle
+ 
+         # Test serialization/deserialization of AlchemicalState in CompoundState.
+-        alanine_state = copy.deepcopy(self.alanine_state)
+-        compound_state = states.CompoundThermodynamicState(alanine_state, [alchemical_state])
+-
+-        # The serialized system is standard.
+-        serialization = utils.serialize(compound_state)
+-        serialized_standard_system = serialization['thermodynamic_state']['standard_system']
+-        # Decompress the serialized_system
+-        serialized_standard_system = zlib.decompress(serialized_standard_system).decode(
+-            states.ThermodynamicState._ENCODING)
+-        assert serialized_standard_system.__hash__() == compound_state._standard_system_hash
+-
+-        # The object is deserialized correctly.
+-        deserialized_state = utils.deserialize(serialization)
+-        assert pickle.dumps(compound_state) == pickle.dumps(deserialized_state)
++        test_cases = [copy.deepcopy(self.alanine_state), copy.deepcopy(self.alanine_state_exact_pme)]
++        for thermodynamic_state in test_cases:
++            compound_state = states.CompoundThermodynamicState(thermodynamic_state, [alchemical_state])
++
++            # The serialized system is standard.
++            serialization = utils.serialize(compound_state)
++            serialized_standard_system = serialization['thermodynamic_state']['standard_system']
++            # Decompress the serialized_system
++            serialized_standard_system = zlib.decompress(serialized_standard_system).decode(
++                states.ThermodynamicState._ENCODING)
++            assert serialized_standard_system.__hash__() == compound_state._standard_system_hash
++
++            # The object is deserialized correctly.
++            deserialized_state = utils.deserialize(serialization)
++            assert pickle.dumps(compound_state) == pickle.dumps(deserialized_state)
+ 
+ 
+ # =============================================================================
+diff --git a/openmmtools/tests/test_states.py b/openmmtools/tests/test_states.py
+index 87cc0d0bb..dc9e57ed0 100644
+--- a/openmmtools/tests/test_states.py
++++ b/openmmtools/tests/test_states.py
+@@ -50,7 +50,9 @@ def setup_class(cls):
+         cls.alanine_positions = alanine_explicit.positions
+         cls.alanine_no_thermostat = alanine_explicit.system
+ 
+-        cls.toluene_implicit = testsystems.TolueneImplicit().system
++        toluene_implicit = testsystems.TolueneImplicit()
++        cls.toluene_positions = toluene_implicit.positions
++        cls.toluene_implicit = toluene_implicit.system
+         cls.toluene_vacuum = testsystems.TolueneVacuum().system
+         thermostat = openmm.AndersenThermostat(cls.std_temperature,
+                                                1.0/unit.picosecond)
+@@ -187,15 +189,6 @@ def test_method_is_barostat_consistent(self):
+         barostat = openmm.MonteCarloBarostat(pressure, temperature + 10*unit.kelvin)
+         assert not state._is_barostat_consistent(barostat)
+ 
+-    def test_method_set_barostat_temperature(self):
+-        """ThermodynamicState._set_barostat_temperature() method."""
+-        barostat = openmm.MonteCarloBarostat(self.std_pressure, self.std_temperature)
+-        new_temperature = self.std_temperature + 10*unit.kelvin
+-
+-        assert ThermodynamicState._set_barostat_temperature(barostat, new_temperature)
+-        assert get_barostat_temperature(barostat) == new_temperature
+-        assert not ThermodynamicState._set_barostat_temperature(barostat, new_temperature)
+-
+     def test_method_set_system_temperature(self):
+         """ThermodynamicState._set_system_temperature() method."""
+         system = copy.deepcopy(self.alanine_no_thermostat)
+@@ -260,7 +253,6 @@ def test_property_pressure_barostat(self):
+ 
+         # Correctly reads and set system pressures
+         periodic_testcases = [self.alanine_explicit]
+-        print('ON IT!')
+         for system in periodic_testcases:
+             state = ThermodynamicState(system, self.std_temperature)
+             assert state.pressure is None
+@@ -506,7 +498,7 @@ def test_method_set_integrator_temperature(self):
+ 
+         for thermostated, integrator in test_cases:
+             if thermostated:
+-                state._set_integrator_temperature(integrator)
++                assert state._set_integrator_temperature(integrator)
+                 for _integrator in ThermodynamicState._loop_over_integrators(integrator):
+                     try:
+                         assert _integrator.getTemperature() == new_temperature
+@@ -514,7 +506,7 @@ def test_method_set_integrator_temperature(self):
+                         pass
+             else:
+                 # It doesn't explode with integrators not coupled to a heat bath
+-                state._set_integrator_temperature(integrator)
++                assert not state._set_integrator_temperature(integrator)
+ 
+     def test_method_standardize_system(self):
+         """ThermodynamicState._standardize_system() class method."""
+@@ -714,6 +706,47 @@ def test_method_reduced_potential(self):
+             state.reduced_potential(incompatible_sampler_state)
+         assert cm.exception.code == ThermodynamicsError.INCOMPATIBLE_SAMPLER_STATE
+ 
++    def test_method_reduced_potential_at_states(self):
++        """ThermodynamicState.reduced_potential_at_states() method.
++
++        Computing the reduced potential singularly and with the class
++        method should give the same result.
++        """
++        # Build a mixed collection of compatible and incompatible thermodynamic states.
++        thermodynamic_states = [
++            ThermodynamicState(self.alanine_explicit, temperature=300*unit.kelvin,
++                               pressure=1.0*unit.atmosphere),
++            ThermodynamicState(self.toluene_implicit, temperature=200*unit.kelvin),
++            ThermodynamicState(self.alanine_explicit, temperature=250*unit.kelvin,
++                               pressure=1.2*unit.atmosphere)
++        ]
++
++        # Group thermodynamic states by compatibility.
++        compatible_groups, original_indices = group_by_compatibility(thermodynamic_states)
++        assert len(compatible_groups) == 2
++        assert original_indices == [[0, 2], [1]]
++
++        # Compute the reduced potentials.
++        expected_energies = []
++        obtained_energies = []
++        for compatible_group in compatible_groups:
++            # Create context.
++            integrator = openmm.VerletIntegrator(2.0*unit.femtoseconds)
++            context = compatible_group[0].create_context(integrator)
++            if len(compatible_group) == 2:
++                context.setPositions(self.alanine_positions)
++            else:
++                context.setPositions(self.toluene_positions)
++
++            # Compute with single-state method.
++            for state in compatible_group:
++                state.apply_to_context(context)
++                expected_energies.append(state.reduced_potential(context))
++
++            # Compute with multi-state method.
++            obtained_energies.extend(ThermodynamicState.reduced_potential_at_states(context, compatible_group))
++        assert np.allclose(np.array(expected_energies), np.array(obtained_energies))
++
+ 
+ # =============================================================================
+ # TEST SAMPLER STATE
+@@ -796,6 +829,55 @@ def test_constructor_from_context(self):
+         sampler_state = SamplerState.from_context(alanine_vacuum_context)
+         assert self.is_sampler_state_equal_context(sampler_state, alanine_vacuum_context)
+ 
++    def test_unitless_cache(self):
++        """Test that the unitless cache for positions and velocities is invalidated."""
++        positions = copy.deepcopy(self.alanine_vacuum_positions)
++
++        alanine_vacuum_context = self.create_context(self.alanine_vacuum_state)
++        alanine_vacuum_context.setPositions(copy.deepcopy(positions))
++
++        test_cases = [
++            SamplerState(positions),
++            SamplerState.from_context(alanine_vacuum_context)
++        ]
++
++        pos_unit = unit.micrometer
++        vel_unit = unit.micrometer / unit.nanosecond
++
++        # Assigning an item invalidates the cache.
++        for sampler_state in test_cases:
++            old_unitless_positions = copy.deepcopy(sampler_state._unitless_positions)
++            sampler_state.positions[5] = [1.0, 1.0, 1.0] * pos_unit
++            assert sampler_state.positions.has_changed
++            assert np.all(old_unitless_positions[5] != sampler_state._unitless_positions[5])
++            sampler_state.positions = copy.deepcopy(positions)
++            assert sampler_state._unitless_positions_cache is None
++
++            # TODO reactivate this test once OpenMM 7.2 is released with bugfix for #1940
++            # if isinstance(sampler_state._positions._value, np.ndarray):
++            #     old_unitless_positions = copy.deepcopy(sampler_state._unitless_positions)
++            #     sampler_state.positions[5:8] = [[2.0, 2.0, 2.0], [2.0, 2.0, 2.0], [2.0, 2.0, 2.0]] * pos_unit
++            #     assert sampler_state.positions.has_changed
++            #     assert np.all(old_unitless_positions[5:8] != sampler_state._unitless_positions[5:8])
++
++            if sampler_state.velocities is not None:
++                old_unitless_velocities = copy.deepcopy(sampler_state._unitless_velocities)
++                sampler_state.velocities[5] = [1.0, 1.0, 1.0] * vel_unit
++                assert sampler_state.velocities.has_changed
++                assert np.all(old_unitless_velocities[5] != sampler_state._unitless_velocities[5])
++                sampler_state.velocities = copy.deepcopy(sampler_state.velocities)
++                assert sampler_state._unitless_velocities_cache is None
++
++                # TODO reactivate this test once OpenMM 7.2 is released with bugfix for #1940
++                # if isinstance(sampler_state._velocities._value, np.ndarray):
++                #     old_unitless_velocities = copy.deepcopy(sampler_state._unitless_velocities)
++                #     sampler_state.velocities[5:8] = [[2.0, 2.0, 2.0], [2.0, 2.0, 2.0], [2.0, 2.0, 2.0]] * vel_unit
++                #     assert sampler_state.velocities.has_changed
++                #     assert np.all(old_unitless_velocities[5:8] != sampler_state._unitless_velocities[5:8])
++            else:
++                assert sampler_state._unitless_velocities is None
++
++
+     def test_method_is_context_compatible(self):
+         """SamplerState.is_context_compatible() method."""
+         # Vacuum.
+@@ -907,10 +989,9 @@ def dummy_parameter(self):
+         def dummy_parameter(self, value):
+             self._dummy_parameter = value
+ 
+-        @classmethod
+-        def _standardize_system(cls, system):
++        def _standardize_system(self, system):
+             try:
+-                cls.set_dummy_parameter(system, cls.standard_dummy_parameter)
++                self.set_dummy_parameter(system, self.standard_dummy_parameter)
+             except TypeError:  # No parameter to set.
+                 raise ComposableStateError()
+ 
+@@ -933,11 +1014,22 @@ def is_context_compatible(context):
+         def apply_to_context(self, context):
+             context.setParameter('dummy_parameter', self.dummy_parameter)
+ 
++        def _on_setattr(self, standard_system, attribute_name):
++            return False
++
++        def _find_force_groups_to_update(self, context, current_context_state, memo):
++            if current_context_state.dummy_parameter == self.dummy_parameter:
++                return {}
++            force, _ = self._find_dummy_force(context.getSystem())
++            return {force.getForceGroup()}
++
+         @classmethod
+         def add_dummy_parameter(cls, system):
+             """Add to system a CustomBondForce with a dummy parameter."""
+             force = openmm.CustomBondForce('dummy_parameter')
+             force.addGlobalParameter('dummy_parameter', cls.standard_dummy_parameter)
++            max_force_group = cls._find_max_force_group(system)
++            force.setForceGroup(max_force_group + 1)
+             system.addForce(force)
+ 
+         @staticmethod
+@@ -954,6 +1046,14 @@ def set_dummy_parameter(cls, system, value):
+             force, parameter_id = cls._find_dummy_force(system)
+             force.setGlobalParameterDefaultValue(parameter_id, value)
+ 
++        @staticmethod
++        def _find_max_force_group(system):
++            max_force_group = 0
++            for force in system.getForces():
++                if max_force_group < force.getForceGroup():
++                    max_force_group = force.getForceGroup()
++            return max_force_group
++
+     @classmethod
+     def get_dummy_parameter(cls, system):
+         force, parameter_id = cls.DummyState._find_dummy_force(system)
+@@ -1071,7 +1171,7 @@ def test_method_standardize_system(self):
+         assert not compound_state.is_context_compatible(context)
+ 
+     def test_method_apply_to_context(self):
+-        """CompoundThermodynamicState.apply_to_context() method."""
++        """Test CompoundThermodynamicState.apply_to_context() method."""
+         dummy_parameter = self.DummyState.standard_dummy_parameter
+         thermodynamic_state = ThermodynamicState(self.alanine_explicit, self.std_temperature)
+         thermodynamic_state.pressure = self.std_pressure
+@@ -1090,6 +1190,22 @@ def test_method_apply_to_context(self):
+         assert context.getParameter('dummy_parameter') == self.dummy_parameter
+         assert context.getParameter(barostat.Pressure()) == new_pressure / unit.bar
+ 
++    def test_method_find_force_groups_to_update(self):
++        """Test CompoundThermodynamicState._find_force_groups_to_update() method."""
++        alanine_explicit = copy.deepcopy(self.alanine_explicit)
++        thermodynamic_state = ThermodynamicState(alanine_explicit, self.std_temperature)
++        compound_state = CompoundThermodynamicState(thermodynamic_state, [self.dummy_state])
++        context = compound_state.create_context(openmm.VerletIntegrator(2.0*unit.femtoseconds))
++
++        # No force group should be updated if the two states are identical.
++        assert compound_state._find_force_groups_to_update(context, compound_state, memo={}) == set()
++
++        # If the dummy parameter changes, there should be 1 force group to update.
++        compound_state2 = copy.deepcopy(compound_state)
++        compound_state2.dummy_parameter -= 0.5
++        group = self.DummyState._find_max_force_group(context.getSystem())
++        assert compound_state._find_force_groups_to_update(context, compound_state2, memo={}) == {group}
++
+ 
+ # =============================================================================
+ # TEST SERIALIZATION
+diff --git a/openmmtools/tests/test_utils.py b/openmmtools/tests/test_utils.py
+index 8cd282b23..9c0adfb43 100644
+--- a/openmmtools/tests/test_utils.py
++++ b/openmmtools/tests/test_utils.py
+@@ -71,6 +71,67 @@ def test_math_eval():
+ # TEST QUANTITY UTILITIES
+ # =============================================================================
+ 
++def test_tracked_quantity():
++    """Test TrackedQuantity objects."""
++    def reset(q):
++        assert tracked_quantity.has_changed is True
++        tracked_quantity.has_changed = False
++
++    test_cases = [
++        np.array([10.0, 20.0, 30.0]) * unit.kelvin,
++        [1.0, 2.0, 3.0] * unit.nanometers,
++    ]
++    for quantity in test_cases:
++        tracked_quantity = TrackedQuantity(quantity)
++        u = tracked_quantity.unit
++        assert tracked_quantity.has_changed is False
++
++        tracked_quantity[0] = 5.0 * u
++        assert tracked_quantity[0] == 5.0 * u
++        reset(tracked_quantity)
++
++        tracked_quantity[0:2] = [5.0, 6.0] * u
++        assert np.all(tracked_quantity[0:2] == [5.0, 6.0] * u)
++        reset(tracked_quantity)
++
++        if isinstance(tracked_quantity._value, list):
++            del tracked_quantity[0]
++            assert len(tracked_quantity) == 2
++            reset(tracked_quantity)
++
++            tracked_quantity.append(10.0*u)
++            assert len(tracked_quantity) == 3
++            reset(tracked_quantity)
++
++            tracked_quantity.extend([11.0, 12.0]*u)
++            assert len(tracked_quantity) == 5
++            reset(tracked_quantity)
++
++            element = 15.0*u
++            tracked_quantity.insert(1, element)
++            assert len(tracked_quantity) == 6
++            reset(tracked_quantity)
++
++            tracked_quantity.remove(element.value_in_unit(u))
++            assert len(tracked_quantity) == 5
++            reset(tracked_quantity)
++
++            assert tracked_quantity.pop().unit == u
++            assert len(tracked_quantity) == 4
++            reset(tracked_quantity)
++        else:
++            # Check that numpy views are handled correctly.
++            view = tracked_quantity[:3]
++            view[0] = 20.0*u
++            assert tracked_quantity[0] == 20.0*u
++            reset(tracked_quantity)
++
++            view2 = view[1:]
++            view2[0] = 30.0*u
++            assert tracked_quantity[1] == 30.0*u
++            reset(tracked_quantity)
++
++
+ def test_is_quantity_close():
+     """Test is_quantity_close method."""
+     # (quantity1, quantity2, test_result)
+@@ -78,6 +139,8 @@ def test_is_quantity_close():
+                   (300.0*unit.kelvin, 300.00000004*unit.kelvin, False),
+                   (1.01325*unit.bar, 1.01325000006*unit.bar, True),
+                   (1.01325*unit.bar, 1.0132500006*unit.bar, False)]
++
++    err_msg = 'obtained: {}, expected: {} (quantity1: {}, quantity2: {})'
+     for quantity1, quantity2, test_result in test_cases:
+         msg = "Test failed: ({}, {}, {})".format(quantity1, quantity2, test_result)
+         assert is_quantity_close(quantity1, quantity2) == test_result, msg
+diff --git a/openmmtools/utils.py b/openmmtools/utils.py
+index ceeb9590b..5f6a63321 100644
+--- a/openmmtools/utils.py
++++ b/openmmtools/utils.py
+@@ -326,6 +326,57 @@ def _math_eval(node):
+ # QUANTITY UTILITIES
+ # =============================================================================
+ 
++def _changes_state(func):
++    """Decorator to signal changes in TrackedQuantity."""
++    @functools.wraps(func)
++    def wrapper(self, *args, **kwargs):
++        self.has_changed = True
++        return func(self, *args, **kwargs)
++    return wrapper
++
++
++class TrackedQuantity(unit.Quantity):
++    """A quantity that keeps track of whether it has been changed."""
++
++    def __init__(self, *args, **kwargs):
++        super(TrackedQuantity, self).__init__(*args, **kwargs)
++        self.has_changed = False
++
++    def __getitem__(self, item):
++        if isinstance(item, slice) and isinstance(self._value, np.ndarray):
++            return TrackedQuantityView(self, super(TrackedQuantity, self).__getitem__(item))
++        # No need to track a copy.
++        return super(TrackedQuantity, self).__getitem__(item)
++
++    __setitem__ = _changes_state(unit.Quantity.__setitem__)
++    __delitem__ = _changes_state(unit.Quantity.__delitem__)
++    append = _changes_state(unit.Quantity.append)
++    extend = _changes_state(unit.Quantity.extend)
++    insert = _changes_state(unit.Quantity.insert)
++    remove = _changes_state(unit.Quantity.remove)
++    pop = _changes_state(unit.Quantity.pop)
++
++
++class TrackedQuantityView(unit.Quantity):
++    """Keeps truck of a numpy view for TrackedQuantity."""
++
++    def __init__(self, tracked_quantity, *args, **kwargs):
++        super(TrackedQuantityView, self).__init__(*args, **kwargs)
++        self._tracked_quantity = tracked_quantity  # Parent.
++
++    def __getitem__(self, item):
++        if isinstance(item, slice):
++            return TrackedQuantityView(self._tracked_quantity,
++                                       super(TrackedQuantityView, self).__getitem__(item))
++        # No need to track a copy.
++        return super(TrackedQuantityView, self).__getitem__(item)
++
++    def __setitem__(self, key, value):
++        super(TrackedQuantityView, self).__setitem__(key, value)
++        self._tracked_quantity.has_changed = True
++
++
++
+ # List of simtk.unit methods that are actually units and functions instead of base classes
+ # Pre-computed to reduce run-time cost
+ # Get the built-in units
+diff --git a/setup.py b/setup.py
+index 87b690c0d..c4cf06767 100644
+--- a/setup.py
++++ b/setup.py
+@@ -14,7 +14,7 @@
+ DOCLINES = __doc__.split("\n")
+ 
+ ########################
+-VERSION = "0.13.5"
++VERSION = "0.14.0"
+ ISRELEASED = False
+ __version__ = VERSION
+ ########################

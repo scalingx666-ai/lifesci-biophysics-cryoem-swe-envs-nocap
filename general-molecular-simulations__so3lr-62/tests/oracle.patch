@@ -1,0 +1,855 @@
+diff --git a/so3lr/cli/so3lr_cli.py b/so3lr/cli/so3lr_cli.py
+index 1f0864a..f65ec17 100644
+--- a/so3lr/cli/so3lr_cli.py
++++ b/so3lr/cli/so3lr_cli.py
+@@ -528,9 +528,10 @@ def flash_options(f: Callable) -> Callable:
+                      help='Deprecated: --precision mixed (on) or float32 (off).')(f)
+     f = click.option('--flash-kernels', 'flash_kernels', default='auto',
+                      type=click.Choice(list(KERNELS)),
+-                     help='SO3LR-Flash kernels: cuda (so3lr-tauri-s/m/l and so3lr, fast mode, an sm_90 GPU with '
+-                          'nvcc: tensor-core attention, 3x faster, built on first use) or pallas (Triton, any '
+-                          'GPU); auto takes cuda where it applies, else pallas, and says which. [default: auto]')(f)
++                     help='SO3LR-Flash kernels: cuda (so3lr-tauri-s/m/l and so3lr, fast mode, a GPU of compute '
++                          'capability 8.0 or newer with nvcc: tensor-core attention, 3x faster, built on first '
++                          'use) or pallas (Triton, any GPU); auto takes cuda where it applies, else pallas, and '
++                          'says which. [default: auto]')(f)
+     f = click.option('--flash-devices', 'flash_devices', default=1, type=click.IntRange(min=1),
+                      help='SO3LR-Flash on this many GPUs of the node: each computes an equal share '
+                           'of the atoms, for systems that fit on one GPU but should run faster. '
+diff --git a/so3lr/flash/__init__.py b/so3lr/flash/__init__.py
+index 7a92cea..1a29f47 100644
+--- a/so3lr/flash/__init__.py
++++ b/so3lr/flash/__init__.py
+@@ -8,7 +8,8 @@
+ exactly (energy and forces; real-space long range). ``loader.load_params`` reads a
+ registry model; ``md.perform_md_flash`` runs ``so3lr nve|nvt|nvt-langevin|npt``, which
+ use it by default wherever it applies (``check.flash_problem``); ``verify`` compares it
+-with the neighbour-list potential. On an sm_90 GPU with nvcc, so3lr-tauri-s/m/l's fast mode
+-runs CUDA kernels (cuda: the attention per pair on tensor cores, 3x the speed), picked
+-automatically (flash_kernels); the Pallas kernels serve everything else.
++with the neighbour-list potential. On an NVIDIA GPU of compute capability 8.0 or newer with
++nvcc, so3lr-tauri-s/m/l's fast mode runs CUDA kernels (cuda: the attention per pair on tensor
++cores, 3x the speed), picked automatically (flash_kernels); the Pallas kernels serve
++everything else.
+ """
+diff --git a/so3lr/flash/cuda/__init__.py b/so3lr/flash/cuda/__init__.py
+index 4945715..50ca0d7 100644
+--- a/so3lr/flash/cuda/__init__.py
++++ b/so3lr/flash/cuda/__init__.py
+@@ -27,6 +27,7 @@
+ import jax.numpy as jnp
+ import numpy as np
+ 
++from . import build
+ from .build import BuildError, bwd_copies, load_kernels, problem
+ 
+ logger = logging.getLogger("SO3LR")
+@@ -124,6 +125,14 @@ def chunk_kib_per_row(eng):
+ MODES = ("fast", "default")
+ 
+ 
++def serves(mode):
++    """Whether the kernels serve an engine memory mode (engine.MODES): all but the Pallas
++    kernels' own, those of the attention in passes (as unsupported finds on an engine)."""
++    from .. import engine as E
++    kw = E.MODES[mode][0]
++    return not (kw.get("split_channels") or kw.get("split_blocks"))
++
++
+ def unsupported(eng):
+     """Why the CUDA kernels cannot serve this engine (None: they can, memory aside)."""
+     why = problem()
+@@ -133,22 +142,27 @@ def unsupported(eng):
+         return "float64"
+     if not jax.config.jax_enable_x64:
+         return "float32 positions (the kernels take float64 ones: jax_enable_x64)"
+-    if variant(eng) is None:
++    var = variant(eng)
++    if var is None:
+         return "a model other than so3lr-tauri-s/m/l or so3lr (32 features per head, 4 or 8 heads of degrees 1-4)"
++    if build.tiles(var) is None:
++        return f"the model's kernels need more shared memory per block than this GPU's {build.smem()[0] // 1024} KiB"
+     if eng.split or eng.blocks:
+         return "a memory mode of the Pallas kernels' own (the attention in passes)"
+     return None
+ 
+ 
+-def plan(eng, free=None):
+-    """(bytes for a chunk's buffers, None) for the kernels on this engine: None where every
+-    layer's per-pair data fits for its backward (in a mode keeping the attention outputs),
+-    else a chunk's (CHUNK_BUDGET) next to the per-atom arrays of the engine's mode; or (None,
+-    why) where neither fits."""
+-    if free is None:
+-        from ..md import _free_bytes
+-        free = _free_bytes()
+-    if eng.keep_attention and eng.n * kib_per_atom(eng) * 1024 * MARGIN + GIB <= free:
++def kept_bytes(eng):
++    """The bytes the kernels need on this engine with every layer's per-pair data kept."""
++    return eng.n * kib_per_atom(eng) * 1024 * MARGIN + GIB
++
++
++def plan(eng, free):
++    """(bytes for a chunk's buffers, None) for the kernels on this engine in free bytes: None
++    where every layer's per-pair data fits for its backward (in a mode keeping the attention
++    outputs), else a chunk's (CHUNK_BUDGET) next to the per-atom arrays of the engine's mode;
++    or (None, why) where neither fits."""
++    if eng.keep_attention and kept_bytes(eng) <= free:
+         return None, None
+     room = free - eng.n * chunked_kib_per_atom(eng) * 1024 * MARGIN - GIB
+     # half the room, between the bounds: larger chunks make fewer pairs twice (at their edges)
+@@ -164,24 +178,26 @@ def plan(eng, free=None):
+ 
+ 
+ def pick_mode(n, free, params, statics):
+-    """The fastest of MODES in which the kernels fit n atoms in free bytes (their per-pair data
+-    kept, or a chunk of rows at a time), or None: they do not serve this model here, or it
+-    fits none (the Pallas kernels' modes go further)."""
++    """(the fastest of MODES in which the kernels fit n atoms in free bytes (their per-pair
++    data kept, or a chunk of rows at a time), None), or (None, why): they do not serve this
++    model here, or it fits none (the Pallas kernels' modes go further)."""
+     from .. import engine as E
+     # what the estimates read of an engine for these atoms, as the engine would make it
+     F, nh, G, M, sh = E.model_widths(params, statics)
+     eng = types.SimpleNamespace(n=n, nl=n, statics=statics, dtype=statics.get("dtype", jnp.float32), F=F, nh=nh,
+                                 G=G, M=M, sh=sh, K=E.neighbour_rows(float(statics["cutoff"])), split=False,
+                                 blocks=False, keep=True, keep_attention=True, staged=False)
+-    if unsupported(eng):
+-        return None
++    why = unsupported(eng)
++    if why:
++        return None, why
+     for name in MODES:
+         kw, eng.staged = E.MODES[name][:2]
+         eng.keep = kw.get("keep_layer_inputs", True)
+         eng.keep_attention = kw.get("keep_attention", False) and eng.keep
+-        if plan(eng, free)[1] is None:
+-            return name
+-    return None
++        why = plan(eng, free)[1]
++        if why is None:
++            return name, None
++    return None, why
+ 
+ 
+ def low_rank(T, D, rank, spacing=None):
+@@ -194,18 +210,24 @@ def low_rank(T, D, rank, spacing=None):
+     return jnp.asarray(T @ V, jnp.float32), jnp.asarray(D @ V, jnp.float32), jnp.asarray(V.T, jnp.float32)
+ 
+ 
+-@functools.cache
+ def ffi_prefix(var):
+-    """The FFI target names' prefix of a variant's kernels, registered once per process. The
+-    names depend on the variant alone, so the jitted programs hit the persistent compilation
+-    cache from one process to the next."""
++    """The FFI target names' prefix of a variant's kernels as built for this GPU (its
++    architecture and tiles), registered once per process. The names depend on these alone, so
++    the jitted programs hit the persistent compilation cache from one process to the next."""
++    t = build.tiles(var)
++    prefix = ("so3lr_flash_cuda_" + "_".join(f"{v:x}" if i == 4 else str(v) for i, v in enumerate(var))
++              + f"_{build.arch()}_" + "_".join(str(int(v)) for tile in t.values() for v in tile[:4]))
++    _register(prefix, var)
++    return prefix
++
++
++@functools.cache
++def _register(prefix, var):
+     libs = load_kernels(var)
+-    prefix = "so3lr_flash_cuda_" + "_".join(f"{v:x}" if i == 4 else str(v) for i, v in enumerate(var))
+     for name, (lib, sym) in (("prep", (libs["fwd"], "PairPrep")), ("fwd", (libs["fwd"], "AttPair")),
+                              ("msg", (libs["fwd"], "AttMsg")), ("bwd", (libs["bwd"], "BwdPair7")),
+                              ("gather", (libs["bwd"], "BwdGather")), ("lr", (libs["lr"], "LongRange"))):
+         jax.ffi.register_ffi_target(f"{prefix}_{name}", jax.ffi.pycapsule(getattr(lib, sym)), platform="CUDA")
+-    return prefix
+ 
+ 
+ class CudaKernels:
+@@ -217,9 +239,10 @@ class CudaKernels:
+     attention alone: a chunk's pairs are those of its rows, a pair with a partner outside the
+     chunk made by both chunks, as the devices do."""
+ 
+-    def __init__(self, eng, chunk=None, budget=None):
++    def __init__(self, eng, chunk=None, free=None):
+         self.eng = eng
+-        self._chunk, self._budget = chunk, budget
++        self._chunk, self._free = chunk, free         # rows asked for, or the bytes planned in
++        self._budget = None if free is None else plan(eng, free)[0]     # a chunk's (None: kept)
+         self.variant = variant(eng)
+         NH, rank = self.variant[1], self.variant[5]
+         self.copies = bwd_copies(self.variant)      # of the per-slot forces and ev gradients
+@@ -239,13 +262,53 @@ def __init__(self, eng, chunk=None, budget=None):
+             self.layers.append(dict(W=W, tabs=[u1v, u1d, u2v, u2d], V=[v1, v2]))
+         self.scal = eng.scal.at[1].multiply(TABLE_SUB).at[2].divide(TABLE_SUB)
+         self.pair_tables = (eng.phi_v[::PAIR_SUB], eng.phi_d[::PAIR_SUB], eng.c6lr_v[::PAIR_SUB], eng.c6lr_d[::PAIR_SUB])
+-        self.kib = (kib_per_atom(eng) if self.chunk is None
+-                    else chunked_kib_per_atom(eng) + chunk_kib_per_row(eng) * self.chunk / eng.n)
+         self._orig_build, self._orig_heads, self._orig_head_backward = eng.build, eng._heads, eng._head_backward
+         self._calls = {}                  # the FFI calls per layout of the rows and range (_sized)
+         self._pp = None                   # the current trace's pair records (PI, PG, PIDX, off)
+         self._post_vjp, self._proj, self._heads_vjp = {}, {}, None
+ 
++    def wire(self):
++        """The engine's methods on these kernels: with the per-pair data kept, the layers (with
++        what the forward keeps for the backward) and the heads; in chunks the attention alone,
++        in the engine's layers and modes."""
++        eng = self.eng
++        eng.build, eng._long_range = self.build, self.long_range
++        kept = dict(_layer_forward=self.layer_forward, _layer_backward=self.layer_backward,
++                    _heads=self.heads, _head_backward=self.head_backward)
++        chunked = dict(_attend=self.attend, _attention_backward_pass=self.attention_backward_pass)
++        on, off = (kept, chunked) if self.chunk is None else (chunked, kept)
++        for name in off:
++            eng.__dict__.pop(name, None)          # the engine's own
++        for name, fn in on.items():
++            setattr(eng, name, fn)
++
++    def replan(self):
++        """After the neighbour rows widen, planned again in the memory the kernels were planned
++        in: the per-pair data kept while it fits, else a chunk of rows at a time (the chunks'
++        budget made again; the smallest chunks where the estimate finds room for none)."""
++        if self._chunk is not None:                   # rows asked for
++            return
++        budget, why = plan(self.eng, self._free)
++        if why:
++            logger.warning("Flash: the neighbour rows widened (%d): %s; CUDA kernels in the smallest chunks",
++                           self.eng.K, why)
++            budget = MIN_CHUNK
++        elif budget is None:
++            return                                    # the per-pair data kept still fits
++        was_kept = self._budget is None
++        self._budget = budget                         # the FFI calls follow at the next trace (_sized)
++        if was_kept:
++            self.wire()
++            logger.info("Flash: the neighbour rows widened (%d): CUDA kernels in chunks of %d rows (~%.0f KiB/atom)",
++                        self.eng.K, self.chunk, self.kib)
++
++    @property
++    def kib(self):
++        """What the engine holds per atom at its peak on these kernels, in KiB (the estimates)."""
++        eng = self.eng
++        return (kib_per_atom(eng) if self.chunk is None
++                else chunked_kib_per_atom(eng) + chunk_kib_per_row(eng) * self.chunk / eng.n)
++
+     @property
+     def chunk(self):
+         """Rows per chunk (None: every layer's per-pair data kept): as asked, or as many as the
+@@ -541,31 +604,24 @@ def attach(eng, strict=False, chunk=None):
+     object, or None (with a log line) where they do not apply or cannot be built; strict
+     (kernels="cuda" asked for explicitly) raises instead of falling back. chunk (rows): the
+     per-pair data a chunk at a time whatever the memory (default: as plan finds room)."""
+-    why, budget = unsupported(eng), None
++    why, free = unsupported(eng), None
+     if why is None and chunk is None:
+-        budget, why = plan(eng)
++        from ..md import _free_bytes
++        free = _free_bytes()
++        why = plan(eng, free)[1]
+     if why:
+         if strict:
+             raise RuntimeError(f"Flash: the CUDA kernels do not serve this engine ({why})")
+         logger.info("Flash: CUDA kernels not used (%s); Pallas kernels", why)
+         return None
+     try:
+-        ck = CudaKernels(eng, chunk, budget)
++        ck = CudaKernels(eng, chunk, free)
+     except (BuildError, OSError) as e:       # nvcc failed or unusable, a library does not load, no lock
+         if strict:
+             raise
+         logger.warning("Flash: CUDA kernels not built (%s); Pallas kernels", str(e).splitlines()[0][:160])
+         return None
+-    eng.build = ck.build
+-    eng._long_range = ck.long_range
+-    if ck.chunk is None:                     # the layers, with what the forward keeps for the backward
+-        eng._layer_forward = ck.layer_forward
+-        eng._layer_backward = ck.layer_backward
+-        eng._heads = ck.heads
+-        eng._head_backward = ck.head_backward
+-    else:                                    # the attention alone, in the engine's layers and modes
+-        eng._attend = ck.attend
+-        eng._attention_backward_pass = ck.attention_backward_pass
++    ck.wire()
+     eng.cuda_kernels = ck
+     logger.info("Flash: CUDA kernels (TF32 x3 attention, gather-only messages and gradients; %s; ~%.0f KiB/atom)",
+                 f"chunks of {ck.chunk} rows" if ck.chunk else "per-pair data kept", ck.kib)
+diff --git a/so3lr/flash/cuda/attn_bwd7.cu b/so3lr/flash/cuda/attn_bwd7.cu
+index 9db8a89..4fcc995 100644
+--- a/so3lr/flash/cuda/attn_bwd7.cu
++++ b/so3lr/flash/cuda/attn_bwd7.cu
+@@ -23,9 +23,12 @@ constexpr int MT = TP / 16;
+ #ifdef CHSPLIT
+ // one channel per CTA (blockIdx.y): 4 producer + HC consumer warps; each channel's CTA writes
+ // its own copy of the per-slot forces and ev gradients, which the gather sums
+-constexpr int NCH = 1, NCW = HC, MINB = HC == 4 ? 2 : 1;
++constexpr int NCH = 1, NCW = HC;
+ #else
+-constexpr int NCH = 2, NCW = 2 * HC, MINB = 1;
++constexpr int NCH = 2, NCW = 2 * HC;
++#endif
++#ifndef CTAS                  // CTAs per SM (the registers' bound): as many as the shared memory holds, up to two
++#define CTAS (NCH == 1 && HC == 4 ? 2 : 1)
+ #endif
+ constexpr int NPW = 4, NTH = (NPW + NCW) * 32, NST = NSTAGES;
+ constexpr int BSW = FC + 4;   // wb rows read transposed (gz = gw @ wb^T: B[kk][n] = wb[n][kk])
+@@ -189,13 +192,18 @@ __device__ __forceinline__ void bwd_epilogue(const B7Params& p, const B7Stage& S
+ 
+ constexpr int BVW = R + 4;    // V transposed, fp32: [FC n][R + 4] per channel (ldmatrix)
+ constexpr int BV_FLOATS = NCH * FC * BVW;
+-__global__ void __launch_bounds__(NTH, MINB) bwd7(B7Params p) {
++constexpr int B7_SMEM = (BV_FLOATS + NCH * SH * BSW) * sizeof(float) + NST * sizeof(B7Stage) + sizeof(B7Epi);
++#ifdef SMEM
++// build.py sized the tiles by its count of the shared memory (with WA's): the kernel's own
++static_assert(B7_SMEM + sizeof(FilterW1) == SMEM, "build.bwd_smem differs from the kernel's");
++#endif
++__global__ void __launch_bounds__(NTH, CTAS) bwd7(B7Params p) {
+   extern __shared__ float smf[];
+   float* Bv = smf;                                                     // [NCH][R][BVW]: V rows (uint2 hi/lo, or fp32)
+   float* Bw = smf + BV_FLOATS;                                         // [NCH][SH][BSW]: wb rows
+   B7Stage* st = reinterpret_cast<B7Stage*>(Bw + NCH * SH * BSW);       // [NST]
+   B7Epi* Es = reinterpret_cast<B7Epi*>(st + NST);           // one: the consumers run each tile's epilogue
+-  __shared__ float WA[2][NH + 1][SH];
++  __shared__ FilterW1 WA;
+   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+   const int ch0 = NCH == 1 ? (int)blockIdx.y : 0;                      // the CTA's channel (CHSPLIT)
+   for (int i = tid; i < NCH * KD * FC; i += NTH) {
+@@ -685,9 +693,8 @@ static ffi::Error B7Impl(cudaStream_t stream, F32 q1, F32 k1, F32 v1, F32 q2, F3
+   p.SC = SC->typed_data(); p.FV = FV->typed_data(); p.GEV = GEV->typed_data();
+   p.n = (int)off.dimensions()[0] - 1;
+   p.nslot = (int)(SC->dimensions()[0] / NSC); p.pmax = (int)P;
+-  const int smem = (BV_FLOATS + NCH * SH * BSW) * sizeof(float) + NST * sizeof(B7Stage) + sizeof(B7Epi);
+-  set_max_smem<bwd7>(smem);
+-  bwd7<<<dim3(num_sms(), NCH == 1 ? 2 : 1), NTH, smem, stream>>>(p);
++  set_max_smem<bwd7>(B7_SMEM);
++  bwd7<<<dim3(num_sms(), NCH == 1 ? 2 : 1), NTH, B7_SMEM, stream>>>(p);
+   return launch_status();
+ }
+ 
+diff --git a/so3lr/flash/cuda/attn_common.cuh b/so3lr/flash/cuda/attn_common.cuh
+index f244718..691f13e 100644
+--- a/so3lr/flash/cuda/attn_common.cuh
++++ b/so3lr/flash/cuda/attn_common.cuh
+@@ -37,6 +37,9 @@ static_assert(NH % HC == 0 && F == NH * 32 && M % 8 == 0 && SH % 32 == 0, "one h
+ #endif
+ constexpr int R = RANK;                   // the radial tables' rank
+ constexpr int KD = SH + R;                // the filter product's inner dimension: [hz | coeffs]
++// the spherical filters' first layer of both channels (a row of weights per degree entry, then
++// the bias), in both kernels' shared memory
++using FilterW1 = float[2][NH + 1][SH];
+ // the entries' first equivariant component and harmonic offset (d^2 - 1), as the engine's ys
+ __host__ __device__ constexpr int ev_start(int e) {
+   int st = 0;
+diff --git a/so3lr/flash/cuda/attn_pair7.cu b/so3lr/flash/cuda/attn_pair7.cu
+index de3a614..95eb26c 100644
+--- a/so3lr/flash/cuda/attn_pair7.cu
++++ b/so3lr/flash/cuda/attn_pair7.cu
+@@ -98,7 +98,11 @@ constexpr int MT = TP / 16;                        // mma row tiles per tile
+ #define NSTAGES 2
+ #endif
+ // one channel per CTA (blockIdx.y): 4 producer + HC consumer warps; two CTAs per SM with 4 heads
+-constexpr int NCW = HC, MINB = HC == 4 ? 2 : 1;      // consumer warps (one per head), CTAs per SM
++// where the shared memory holds them (CTAS: the registers' bound)
++#ifndef CTAS
++#define CTAS (HC == 4 ? 2 : 1)
++#endif
++constexpr int NCW = HC;                              // consumer warps (one per head)
+ constexpr int NPW = 4, NTH = (NPW + NCW) * 32, NST = NSTAGES;
+ constexpr int BS_FLOATS = FC * (KD + 4);           // the weights, transposed: n rows, k columns
+ 
+@@ -130,11 +134,11 @@ struct Stage {
+ #endif
+ // KEEPW: write the filters per pair for the backward (else the scores only)
+ template <bool KEEPW>
+-__global__ void __launch_bounds__(NTH, MINB) att_pair(PairParams p) {
++__global__ void __launch_bounds__(NTH, CTAS) att_pair(PairParams p) {
+   extern __shared__ float smf[];
+   float* Bs = smf;                                                   // [FC][KD + 4] fp32, transposed (n rows, k columns)
+   Stage* st = reinterpret_cast<Stage*>(smf + BS_FLOATS);             // [NST]
+-  __shared__ float WA[2][NH + 1][SH];
++  __shared__ FilterW1 WA;
+   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+   const int ch0 = (int)blockIdx.y;                                   // the CTA's channel
+   for (int i = tid; i < KD * FC; i += NTH) {
+@@ -479,9 +483,11 @@ static ffi::Error PrepImpl(cudaStream_t stream, F64 px, F64 py, F64 pz, F64 box,
+   return launch_status();
+ }
+ 
+-static int smem_bytes() {
+-  return BS_FLOATS * sizeof(float) + NST * sizeof(Stage);
+-}
++constexpr int PAIR_SMEM = BS_FLOATS * sizeof(float) + NST * sizeof(Stage);
++#ifdef SMEM
++// build.py sized the tiles by its count of the shared memory (with WA's): the kernel's own
++static_assert(PAIR_SMEM + sizeof(FilterW1) == SMEM, "build.fwd_smem differs from the kernel's");
++#endif
+ 
+ static ffi::Error PairImpl(cudaStream_t stream, F32 q1, F32 k1, F32 q2, F32 k2, F32 ev, S32 PI, F32 PG, S32 off,
+                            F32 u1v, F32 u1d, F32 u2v, F32 u2d, F32 wa1, F32 ba1, F32 wb1, F32 bb1, F32 wa2, F32 ba2,
+@@ -497,13 +503,12 @@ static ffi::Error PairImpl(cudaStream_t stream, F32 q1, F32 k1, F32 q2, F32 k2,
+   p.vr1 = vr1.typed_data(); p.vr2 = vr2.typed_data(); p.cdeg = cdeg.typed_data(); p.scal = scal.typed_data();
+   p.S = S->typed_data(); p.Wst = Wst->typed_data();
+   p.n = (int)off.dimensions()[0] - 1; p.pmax = (int)P;
+-  const int smem = smem_bytes();
+   if (keep_w) {
+-    set_max_smem<att_pair<true>>(smem);
+-    att_pair<true><<<dim3(num_sms(), 2), NTH, smem, stream>>>(p);
++    set_max_smem<att_pair<true>>(PAIR_SMEM);
++    att_pair<true><<<dim3(num_sms(), 2), NTH, PAIR_SMEM, stream>>>(p);
+   } else {
+-    set_max_smem<att_pair<false>>(smem);
+-    att_pair<false><<<dim3(num_sms(), 2), NTH, smem, stream>>>(p);
++    set_max_smem<att_pair<false>>(PAIR_SMEM);
++    att_pair<false><<<dim3(num_sms(), 2), NTH, PAIR_SMEM, stream>>>(p);
+   }
+   return launch_status();
+ }
+diff --git a/so3lr/flash/cuda/build.py b/so3lr/flash/cuda/build.py
+index a06f799..030bc97 100644
+--- a/so3lr/flash/cuda/build.py
++++ b/so3lr/flash/cuda/build.py
+@@ -1,6 +1,7 @@
+ """The CUDA kernels built with nvcc on first use, each library cached by its source (and the
+ headers), flags, the compiler's version, the GPU architecture and the JAX version
+-(``$SO3LR_CUDA_CACHE``, default ``~/.cache/so3lr/flash_cuda``). ``$SO3LR_CUDA_FLAGS`` adds
++(``$SO3LR_CUDA_CACHE``, default ``~/.cache/so3lr/flash_cuda``). The attention kernels' tiles
++are the largest whose shared memory fits the GPU's (``tiles``). ``$SO3LR_CUDA_FLAGS`` adds
+ nvcc options: ``-lineinfo``, or one of the kernels' ablation switches for a timing-only
+ build (wrong results): ``-DNOMMA`` ``-DNOPROD`` ``-DNOQK`` ``-DNOWST`` (the forward),
+ ``-DB_NOMMA`` ``-DB_NOPROD`` ``-DB_NOEPI`` ``-DB_NOQK`` (the backward), ``-DNOPAIR`` (the long
+@@ -9,10 +10,12 @@
+ import functools
+ import glob
+ import hashlib
++import itertools
+ import logging
+ import os
+ import shutil
+ import subprocess
++from typing import NamedTuple
+ 
+ import jax
+ 
+@@ -26,21 +29,24 @@ class BuildError(RuntimeError):
+     """nvcc failed, or a built library does not load."""
+ 
+ 
+-# library: (source, flags) for a model variant. Four heads (so3lr-tauri-s/m, so3lr): the
+-# forward one channel per CTA (two per SM), 64-pair tiles, the backward both channels in one
+-# CTA, 32-pair tiles. Eight heads (so3lr-tauri-l): every head of a channel in one CTA (one per
+-# SM) in both, the backward's two channel CTAs writing two copies of the per-slot forces and ev
+-# gradients (``bwd_copies``). The gather: two warps per atom (four with eight heads). The long
++# library: (source, flags) for a model variant. The attention kernels: producer warps fill a
++# stage per tile of pairs, a consumer warp per channel and head takes it (double buffered:
++# two stages). Four heads (so3lr-tauri-s/m, so3lr): the forward one channel per CTA (two CTAs
++# an SM where they fit), the backward both channels in one CTA. Eight heads (so3lr-tauri-l):
++# a channel per CTA in both, the backward's two channel CTAs writing two copies of the
++# per-slot forces and ev gradients (``bwd_copies``). Where the shared memory is smaller, the
++# tiles are (``tiles``). The gather: two warps per atom (four with eight heads). The long
+ # range: fast math.
+ def kernel_flags(variant):
+     """{"fwd", "bwd", "lr"}: (source, flags) for ``variant`` = (features, heads, components,
+-    hidden units, degrees as nibbles, rank)."""
++    hidden units, degrees as nibbles, rank) on this GPU."""
+     F, NH, M, SH, degs, rank = variant
++    t = tiles(variant)
+     v = [f"-DVF={F}", f"-DVNH={NH}", f"-DVM={M}", f"-DVSH={SH}", f"-DVDEGS={degs:#x}", f"-DRANK={rank}"]
+     extra = os.environ.get("SO3LR_CUDA_FLAGS", "").split()
+     return {
+-        "fwd": ("attn_pair7.cu", v + ["-DCHSPLIT", "-DTP=64", "-DLDM"] + extra),
+-        "bwd": ("attn_bwd7.cu", v + (["-DCHSPLIT"] if NH == 8 else []) + ["-DTP=32", "-DGSPLIT=2", "-DLDM"] + extra),
++        "fwd": ("attn_pair7.cu", v + t["fwd"].flags() + ["-DLDM"] + extra),
++        "bwd": ("attn_bwd7.cu", v + t["bwd"].flags() + ["-DGSPLIT=2", "-DLDM"] + extra),
+         "lr": ("lr.cu", ["--use_fast_math"] + extra),
+     }
+ 
+@@ -48,7 +54,89 @@ def kernel_flags(variant):
+ def bwd_copies(variant):
+     """The copies of the per-slot forces and ev gradients the backward of ``variant`` writes:
+     one per channel where each channel runs in its own CTA."""
+-    return 2 if "-DCHSPLIT" in kernel_flags(variant)["bwd"][1] else 1
++    return 2 if tiles(variant)["bwd"].split else 1
++
++
++class Tile(NamedTuple):
++    """An attention kernel's tiles: pairs per tile, pipeline stages, a CTA per channel, CTAs an
++    SM holds (the registers' bound), and its shared memory per CTA in bytes."""
++    pairs: int
++    stages: int
++    split: bool
++    ctas: int
++    smem: int
++
++    def flags(self):
++        return (["-DCHSPLIT"] if self.split else []) + [f"-DTP={self.pairs}", f"-DNSTAGES={self.stages}",
++                                                       f"-DCTAS={self.ctas}", f"-DSMEM={self.smem}"]
++
++
++def fwd_smem(variant, pairs, stages, split):
++    """The forward's shared memory per CTA in bytes (attn_pair7.cu asserts the same): a channel's
++    weights [FC][KD + 4], the stages of a tile of pairs (their [hz | coefficients] rows,
++    records, cutoffs and scores), the filters' first layer. It always runs a CTA per channel
++    (split, as bwd_smem's, is not read)."""
++    _, NH, _, SH, _, R = variant
++    FC, KD = 32 * NH, SH + R
++    return 4 * (FC * (KD + 4) + 2 * (NH + 1) * SH) + stages * pairs * (4 * (KD + 4) + 20 + 8 * NH)
++
++
++def bwd_smem(variant, pairs, stages, split):
++    """The backward's shared memory per CTA in bytes (attn_bwd7.cu asserts the same): its
++    channels' weights (V transposed, wb), the stages of a tile of pairs, the epilogue's partials,
++    the filters' first layer. split: a CTA per channel."""
++    _, NH, _, SH, _, R = variant
++    FC, nch = 32 * NH, 1 if split else 2
++    ncw = nch * NH                                       # consumer warps
++    stage = pairs * (4 * nch * (SH + R + 12) + 32 * NH + 48)
++    epi = 4 * pairs * (ncw * NH + 2 * ncw + 10 * NH)
++    return 4 * (nch * FC * (R + 4) + nch * SH * (FC + 4) + 2 * (NH + 1) * SH) + stages * stage + epi
++
++
++def tiles(variant):
++    """{"fwd", "bwd"}: the attention kernels' Tile on this GPU, or None where none fits its
++    shared memory. Of the tiles that fit a block (the largest first, two stages before one, the
++    backward's channels in one CTA before a CTA each), the first of which an SM holds as many
++    CTAs as the kernel is written for (two where a CTA has four heads), else the first."""
++    return _tiles(variant, smem())
++
++
++@functools.cache
++def _tiles(variant, limits):
++    per_block, per_sm, reserved = limits
++    NH = variant[1]
++
++    def pick(size, pairs, splits):
++        first = None
++        for split, stages, p in itertools.product(splits, (2, 1), pairs):
++            nbytes = size(variant, p, stages, split)
++            if nbytes <= min(per_block, per_sm - reserved):
++                most = 2 if split and NH == 4 else 1
++                t = Tile(p, stages, split, min(most, per_sm // (nbytes + reserved)), nbytes)
++                if t.ctas == most:
++                    return t
++                first = first or t
++        return first
++    fwd = pick(fwd_smem, (64, 32, 16), (True,))
++    bwd = pick(bwd_smem, (32, 16), (False, True) if NH == 4 else (True,))
++    return None if fwd is None or bwd is None else {"fwd": fwd, "bwd": bwd}
++
++
++@functools.cache
++def smem():
++    """The first GPU's shared memory in bytes: per block (opt-in), per SM, and the reserve per
++    block (the driver's attributes; the process's GPUs taken alike, as for the architecture)."""
++    cu, dev = ctypes.CDLL("libcuda.so.1"), ctypes.c_int()
++    if cu.cuInit(0) or cu.cuDeviceGet(ctypes.byref(dev), jax.local_devices()[0].local_hardware_id):
++        raise BuildError("Flash CUDA kernels: no GPU for the CUDA driver")
++
++    def attribute(a):
++        v = ctypes.c_int()
++        if cu.cuDeviceGetAttribute(ctypes.byref(v), a, dev):
++            raise BuildError(f"Flash CUDA kernels: the GPU's attribute {a} not found (CUDA driver)")
++        return v.value
++    # CU_DEVICE_ATTRIBUTE_ MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, _PER_MULTIPROCESSOR, RESERVED_SHARED_MEMORY_PER_BLOCK
++    return tuple(attribute(a) for a in (97, 81, 111))
+ 
+ 
+ def nvcc_path():
+@@ -73,8 +161,9 @@ def arch():
+ 
+ @functools.cache
+ def problem():
+-    """Why the kernels cannot be built here (None: they can): no GPU, an AMD GPU, a GPU of
+-    another architecture than sm_90, no nvcc. Decided once per process."""
++    """Why the kernels cannot be built here (None: they can): no GPU, an AMD GPU, one of compute
++    capability below 8.0 (the kernels' TF32 tensor-core products), no nvcc. Decided once per
++    process."""
+     try:
+         dev = jax.devices()[0]
+     except Exception as exc:                 # no backend at all
+@@ -83,9 +172,13 @@ def problem():
+         return f"no GPU (this process has {dev.platform})"
+     if is_rocm():
+         return "an AMD GPU"
+-    sm = arch()
+-    if not sm.startswith("sm_9"):
+-        return f"a {sm} GPU (the kernels are written for sm_90)"
++    cc = str(getattr(dev, "compute_capability", None))
++    if not cc[:1].isdigit() or int(cc.split(".")[0]) < 8:
++        return f"a GPU of compute capability {cc} (the kernels need 8.0 or newer)"
++    try:
++        smem()
++    except (OSError, BuildError) as exc:      # the driver library, or its answer
++        return f"the GPU's shared memory unknown ({exc})"
+     try:
+         nvcc_path()
+     except RuntimeError as exc:
+@@ -93,12 +186,11 @@ def problem():
+     return None
+ 
+ 
+-@functools.cache
+ def load_kernels(variant):
+-    """{"fwd", "bwd", "lr"}: the loaded libraries of a model variant, built where the cache
+-    has none: the three at once, under a lock (processes starting together on an empty cache
+-    build once), each keyed on its own source and flags (the long range's library is shared
+-    by the variants)."""
++    """{"fwd", "bwd", "lr"}: the loaded libraries of a model variant on this GPU, built where
++    the cache has none: the three at once, under a lock (processes starting together on an
++    empty cache build once), each keyed on its own source and flags (the long range's library
++    is shared by the variants)."""
+     why = problem()
+     if why:
+         raise RuntimeError(f"Flash CUDA kernels: {why}")
+diff --git a/so3lr/flash/engine.py b/so3lr/flash/engine.py
+index 0432631..76234c3 100644
+--- a/so3lr/flash/engine.py
++++ b/so3lr/flash/engine.py
+@@ -2201,6 +2201,8 @@ def widen(self):
+         """Wider neighbour rows and long-range scratch after an overflow; recompiles."""
+         self.K = int(math.ceil(self.K * 1.25 / 16) * 16)
+         self.maxh = min(int(self.maxh * 1.5), self.n)
++        if self.cuda_kernels is not None:
++            self.cuda_kernels.replan()   # the per-pair data in chunks where kept it no longer fits
+         self._build_jit()
+ 
+     def _build_jit(self):
+diff --git a/so3lr/flash/md.py b/so3lr/flash/md.py
+index 6ff1c24..8e17dda 100644
+--- a/so3lr/flash/md.py
++++ b/so3lr/flash/md.py
+@@ -125,14 +125,21 @@ def build_engine(atoms, settings, dtype, box_margin=None, positions=None):
+     kernels = settings.get("flash_kernels") or "auto"
+     picked = None
+     if mode == "auto":
+-        from .cuda import pick_mode as cuda_mode
++        from .cuda import pick_mode as cuda_mode, serves as cuda_serves
+         # the CUDA kernels' fastest mode that fits, else the Pallas kernels' (theirs go
+         # further); the CUDA kernels need no long-range scratch, and PME's meshes are not
+         # alive at their peak (2 GiB left for what the engine allocates before it plans)
+-        picked = cuda_mode(n, _free_bytes() - (2 << 30), params, statics) if kernels != "pallas" else None
++        free = max(_free_bytes() - (2 << 30), 0)
++        picked, why = cuda_mode(n, free, params, statics) if kernels != "pallas" else (None, None)
+         mode = picked or pick_mode(n, _free_bytes() - reserve, statics)
+         if not picked and kernels == "auto":
+             kernels = "pallas"           # not the CUDA kernels in a mode of theirs auto does not pick
++        elif not picked and kernels == "cuda" and not cuda_serves(mode):
++            # asked for, the kernels serve the leaner modes in chunks, but not those of the
++            # attention in passes (why: their memory, or what they do not serve at all)
++            raise RuntimeError(f"Flash: flash_kernels cuda: the CUDA kernels do not serve this run ({why}), and "
++                               f"the memory mode it fits in, {mode}, is the Pallas kernels' own "
++                               f"(flash_kernels auto or pallas)")
+     total_charge = float(settings.get("total_charge") or 0)
+     embed = settings.get("charge_embed_total_charge")
+     equil = settings.get("charge_equilibration_total_charge")
+diff --git a/tests/test_flash.py b/tests/test_flash.py
+index 6a11938..6be0603 100644
+--- a/tests/test_flash.py
++++ b/tests/test_flash.py
+@@ -12,6 +12,7 @@
+ potential, periodic and with no box (12 and 1000 A cutoffs); PySAGES on flash against the
+ neighbour-list engine. With two or more: the same on several GPUs as on one, and MD on two.
+ """
++import functools
+ import itertools
+ import json
+ import pathlib
+@@ -1084,11 +1085,13 @@ def test_eval_falls_back_for_other_targets(tmp_path):
+     assert "flash cannot: it evaluates energy and forces, not dipole_vec, hirshfeld_ratios" in log, log[-2000:]
+ 
+ 
+-def _so3lr(args, cwd, env=None):
++def _so3lr(args, cwd):
+     sys.path.insert(0, str(pathlib.Path(__file__).parent))
+     from subprocess_env import so3lr_subprocess_env
++    # this process holds most of each GPU (its own tests): the runs allocate as they go,
++    # leaving them room on smaller GPUs, and NCCL and cuSolver room
+     result = subprocess.run(["so3lr", *args], cwd=cwd, capture_output=True, text=True,
+-                            env=so3lr_subprocess_env(env))
++                            env=so3lr_subprocess_env({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}))
+     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
+ 
+ 
+@@ -1523,11 +1526,8 @@ def test_md_on_two_gpus(tmp_path):
+     write(tmp_path / "w.xyz", _water((3, 3, 3)))
+     run = ["--input", "w.xyz", "--no-relax", "--md-cycles", "2", "--md-steps", "5", "--precision", "float64",
+            "--lr-cutoff", "10", "--kspace-electrostatics", "pme"]
+-    # this process holds most of each GPU (its own tests): the runs allocate as they go,
+-    # leaving NCCL and cuSolver room
+-    env = {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}
+-    _so3lr(["nvt", *run, "--output", "a.hdf5"], tmp_path, env)
+-    _so3lr(["nvt", *run, "--flash-devices", "2", "--output", "b.hdf5"], tmp_path, env)
++    _so3lr(["nvt", *run, "--output", "a.hdf5"], tmp_path)
++    _so3lr(["nvt", *run, "--flash-devices", "2", "--output", "b.hdf5"], tmp_path)
+     assert "Flash: 2 GPUs" in (tmp_path / "b.log").read_text()
+     with h5py.File(tmp_path / "a.hdf5") as a, h5py.File(tmp_path / "b.hdf5") as b:
+         _check("positions", b["positions"][:], a["positions"][:], 1e-9)
+@@ -1605,13 +1605,37 @@ def test_pick_splits_takes_only_allowed_splits():
+ 
+ # ---- the CUDA kernels (so3lr/flash/cuda) -----------------------------------------------
+ def _cuda_kernels_problem():
+-    """Why the CUDA kernels cannot run here (None: they can): no GPU, a GPU other than sm_90,
+-    no nvcc."""
++    """Why the CUDA kernels cannot run here (None: they can): no GPU, one of compute capability
++    below 8.0, no nvcc."""
+     from so3lr.flash.cuda import build
+     return build.problem()
+ 
+ 
+-CUDA = pytest.mark.skipif(_cuda_kernels_problem() is not None, reason="the CUDA kernels need an sm_90 GPU and nvcc")
++CUDA = pytest.mark.skipif(_cuda_kernels_problem() is not None,
++                          reason="the CUDA kernels need a GPU of compute capability 8.0 or newer and nvcc")
++
++
++# shared memory in bytes: per block (opt-in), per SM, reserved per block
++SMEM_227K, SMEM_163K, SMEM_99K = (232448, 233472, 1024), (166912, 167936, 1024), (101376, 102400, 1024)
++# the kernels' build variants of so3lr-tauri-m and -l (cuda.variant)
++M_VARIANT, L_VARIANT = (128, 4, 24, 32, 0x4321, 48), (256, 8, 48, 64, 0x44332211, 64)
++
++
++@pytest.mark.parametrize("limits,m,l", [
++    (SMEM_227K, ((64, 2, True, 2), (32, 2, False, 1)), ((64, 2, True, 1), (32, 2, True, 1))),
++    (SMEM_163K, ((32, 2, True, 2), (32, 2, False, 1)), ((16, 2, True, 1), (16, 1, True, 1))),
++    (SMEM_99K, ((64, 2, True, 1), (32, 2, True, 1)), None),
++])
++def test_cuda_kernel_tiles(monkeypatch, limits, m, l):
++    """The attention kernels' tiles (pairs, stages, a CTA per channel, CTAs per SM) follow the
++    GPU's shared memory per block and per SM: the largest that fit, two CTAs of four heads on an
++    SM where they fit; none for so3lr-tauri-l where a block has less than its 16-pair tiles'."""
++    from so3lr.flash.cuda import build
++    monkeypatch.setattr(build, "smem", lambda: limits)
++    for var, want in ((M_VARIANT, m), (L_VARIANT, l)):
++        t = build.tiles(var)
++        assert (None if t is None else (t["fwd"][:4], t["bwd"][:4])) == want
++        assert t is None or max(t["fwd"].smem, t["bwd"].smem) <= limits[0]
+ 
+ 
+ def _engine(model, atoms, precision, **kw):
+@@ -1620,6 +1644,25 @@ def _engine(model, atoms, precision, **kw):
+     return E.FlashSO3LR(params, statics, atoms.get_atomic_numbers(), np.asarray(atoms.cell[:]), **kw)
+ 
+ 
++def _skip_without_tiles(model):
++    """Skip on a GPU whose shared memory per block so3lr-tauri-l's kernels do not fit."""
++    from so3lr.flash.cuda import build
++    if "tauri-l" in model and build.tiles(L_VARIANT) is None:
++        pytest.skip("so3lr-tauri-l's CUDA kernels need more shared memory per block than this GPU has")
++
++
++@functools.cache
++def _cuda_ref(model):
++    """Energy, forces and dE/d(strain) per axis of 27 water boxes on the CUDA kernels as built for
++    this GPU, every layer's per-pair data kept: the reference of the kernels' other paths."""
++    _skip_without_tiles(model)
++    atoms = _water((3, 3, 3))
++    eng = _engine(model, atoms, "float32", keep_attention=True, kernels="cuda")
++    assert eng.cuda_kernels is not None and eng.cuda_kernels.chunk is None
++    return tuple(np.asarray(x) for x in eng.energy_forces_strain(jnp.asarray(atoms.get_positions(), jnp.float32),
++                                                                   diag=True))
++
++
+ @CUDA
+ @pytest.mark.parametrize("model", ["so3lr-tauri-m-2606", "so3lr-tauri-s-2606", "so3lr-tauri-l-2606", "so3lr"])
+ def test_cuda_kernels_follow_float64(model):
+@@ -1627,6 +1670,7 @@ def test_cuda_kernels_follow_float64(model):
+     float64 engine's energy, forces and dE/d(strain) per axis (the angular forces' part, which
+     cancels in the isotropic sum) to float32 accuracy, in the jitted program and in the
+     staged one."""
++    _skip_without_tiles(model)
+     atoms = _water((4, 4, 4))
+     R = atoms.get_positions()
+     e_ref, f_ref, w_ref = _engine(model, atoms, "float64").energy_forces_strain(jnp.asarray(R, jnp.float64), diag=True)
+@@ -1659,19 +1703,31 @@ def test_cuda_kernels_fall_back_where_they_do_not_apply():
+ 
+ 
+ @CUDA
+-def test_cuda_kernels_widen_rows():
++def test_cuda_kernels_widen_rows(monkeypatch):
+     """Neighbour rows too short for water on the CUDA kernels: the engine widens them (its
+     pair records and filters sized for the wider rows at the next program) and gives what
+-    wide ones give, jitted and staged."""
++    wide ones give, jitted and staged; where the wider rows' per-pair data no longer fits the
++    memory the kernels were planned in, a chunk of rows at a time."""
++    from so3lr.flash import cuda
++    from so3lr.flash import md as flash_md
+     atoms = _water((3, 3, 3))
+     R = jnp.asarray(atoms.get_positions(), jnp.float32)
+-    e_ref, f_ref = _engine("so3lr-tauri-m-2606", atoms, "float32", keep_attention=True, kernels="cuda").energy_forces(R)
+-    for staged in (False, True):
++    e_ref, f_ref, _ = _cuda_ref("so3lr-tauri-m-2606")
++
++    def widened(staged):
+         eng = _engine("so3lr-tauri-m-2606", atoms, "float32", keep_attention=True, kernels="cuda", max_neighbours=16)
+         e, f = (eng.energy_forces_staged if staged else eng.energy_forces)(R)
+-        assert eng.K > 16 and eng.cuda_kernels is not None
++        assert eng.K > 16
+         _check("energy", e, e_ref, 1e-6)
+         _check("forces", f, f_ref, 1e-5)
++        return eng
++
++    for staged in (False, True):
++        eng = widened(staged)
++        assert eng.cuda_kernels.chunk is None
++    need = cuda.kept_bytes(eng)          # the wider rows' per-pair data, kept
++    monkeypatch.setattr(flash_md, "_free_bytes", lambda: need - 1)
++    assert widened(False).cuda_kernels.chunk is not None
+ 
+ 
+ @CUDA
+@@ -1692,9 +1748,7 @@ def test_cuda_kernels_in_chunks(model, kw):
+     from so3lr.flash import cuda
+     atoms = _water((3, 3, 3))
+     R = jnp.asarray(atoms.get_positions(), jnp.float32)
+-    ref = _engine(model, atoms, "float32", keep_attention=True, kernels="cuda")
+-    assert ref.cuda_kernels is not None and ref.cuda_kernels.chunk is None
+-    e_ref, f_ref, w_ref = ref.energy_forces_strain(R, diag=True)
++    e_ref, f_ref, w_ref = _cuda_ref(model)
+     runs = [(1, False, 1100), (1, True, 1100)]
+     if len(jax.local_devices()) >= 2 and kw.get("keep_attention"):
+         runs.append((2, False, 550))                               # several GPUs run the jitted fast mode
+@@ -1707,3 +1761,50 @@ def test_cuda_kernels_in_chunks(model, kw):
+         _check("energy", e, e_ref, 1e-6)
+         _check("forces", f, f_ref, 1e-5)
+         _check("dE/d(strain) per axis", w, w_ref, 1e-5)
++
++
++@CUDA
++@pytest.mark.parametrize("limits,fits,declines", [
++    (SMEM_163K, ["so3lr-tauri-m-2606", "so3lr-tauri-l-2606"], []),
++    (SMEM_99K, ["so3lr-tauri-m-2606"], ["so3lr-tauri-l-2606"]),
++])
++def test_cuda_kernels_for_less_shared_memory(monkeypatch, limits, fits, declines):
++    """The kernels as built for compute capability 8.0 (this GPU's driver compiles their PTX)
++    and a GPU of less shared memory (smaller tiles, one stage, a CTA per channel) give what this
++    GPU's build gives, the per-pair data kept and in chunks; a model whose kernels need more
++    shared memory than a block has takes the Pallas kernels."""
++    from so3lr.flash import cuda
++    from so3lr.flash.cuda import build
++    if build.arch() == "sm_80" and build.smem() == limits:
++        pytest.skip("this GPU's own build")
++    atoms = _water((3, 3, 3))
++    R = jnp.asarray(atoms.get_positions(), jnp.float32)
++    refs = {m: _cuda_ref(m) for m in fits}                         # this GPU's build, before the patch
++    monkeypatch.setattr(build, "arch", lambda: "sm_80")
++    monkeypatch.setattr(build, "smem", lambda: limits)
++    for m in fits:
++        e_ref, f_ref, w_ref = refs[m]
++        for chunk in (None, 1100):
++            eng = _engine(m, atoms, "float32", keep_attention=True, kernels="pallas")
++            assert "_sm_80_" in cuda.attach(eng, strict=True, chunk=chunk).prefix
++            e, f, w = eng.energy_forces_strain(R, diag=True)
++            _check("energy", e, e_ref, 1e-6)
++            _check("forces", f, f_ref, 1e-5)
++            _check("dE/d(strain) per axis", w, w_ref, 1e-5)
++    for m in declines:
++        eng = _engine(m, atoms, "float32", keep_attention=True, kernels="pallas")
++        assert cuda.attach(eng) is None
++        with pytest.raises(RuntimeError, match="shared memory"):
++            cuda.attach(eng, strict=True)
++
++
++@CUDA
++def test_cuda_kernels_asked_for_say_why_they_do_not_fit(monkeypatch):
++    """flash_kernels cuda where the CUDA kernels fit none of their modes and the mode that fits
++    is one they do not serve (the attention in passes): the MD's engine says so, with the memory
++    they need."""
++    from so3lr.flash import md as flash_md
++    monkeypatch.setattr(flash_md, "_free_bytes", lambda: 1 << 29)
++    with pytest.raises(RuntimeError, match="flash_kernels cuda.*GiB of the 0 free.*minimal"):
++        flash_md.build_engine(_water((3, 3, 3)), dict(model_path="so3lr-tauri-m-2606", flash_kernels="cuda"),
++                              jnp.float32)

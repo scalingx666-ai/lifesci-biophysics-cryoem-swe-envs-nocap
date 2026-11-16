@@ -1,0 +1,871 @@
+diff --git a/mmtbx/probe/ContactDB.cpp b/mmtbx/probe/ContactDB.cpp
+new file mode 100644
+index 0000000000..d7a0948eb5
+--- /dev/null
++++ b/mmtbx/probe/ContactDB.cpp
+@@ -0,0 +1,254 @@
++// Licensed under the Apache 2 license
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "ContactDB.h"
++#include <boost/python.hpp>
++#include <algorithm>
++#include <cmath>
++#include <stdexcept>
++
++namespace molprobity {
++  namespace probe {
++
++    using iotbx::pdb::hierarchy::atom;
++    namespace af = scitbx::af;
++
++    namespace {
++      bool by_iseq(atom const& a, atom const& b) { return a.data->i_seq < b.data->i_seq; }
++
++      bool contains(std::vector<atom> const& v, unsigned i_seq) {
++        for (size_t k = 0; k < v.size(); k++) { if (v[k].data->i_seq == i_seq) { return true; } }
++        return false;
++      }
++    }
++
++    ContactDB::ContactDB(ExtraAtomInfoMap const& info, DotScorer const& scorer, SpatialQuery& grid,
++                         SpatialQuery& phantoms, DotSphereCache const& dotCache)
++      : m_info(info), m_scorer(scorer), m_grid(&grid), m_phantoms(&phantoms), m_dotCache(dotCache)
++      , m_probeRadius(0.25), m_maxRadius(0), m_minOccupancy(0), m_overlapScale(0.5)
++      , m_excludedBondChainLength(4), m_includeMainchainMainchain(true), m_includeWaterWater(false)
++      , m_separateWorseClashes(false), m_reportHBonds(true), m_reportClashes(true)
++      , m_reportVdws(true), m_onlyBadClashes(false)
++    {}
++
++    void ContactDB::set_atom_data(af::shared<int> flags, af::shared<int> model, af::shared<int> chain,
++                                  af::shared<int> atomGroup, af::shared<int> altloc)
++    {
++      m_flags.assign(flags.begin(), flags.end());
++      m_model.assign(model.begin(), model.end());
++      m_chain.assign(chain.begin(), chain.end());
++      m_group.assign(atomGroup.begin(), atomGroup.end());
++      m_altloc.assign(altloc.begin(), altloc.end());
++    }
++
++    void ContactDB::set_bonds(af::shared<int> offsets, af::shared<atom> targets)
++    {
++      m_bondOffsets.assign(offsets.begin(), offsets.end());
++      m_bondTargets.assign(targets.begin(), targets.end());
++    }
++
++    void ContactDB::set_params(double probeRadius, double maxRadius, double minOccupancy,
++                               int excludedBondChainLength, bool includeMainchainMainchain,
++                               bool includeWaterWater, double overlapScale, bool separateWorseClashes,
++                               bool reportHBonds, bool reportClashes, bool reportVdws, bool onlyBadClashes)
++    {
++      m_probeRadius = probeRadius; m_maxRadius = maxRadius; m_minOccupancy = minOccupancy;
++      m_excludedBondChainLength = excludedBondChainLength;
++      m_includeMainchainMainchain = includeMainchainMainchain; m_includeWaterWater = includeWaterWater;
++      m_overlapScale = overlapScale; m_separateWorseClashes = separateWorseClashes;
++      m_reportHBonds = reportHBonds; m_reportClashes = reportClashes; m_reportVdws = reportVdws;
++      m_onlyBadClashes = onlyBadClashes;
++    }
++
++    void ContactDB::build(af::shared<atom> sources)
++    {
++      m_sources.assign(sources.begin(), sources.end());
++      m_records.assign(m_sources.size(), std::vector<PairRecord>());
++      for (size_t i = 0; i < m_sources.size(); i++) {
++        score_atom(m_sources[i], m_records[i]);
++      }
++    }
++
++    boost::python::tuple ContactDB::pairs() const
++    {
++      af::shared<int> src, cause, counts;
++      af::shared<double> gap, bumpGap, typeGap;
++      af::shared<bool> hasBump;
++      af::shared<Point> bumpLoc;
++      for (size_t i = 0; i < m_sources.size(); i++) {
++        for (size_t j = 0; j < m_records[i].size(); j++) {
++          PairRecord const& r = m_records[i][j];
++          src.push_back(static_cast<int>(i));
++          cause.push_back(static_cast<int>(r.cause));
++          gap.push_back(r.minGap);
++          for (int t = 0; t < N_TYPES; t++) {
++            counts.push_back(static_cast<int>(r.counts[t]));
++            typeGap.push_back(r.typeMinGap[t]);
++          }
++          hasBump.push_back(r.hasBump);
++          bumpGap.push_back(r.bumpGap);
++          bumpLoc.push_back(r.bumpLoc);
++        }
++      }
++      return boost::python::make_tuple(src, cause, gap, counts, hasBump, bumpGap, bumpLoc, typeGap);
++    }
++
++    unsigned ContactDB::idx(atom const& a) const
++    {
++      unsigned i = a.data->i_seq;
++      if (i >= m_flags.size()) { throw std::out_of_range("ContactDB: atom i_seq beyond per-atom arrays"); }
++      return i;
++    }
++
++    bool ContactDB::compatible(atom const& a, atom const& b) const
++    {
++      int x = m_altloc[idx(a)], y = m_altloc[idx(b)];
++      return x == 0 || y == 0 || x == y;
++    }
++
++    // Port of mmtbx.probe.Helpers.getAtomsWithinNBonds.
++    std::vector<atom> ContactDB::excluded_for(atom const& a, unsigned N, unsigned nonHydrogenN) const
++    {
++      Point const& aLoc = a.data->xyz;
++      double aRad = m_info.getMappingFor(a).getVdwRadius();
++      bool atomIsHydrogen = a.element_is_hydrogen();
++      if (m_info.getMappingFor(a).getIsDummyHydrogen()) { N = 1; }
++      std::vector<atom> found(1, a);   // a handful of atoms, so linear membership tests
++      for (unsigned i = 0; i < N; i++) {
++        size_t levelSize = found.size();
++        for (size_t k = 0; k < levelSize; k++) {
++          unsigned s = idx(found[k]);
++          if (s + 1 >= m_bondOffsets.size()) { throw std::out_of_range("ContactDB: bond offsets too short"); }
++          for (int b = m_bondOffsets[s]; b < m_bondOffsets[s + 1]; b++) {
++            atom const& n = m_bondTargets[b];
++            if (contains(found, n.data->i_seq)) { continue; }
++            if (i < nonHydrogenN || atomIsHydrogen || n.element_is_hydrogen()) {
++              if (compatible(a, n)) {
++                Point const& nLoc = n.data->xyz;
++                double nRad = m_info.getMappingFor(n).getVdwRadius();
++                double dx = nLoc[0] - aLoc[0], dy = nLoc[1] - aLoc[1], dz = nLoc[2] - aLoc[2];
++                double d = std::sqrt(dx*dx + dy*dy + dz*dz);
++                if (d <= aRad + nRad + 2 * m_probeRadius) {
++                  found.push_back(n);
++                }
++              }
++            }
++          }
++        }
++      }
++      found.erase(found.begin());
++      return found;
++    }
++
++    // Port of probe2.Program._generate_interaction_dots for one source atom.
++    void ContactDB::score_atom(atom const& src, std::vector<PairRecord>& out)
++    {
++      unsigned si = idx(src);
++      int sf = m_flags[si];
++      if ((sf & IGNORE) || src.data->occ < m_minOccupancy) { return; }
++      af::shared<atom> nearby = m_grid->neighbors(src.data->xyz, 0.00001, m_maxRadius);
++      double srcVdw = m_info.getMappingFor(src).getVdwRadius();
++      Point const& sXYZ = src.data->xyz;
++
++      std::vector<atom> atomSet;
++      for (size_t k = 0; k < nearby.size(); k++) {
++        atom const& n = nearby[k];
++        unsigned ni = idx(n);
++        int nf = m_flags[ni];
++        Point const& nXYZ = n.data->xyz;
++        double dx = nXYZ[0] - sXYZ[0], dy = nXYZ[1] - sXYZ[1], dz = nXYZ[2] - sXYZ[2];
++        double d_sq = dx*dx + dy*dy + dz*dz;
++        double cutoff = m_info.getMappingFor(n).getVdwRadius() + srcVdw + 2 * m_probeRadius;
++        if (!(d_sq <= cutoff * cutoff)) { continue; }
++        if (!m_includeMainchainMainchain && (sf & MAINCHAIN) && (nf & MAINCHAIN)
++            && !((sf & HET) || (nf & HET)) && m_chain[si] == m_chain[ni]) { continue; }
++        if (nf & IGNORE) { continue; }
++        else if (n.data->occ < m_minOccupancy) { continue; }
++        else if ((sf & WATER) && (nf & WATER)) {
++          if (!m_includeWaterWater) { continue; }
++          else if (m_group[si] == m_group[ni]) { continue; }
++        }
++        else if (!compatible(src, n)) { continue; }
++        else if (m_model[si] != m_model[ni]) { continue; }
++        atomSet.push_back(n);
++      }
++      if (atomSet.empty()) { return; }
++
++      std::vector<atom> excluded = excluded_for(src, m_excludedBondChainLength, 3);
++      if (m_info.getMappingFor(src).getIsDummyHydrogen()) {
++        af::shared<atom> nearbyPhantoms = m_phantoms->neighbors(src.data->xyz, 0.00001, m_maxRadius);
++        for (size_t k = 0; k < atomSet.size(); k++) {
++          if (!m_info.getMappingFor(atomSet[k]).getIsAcceptor()) { excluded.push_back(atomSet[k]); }
++        }
++        excluded.insert(excluded.end(), nearbyPhantoms.begin(), nearbyPhantoms.end());
++      }
++
++      std::sort(atomSet.begin(), atomSet.end(), by_iseq);
++      af::shared<atom> interacting, exclude;
++      for (size_t k = 0; k < excluded.size(); k++) { exclude.push_back(excluded[k]); }
++      for (size_t k = 0; k < atomSet.size(); k++) {
++        if (contains(excluded, atomSet[k].data->i_seq)) { continue; }
++        if (!interacting.empty() && interacting.back().data->i_seq == atomSet[k].data->i_seq) { continue; }
++        interacting.push_back(atomSet[k]);
++      }
++
++      af::shared<Point> const& dots = m_dotCache.get_sphere(srcVdw).dots();
++      af::shared<DotScorer::CheckDotResult> results =
++        m_scorer.check_dots(src, dots, m_probeRadius, interacting, exclude, m_overlapScale);
++      bool srcWild = m_altloc[si] == 0;
++      for (size_t k = 0; k < results.size(); k++) {
++        DotScorer::CheckDotResult const& res = results[k];
++        unsigned ci = idx(res.cause);
++        if (!(m_flags[ci] & TARGET)) { continue; }
++        if (res.overlapType != DotScorer::HydrogenBond) {
++          if (srcWild || m_altloc[ci] == 0) {
++            if (src.data->occ + res.cause.data->occ <= 1) { continue; }
++          }
++        }
++        DotScorer::InteractionType itype = m_scorer.interaction_type(res.overlapType, res.gap, m_separateWorseClashes);
++        if (itype == DotScorer::Invalid) { continue; }
++        bool show;
++        if (!m_onlyBadClashes) {
++          show = (m_reportHBonds && res.overlapType == DotScorer::HydrogenBond)
++              || (m_reportClashes && res.overlapType == DotScorer::Clash)
++              || (m_reportVdws && res.overlapType == DotScorer::NoOverlap);
++        } else {
++          show = m_reportClashes && (itype == DotScorer::Bump || itype == DotScorer::BadBump);
++        }
++        if (!show) { continue; }
++        PairRecord* rec = 0;
++        for (size_t r = 0; r < out.size(); r++) {
++          if (out[r].cause == ci) { rec = &out[r]; break; }
++        }
++        if (!rec) {
++          PairRecord fresh;
++          fresh.cause = ci; fresh.minGap = 1e9; fresh.hasBump = false; fresh.bumpGap = 1e9;
++          std::fill(fresh.counts, fresh.counts + N_TYPES, 0u);
++          std::fill(fresh.typeMinGap, fresh.typeMinGap + N_TYPES, 1e9);
++          out.push_back(fresh);
++          rec = &out.back();
++        }
++        rec->counts[itype]++;
++        if (res.gap < rec->minGap) { rec->minGap = res.gap; }
++        if (res.gap < rec->typeMinGap[itype]) { rec->typeMinGap[itype] = res.gap; }
++        if (itype == DotScorer::Bump && (!rec->hasBump || res.gap < rec->bumpGap)) {
++          rec->hasBump = true;
++          rec->bumpGap = res.gap;
++          // Same arithmetic as probe2.py: loc = srcXYZ + dotOffset, per component.
++          rec->bumpLoc = Point(sXYZ[0] + res.dotOffset[0], sXYZ[1] + res.dotOffset[1],
++                               sXYZ[2] + res.dotOffset[2]);
++        }
++      }
++    }
++
++  }
++}
+diff --git a/mmtbx/probe/ContactDB.h b/mmtbx/probe/ContactDB.h
+new file mode 100644
+index 0000000000..086040a4da
+--- /dev/null
++++ b/mmtbx/probe/ContactDB.h
+@@ -0,0 +1,95 @@
++// Licensed under the Apache 2 license
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#pragma once
++#include "Scoring.h"
++#include "SpatialQuery.h"
++#include "DotSpheres.h"
++#include <iotbx/pdb/hierarchy.h>
++#include <scitbx/array_family/shared.h>
++#include <boost/python/tuple.hpp>
++#include <vector>
++
++namespace molprobity {
++  namespace probe {
++
++    /// @brief Contacts summarized per (source, cause) atom pair instead of per dot.
++    ///
++    /// Implements the per-atom loop of probe2's _generate_interaction_dots() with the
++    /// same filters and the same DotScorer::check_dots(), but keeps, for each pair, the
++    /// dot count per InteractionType, the minimum gap, and the minimum-gap Bump dot (the
++    /// line clashscore2 builds a clash from). Candidate atoms are passed to check_dots in
++    /// i_seq order, so ties between atoms at equal gap resolve the same way every run.
++    class ContactDB {
++    public:
++      enum { N_TYPES = 7 };
++      enum AtomFlag { IGNORE = 1, MAINCHAIN = 2, HET = 4, WATER = 8, TARGET = 16 };
++
++      struct PairRecord {
++        unsigned cause;
++        unsigned counts[N_TYPES];
++        double minGap;
++        double typeMinGap[N_TYPES];   ///< Smallest gap per InteractionType (1e9 if none)
++        bool hasBump;
++        double bumpGap;     ///< Smallest gap among this pair's Bump dots (first one on ties)
++        Point bumpLoc;      ///< Location of that dot
++      };
++
++      /// The grids are referenced, not copied; the Python binding keeps them alive.
++      ContactDB(ExtraAtomInfoMap const& info, DotScorer const& scorer, SpatialQuery& grid,
++                SpatialQuery& phantoms, DotSphereCache const& dotCache);
++
++      /// Per-atom properties indexed by i_seq. altloc: 0 means "" or " " (compatible with all).
++      void set_atom_data(scitbx::af::shared<int> flags, scitbx::af::shared<int> model,
++                         scitbx::af::shared<int> chain, scitbx::af::shared<int> atomGroup,
++                         scitbx::af::shared<int> altloc);
++
++      /// Bonded neighbors in CSR form: neighbors of i_seq i are targets[offsets[i]..offsets[i+1]).
++      void set_bonds(scitbx::af::shared<int> offsets,
++                     scitbx::af::shared<iotbx::pdb::hierarchy::atom> targets);
++
++      void set_params(double probeRadius, double maxRadius, double minOccupancy,
++                      int excludedBondChainLength, bool includeMainchainMainchain,
++                      bool includeWaterWater, double overlapScale, bool separateWorseClashes,
++                      bool reportHBonds, bool reportClashes, bool reportVdws, bool onlyBadClashes);
++
++      /// Score every source atom, in the given order.
++      void build(scitbx::af::shared<iotbx::pdb::hierarchy::atom> sources);
++
++      /// Flat arrays, one entry per pair in source order: (source index into the build()
++      /// list, cause i_seq, min gap, N_TYPES counts per pair, has-Bump flag, Bump gap,
++      /// Bump location, N_TYPES minimum gaps per pair).
++      boost::python::tuple pairs() const;
++
++    private:
++      unsigned idx(iotbx::pdb::hierarchy::atom const& a) const;
++      bool compatible(iotbx::pdb::hierarchy::atom const& a, iotbx::pdb::hierarchy::atom const& b) const;
++      std::vector<iotbx::pdb::hierarchy::atom> excluded_for(iotbx::pdb::hierarchy::atom const& a,
++                                                            unsigned N, unsigned nonHydrogenN) const;
++      void score_atom(iotbx::pdb::hierarchy::atom const& src, std::vector<PairRecord>& out);
++
++      ExtraAtomInfoMap m_info;
++      DotScorer m_scorer;
++      SpatialQuery* m_grid;
++      SpatialQuery* m_phantoms;
++      DotSphereCache m_dotCache;
++      std::vector<int> m_flags, m_model, m_chain, m_group, m_altloc, m_bondOffsets;
++      std::vector<iotbx::pdb::hierarchy::atom> m_bondTargets, m_sources;
++      std::vector<std::vector<PairRecord> > m_records;
++      double m_probeRadius, m_maxRadius, m_minOccupancy, m_overlapScale;
++      int m_excludedBondChainLength;
++      bool m_includeMainchainMainchain, m_includeWaterWater, m_separateWorseClashes,
++           m_reportHBonds, m_reportClashes, m_reportVdws, m_onlyBadClashes;
++    };
++
++  }
++}
+diff --git a/mmtbx/probe/SConscript b/mmtbx/probe/SConscript
+index 91c47e19dd..80d95091c0 100644
+--- a/mmtbx/probe/SConscript
++++ b/mmtbx/probe/SConscript
+@@ -23,7 +23,8 @@ if (not env_etc.no_boost_python):
+     source=[
+       "Scoring.cpp",
+       "DotSpheres.cpp",
+-      "SpatialQuery.cpp"])
++      "SpatialQuery.cpp",
++      "ContactDB.cpp"])
+ 
+   env_bpl.Append(LIBPATH=["#probe/lib"])
+   env_bpl.Prepend(LIBS=["probelib", "iotbx_pdb", "cctbx", "scitbx_boost_python"])
+diff --git a/mmtbx/probe/boost_python/probe_bpl.cpp b/mmtbx/probe/boost_python/probe_bpl.cpp
+index 1db6e4742a..e284e90a08 100644
+--- a/mmtbx/probe/boost_python/probe_bpl.cpp
++++ b/mmtbx/probe/boost_python/probe_bpl.cpp
+@@ -19,6 +19,7 @@
+ #include <mmtbx/probe/DotSpheres.h>
+ #include <mmtbx/probe/SpatialQuery.h>
+ #include <mmtbx/probe/Scoring.h>
++#include <mmtbx/probe/ContactDB.h>
+ 
+ using namespace boost::python;
+ using namespace molprobity::probe;
+@@ -182,4 +183,21 @@ BOOST_PYTHON_MODULE(mmtbx_probe_ext)
+ 
+   // Export the helper functions
+   def("set_atom_i_seq", set_atom_i_seq, "Set the i_seq on an atom, required for Phantom Hydrogen processing.");
++
++  // The two SpatialQuery arguments are referenced, so keep them alive with the ContactDB.
++  class_<ContactDB>("ContactDB", init<ExtraAtomInfoMap const&, DotScorer const&, SpatialQuery&,
++                                      SpatialQuery&, DotSphereCache const&>()
++                    [with_custodian_and_ward<1, 4, with_custodian_and_ward<1, 5> >()])
++    .def("set_atom_data", &ContactDB::set_atom_data)
++    .def("set_bonds", &ContactDB::set_bonds)
++    .def("set_params", &ContactDB::set_params)
++    .def("build", &ContactDB::build)
++    .def("pairs", &ContactDB::pairs)
++    ;
++  scope().attr("ContactDB_IGNORE") = int(ContactDB::IGNORE);
++  scope().attr("ContactDB_MAINCHAIN") = int(ContactDB::MAINCHAIN);
++  scope().attr("ContactDB_HET") = int(ContactDB::HET);
++  scope().attr("ContactDB_WATER") = int(ContactDB::WATER);
++  scope().attr("ContactDB_TARGET") = int(ContactDB::TARGET);
++  scope().attr("ContactDB_N_TYPES") = int(ContactDB::N_TYPES);
+ }
+diff --git a/mmtbx/programs/probe2.py b/mmtbx/programs/probe2.py
+index 772a3406f4..65c61b45ec 100644
+--- a/mmtbx/programs/probe2.py
++++ b/mmtbx/programs/probe2.py
+@@ -27,6 +27,7 @@
+ from mmtbx.probe import Helpers
+ from iotbx import pdb
+ from iotbx.pdb import common_residue_names_get_class
++from scitbx.array_family import flex
+ 
+ version = "4.13.0"
+ 
+@@ -119,6 +120,13 @@
+     .short_caption = Write the output files
+     .help = Write the output files(s) when this is True (default). Set to False when harnessing the program.
+ 
++  contact_records = False
++    .type = bool
++    .short_caption = Keep per-atom-pair contact records instead of dots
++    .help = For programs harnessing probe2: summarize contacts per atom pair in C++ (see \
++            mmtbx/probe/ContactDB.h) and store no dots, so dot output is empty. The records \
++            are left in the program's _contactRecords list as (ContactDB, source atoms) pairs.
++
+   file_name = None
+     .type = str
+     .short_caption = Output file name
+@@ -425,6 +433,10 @@ def _condense(dotInfoList, condense):
+ 
+ # ------------------------------------------------------------------------------
+ 
++# Probe reads only bonds from the restraints. None skips the plain-pair table, which is
++# for ADP restraints only; at the default 5 A it is ~0.6 GB on 1aon.
++PLAIN_PAIRS_RADIUS = None
++
+ def getPdbInterpretationParams(useNeutronDistances = False):
+   '''
+     PDB interpretation parameters probe2 uses to make restraints.  A caller that
+@@ -803,6 +815,12 @@ def _generate_interaction_dots(self, sourceAtoms, targetSet, spatialQuery, phant
+       atomclass and dot type.
+     '''
+ 
++    if self.params.output.contact_records:
++      self._contactRecords.append(
++        (self._build_contact_records(sourceAtoms, targetSet, spatialQuery, phantomsQuery, bondedNeighborLists),
++         list(sourceAtoms)))
++      return
++
+     # Store constants used frequently
+     probeRadius = self.params.probe.probe_radius
+     include_mainchain_mainchain = self.params.include_mainchain_mainchain
+@@ -922,7 +940,7 @@ def _generate_interaction_dots(self, sourceAtoms, targetSet, spatialQuery, phant
+         srcDots = self._dots[src]
+         scale = self.params.overlap_scale_factor
+         # check_dots keeps the first of equally close atoms (alternates at one position),
+-        # so order by i_seq: a set's order varies from run to run.
++        # so order by i_seq: a set's order varies from run to run. ContactDB does the same.
+         interacting = sorted(atomSet, key=lambda a: a.i_seq)
+         for res in self._dotScorer.check_dots(src, srcDots, probeRadius, interacting, excluded, scale):
+ 
+@@ -1007,6 +1025,56 @@ def _generate_interaction_dots(self, sourceAtoms, targetSet, spatialQuery, phant
+           # Save the dot
+           self._save_dot(src, res.cause, atomClass, loc, spikeloc, overlapType, res.gap, ptmaster, 0)
+ 
++# ------------------------------------------------------------------------------
++
++  def _build_contact_records(self, sourceAtoms, targetSet, spatialQuery, phantomsQuery, bondedNeighborLists):
++    '''
++      Same contacts as _generate_interaction_dots(), summarized per atom pair in C++.
++      Flattens the per-atom state into i_seq-indexed arrays for probeExt.ContactDB.
++      :return: The built probeExt.ContactDB.
++    '''
++    atoms = {a.i_seq: a for a in self._atomClasses}
++    for a, nbrs in bondedNeighborLists.items():
++      atoms.setdefault(a.i_seq, a)
++      for n in nbrs:
++        atoms.setdefault(n.i_seq, n)
++    size = max(atoms) + 1
++    flags, model, chain, group, alt = (flex.int(size, 0) for _ in range(5))
++    codes = ({}, {}, {}, {})   # model, chain, atom group and altloc ids -> small ints
++    def code(table, key):
++      return table.setdefault(key, len(table) + 1)
++    for i, a in atoms.items():
++      ag = a.parent()
++      if a in self._atomClasses:
++        flags[i] = ((probeExt.ContactDB_IGNORE if self._atomClasses[a] == 'ignore' else 0) |
++                    (probeExt.ContactDB_MAINCHAIN if self._inMainChain[a] else 0) |
++                    (probeExt.ContactDB_HET if self._inHet[a] else 0) |
++                    (probeExt.ContactDB_WATER if self._inWater[a] else 0) |
++                    (probeExt.ContactDB_TARGET if a in targetSet else 0))
++      ch = ag.parent().parent()
++      model[i] = code(codes[0], ch.parent().id)
++      chain[i] = code(codes[1], ch.id)
++      group[i] = code(codes[2], ag.memory_id())
++      alt[i] = 0 if ag.altloc in ('', ' ') else code(codes[3], ag.altloc)
++    by_iseq = {a.i_seq: nbrs for a, nbrs in bondedNeighborLists.items()}
++    offsets, targets = flex.int([0]), []
++    for i in range(size):
++      targets.extend(by_iseq.get(i, []))
++      offsets.append(len(targets))
++
++    params, spo = self.params, self.params.output
++    probeRadius = params.probe.probe_radius
++    db = probeExt.ContactDB(self._extraAtomInfo, self._dotScorer, spatialQuery, phantomsQuery,
++                            Helpers.createDotSphereCache(params.probe))
++    db.set_atom_data(flags, model, chain, group, alt)
++    db.set_bonds(offsets, targets)
++    db.set_params(probeRadius, 2*self._maximumVDWRadius + 2*probeRadius, params.minimum_occupancy,
++                  params.excluded_bond_chain_length, params.include_mainchain_mainchain,
++                  params.include_water_water, params.overlap_scale_factor, spo.separate_worse_clashes,
++                  spo.report_hydrogen_bonds, spo.report_clashes, spo.report_vdws, spo.only_report_bad_clashes)
++    db.build(list(sourceAtoms))
++    return db
++
+ # ------------------------------------------------------------------------------
+ 
+   def _generate_surface_dots_for(self, src, nearby):
+@@ -1936,6 +2004,8 @@ def overrideModel(self, model, processed = False):
+   def run(self):
+     # String that will be output to the specified file.
+     outString = ''
++    # Unlike the per-model dot results, contact records accumulate across models.
++    self._contactRecords = []
+ 
+     if (self.params.output.add_kinemage_keyword and not self.params.output.count_dots
+         and self.params.output.format == 'kinemage'):
+@@ -1962,7 +2032,8 @@ def run(self):
+       and (self.model.get_restraints_manager() is not None) )
+     try:
+       if not alreadyProcessed:
+-        self.model.process(make_restraints=True, pdb_interpretation_params=p) # make restraints
++        self.model.process(make_restraints=True, pdb_interpretation_params=p,
++                           plain_pairs_radius=PLAIN_PAIRS_RADIUS) # make restraints
+       geometry = self.model.get_restraints_manager().geometry
+       sites_cart = self.model.get_sites_cart() # cartesian coordinates
+       bondProxies, asu = \
+@@ -1973,7 +2044,8 @@ def run(self):
+         self.model.add_crystal_symmetry_if_necessary()
+ 
+         # Retry with the adjusted model
+-        self.model.process(make_restraints=True, pdb_interpretation_params=p) # make restraints
++        self.model.process(make_restraints=True, pdb_interpretation_params=p,
++                           plain_pairs_radius=PLAIN_PAIRS_RADIUS) # make restraints
+         geometry = self.model.get_restraints_manager().geometry
+         sites_cart = self.model.get_sites_cart() # cartesian coordinates
+         bondProxies, asu = \
+diff --git a/mmtbx/run_tests.py b/mmtbx/run_tests.py
+index 25e927fa37..6f1692c14a 100644
+--- a/mmtbx/run_tests.py
++++ b/mmtbx/run_tests.py
+@@ -316,6 +316,7 @@
+   "$D/validation/regression/tst_ramalyze_rare.py",
+   "$D/validation/regression/tst_clashscore.py",
+   "$D/validation/regression/tst_clashscore_2.py",
++  "$D/validation/regression/tst_probe2_contact_records.py",
+   "$D/validation/regression/tst_restraints.py",
+   "$D/validation/regression/tst_omegalyze.py",
+   "$D/validation/regression/tst_rna_validate.py",
+diff --git a/mmtbx/validation/clashscore2.py b/mmtbx/validation/clashscore2.py
+index 1960b821d7..e804f53c25 100644
+--- a/mmtbx/validation/clashscore2.py
++++ b/mmtbx/validation/clashscore2.py
+@@ -17,6 +17,7 @@
+ import sys
+ import six
+ import json
++import collections
+ import copy
+ import tempfile
+ 
+@@ -269,13 +270,15 @@ def __init__(self,
+         try:
+           try:
+             master.process(make_restraints=True,
+-              pdb_interpretation_params=probe2.getPdbInterpretationParams(nuclear))
++              pdb_interpretation_params=probe2.getPdbInterpretationParams(nuclear),
++              plain_pairs_radius=probe2.PLAIN_PAIRS_RADIUS)
+           except Exception:
+             # Fix up bogus unit cell when it occurs by checking crystal
+             # symmetry, the same way probe2's run() does, then retry.
+             master.add_crystal_symmetry_if_necessary()
+             master.process(make_restraints=True,
+-              pdb_interpretation_params=probe2.getPdbInterpretationParams(nuclear))
++              pdb_interpretation_params=probe2.getPdbInterpretationParams(nuclear),
++              plain_pairs_radius=probe2.PLAIN_PAIRS_RADIUS)
+           if master.get_restraints_manager() is not None:
+             processed_master = master
+             master_key_to_index = _atom_index_by_key(master.get_hierarchy())
+@@ -428,6 +431,36 @@ def as_coot_data(self):
+           result.atoms_info[1].id_str(), result.overlap, result.xyz))
+     return data
+ 
++def contact_record_runs(p2):
++  """
++  The runs of dots probe2's raw and JSON writers emit, rebuilt from its per-atom-pair
++  records (output.contact_records=True): one entry per (source, target, interaction
++  type), in writer order (atom class, then interaction type, then source atom, then
++  target name), which is the order _condense() leaves a source's dots in.
++  Yields (atomClass, interaction type, source atom, target atom, dot count, smallest
++  dot gap, location of the smallest-gap Bump dot or None).
++  """
++  import mmtbx_probe_ext as probeExt
++  n_types = probeExt.ContactDB_N_TYPES
++  bump = int(probeExt.InteractionType.Bump)
++  name = probe2.DotInfo._cachedName
++  atoms = {a.i_seq: a for a in p2._atomClasses}
++  runs = collections.defaultdict(list)
++  for call, (db, sources) in enumerate(p2._contactRecords):
++    src, cause, gap, counts, hasBump, bumpGap, bumpLoc, typeGap = db.pairs()
++    for k in range(len(src)):
++      s, t = sources[src[k]], atoms[cause[k]]
++      for itype in range(n_types):
++        count = counts[k * n_types + itype]
++        if count:
++          g = typeGap[k * n_types + itype]
++          runs[(p2._atomClasses[s], itype)].append(
++            ((call, src[k], name(s) + name(t), g), s, t, count, g, bumpLoc[k] if itype == bump else None))
++  for atomClass in probe2._allAtomClasses:   # probe2 lists 'Se' twice and writes it twice
++    for itype in probe2._interactionTypes:
++      for _, s, t, count, g, loc in sorted(runs.get((atomClass, int(itype)), []), key=lambda r: r[0]):
++        yield atomClass, itype, s, t, count, g, loc
++
+ class probe_line_info(object): # this is parent
+   def __init__(self, line, model_id=""):
+     self.overlap_value = None
+@@ -503,6 +536,9 @@ def __init__(self, line, model_id=""):
+       self.overlap_value = self.gap
+ 
+ class probe_clashscore_manager(object):
++  # False restores the per-dot JSON path for the default mode (for comparisons).
++  use_contact_records = True
++
+   def __init__(self,
+                fast = False,
+                condensed_probe=False,
+@@ -611,6 +647,52 @@ def process_json_probe_output(self, probe_json):
+         self.put_group_into_dict(previous_line, new_clash_hash, new_hbond_hash)
+     return self.filter_dicts(new_clash_hash, new_hbond_hash)
+ 
++  def process_contact_records(self, p2):
++    """
++    The clash list process_json_probe_output() builds from probe2's per-dot JSON, built
++    instead from probe2's per-atom-pair records (output.contact_records=True).
++
++    That parse merges consecutive lines with the same atom pair, so the line stream is
++    rebuilt at the level of those runs, in the order probe2 writes them: atom class, then
++    interaction type, then source atom, then target name.  Each run's line carries the
++    values of its smallest-gap dot, formatted as the JSON writer formats them, and goes
++    through the same merging, put_group_into_dict() and filter_dicts().
++    """
++    import mmtbx_probe_ext as probeExt
++
++    def atom_json(a):
++      ag = a.parent()
++      rg = ag.parent()
++      return {"chainID": rg.parent().id, "resID": rg.resseq_as_int(), "iCode": rg.icode.strip(),
++              "resName": ag.resname.strip().upper(), "atomName": a.name, "alt": ag.altloc.strip()}
++
++    def r3(v):
++      return float("{:.3f}".format(v))
++
++    new_clash_hash = {}
++    new_hbond_hash = {}
++    previous_line = None
++    for atomClass, itype, s, t, count, g, loc in contact_record_runs(p2):
++      loc = loc if loc is not None else (0.0, 0.0, 0.0)
++      line = json_probe_line_info({
++        "master": "", "group": "", "type": probeExt.DotScorer.interaction_type_short_name(itype),
++        "srcClass": atomClass, "targetClass": p2._atomClasses.get(t, ""),
++        "srcBFactor": float("{:.2f}".format(s.b)), "targetBFactor": float("{:.2f}".format(t.b)),
++        "src": atom_json(s), "target": atom_json(t), "gap": 0.0, "dotGap": r3(g),
++        "spike": [0.0, 0.0, 0.0], "spikeLen": 0.0, "scoreOverDensity": 0.0,
++        "loc": [r3(loc[0]), r3(loc[1]), r3(loc[2])]}, self.model_id)
++      if previous_line is not None:
++        if line.is_similar(previous_line):
++          previous_line.overlap_value = min(previous_line.overlap_value, line.overlap_value)
++        else:
++          self.put_group_into_dict(previous_line, new_clash_hash, new_hbond_hash)
++          previous_line = line
++      else:
++        previous_line = line
++    if previous_line is not None:
++      self.put_group_into_dict(previous_line, new_clash_hash, new_hbond_hash)
++    return self.filter_dicts(new_clash_hash, new_hbond_hash)
++
+   def get_condensed_clashes(self, probe_json):
+     clashes = set() # [(src, targ), (src, targ)]
+     hbonds = [] # (src, targ), (targ, src)
+@@ -678,13 +760,20 @@ def run_probe_clashscore(self, data_manager, hydrogenated_model, processed=False
+       "output.report_vdws=False",
+       "ignore_lack_of_explicit_hydrogens=True",
+     ]
++    # The default (non-condensed, non-fast) path takes probe2's per-pair contact records
++    # rather than per-dot JSON: same clash list, without storing and re-parsing every dot.
++    use_records = (not self.fast) and (not self.condensed_probe) and self.use_contact_records
++    if use_records:
++      args += ["output.contact_records=True", "output.write_files=False"]
+     master_phil, probe2_params = _probe2_params_from_args(args, tempName)
+     p2 = probe2.Program(data_manager, probe2_params,
+                        master_phil=master_phil, logger=null_out())
+     p2.overrideModel(hydrogenated_model, processed=processed)
+     dots, output = p2.run()
+     probe_json = output
+-    os.unlink(tempName)
++    del dots
++    if not use_records:
++      os.unlink(tempName)
+ 
+     # Debugging facility, do not remove!
+     # import random
+@@ -700,7 +789,11 @@ def run_probe_clashscore(self, data_manager, hydrogenated_model, processed=False
+     #   f.write('\n'.join(probe_json))
+ 
+     if not self.fast:
+-      temp = self.process_json_probe_output(probe_json)
++      if use_records:
++        temp = self.process_contact_records(p2)
++      else:
++        temp = self.process_json_probe_output(probe_json)
++      del p2, probe_json
+       self.n_clashes = len(temp)
+ 
+       # Optionally call probe2 again to get non-condensed output including VDW
+diff --git a/mmtbx/validation/regression/tst_probe2_contact_records.py b/mmtbx/validation/regression/tst_probe2_contact_records.py
+new file mode 100644
+index 0000000000..cda96999a0
+--- /dev/null
++++ b/mmtbx/validation/regression/tst_probe2_contact_records.py
+@@ -0,0 +1,134 @@
++"""
++clashscore2's per-atom-pair contact records must give the same results as the per-dot
++JSON parse they replace.
++"""
++from __future__ import absolute_import, division, print_function
++import time
++import iotbx.phil
++import libtbx.load_env
++from iotbx.data_manager import DataManager
++from libtbx.utils import null_out
++from mmtbx.probe import Helpers
++from mmtbx.validation import clashscore2
++
++# Alternates on a backbone and a side chain, partial-occupancy waters (from tst_clashscore_2).
++pdb_str = """\
++CRYST1   50.000   50.000   50.000  90.00  90.00  90.00 P 1
++ATOM      1  N   ASN A   1      12.388  -5.203  29.298  1.00 13.23           N
++ATOM      2  CA  ASN A   1      12.398  -3.931  28.500  1.00  6.85           C
++ATOM      3  CB  ASN A   1      13.493  -3.033  29.043  1.00  7.32           C
++ATOM      4  CG  ASN A   1      13.414  -1.559  28.658  1.00  7.93           C
++ATOM      5  OD1 ASN A   1      14.388  -0.782  28.842  1.00 10.99           O
++ATOM      6  ND2 ASN A   1      12.315  -1.201  28.134  1.00 11.12           N
++ATOM      7  C  AASN A   1      12.384  -4.463  27.091  0.45  6.81           C
++ATOM      8  O  AASN A   1      12.645  -5.635  26.750  0.45  8.28           O
++ATOM      9  C  BASN A   1      12.891  -4.205  27.064  0.55  9.54           C
++ATOM     10  O  BASN A   1      14.004  -4.638  26.750  0.55 12.04           O
++ATOM    180  N   GLU A  25      17.119   0.317  19.886  1.00  4.46           N
++ATOM    181  CA  GLU A  25      17.951   0.073  21.066  1.00  4.05           C
++ATOM    182  C   GLU A  25      17.083  -0.029  22.303  1.00  3.92           C
++ATOM    183  O   GLU A  25      16.053   0.642  22.379  1.00  4.03           O
++ATOM    184  CB  GLU A  25      18.993   1.197  21.334  1.00  5.58           C
++ATOM    185  CG  GLU A  25      20.050   1.356  20.259  1.00  6.70           C
++ATOM    186  CD AGLU A  25      21.014   2.440  20.770  0.47  7.87           C
++ATOM    187  OE1AGLU A  25      22.134   2.188  21.301  0.47  9.47           O
++ATOM    188  OE2AGLU A  25      20.526   3.611  20.664  0.47  7.81           O
++ATOM    189  CD BGLU A  25      20.877   2.608  20.405  0.53  8.00           C
++ATOM    190  OE1BGLU A  25      21.950   2.605  19.769  0.53  8.34           O
++ATOM    191  OE2BGLU A  25      20.372   3.528  21.137  0.53  7.48           O
++ATOM    192  N   VAL A  26      17.559  -0.774  23.291  1.00  4.51           N
++ATOM    193  CA  VAL A  26      16.931  -0.812  24.603  1.00  4.35           C
++ATOM    194  C   VAL A  26      17.394   0.427  25.384  1.00  4.53           C
++ATOM    195  O   VAL A  26      18.565   0.603  25.717  1.00  6.63           O
++ATOM    196  CB  VAL A  26      17.285  -2.120  25.322  1.00  6.28           C
++ATOM    197  CG1 VAL A  26      16.710  -2.090  26.737  1.00  8.38           C
++ATOM    198  CG2 VAL A  26      16.793  -3.328  24.541  1.00  7.99           C
++ATOM    199  N   VAL A  27      16.430   1.306  25.641  1.00  4.09           N
++ATOM    200  CA  VAL A  27      16.630   2.593  26.282  1.00  4.04           C
++ATOM    201  C   VAL A  27      15.546   2.821  27.325  1.00  3.81           C
++ATOM    202  O   VAL A  27      14.515   2.145  27.331  1.00  4.70           O
++ATOM    203  CB  VAL A  27      16.645   3.734  25.238  1.00  4.32           C
++ATOM    204  CG1 VAL A  27      17.867   3.681  24.325  1.00  5.54           C
++ATOM    205  CG2 VAL A  27      15.361   3.732  24.400  1.00  4.82           C
++ATOM    206  N   THR A  28      15.797   3.825  28.171  1.00  3.67           N
++ATOM    207  CA  THR A  28      14.793   4.268  29.126  1.00  3.78           C
++ATOM    208  C   THR A  28      14.774   5.796  29.120  1.00  3.63           C
++ATOM    209  O   THR A  28      15.846   6.424  29.117  1.00  4.10           O
++ATOM    210  CB  THR A  28      15.041   3.745  30.540  1.00  4.19           C
++ATOM    211  OG1 THR A  28      16.342   4.127  31.000  1.00  4.27           O
++ATOM    212  CG2 THR A  28      14.895   2.227  30.627  1.00  5.21           C
++ATOM    213  N   PRO A  29      13.578   6.399  29.122  1.00  3.53           N
++ATOM    214  CA  PRO A  29      12.262   5.767  29.064  1.00  3.65           C
++ATOM    215  C   PRO A  29      11.992   5.133  27.695  1.00  3.56           C
++ATOM    216  O   PRO A  29      12.719   5.286  26.720  1.00  5.32           O
++ATOM    217  CB  PRO A  29      11.293   6.907  29.372  1.00  4.74           C
++ATOM    218  CG  PRO A  29      12.017   8.133  28.814  1.00  4.83           C
++ATOM    219  CD  PRO A  29      13.477   7.862  29.201  1.00  4.02           C
++ATOM    220  N   MET A  30      10.875   4.415  27.628  1.00  4.82           N
++ATOM    221  CA  MET A  30      10.472   3.706  26.429  1.00  3.92           C
++ATOM    222  C   MET A  30       9.962   4.670  25.386  1.00  3.81           C
++ATOM    223  O   MET A  30       9.205   5.595  25.690  1.00  4.84           O
++ATOM    224  CB  MET A  30       9.331   2.734  26.807  1.00  4.57           C
++ATOM    225  CG  MET A  30       8.873   1.861  25.654  1.00  4.88           C
++ATOM    226  SD  MET A  30      10.130   0.613  25.308  1.00  5.54           S
++ATOM    227  CE AMET A  30       9.590   0.158  23.659  0.80  5.92           C
++ATOM    228  CE BMET A  30       9.842  -0.500  26.625  0.20 14.35           C
++ATOM    229  N   GLY A  31      10.375   4.449  24.142  1.00  3.74           N
++ATOM    230  CA  GLY A  31       9.846   5.184  23.024  1.00  4.22           C
++ATOM    231  C   GLY A  31       8.887   4.357  22.184  1.00  3.46           C
++ATOM    232  O   GLY A  31       8.350   3.328  22.642  1.00  3.89           O
++ATOM    233  N   ILE A  32       8.655   4.794  20.950  1.00  3.51           N
++ATOM    234  CA  ILE A  32       7.877   3.976  20.038  1.00  3.38           C
++ATOM    235  C   ILE A  32       8.559   2.602  19.944  1.00  3.44           C
++ATOM    236  O   ILE A  32       9.782   2.531  19.754  1.00  3.63           O
++ATOM    237  CB  ILE A  32       7.807   4.651  18.658  1.00  3.57           C
++ATOM    238  CG1 ILE A  32       7.052   5.977  18.750  1.00  4.18           C
++ATOM    239  CG2 ILE A  32       7.139   3.697  17.669  1.00  4.59           C
++ATOM    240  CD1 ILE A  32       7.076   6.794  17.464  1.00  4.77           C
++ATOM    241  N   PRO A  33       7.817   1.492  20.034  1.00  3.75           N
++ATOM    242  CA  PRO A  33       8.459   0.197  19.927  1.00  4.43           C
++ATOM    243  C   PRO A  33       9.162   0.012  18.587  1.00  3.94           C
++ATOM    244  O   PRO A  33       8.668   0.406  17.535  1.00  4.50           O
++ATOM    245  CB  PRO A  33       7.289  -0.810  20.093  1.00  6.13           C
++ATOM    246  CG  PRO A  33       6.309  -0.027  20.992  1.00  6.43           C
++ATOM    247  CD  PRO A  33       6.394   1.383  20.414  1.00  4.84           C
++ATOM    248  N   ALA A  34      10.310  -0.693  18.648  1.00  4.36           N
++ATOM    249  CA  ALA A  34      11.123  -0.882  17.448  1.00  4.68           C
++ATOM    250  C   ALA A  34      10.374  -1.543  16.299  1.00  4.72           C
++ATOM    251  O   ALA A  34      10.729  -1.285  15.141  1.00  5.19           O
++ATOM    252  CB  ALA A  34      12.370  -1.700  17.814  1.00  7.22           C
++TER
++HETATM  156  O   HOH A 173       9.659  -2.091  27.019  0.29  6.50           O
++HETATM  191  O   HOH A 208      24.121   2.918  18.439  0.20  7.03           O
++HETATM  217  O   HOH A 234      10.755   0.622  29.147  0.23  8.84           O
++HETATM  230  O   HOH A 247      23.962   1.544  18.100  0.26  4.79           O
++END
++"""
++
++def run_clashscore2(**kwds):
++  dm = DataManager()
++  dm.process_model_str("model", pdb_str)
++  probe_params = iotbx.phil.parse(Helpers.probe_phil_parameters).extract()
++  return clashscore2.clashscore2(probe_parameters=probe_params.probe, data_manager=dm,
++                                 keep_hydrogens=False, out=null_out(), **kwds)
++
++def exercise_contact_records():
++  manager = clashscore2.probe_clashscore_manager
++  assert manager.use_contact_records
++  records = run_clashscore2()
++  manager.use_contact_records = False
++  try:
++    dots = run_clashscore2()
++  finally:
++    manager.use_contact_records = True
++  assert len(records.results) > 0
++  assert records.as_JSON() == dots.as_JSON()
++  assert records.get_clashscore() == dots.get_clashscore()
++
++if (__name__ == "__main__"):
++  if (libtbx.env.has_module("reduce") and libtbx.env.has_module("probe")):
++    t0 = time.time()
++    exercise_contact_records()
++    print("OK. Time: %8.3f" % (time.time() - t0))
++  else:
++    print("Skipping tst_probe2_contact_records: probe or reduce not configured")

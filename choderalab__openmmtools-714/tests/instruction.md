@@ -1,0 +1,25 @@
+# Issue
+
+**Title:** Drop older python version
+
+## Description
+
+## Description
+We can drop python 3.8 testing per NEP 29
+## Todos
+- [ ] Implement feature / fix bug
+- [ ] Add [tests](https://github.com/choderalab/openmmtools/tree/master/openmmtools/tests)
+- [ ] Update [documentation](https://github.com/choderalab/openmmtools/tree/master/docs) as needed
+- [ ] Update [changelog](https://github.com/choderalab/openmmtools/blob/master/docs/releasehistory.rst) to summarize changes in behavior, enhancements, and bugfixes implemented in this PR
+
+## Status
+- [ ] Ready to go
+
+## Changelog message
+```
+
+```
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `6cef59b67327`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

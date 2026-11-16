@@ -1,0 +1,22 @@
+# Issue
+
+**Title:** Fix "Consider dict comprehensions instead of using 'dict()'" issue
+
+## Description
+
+This pull request automatically fixes all occurrences of the following issue:
+
+Issue type: [Consider dict comprehensions instead of using 'dict()'](https://www.quantifiedcode.com/app/issue_class/539Wia7V)
+Issue details: [https://www.quantifiedcode.com/app/project/gh:Becksteinlab:GromacsWrapper?groups=code_patterns/%3A539Wia7V](https://www.quantifiedcode.com/app/project/gh:Becksteinlab:GromacsWrapper?groups=code_patterns/%3A539Wia7V)
+
+To adjust the commit message or the actual code changes, just [rebase](https://git-scm.com/docs/git-rebase) or [cherry-pick](https://git-scm.com/docs/git-cherry-pick) the commits.
+For questions or feedback reach out to cody@quantifiedcode.com.
+
+Legal note: We won't claim any copyrights on the code changes.
+
+Cheers,
+[Cody - Your code quality bot](https://www.quantifiedcode.com/cody)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `2fc389136d53`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

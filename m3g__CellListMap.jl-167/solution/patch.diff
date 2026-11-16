@@ -1,0 +1,1035 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0005d211..d1b36111 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -20,6 +20,7 @@ Version 0.10.0-DEV
+ - ![ENHANCEMENT][badge-enhancement] Improve performance of inner loops.
+ - ![ENHANCEMENT][badge-enhancement] Improve performance of neighborlist reduction and cold start of lists.
+ - ![ENHANCEMENT][badge-enhancement] Update list of unchanched coordinates of `NonPeriodicCell` only if the limits expanded. 
++- ![ENHANCEMENT][badge-enhancement] Split computation of `NonPeriodicCell`s into its own path, which then can be simplified. Should display better performance and scalling, particularly in the cell list construction step.
+ - ![BREAKING][badge-breaking] `map_pairwise!` was renamed to `pairwise!`. 
+ - ![BREAKING][badge-breaking] `pairwise`, without the `!` was removed, to stress the fact that the function always mutates the `output` field of the `ParticleSystem` object. 
+ - ![BREAKING][badge-breaking] The initial value of `output` is not set to `zero(typeof(output))` by default, but retains the given value. Resetting occurs on the call to `pairwise!` by default, and can be skipped with `reset=false`. 
+diff --git a/src/API/ParticleSystem.jl b/src/API/ParticleSystem.jl
+index 1f25f29b..c9fc2559 100644
+--- a/src/API/ParticleSystem.jl
++++ b/src/API/ParticleSystem.jl
+@@ -156,7 +156,7 @@ function ParticleSystem(
+         _uc = isnothing(unitcell) ? limits(_x; validate_coordinates) : unitcell
+         _box = Box(_uc, cutoff; lcell)
+         _cell_list = CellList(_x, _box; parallel, nbatches, validate_coordinates)
+-        _aux = AuxThreaded(_cell_list)
++        _aux = _create_aux(_box, _cell_list)
+         _output_threaded = [copy_output(output) for _ in 1:CellListMap.nbatches(_cell_list, :map)]
+         output = _reset_all_output!(output, _output_threaded; reset = false)
+         return ParticleSystem1{output_name}(_x, output, _box, _cell_list, _output_threaded, _aux, parallel, validate_coordinates)
+@@ -166,7 +166,7 @@ function ParticleSystem(
+         _uc = isnothing(unitcell) ? limits(_x, _y; validate_coordinates) : unitcell
+         _box = Box(_uc, cutoff; lcell)
+         _cell_list = CellList(_x, _y, _box; parallel, nbatches, validate_coordinates)
+-        _aux = AuxThreaded(_cell_list)
++        _aux = _create_aux(_box, _cell_list)
+         _output_threaded = [copy_output(output) for _ in 1:CellListMap.nbatches(_cell_list, :map)]
+         output = _reset_all_output!(output, _output_threaded; reset = false)
+         return ParticleSystem2{output_name}(_x, _y, output, _box, _cell_list, _output_threaded, _aux, parallel, validate_coordinates)
+diff --git a/src/CellListMap.jl b/src/CellListMap.jl
+index fa0c8441..195573e7 100644
+--- a/src/CellListMap.jl
++++ b/src/CellListMap.jl
+@@ -42,6 +42,7 @@ include("./internals/auxiliary_functions.jl")
+ include("./internals/vicinal_cells.jl")
+ include("./internals/self.jl")
+ include("./internals/cross.jl")
++include("./internals/NonPeriodicCells.jl")
+ include("./internals/ParticleSystem.jl")
+ include("./API/ParticleSystem.jl")
+ include("./API/parallel_custom.jl")
+diff --git a/src/internals/Box.jl b/src/internals/Box.jl
+index 7e42c9bd..a5cbf699 100644
+--- a/src/internals/Box.jl
++++ b/src/internals/Box.jl
+@@ -5,7 +5,6 @@
+ struct TriclinicCell end
+ struct OrthorhombicCell end
+ struct NonPeriodicCell end
+-
+ const OrthorhombicCellType = Union{OrthorhombicCell, NonPeriodicCell}
+ const PeriodicCellType = Union{OrthorhombicCell, TriclinicCell}
+ 
+diff --git a/src/internals/CellLists.jl b/src/internals/CellLists.jl
+index d386adb6..a247bb44 100644
+--- a/src/internals/CellLists.jl
++++ b/src/internals/CellLists.jl
+@@ -16,10 +16,10 @@ in memory when building the cell lists. This strategy duplicates the particle co
+ data, but is probably worth the effort. 
+ 
+ =#
+-struct ParticleWithIndex{N, T}
++struct ParticleWithIndex{N,T}
+     index::Int
+     real::Bool
+-    coordinates::SVector{N, T}
++    coordinates::SVector{N,T}
+ end
+ 
+ #=
+@@ -40,10 +40,10 @@ by default the system size that allows multi-threading is greater for this part
+ 
+ =#
+ struct NumberOfBatches
+-    build_cell_lists::Tuple{Bool, Int}
+-    map_computation::Tuple{Bool, Int}
++    build_cell_lists::Tuple{Bool,Int}
++    map_computation::Tuple{Bool,Int}
+ end
+-NumberOfBatches(auto::Tuple{Bool, Bool}, n::Tuple{Int, Int}) =
++NumberOfBatches(auto::Tuple{Bool,Bool}, n::Tuple{Int,Int}) =
+     NumberOfBatches((first(auto), first(n)), (last(auto), last(n)))
+ Base.zero(::Type{NumberOfBatches}) = NumberOfBatches((true, 0), (true, 0))
+ function Base.show(io::IO, ::MIME"text/plain", nbatches::NumberOfBatches)
+@@ -64,20 +64,20 @@ about if this cell is in the border of the box (such that its
+ neighboring cells need to be wrapped) 
+ 
+ =#
+-Base.@kwdef struct Cell{N, T}
++Base.@kwdef struct Cell{N,T}
+     linear_index::Int = 0
+     cartesian_index::CartesianIndex{N} = CartesianIndex{N}(ntuple(i -> 0, Val(N)))
+-    center::SVector{N, T} = zeros(SVector{N, T})
++    center::SVector{N,T} = zeros(SVector{N,T})
+     contains_real::Bool = false
+     n_particles::Int = 0
+-    particles::Vector{ParticleWithIndex{N, T}} = Vector{ParticleWithIndex{N, T}}(undef, 0)
++    particles::Vector{ParticleWithIndex{N,T}} = Vector{ParticleWithIndex{N,T}}(undef, 0)
+ end
+-function Cell{N, T}(cartesian_index::CartesianIndex, box::Box; sizehint::Int = 0) where {N, T}
+-    return Cell{N, T}(
+-        linear_index = cell_linear_index(box.nc, cartesian_index),
+-        cartesian_index = cartesian_index,
+-        center = cell_center(cartesian_index, box),
+-        particles = Vector{ParticleWithIndex{N, T}}(undef, sizehint)
++function Cell{N,T}(cartesian_index::CartesianIndex, box::Box; sizehint::Int=0) where {N,T}
++    return Cell{N,T}(
++        linear_index=cell_linear_index(box.nc, cartesian_index),
++        cartesian_index=cartesian_index,
++        center=cell_center(cartesian_index, box),
++        particles=Vector{ParticleWithIndex{N,T}}(undef, sizehint)
+     )
+ end
+ 
+@@ -94,10 +94,10 @@ scalars are chosen such that with a `SVector{3,Float64}` the
+ complete struct has 32bytes.
+ 
+ =#
+-Base.@kwdef struct ProjectedParticle{N, T}
++Base.@kwdef struct ProjectedParticle{N,T}
+     index::Int
+     xproj::T
+-    coordinates::SVector{N, T}
++    coordinates::SVector{N,T}
+     real::Bool
+ end
+ 
+@@ -112,7 +112,7 @@ $(TYPEDFIELDS)
+ Structure that contains the cell lists information.
+ 
+ =#
+-Base.@kwdef mutable struct CellList{N, T}
++Base.@kwdef mutable struct CellList{N,T}
+     " Number of real particles. "
+     n_real_particles::Int = 0
+     " Number of cells. "
+@@ -128,12 +128,12 @@ Base.@kwdef mutable struct CellList{N, T}
+     " Auxiliary array that contains the indexes in the cells with real particles. "
+     cell_indices_real::Vector{Int} = zeros(Int, 0)
+     " Vector containing cell lists of cells with particles. "
+-    cells::Vector{Cell{N, T}} = Cell{N, T}[]
++    cells::Vector{Cell{N,T}} = Cell{N,T}[]
+     " Number of batches for the parallel calculations. "
+     nbatches::NumberOfBatches = zero(NumberOfBatches)
+     " Auxiliary array to store projected particles. "
+-    projected_particles::Vector{Vector{ProjectedParticle{N, T}}} =
+-        Vector{Vector{ProjectedParticle{N, T}}}(undef, 0)
++    projected_particles::Vector{Vector{ProjectedParticle{N,T}}} =
++        Vector{Vector{ProjectedParticle{N,T}}}(undef, 0)
+ end
+ 
+ function Base.show(io::IO, ::MIME"text/plain", cl::CellList)
+@@ -155,9 +155,9 @@ Structure that will contains the cell lists of two independent sets of
+ particles for cross-computation of interactions
+ 
+ =#
+-struct CellListPair{N, T}
+-    ref_list::CellList{N, T}  # Reference list (iterated in outer loop)
+-    target_list::CellList{N, T}  # Target list (searched for neighbors)
++struct CellListPair{N,T}
++    ref_list::CellList{N,T}  # Reference list (iterated in outer loop)
++    target_list::CellList{N,T}  # Target list (searched for neighbors)
+ end
+ 
+ function Base.show(io::IO, ::MIME"text/plain", cl::CellListPair)
+@@ -175,7 +175,7 @@ every problem. See the parameter `nbatches` of the construction of the cell list
+ tuning this.
+ 
+ =#
+-function update_number_of_batches!(cl::CellList{N, T}, _nbatches = cl.nbatches; parallel = true) where {N, T}
++function update_number_of_batches!(cl::CellList{N,T}, _nbatches=cl.nbatches; parallel=true) where {N,T}
+     auto = (first(_nbatches.build_cell_lists), first(_nbatches.map_computation))
+     n1 = last(_nbatches.build_cell_lists)
+     n2 = last(_nbatches.map_computation)
+@@ -199,8 +199,8 @@ function update_number_of_batches!(cl::CellList{N, T}, _nbatches = cl.nbatches;
+         nbatches = NumberOfBatches(auto, (n1, n2))
+     end
+     _size = isempty(cl.projected_particles) ? 0 : length(cl.projected_particles[1])
+-    for _ in (length(cl.projected_particles) + 1):last(nbatches.map_computation)
+-        push!(cl.projected_particles, Vector{ProjectedParticle{N, T}}(undef, _size))
++    for _ in (length(cl.projected_particles)+1):last(nbatches.map_computation)
++        push!(cl.projected_particles, Vector{ProjectedParticle{N,T}}(undef, _size))
+     end
+     cl.nbatches = nbatches
+     return cl
+@@ -212,10 +212,10 @@ _nbatches_build_cell_lists(n::Int) = _nbatches_default(n)
+ _nbatches_map_computation(n::Int) = _nbatches_default(n)
+ 
+ function update_number_of_batches!(
+-        cl::CellListPair{N, T},
+-        _nbatches::Union{NumberOfBatches, Nothing} = nothing;
+-        parallel = true
+-    ) where {N, T}
++    cl::CellListPair{N,T},
++    _nbatches::Union{NumberOfBatches,Nothing}=nothing;
++    parallel=true
++) where {N,T}
+     if isnothing(_nbatches)
+         # Default call (e.g. when particle count changed): reconstruct auto flags from stored
+         # state. build_cell_lists.auto is correctly preserved across updates. map_computation.auto
+@@ -230,7 +230,7 @@ function update_number_of_batches!(
+     end
+     auto = (first(_nbatches.build_cell_lists), first(_nbatches.map_computation))
+     n_build_ref = last(_nbatches.build_cell_lists)
+-    n_build_target = last(cl.target_list.nbatches.build_cell_lists)
++    n_build_target = last(_nbatches.build_cell_lists)
+     n_map = last(_nbatches.map_computation)
+ 
+     if !parallel
+@@ -257,7 +257,7 @@ function update_number_of_batches!(
+ 
+     ref_list = update_number_of_batches!(cl.ref_list, nbatches_ref; parallel)
+     target_list = update_number_of_batches!(cl.target_list, nbatches_target; parallel)
+-    return CellListPair{N, T}(ref_list, target_list)
++    return CellListPair{N,T}(ref_list, target_list)
+ end
+ 
+ #
+@@ -266,7 +266,7 @@ end
+ # If the number of batches are smaller than 1, the function will set the number of batches
+ # in automatic mode.
+ #
+-function set_number_of_batches!(cl::Union{CellList, CellListPair}, _nbatches::Tuple{Int, Int}; parallel = true)
++function set_number_of_batches!(cl::Union{CellList,CellListPair}, _nbatches::Tuple{Int,Int}; parallel=true)
+     auto = _nbatches .<= 0
+     nbatches = NumberOfBatches((first(auto), first(_nbatches)), (last(auto), last(_nbatches)))
+     return update_number_of_batches!(cl, nbatches; parallel)
+@@ -327,9 +327,9 @@ Auxiliary structure to carry threaded lists and ranges of particles to
+ be considered by each thread on parallel construction. 
+ 
+ =#
+-Base.@kwdef struct AuxThreaded{N, T}
++Base.@kwdef struct AuxThreaded{N,T}
+     idxs::Vector{UnitRange{Int}} = Vector{UnitRange{Int}}(undef, 0)
+-    lists::Vector{CellList{N, T}} = Vector{CellList{N, T}}(undef, 0)
++    lists::Vector{CellList{N,T}} = Vector{CellList{N,T}}(undef, 0)
+     # Accumulators for parallel UpdateCellList! — indexed by cell linear_index.
+     # total_np: atomic accumulator for particle count; reused as write_pos scratch.
+     # contains_real_flags: atomic-or accumulator (0/1) for contains_real.
+@@ -343,9 +343,14 @@ function Base.show(io::IO, ::MIME"text/plain", aux::AuxThreaded)
+     return _print(io, " Auxiliary arrays for nbatches = ", length(aux.lists))
+ end
+ 
+-Base.@kwdef struct AuxThreadedPair{N, T}
+-    ref_list::AuxThreaded{N, T}
+-    target_list::AuxThreaded{N, T}
++# Auxiliary constructors, to dispatch on different cell types (NonPeriodicCell has
++# a special auxiliary data structure)
++_create_aux(::Box, cl::CellList) = AuxThreaded(cl)
++_create_aux(::Box, cl::CellListPair) = AuxThreaded(cl)
++
++Base.@kwdef struct AuxThreadedPair{N,T}
++    ref_list::AuxThreaded{N,T}
++    target_list::AuxThreaded{N,T}
+ end
+ function Base.show(io::IO, ::MIME"text/plain", aux::AuxThreadedPair)
+     _println(io, typeof(aux))
+@@ -380,20 +385,20 @@ CellList{3, Float64}
+ 
+ ```
+ """
+-function AuxThreaded(cl::CellList{N, T}) where {N, T}
++function AuxThreaded(cl::CellList{N,T}) where {N,T}
+     _nbatches = nbatches(cl, :build)
+-    aux = AuxThreaded{N, T}(
+-        idxs = Vector{UnitRange{Int}}(undef, _nbatches),
+-        lists = Vector{CellList{N, T}}(undef, _nbatches),
+-        total_np = zeros(Int, cl.number_of_cells),
+-        contains_real_flags = zeros(Int, cl.number_of_cells),
+-        thread_cell_offsets = [Int[] for _ in 1:_nbatches],
++    aux = AuxThreaded{N,T}(
++        idxs=Vector{UnitRange{Int}}(undef, _nbatches),
++        lists=Vector{CellList{N,T}}(undef, _nbatches),
++        total_np=zeros(Int, cl.number_of_cells),
++        contains_real_flags=zeros(Int, cl.number_of_cells),
++        thread_cell_offsets=[Int[] for _ in 1:_nbatches],
+     )
+     # If the calculation is not parallel, no need to initialize this
+     _nbatches == 1 && return aux
+     @sync for ibatch in eachindex(aux.lists)
+         @spawn begin
+-            cl_batch = CellList{N, T}(number_of_cells = cl.number_of_cells)
++            cl_batch = CellList{N,T}(number_of_cells=cl.number_of_cells)
+             aux.lists[ibatch] = cl_batch
+         end
+     end
+@@ -433,7 +438,7 @@ function set_idxs!(idxs, n_particles, nbatches)
+         if ibatch <= nrem
+             nx += 1
+         end
+-        idxs[ibatch] = first:((first - 1) + nx)
++        idxs[ibatch] = first:((first-1)+nx)
+         first += nx
+     end
+     return nothing
+@@ -504,13 +509,13 @@ CellList{3, Float64}
+ 
+ =#
+ function CellList(
+-        x::ParticleSystemPositions,
+-        box::Box{UnitCellType, N, T};
+-        parallel::Bool = true,
+-        nbatches::Tuple{Int, Int} = (0, 0),
+-        validate_coordinates::F = _validate_coordinates,
+-    ) where {UnitCellType, N, T, F<:Function}
+-    cl = CellList{N, T}(n_real_particles = length(x), number_of_cells = prod(box.nc))
++    x::ParticleSystemPositions,
++    box::Box{UnitCellType,N,T};
++    parallel::Bool=true,
++    nbatches::Tuple{Int,Int}=(0, 0),
++    validate_coordinates::F=_validate_coordinates,
++) where {UnitCellType,N,T,F<:Function}
++    cl = CellList{N,T}(n_real_particles=length(x), number_of_cells=prod(box.nc))
+     set_number_of_batches!(cl, nbatches; parallel)
+     return UpdateCellList!(x, box, cl; parallel, validate_coordinates)
+ end
+@@ -524,7 +529,7 @@ Resets a cell list, by setting everything to zero, but retaining
+ the allocated `particles` and `projected_particles` vectors.
+ 
+ =#
+-function reset!(cl::CellList{N, T}, box, n_real_particles) where {N, T}
++function reset!(cl::CellList{N,T}, box, n_real_particles) where {N,T}
+     new_number_of_cells = prod(box.nc)
+     if new_number_of_cells > cl.number_of_cells
+         resize!(cl.cell_indices, new_number_of_cells)
+@@ -539,7 +544,7 @@ function reset!(cl::CellList{N, T}, box, n_real_particles) where {N, T}
+     # Only reset cells that were populated — cells beyond n_cells_with_particles
+     # retain stale data but are never accessed until re-initialised.
+     for i in 1:cl.n_cells_with_particles
+-        cl.cells[i] = Cell{N, T}(particles = cl.cells[i].particles)
++        cl.cells[i] = Cell{N,T}(particles=cl.cells[i].particles)
+     end
+     # cell_indices_real is written sequentially from position 1 as cells are
+     # discovered, so stale entries beyond n_cells_with_real_particles are
+@@ -583,18 +588,18 @@ CellListMap.CellListPair{Vector{SVector{3, Float64}}, 3, Float64}
+ 
+ =#
+ function CellList(
+-        x::ParticleSystemPositions,
+-        y::ParticleSystemPositions,
+-        box::Box{UnitCellType, N, T};
+-        parallel::Bool = true,
+-        nbatches::Tuple{Int, Int} = (0, 0),
+-        validate_coordinates::F = _validate_coordinates,
+-    ) where {UnitCellType, N, T, F<:Function}
++    x::ParticleSystemPositions,
++    y::ParticleSystemPositions,
++    box::Box{UnitCellType,N,T};
++    parallel::Bool=true,
++    nbatches::Tuple{Int,Int}=(0, 0),
++    validate_coordinates::F=_validate_coordinates,
++) where {UnitCellType,N,T,F<:Function}
+     isnothing(validate_coordinates) || validate_coordinates(x)
+     isnothing(validate_coordinates) || validate_coordinates(y)
+     ref_list = CellList(x, box; parallel, validate_coordinates)
+     target_list = CellList(y, box; parallel, validate_coordinates)
+-    cl_pair = CellListPair{N, T}(ref_list, target_list)
++    cl_pair = CellListPair{N,T}(ref_list, target_list)
+     cl_pair = set_number_of_batches!(cl_pair, nbatches; parallel)
+     return cl_pair
+ end
+@@ -637,12 +642,12 @@ julia> UpdateCellList!(x,box,cl); # update lists
+ 
+ =#
+ function UpdateCellList!(
+-        x::ParticleSystemPositions,
+-        box::Box,
+-        cl::CellList;
+-        parallel::Bool = true,
+-        validate_coordinates::F = _validate_coordinates,
+-    ) where {F<:Function}
++    x::ParticleSystemPositions,
++    box::Box{<:PeriodicCellType},
++    cl::CellList;
++    parallel::Bool=true,
++    validate_coordinates::F=_validate_coordinates,
++) where {F<:Function}
+     if x.updated[]
+         cl = if parallel
+             aux = AuxThreaded(cl)
+@@ -720,13 +725,13 @@ CellList{3, Float64}
+ 
+ =#
+ function UpdateCellList!(
+-        x::ParticleSystemPositions,
+-        box::Box,
+-        cl::CellList{N, T},
+-        aux::Union{Nothing, AuxThreaded{N, T}};
+-        parallel::Bool = true,
+-        validate_coordinates::F = _validate_coordinates,
+-    ) where {N, T, F<:Function}
++    x::ParticleSystemPositions,
++    box::Box{<:PeriodicCellType},
++    cl::CellList{N,T},
++    aux::Union{Nothing,AuxThreaded{N,T}};
++    parallel::Bool=true,
++    validate_coordinates::F=_validate_coordinates,
++) where {N,T,F<:Function}
+ 
+     # validate coordinates
+     isnothing(validate_coordinates) || validate_coordinates(x)
+@@ -828,13 +833,13 @@ function UpdateCellList!(
+             center = cell_center(cartesian_idx, box)
+             if cell_index > length(cl.cells)
+                 push!(
+-                    cl.cells, Cell{N, T}(
+-                        linear_index = li,
+-                        cartesian_index = cartesian_idx,
+-                        center = center,
+-                        contains_real = false,
+-                        n_particles = 0,
+-                        particles = Vector{ParticleWithIndex{N, T}}(undef, 0),
++                    cl.cells, Cell{N,T}(
++                        linear_index=li,
++                        cartesian_index=cartesian_idx,
++                        center=center,
++                        contains_real=false,
++                        n_particles=0,
++                        particles=Vector{ParticleWithIndex{N,T}}(undef, 0),
+                     )
+                 )
+             else
+@@ -895,7 +900,7 @@ function UpdateCellList!(
+                     particles_dst = cl.cells[target_cell_idx].particles
+                     offset = aux.thread_cell_offsets[ibatch][icell]
+                     for ip in 1:aux_cell.n_particles
+-                        particles_dst[offset + ip] = aux_cell.particles[ip]
++                        particles_dst[offset+ip] = aux_cell.particles[ip]
+                     end
+                 end
+             end
+@@ -930,11 +935,11 @@ index `i+ishift`. The shift is used to construct cell lists from fractions of th
+ set of particles in parallel list construction.  
+ 
+ =#
+-function add_particles!(x, box, ishift, cl::CellList{N, T}) where {N, T}
++function add_particles!(x, box, ishift, cl::CellList{N,T}) where {N,T}
+     for ip in eachindex(x)
+         xp = x[ip]
+         # This converts the coordinates to static arrays, if necessary
+-        p = SVector{N, T}(ntuple(i -> xp[i], Val(N)))
++        p = SVector{N,T}(ntuple(i -> xp[i], Val(N)))
+         p = box.rotation * wrap_to_first(p, box.input_unit_cell.matrix)
+         add_particle_to_celllist!(ishift + ip, p, box, cl) # add real particle
+         replicate_particle!(ishift + ip, p, box, cl) # add virtual particles to border cells
+@@ -942,18 +947,6 @@ function add_particles!(x, box, ishift, cl::CellList{N, T}) where {N, T}
+     return cl
+ end
+ 
+-# For NonPeriodicCell, store original coordinates without wrapping or translation.
+-# The computing_box is offset by box.origin so particle_cell maps original coordinates
+-# to valid cell indices directly, avoiding the modular-wrapping discontinuity at x=0.
+-function add_particles!(x, box::Box{NonPeriodicCell}, ishift, cl::CellList{N, T}) where {N, T}
+-    for ip in eachindex(x)
+-        xp = x[ip]
+-        p = SVector{N, T}(ntuple(i -> xp[i], Val(N)))
+-        add_particle_to_celllist!(ishift + ip, p, box, cl)
+-        replicate_particle!(ishift + ip, p, box, cl)
+-    end
+-    return cl
+-end
+ 
+ # Deal with corner cases where a real particle is found in the exact bundary of real box.
+ # This cannot happen because then running over the neighboring boxes can cause an
+@@ -986,12 +979,12 @@ Adds one particle to the cell lists, updating all necessary arrays.
+ 
+ =#
+ function add_particle_to_celllist!(
+-        ip,
+-        x::SVector{N, T},
+-        box,
+-        cl::CellList{N, T};
+-        real_particle::Bool = true
+-    ) where {N, T}
++    ip,
++    x::SVector{N,T},
++    box,
++    cl::CellList{N,T};
++    real_particle::Bool=true
++) where {N,T}
+ 
+     # Increase the counter of number of particles of this list
+     cl.n_particles += 1
+@@ -1014,7 +1007,7 @@ function add_particle_to_celllist!(
+         cl.cell_indices[linear_index] = cell_index
+         if cell_index > length(cl.cells)
+             particles_sizehint = cl.n_real_particles ÷ prod(box.nc)
+-            push!(cl.cells, Cell{N, T}(cartesian_index, box, sizehint = particles_sizehint))
++            push!(cl.cells, Cell{N,T}(cartesian_index, box, sizehint=particles_sizehint))
+         else
+             cell = cl.cells[cell_index]
+             @set! cell.linear_index = linear_index
+@@ -1097,13 +1090,13 @@ julia> UpdateCellList!(x,y,box,cl); # update lists
+ 
+ =#
+ function UpdateCellList!(
+-        x::ParticleSystemPositions,
+-        y::ParticleSystemPositions,
+-        box::Box,
+-        cl_pair::CellListPair;
+-        parallel::Bool = true,
+-        kargs...
+-    )
++    x::ParticleSystemPositions,
++    y::ParticleSystemPositions,
++    box::Box{<:PeriodicCellType},
++    cl_pair::CellListPair;
++    parallel::Bool=true,
++    kargs...
++)
+     cl_pair = if parallel
+         aux = AuxThreaded(cl_pair)
+         UpdateCellList!(x, y, box, cl_pair, aux; parallel, kargs...)
+@@ -1172,25 +1165,25 @@ julia> @btime UpdateCellList!(\$x,\$y,\$box,\$cl,\$aux)
+ CellListMap.CellListPair{Vector{SVector{3, Float64}}, 3, Float64}
+    50000 particles in the reference vector.
+    7414 cells with real particles of target vector.
+-   
++
+ julia> @btime UpdateCellList!(\$x,\$y,\$box,\$cl,\$aux,parallel=false)
+    13.042 ms (0 allocations: 0 bytes)
+  CellListMap.CellListPair{Vector{SVector{3, Float64}}, 3, Float64}
+     50000 particles in the reference vector.
+     15031 cells with real particles of target vector.
+- 
++
+ ```
+ 
+ =#
+ function UpdateCellList!(
+-        x::ParticleSystemPositions,
+-        y::ParticleSystemPositions,
+-        box::Box,
+-        cl_pair::CellListPair{N, T},
+-        aux::Union{Nothing, AuxThreadedPair};
+-        parallel::Bool = true,
+-        validate_coordinates::F = _validate_coordinates,
+-    ) where {N, T, F<:Function}
++    x::ParticleSystemPositions,
++    y::ParticleSystemPositions,
++    box::Box{<:PeriodicCellType},
++    cl_pair::CellListPair{N,T},
++    aux::Union{Nothing,AuxThreadedPair};
++    parallel::Bool=true,
++    validate_coordinates::F=_validate_coordinates,
++) where {N,T,F<:Function}
+     isnothing(validate_coordinates) || validate_coordinates(x)
+     isnothing(validate_coordinates) || validate_coordinates(y)
+     ref_aux = isnothing(aux) ? nothing : aux.ref_list
+@@ -1205,5 +1198,5 @@ function UpdateCellList!(
+         UpdateCellList!(y, box, target_list, target_aux; parallel, validate_coordinates)
+         y.updated[] = false
+     end
+-    return CellListPair{N, T}(ref_list, target_list)
++    return CellListPair{N,T}(ref_list, target_list)
+ end
+diff --git a/src/internals/NonPeriodicCells.jl b/src/internals/NonPeriodicCells.jl
+new file mode 100644
+index 00000000..36bb2c04
+--- /dev/null
++++ b/src/internals/NonPeriodicCells.jl
+@@ -0,0 +1,352 @@
++#
++# Dedicated computation path for NonPeriodicCell systems.
++#
++# Key differences from the periodic path:
++#   - No coordinate wrapping (positions stored as-is)
++#   - No phantom/image particle creation (replicate_particle! not called)
++#   - Cell list construction uses thread-local histograms instead of atomic CAS loops
++#   - Inner loop and vicinal cell interactions carry no real/image particle checks
++#
++
++# Auxiliary structure for non-periodic cell list construction.
++# thread_counts[ibatch] is a per-thread histogram over cell linear indices;
++# it is repurposed as per-thread write offsets during the scatter phase.
++mutable struct AuxNonPeriodic{N,T}
++    idxs::Vector{UnitRange{Int}}
++    thread_counts::Vector{Vector{Int}}
++    total_np::Vector{Int}
++end
++
++mutable struct AuxNonPeriodicPair{N,T}
++    ref_list::AuxNonPeriodic{N,T}
++    target_list::AuxNonPeriodic{N,T}
++end
++
++function AuxNonPeriodic(cl::CellList{N,T}) where {N,T}
++    _nbatches = nbatches(cl, :build)
++    ncells = cl.number_of_cells
++    idxs = Vector{UnitRange{Int}}(undef, _nbatches)
++    thread_counts = [zeros(Int, ncells) for _ in 1:_nbatches]
++    total_np = zeros(Int, ncells)
++    set_idxs!(idxs, cl.n_real_particles, _nbatches)
++    return AuxNonPeriodic{N,T}(idxs, thread_counts, total_np)
++end
++
++function Base.show(io::IO, ::MIME"text/plain", aux::AuxNonPeriodic)
++    _println(io, typeof(aux))
++    return _print(io, " Auxiliary arrays for nbatches = ", length(aux.idxs))
++end
++
++function AuxNonPeriodicPair(cl_pair::CellListPair{N,T}) where {N,T}
++    return AuxNonPeriodicPair{N,T}(
++        AuxNonPeriodic(cl_pair.ref_list),
++        AuxNonPeriodic(cl_pair.target_list),
++    )
++end
++
++function Base.show(io::IO, ::MIME"text/plain", aux::AuxNonPeriodicPair)
++    _println(io, typeof(aux))
++    return _print(io, " Auxiliary arrays for nbatches = ", (length(aux.ref_list.idxs), length(aux.target_list.idxs)))
++end
++
++#
++# Dispatch helper: creates the appropriate auxiliary structure for the box type.
++# Used in ParticleSystem constructors and update methods so that NonPeriodicCell
++# systems get AuxNonPeriodic while periodic systems get the existing AuxThreaded.
++#
++_create_aux(::Box{NonPeriodicCell}, cl::CellList) = AuxNonPeriodic(cl)
++_create_aux(::Box{NonPeriodicCell}, cl::CellListPair) = AuxNonPeriodicPair(cl)
++
++#
++# add_particles! — no wrapping, no image replication.
++#
++function add_particles!(x, box::Box{NonPeriodicCell}, ishift, cl::CellList{N,T}) where {N,T}
++    for ip in eachindex(x)
++        xp = x[ip]
++        p = SVector{N,T}(ntuple(i -> xp[i], Val(N)))
++        add_particle_to_celllist!(ishift + ip, p, box, cl)
++    end
++    return cl
++end
++
++# Resize projected_particles to hold the largest cell; called after every cell list build.
++function _update_projected_particles!(cl::CellList)
++    maxnp = 0
++    for i in 1:cl.n_cells_with_particles
++        maxnp = max(maxnp, cl.cells[i].n_particles)
++    end
++    for i in eachindex(cl.projected_particles)
++        if maxnp > length(cl.projected_particles[i])
++            resize!(cl.projected_particles[i], maxnp)
++        end
++    end
++end
++
++#
++# Algorithm (parallel path):
++#   Phase 1 — each thread builds a local histogram over cell linear indices (no atomics).
++#   Phase 2a — serial reduction of thread histograms into total_np.
++#   Phase 2b — serial cell initialisation using total_np.
++#   Phase 3 — serial computation of per-thread write offsets (thread_counts repurposed).
++#   Phase 4 — parallel scatter: each thread writes its particles using pre-computed offsets.
++#
++function UpdateCellList!(
++    x::ParticleSystemPositions,
++    box::Box{NonPeriodicCell},
++    cl::CellList{N,T},
++    aux::AuxNonPeriodic{N,T};
++    parallel::Bool=true,
++    validate_coordinates::F=_validate_coordinates,
++) where {N,T,F<:Function}
++
++    isnothing(validate_coordinates) || validate_coordinates(x)
++
++    _nbatches = nbatches(cl, :build)
++    if !parallel || _nbatches == 1
++        reset!(cl, box, length(x))
++        add_particles!(x, box, 0, cl)
++    else
++
++        reset!(cl, box, 0)
++        cl.n_real_particles = length(x)
++        set_idxs!(aux.idxs, length(x), _nbatches)
++
++        number_of_cells = cl.number_of_cells
++        for ibatch in eachindex(aux.thread_counts)
++            if length(aux.thread_counts[ibatch]) < number_of_cells
++                resize!(aux.thread_counts[ibatch], number_of_cells)
++            end
++            fill!(view(aux.thread_counts[ibatch], 1:number_of_cells), 0)
++        end
++        if length(aux.total_np) < number_of_cells
++            resize!(aux.total_np, number_of_cells)
++        end
++        fill!(view(aux.total_np, 1:number_of_cells), 0)
++
++        # Phase 1: thread-local histograms — no atomic operations
++        @sync for ibatch in eachindex(aux.idxs)
++            @spawn begin
++                prange = aux.idxs[ibatch]
++                isempty(prange) && return
++                counts = aux.thread_counts[ibatch]
++                for ip in prange
++                    xp = x[ip]
++                    p = SVector{N,T}(ntuple(i -> xp[i], Val(N)))
++                    ci = real_particle_border_case(particle_cell(p, box), box)
++                    li = cell_linear_index(box.nc, ci)
++                    counts[li] += 1
++                end
++            end
++        end
++
++        # Phase 2a: serial reduction of histograms
++        for ibatch in eachindex(aux.thread_counts)
++            counts = aux.thread_counts[ibatch]
++            for li in 1:number_of_cells
++                aux.total_np[li] += counts[li]
++            end
++        end
++
++        # Phase 2b: serial cell initialisation
++        for li in 1:number_of_cells
++            np = aux.total_np[li]
++            np == 0 && continue
++            cl.n_cells_with_particles += 1
++            cl.n_particles += np
++            cl.cell_indices[li] = cl.n_cells_with_particles
++            cell_index = cl.n_cells_with_particles
++            cartesian_idx = cell_cartesian_indices(box.nc, li)
++            center_c = cell_center(cartesian_idx, box)
++            if cell_index > length(cl.cells)
++                push!(
++                    cl.cells, Cell{N,T}(
++                        linear_index=li,
++                        cartesian_index=cartesian_idx,
++                        center=center_c,
++                        contains_real=true,
++                        n_particles=np,
++                        particles=Vector{ParticleWithIndex{N,T}}(undef, np),
++                    )
++                )
++            else
++                cell = cl.cells[cell_index]
++                @set! cell.linear_index = li
++                @set! cell.cartesian_index = cartesian_idx
++                @set! cell.center = center_c
++                @set! cell.contains_real = true
++                @set! cell.n_particles = np
++                cl.cells[cell_index] = cell
++                if np > length(cl.cells[cell_index].particles)
++                    resize!(cl.cells[cell_index].particles, np)
++                end
++            end
++            # All cells in a non-periodic system contain only real particles
++            cl.n_cells_with_real_particles += 1
++            if cl.n_cells_with_real_particles > length(cl.cell_indices_real)
++                push!(cl.cell_indices_real, cell_index)
++            else
++                cl.cell_indices_real[cl.n_cells_with_real_particles] = cell_index
++            end
++        end
++
++        # Phase 3: compute per-thread write offsets (serial).
++        # thread_counts[ibatch][li] is repurposed: original count → starting write offset
++        # for thread ibatch at cell li.  total_np is reused as a running offset counter.
++        fill!(view(aux.total_np, 1:number_of_cells), 0)
++        for ibatch in eachindex(aux.thread_counts)
++            counts = aux.thread_counts[ibatch]
++            for li in 1:number_of_cells
++                np = counts[li]
++                np == 0 && continue
++                counts[li] = aux.total_np[li]   # starting offset for this batch
++                aux.total_np[li] += np
++            end
++        end
++
++        # Phase 4: parallel scatter — write ranges are disjoint by construction
++        @sync for ibatch in eachindex(aux.idxs)
++            @spawn begin
++                prange = aux.idxs[ibatch]
++                isempty(prange) && return
++                offsets = aux.thread_counts[ibatch]
++                for ip in prange
++                    xp = x[ip]
++                    p = SVector{N,T}(ntuple(i -> xp[i], Val(N)))
++                    ci = real_particle_border_case(particle_cell(p, box), box)
++                    li = cell_linear_index(box.nc, ci)
++                    target_cell_idx = cl.cell_indices[li]
++                    offset = offsets[li]
++                    offsets[li] += 1
++                    cl.cells[target_cell_idx].particles[offset+1] = ParticleWithIndex(ip, true, p)
++                end
++            end
++        end
++
++    end # if/else parallel
++
++    _update_projected_particles!(cl)
++    x.updated[] = false
++    return cl
++end
++
++function UpdateCellList!(
++    x::ParticleSystemPositions,
++    box::Box{NonPeriodicCell},
++    cl::CellList;
++    parallel::Bool=true,
++    validate_coordinates::F=_validate_coordinates,
++) where {F<:Function}
++    if parallel
++        aux = AuxNonPeriodic(cl)
++        cl = UpdateCellList!(x, box, cl, aux; parallel, validate_coordinates)
++    else
++        isnothing(validate_coordinates) || validate_coordinates(x)
++        reset!(cl, box, length(x))
++        add_particles!(x, box, 0, cl)
++        _update_projected_particles!(cl)
++        x.updated[] = false
++    end
++    cl = update_number_of_batches!(cl; parallel)
++    return cl
++end
++
++function UpdateCellList!(
++    x::ParticleSystemPositions,
++    y::ParticleSystemPositions,
++    box::Box{NonPeriodicCell},
++    cl_pair::CellListPair{N,T},
++    aux::AuxNonPeriodicPair{N,T};
++    parallel::Bool=true,
++    validate_coordinates::F=_validate_coordinates,
++) where {N,T,F<:Function}
++    isnothing(validate_coordinates) || validate_coordinates(x)
++    isnothing(validate_coordinates) || validate_coordinates(y)
++    ref_list = cl_pair.ref_list
++    target_list = cl_pair.target_list
++    if x.updated[]
++        UpdateCellList!(x, box, ref_list, aux.ref_list; parallel, validate_coordinates)
++        x.updated[] = false
++    end
++    if y.updated[]
++        UpdateCellList!(y, box, target_list, aux.target_list; parallel, validate_coordinates)
++        y.updated[] = false
++    end
++    return CellListPair{N,T}(ref_list, target_list)
++end
++
++#
++# Inner loop dispatch: forward neighbor iteration avoids double-counting without
++# needing the real/image index checks used in the periodic path.
++#
++inner_loop!(f::F, box::Box{NonPeriodicCell}, cellᵢ, cl::CellList, output, ibatch) where {F<:Function} =
++    inner_loop!(f, neighbor_cells_forward, box, cellᵢ, cl, output, ibatch)
++
++#
++# Self interactions within a single cell: upper-triangle loop, no real/image checks.
++#
++function _current_cell_interactions!(box::Box{NonPeriodicCell}, f::F, cell, output) where {F<:Function}
++    (; cutoff_sqr, inv_rotation) = box
++    for i in 1:(cell.n_particles-1)
++        pᵢ = cell.particles[i]
++        xpᵢ = pᵢ.coordinates
++        xpᵢ_rot = inv_rotation * xpᵢ
++        for j in (i+1):cell.n_particles
++            pⱼ = cell.particles[j]
++            d2 = sum(abs2, xpᵢ - pⱼ.coordinates)
++            if d2 <= cutoff_sqr
++                pair = NeighborPair(pᵢ.index, pⱼ.index, xpᵢ_rot, inv_rotation * pⱼ.coordinates, d2)
++                output = f(pair, output)
++            end
++        end
++    end
++    return output
++end
++
++#
++# Cross interactions between two cells (CellListPair): all pairs, no real/image checks.
++#
++function _current_cell_interactions!(
++    box::Box{NonPeriodicCell}, f::F, cellᵢ::Cell, cellⱼ::Cell, output
++) where {F<:Function}
++    (; cutoff_sqr, inv_rotation) = box
++    for i in 1:cellᵢ.n_particles
++        pᵢ = cellᵢ.particles[i]
++        xpᵢ = pᵢ.coordinates
++        xpᵢ_rot = inv_rotation * xpᵢ
++        for j in 1:cellⱼ.n_particles
++            pⱼ = cellⱼ.particles[j]
++            d2 = sum(abs2, xpᵢ - pⱼ.coordinates)
++            if d2 <= cutoff_sqr
++                pair = NeighborPair(pᵢ.index, pⱼ.index, xpᵢ_rot, inv_rotation * pⱼ.coordinates, d2)
++                output = f(pair, output)
++            end
++        end
++    end
++    return output
++end
++
++#
++# Vicinal cell interactions: no real/image checks needed; Skip is irrelevant because
++# forward-only neighbor iteration already prevents double-counting for self computations.
++#
++function _vinicial_cells!(
++    f::F, box::Box{NonPeriodicCell}, cellᵢ, pp, Δc, output, ::Val
++) where {F<:Function}
++    (; cutoff, cutoff_sqr, inv_rotation) = box
++    for i in 1:cellᵢ.n_particles
++        pᵢ = cellᵢ.particles[i]
++        xpᵢ = pᵢ.coordinates
++        xpᵢ_rot = inv_rotation * xpᵢ
++        xproj = dot(xpᵢ - cellᵢ.center, Δc)
++        n = partition!(el -> abs(el.xproj - xproj) <= cutoff, pp)
++        for j in 1:n
++            pⱼ = pp[j]
++            d2 = sum(abs2, xpᵢ - pⱼ.coordinates)
++            if d2 <= cutoff_sqr
++                pair = NeighborPair(pᵢ.index, pⱼ.index, xpᵢ_rot, inv_rotation * pⱼ.coordinates, d2)
++                output = f(pair, output)
++            end
++        end
++    end
++    return output
++end
+diff --git a/src/internals/ParticleSystem.jl b/src/internals/ParticleSystem.jl
+index 56af3b1c..e9478150 100644
+--- a/src/internals/ParticleSystem.jl
++++ b/src/internals/ParticleSystem.jl
+@@ -103,7 +103,7 @@ function UpdateParticleSystem!(sys::ParticleSystem1)
+             sys._cell_list = update_number_of_batches!(sys._cell_list; parallel = sys.parallel)
+             _new_nbatches = get_nbatches(sys)
+             if _old_nbatches != _new_nbatches
+-                sys._aux = AuxThreaded(sys._cell_list)
++                sys._aux = _create_aux(sys._box, sys._cell_list)
+                 sys._output_threaded = [copy_output(sys.output) for _ in 1:_new_nbatches[2]]
+             end
+         end
+@@ -150,7 +150,7 @@ function UpdateParticleSystem!(sys::ParticleSystem2)
+             sys._cell_list = update_number_of_batches!(sys._cell_list; parallel = sys.parallel)
+             _new_nbatches = get_nbatches(sys)
+             if _old_nbatches != _new_nbatches
+-                sys._aux = AuxThreaded(sys._cell_list)
++                sys._aux = _create_aux(sys._box, sys._cell_list)
+                 sys._output_threaded = [copy_output(sys.output) for _ in 1:_new_nbatches[2]]
+             end
+         end
+diff --git a/src/internals/self.jl b/src/internals/self.jl
+index 3b39be66..9e6b1de5 100644
+--- a/src/internals/self.jl
++++ b/src/internals/self.jl
+@@ -103,7 +103,7 @@ end
+ # Inner loop for Orthorhombic cells is faster because we can guarantee that
+ # there are not repeated computations even if running over half of the cells.
+ #
+-inner_loop!(f::F, box::Box{<:OrthorhombicCellType}, cellᵢ, cl::CellList, output, ibatch) where {F <: Function} =
++inner_loop!(f::F, box::Box{OrthorhombicCell}, cellᵢ, cl::CellList, output, ibatch) where {F <: Function} =
+     inner_loop!(f, neighbor_cells_forward, box, cellᵢ, cl, output, ibatch)
+ inner_loop!(f::F, box::Box{<:TriclinicCell}, cellᵢ, cl::CellList, output, ibatch) where {F <: Function} =
+     inner_loop!(f, neighbor_cells, box, cellᵢ, cl, output, ibatch)
+@@ -140,7 +140,7 @@ end
+ 
+ # Call with single cell: this implies that this is a self-computation, and thus we loop over the
+ # upper triangle only in the case of the Orthorhombic cell
+-function _current_cell_interactions!(box::Box{<:OrthorhombicCellType}, f::F, cell, output) where {F <: Function}
++function _current_cell_interactions!(box::Box{OrthorhombicCell}, f::F, cell, output) where {F <: Function}
+     (; cutoff_sqr, inv_rotation) = box
+     # loop over list of non-repeated particles of cell ic.
+     for i in 1:(cell.n_particles - 1)
+diff --git a/src/internals/vicinal_cells.jl b/src/internals/vicinal_cells.jl
+index 04605757..80bff661 100644
+--- a/src/internals/vicinal_cells.jl
++++ b/src/internals/vicinal_cells.jl
+@@ -18,7 +18,7 @@ end
+ # first parameter (the type Self, or Cross, computation, is not needed here, because the symmetry
+ # allows to never compute repeated interactions anyway.
+ #
+-function _vinicial_cells!(f::F, box::Box{<:OrthorhombicCellType}, cellᵢ, pp, Δc, output, ::Val{Skip}) where {F <: Function, Skip}
++function _vinicial_cells!(f::F, box::Box{OrthorhombicCell}, cellᵢ, pp, Δc, output, ::Val{Skip}) where {F <: Function, Skip}
+     (; cutoff, cutoff_sqr, inv_rotation) = box
+     # Loop over particles of cell icell
+     for i in 1:cellᵢ.n_particles
+diff --git a/test/API/neighborlists.jl b/test/API/neighborlists.jl
+index 7e51fc48..b36b212f 100644
+--- a/test/API/neighborlists.jl
++++ b/test/API/neighborlists.jl
+@@ -384,6 +384,24 @@ end
+         @test is_unique(cl; self = false)
+         @test compare_nb_lists(cl, nb, y, x, r)[1]
+ 
++        # Updating coordinates
++        x = [rand(SVector{N, Float64}) for _ in 1:500]
++        y = [rand(SVector{N, Float64}) for _ in 1:250]
++        nb = nl_NN(BallTree, inrange, x, y, r)
++
++        nbs = InPlaceNeighborList(xpositions=x, ypositions=y, cutoff=r)
++        cl = CellListMap.neighborlist!(nbs)
++        @test is_unique(cl; self = false)
++        @test compare_nb_lists(cl, nb, x, y, r)[1]
++
++        x = [rand(SVector{N, Float64}) for _ in 1:250]
++        y = [rand(SVector{N, Float64}) for _ in 1:500]
++        nb = nl_NN(BallTree, inrange, x, y, r)
++        update!(nbs; xpositions=x, ypositions=y, cutoff=r)
++        cl = CellListMap.neighborlist!(nbs)
++        @test is_unique(cl; self = false)
++        @test compare_nb_lists(cl, nb, x, y, r)[1]
++
+     end
+ 
+ end
+diff --git a/test/internals/NonPeriodicCells.jl b/test/internals/NonPeriodicCells.jl
+new file mode 100644
+index 00000000..19141399
+--- /dev/null
++++ b/test/internals/NonPeriodicCells.jl
+@@ -0,0 +1,23 @@
++@testitem "NonPeriodicCells"  begin
++    using CellListMap
++    using StaticArrays
++    using ShowMethodTesting
++
++    x = rand(SVector{3,Float64}, 90)
++    y = rand(SVector{3,Float64}, 130)
++
++    # These show methods are now internal and will be probably removed.
++
++    sys = ParticleSystem(positions=x, cutoff=0.1, output=0.0, nbatches=(4,4))
++    @test parse_show(sys._aux; repl = Dict("CellListMap." => "")) ≈ """ 
++        CellListMap.AuxNonPeriodic{3, Float64}
++        Auxiliary arrays for nbatches = 4
++    """
++
++    sys2 = ParticleSystem(xpositions=x, ypositions=y, cutoff=0.1, output=0.0, nbatches=(4,4))
++    @test parse_show(sys2._aux; repl = Dict("CellListMap." => "")) ≈ """ 
++        CellListMap.AuxNonPeriodicPair{3, Float64}
++        Auxiliary arrays for nbatches = (4, 4)
++    """
++
++end
+\ No newline at end of file

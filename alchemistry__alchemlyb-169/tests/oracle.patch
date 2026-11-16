@@ -1,0 +1,280 @@
+diff --git a/CHANGES b/CHANGES
+index cc6b0ebf..10718ca3 100644
+--- a/CHANGES
++++ b/CHANGES
+@@ -20,7 +20,11 @@ The rules for this file:
+ Changes
+ 
+ Enhancements
+-  - support for Interleaved Double-Wide Sampling (IDWS) in NAMD (PR #135)
++  - support for Interleaved Double-Wide Sampling (IDWS) in NAMD (PR #135).
++    Windows may be split across NAMD .fepout files, allowing for interrupted
++    and restarted simulations, but each window must be complete (issue #145).
++    Various malformations of input files are detected, where lambdas do not
++    monotonically increase or decrease, or are inconsistent or missing.
+   - Convenience function for decorrelating u_nk and dHdl (PR #163).
+ 
+ Fixes
+diff --git a/src/alchemlyb/parsing/namd.py b/src/alchemlyb/parsing/namd.py
+index 2aafbee7..e1665e7c 100644
+--- a/src/alchemlyb/parsing/namd.py
++++ b/src/alchemlyb/parsing/namd.py
+@@ -3,6 +3,8 @@
+ """
+ import pandas as pd
+ import numpy as np
++from os.path import basename
++from re import split
+ import logging
+ from .util import anyopen
+ from . import _init_attrs
+@@ -13,6 +15,15 @@
+ k_b = R_kJmol * kJ2kcal
+ 
+ 
++def _filename_sort_key(s):
++    """Key for natural-sorting filenames, ignoring the path.
++
++    This means that unlike with the standard Python sorted() function, "foo9" < "foo10".
++    """
++
++    return [int(t) if t.isdigit() else t.lower() for t in split(r'(\d+)', basename(s))]
++
++
+ def _get_lambdas(fep_files):
+     """Retrieves all lambda values included in the FEP files provided.
+     
+@@ -36,7 +47,7 @@ def _get_lambdas(fep_files):
+     is_ascending = set()
+     endpoint_windows = []
+ 
+-    for fep_file in sorted(fep_files):
++    for fep_file in sorted(fep_files, key=_filename_sort_key):
+         with anyopen(fep_file, 'r') as f:
+             for line in f:
+                 l = line.strip().split()
+@@ -101,7 +112,17 @@ def extract_u_nk(fep_files, T):
+     Parameters
+     ----------
+     fep_file : str or list of str
+-        Path to fepout file(s) to extract data from.
++        Path to fepout file(s) to extract data from. These are sorted by filename,
++        not including the path, prior to processing, using natural-sort. This way,
++        filenames including numbers without leading zeros are handled intuitively.
++
++        Windows may be split across files, or more than one window may be present
++        in a given file. Windows without footer lines (which may be in a different
++        file than the respective header lines) will raise an error. This means that
++        while windows may have been interrupted and restarted, they must be
++        complete. Lambda values are expected to increase or decrease monotonically,
++        and match between header and footer of each window.
++
+     T : float
+         Temperature in Kelvin at which the simulation was sampled.
+ 
+@@ -121,7 +142,8 @@ def extract_u_nk(fep_files, T):
+         the constants used by the corresponding MD engine.
+ 
+     .. versionchanged:: 0.6.0
+-        Support for Interleaved Double-Wide Sampling files added.
++        Support for Interleaved Double-Wide Sampling files added, with various
++        robustness checks.
+ 
+         `fep_files` can now be a list of filenames.
+     """
+@@ -150,7 +172,8 @@ def extract_u_nk(fep_files, T):
+     # We keep track of which lambda window we're in, but since it can span multiple files,
+     # only reset these variables here and after the end of each window
+     lambda1_at_start, lambda2_at_start, lambda_idws_at_start = None, None, None
+-    for fep_file in sorted(fep_files):
++
++    for fep_file in sorted(fep_files, key=_filename_sort_key):
+         # Note we have not set parsing=False because we could be continuing one window across
+         # more than one fepout file
+         with anyopen(fep_file, 'r') as f:
+@@ -168,6 +191,11 @@ def extract_u_nk(fep_files, T):
+                 # within the same file, then complain. This can happen if truncated fepout files
+                 # are presented in the wrong order.
+                 if l[0] == '#NEW':
++                    if parsing:
++                        logger.error(f'Window with lambda1: {lambda1_at_start} lambda2: {lambda2_at_start} lambda_idws: {lambda_idws_at_start} appears truncated')
++                        logger.error(f'because a new window was encountered in {fep_file} before the previous one finished.')
++                        raise ValueError('New window begun after truncated window')
++
+                     lambda1_at_start, lambda2_at_start = float(l[6]), float(l[8])
+                     lambda_idws_at_start = float(l[10]) if 'LAMBDA_IDWS' in l else None
+                     has_idws = True if lambda_idws_at_start is not None else False
+@@ -264,6 +292,8 @@ def extract_u_nk(fep_files, T):
+ 
+     if len(win_de) != 0 or len(win_de_back) != 0: # pragma: no cover
+         logger.warning('Trailing data without footer line (\"#Free energy...\"). Interrupted run?')
++        raise ValueError('Last window is truncated')
++
+ 
+     if lambda2 in (0.0, 1.0):
+         # this excludes the IDWS case where a dataframe already exists for both endpoints
+diff --git a/src/alchemlyb/tests/parsing/test_namd.py b/src/alchemlyb/tests/parsing/test_namd.py
+index fe003f33..d12ff65d 100644
+--- a/src/alchemlyb/tests/parsing/test_namd.py
++++ b/src/alchemlyb/tests/parsing/test_namd.py
+@@ -73,6 +73,9 @@ def _corrupt_fepout(fepout_in, params, tmp_path):
+         a modified list of tokens that will be reassembled into the line to be
+         output.
+ 
++        The function may return None if this line should not be written. This
++        can be used to delete lines from the fepout.
++
+     Returns
+     -------
+     The name of a temporary file which pytest will unlink.
+@@ -84,8 +87,10 @@ def _corrupt_fepout(fepout_in, params, tmp_path):
+             for line in f_in:
+                 for prefix, func in params:
+                     if line.startswith(prefix):
+-                        line = ' '.join(func(line.split())) + '\n'
+-                f_out.write(line)
++                        tokens_out = func(line.split())
++                        line = ' '.join(tokens_out) + '\n' if tokens_out is not None else None
++                if line is not None:
++                    f_out.write(line)
+     return str(fepout_out)
+ 
+ 
+@@ -105,12 +110,14 @@ def func_free_line(l):
+         return l
+ 
+     for i in range(len(filenames)):
+-        restarted_dataset['data']['both'][i] = \
+-            _corrupt_fepout(filenames[i], [('#Free', func_free_line)], tmp_path)
++        filenames[i] = _corrupt_fepout(filenames[i], [('#Free', func_free_line)], tmp_path)
+         # Only actually modify one window so we don't trigger the wrong exception
+         if changed is True:
+             break
+ 
++    # Don't directly modify the glob object
++    restarted_dataset['data']['both'] = filenames
++
+     return restarted_dataset
+ 
+ 
+@@ -170,9 +177,10 @@ def func_free_line(l):
+         return l
+ 
+     for i in range(len(filenames)):
+-        restarted_dataset['data']['both'][i] = \
++        filenames[i] = \
+             _corrupt_fepout(filenames[i], [('#NEW', func_new_line), ('#Free', func_free_line)], tmp_path)
+ 
++    restarted_dataset['data']['both'] = filenames
+     return restarted_dataset
+ 
+ 
+@@ -204,8 +212,9 @@ def func_free_line(l):
+         return l
+ 
+     for i in range(len(filenames)):
+-        restarted_dataset['data']['both'][i] = _corrupt_fepout(filenames[i], [('#NEW', func_new_line)], tmp_path)
++        filenames[i] = _corrupt_fepout(filenames[i], [('#NEW', func_new_line)], tmp_path)
+ 
++    restarted_dataset['data']['both'] = filenames
+     return restarted_dataset
+ 
+ 
+@@ -226,7 +235,38 @@ def func_free_line(l):
+     # Reverse the direction of lambdas for this window
+     idx_to_corrupt = filenames.index(sorted(filenames)[-3])
+     fname1 = _corrupt_fepout(filenames[idx_to_corrupt], [('#NEW', func_new_line), ('#Free', func_free_line)], tmp_path)
+-    restarted_dataset['data']['both'][idx_to_corrupt] = fname1
++    filenames[idx_to_corrupt] = fname1
++    restarted_dataset['data']['both'] = filenames
++    return restarted_dataset
++
++
++@pytest.fixture
++def restarted_dataset_all_windows_truncated(restarted_dataset, tmp_path):
++    """Returns dataset where all windows are truncated (no #Free... footer lines)."""
++
++    filenames = sorted(restarted_dataset['data']['both'])
++
++    def func_free_line(l):
++        return None
++
++    for i in range(len(filenames)):
++        filenames[i] = _corrupt_fepout(filenames[i], [('#Free', func_free_line)], tmp_path)
++    
++    restarted_dataset['data']['both'] = filenames
++    return restarted_dataset
++
++
++@pytest.fixture
++def restarted_dataset_last_window_truncated(restarted_dataset, tmp_path):
++    """Returns dataset where the last window is truncated (no #Free... footer line)."""
++
++    filenames = sorted(restarted_dataset['data']['both'])
++
++    def func_free_line(l):
++        return None
++
++    filenames[-1] = _corrupt_fepout(filenames[-1], [('#Free', func_free_line)], tmp_path)
++    restarted_dataset['data']['both'] = filenames
+     return restarted_dataset
+ 
+ 
+@@ -241,6 +281,19 @@ def test_u_nk_restarted():
+     assert u_nk.shape == (30061, 11)
+ 
+ 
++def test_u_nk_restarted_missing_window_header(tmp_path):
++    """Test that u_nk has the correct form when a #NEW line is missing from the restarted dataset
++    and the parser has to infer lambda_idws for that window."""
++    filenames = sorted(load_restarted()['data']['both'])
++    # Remove "#NEW" line
++    filenames[4] = _corrupt_fepout(filenames[4], [('#NEW', lambda l: None),], tmp_path)
++
++    u_nk = extract_u_nk(filenames, T=300)
++    
++    assert u_nk.index.names == ['time', 'fep-lambda']
++    assert u_nk.shape == (30061, 11)
++
++
+ def test_u_nk_restarted_reversed():
+     filenames = load_restarted_reversed()['data']['both']
+     u_nk = extract_u_nk(filenames, T=300)
+@@ -249,6 +302,19 @@ def test_u_nk_restarted_reversed():
+     assert u_nk.shape == (30170, 11)
+ 
+ 
++def test_u_nk_restarted_reversed_missing_window_header(tmp_path):
++    """Test that u_nk has the correct form when a #NEW line is missing from the restarted_reversed dataset
++    and the parser has to infer lambda_idws for that window."""
++    filenames = sorted(load_restarted_reversed()['data']['both'])
++    # Remove "#NEW" line
++    filenames[4] = _corrupt_fepout(filenames[4], [('#NEW', lambda l: None),], tmp_path)
++
++    u_nk = extract_u_nk(filenames, T=300)
++    
++    assert u_nk.index.names == ['time', 'fep-lambda']
++    assert u_nk.shape == (30170, 11)
++
++
+ def test_u_nk_restarted_direction_changed(restarted_dataset_direction_changed):
+     """Test that when lambda values change direction within a dataset, parsing throws an error."""
+ 
+@@ -288,3 +354,17 @@ def test_u_nk_restarted_toomany_lambda2(restarted_dataset_toomany_lambda2):
+ 
+     with pytest.raises(ValueError, match='More than one lambda2 value for a particular lambda1'):
+         u_nk = extract_u_nk(restarted_dataset_toomany_lambda2['data']['both'], T=300)
++
++
++def test_u_nk_restarted_all_windows_truncated(restarted_dataset_all_windows_truncated):
++    """Test that when there is more than one lambda2 for a given lambda1, parsing throws an error."""
++
++    with pytest.raises(ValueError, match='New window begun after truncated window'):
++        u_nk = extract_u_nk(restarted_dataset_all_windows_truncated['data']['both'], T=300)
++
++
++def test_u_nk_restarted_last_window_truncated(restarted_dataset_last_window_truncated):
++    """Test that when there is more than one lambda2 for a given lambda1, parsing throws an error."""
++
++    with pytest.raises(ValueError, match='Last window is truncated'):
++        u_nk = extract_u_nk(restarted_dataset_last_window_truncated['data']['both'], T=300)

@@ -1,0 +1,606 @@
+diff --git a/tests/test_free_energy.py b/tests/test_free_energy.py
+index 86c0bca86e..2a3c3f785a 100644
+--- a/tests/test_free_energy.py
++++ b/tests/test_free_energy.py
+@@ -672,3 +672,24 @@ def modify_nb_cutoff(nb):
+         [replace(sp, potential=replace(sp.potential, params_init=params_init_1))],
+         r"shape mismatch in field \$\.\[\d\].params_init\.\[0\]",
+     )
++
++
++def test_initial_state_to_bound_impl():
++    # get initial state : near-duplicate of pytest fixture
++    # initial_state = solvent_hif2a_ligand_pair_single_topology_lam0_state()
++    mol_a, mol_b, core = get_hif2a_ligand_pair_single_topology()
++    forcefield = Forcefield.load_default()
++    st = SingleTopology(mol_a, mol_b, core, forcefield)
++    solvent_sys, solvent_conf, solvent_box, solvent_top = builders.build_water_system(
++        3.0, forcefield.water_ff, mols=[st.mol_a, st.mol_b]
++    )
++    solvent_host_config = HostConfig(solvent_sys, solvent_conf, solvent_box, solvent_conf.shape[0], solvent_top)
++    solvent_host = setup_optimized_host(st, solvent_host_config)
++    initial_state = setup_initial_states(st, solvent_host, DEFAULT_TEMP, [0.5], 2024)[0]
++
++    # minimal test
++    bound_impl = initial_state.to_bound_impl()
++    x, box = initial_state.x0, initial_state.box0
++    du_dx, u = bound_impl.execute(x, box, compute_du_dx=True, compute_u=True)
++    assert np.isfinite(u)
++    assert np.isfinite(du_dx).all()
+diff --git a/tests/test_protocol_optimization.py b/tests/test_protocol_optimization.py
+index d514095076..f2f624e2c9 100644
+--- a/tests/test_protocol_optimization.py
++++ b/tests/test_protocol_optimization.py
+@@ -6,23 +6,27 @@
+ from pymbar.testsystems import HarmonicOscillatorsTestCase
+ from scipy.special import logsumexp
+ 
++from timemachine.fe.rbfe import estimate_relative_free_energy_bisection
++from timemachine.ff import Forcefield
+ from timemachine.optimize.protocol import (
+     construct_work_stddev_estimator,
++    greedily_optimize_protocol,
+     linear_u_kn_interpolant,
+     log_weights_from_mixture,
+-    rebalance_initial_protocol,
++    make_fast_approx_overlap_distance_fxn,
++    rebalance_initial_protocol_by_work_stddev,
+ )
++from timemachine.testsystems.relative import get_hif2a_ligand_pair_single_topology
+ 
+ np.random.seed(2021)
+ 
+-pytestmark = [pytest.mark.nocuda]
+-
+ 
++@pytest.mark.nocuda
+ def test_rebalance_initial_protocol():
+     """Integration test: assert that protocol optimization improves run-to-run variance in free energy estimates"""
+     initial_protocol = np.linspace(0, 1, 64)
+     mbar = simulate_protocol(initial_protocol, seed=2021)
+-    new_protocol = rebalance_initial_protocol(
++    new_protocol = rebalance_initial_protocol_by_work_stddev(
+         initial_protocol,
+         mbar.f_k,
+         mbar.u_kn,
+@@ -52,6 +56,7 @@ def test_rebalance_initial_protocol():
+     assert new_stddev < old_stddev
+ 
+ 
++@pytest.mark.nocuda
+ def test_log_weights_from_mixture():
+     """Assert self-consistency between
+     (1) delta_f from mbar.f_k[-1] - mbar.f_k[0] and
+@@ -72,6 +77,7 @@ def test_log_weights_from_mixture():
+     np.testing.assert_almost_equal(source_delta_f, recons_delta_f)
+ 
+ 
++@pytest.mark.nocuda
+ def test_linear_u_kn_interpolant():
+     """Assert self-consistency with input"""
+     lambdas = np.linspace(0, 1, 64)
+@@ -83,6 +89,7 @@ def test_linear_u_kn_interpolant():
+         np.testing.assert_allclose(mbar.u_kn[k], vec_u_interp(lambdas[k]))
+ 
+ 
++@pytest.mark.nocuda
+ def test_work_stddev_estimator():
+     """Assert nonegative, assert bigger estimates for more distant pairs"""
+     lambdas = np.linspace(0, 1, 64)
+@@ -121,3 +128,110 @@ def simulate_protocol(lambdas_k, n_samples_per_window=100, seed=None):
+         xs, u_kn, N_k, s_n = testsystem.sample(N_k, seed=seed)
+     mbar = MBAR(u_kn, N_k)
+     return mbar
++
++
++def summarize_protocol(lambdas, dist_fxn):
++    K = len(lambdas)
++    neighbor_distances = []
++    for k in range(K - 1):
++        neighbor_distances.append(dist_fxn(lambdas[k], lambdas[k + 1]))
++    neighbor_distances = np.array(neighbor_distances)
++    min_dist, max_dist = np.min(neighbor_distances), np.max(neighbor_distances)
++    msg = f"\t# states = {K}, min(d(i,i+1)) = {min_dist:.3f}, max(d(i,i+1)) = {max_dist:.3f}"
++    msg += f"\t{str(neighbor_distances)}"
++    print(msg)
++    return neighbor_distances
++
++
++@pytest.mark.nocuda
++def test_overlap_rebalancing_on_gaussian():
++    # initial_lams = linspace(0,1), along a path where nonuniform lams are probably better
++    initial_num_states = 20
++
++    def initial_path(lam):
++        offset = lam * 4
++        force_constant = 2 ** (4 * lam)
++        return (offset, force_constant)
++
++    initial_lams = np.linspace(0, 1, initial_num_states)
++    initial_params = [initial_path(lam) for lam in initial_lams]
++
++    with patch("numpy.int", int):
++        # make a pymbar test case
++        O_k = [offset for (offset, _) in initial_params]
++        K_k = [force_constant for (_, force_constant) in initial_params]
++        test_case = HarmonicOscillatorsTestCase(O_k=O_k, K_k=K_k)
++
++        # get samples, estimate free energies
++        _, u_kn, N_k, _ = test_case.sample(N_k=[100] * initial_num_states)
++        mbar = MBAR(u_kn, N_k)
++        f_k = mbar.f_k
++
++    # make a fast d(lam_i, lam_j) fxn
++    overlap_dist = make_fast_approx_overlap_distance_fxn(initial_lams, u_kn, f_k, N_k)
++
++    print("initial protocol: ")
++    _ = summarize_protocol(initial_lams, overlap_dist)
++
++    # optimize for a target neighbor distance
++    target_overlap = 0.1
++    target_dist = 1 - target_overlap
++    print(f"optimized with target dist = {target_dist} (target overlap = {target_overlap}):")
++    xtol = 1e-4
++    greedy_prot = greedily_optimize_protocol(overlap_dist, target_dist, bisection_xtol=xtol)
++    greedy_nbr_dist = summarize_protocol(greedy_prot, overlap_dist)
++    assert np.max(greedy_nbr_dist) <= target_dist + (10 * xtol)
++
++    # also, sanity-check the overlap_dist function: d(x,x)==0, d(x,y)==d(y,x), x<y<z => d(x,y)<d(x,z)
++    rng = np.random.default_rng(2024)
++    random_lams = rng.uniform(0, 1, 20)
++    self_distances = [overlap_dist(lam, lam) for lam in random_lams]
++    np.testing.assert_allclose(self_distances, 0.0, atol=1e-10)
++    for lam_i in random_lams:
++        # compare to some random lam_j between lam_i and 1
++        lams_above = sorted(set(rng.uniform(lam_i, 1, 5)))
++        distances_to_sorted_larger_lams = np.array([overlap_dist(lam_i, lam_j) for lam_j in lams_above])
++
++        # assert x < y < z implies d(x, y) <= d(x, z)
++        eps = 1e-3
++        np.testing.assert_array_less(distances_to_sorted_larger_lams[:-1], distances_to_sorted_larger_lams[1:] + eps)
++
++        # assert symmetric
++        _distances_flipped = np.array([overlap_dist(lam_j, lam_i) for lam_j in lams_above])
++        np.testing.assert_allclose(distances_to_sorted_larger_lams, _distances_flipped)
++
++
++@pytest.mark.nightly(reason="Slow")
++def test_greedy_overlap_on_st_vacuum():
++    # get bisection result
++    mol_a, mol_b, core = get_hif2a_ligand_pair_single_topology()
++    ff = Forcefield.load_default()
++    bisection_result = estimate_relative_free_energy_bisection(
++        mol_a, mol_b, core, ff, None, n_windows=48, min_overlap=2 / 3
++    )
++
++    # get MBAR inputs, lambdas
++    u_kn, N_k = bisection_result.compute_u_kn()
++    lambdas = np.array([s.lamb for s in bisection_result.final_result.initial_states])
++
++    # make approx overlap distance fxn
++    f_k = MBAR(u_kn, N_k).f_k
++    overlap_dist = make_fast_approx_overlap_distance_fxn(lambdas, u_kn, f_k, N_k)
++
++    # call protocol optimization, with various target values for neighbor overlap
++    print("initial protocol (from bisection): ")
++    _ = summarize_protocol(lambdas, overlap_dist)
++    target_overlap_levels = [0.05, 0.1, 0.2, 0.4, 0.666]
++    protocol_lengths = []
++    for target_overlap in target_overlap_levels:
++        target_dist = 1 - target_overlap
++        print(f"optimized with target dist = {target_dist} (target overlap = {target_overlap}):")
++        xtol = 1e-4
++        greedy_prot = greedily_optimize_protocol(overlap_dist, target_dist, bisection_xtol=xtol)
++        greedy_nbr_dist = summarize_protocol(greedy_prot, overlap_dist)
++        protocol_length = len(greedy_prot)
++        assert protocol_length < len(lambdas), "surprise: optimized protocol is longer than initial protocol"
++        max_dist_lt_target_dist = np.max(greedy_nbr_dist) <= target_dist + (10 * xtol)
++        assert max_dist_lt_target_dist, "failure: optimized protocol didn't satisfy overlap target"
++        protocol_lengths.append(protocol_length)
++    assert np.all(np.diff(protocol_lengths) >= 0), "surprise: more stringent overlap target -> fewer windows"
+diff --git a/timemachine/fe/free_energy.py b/timemachine/fe/free_energy.py
+index 1a58f04188..0ca5c2fb73 100644
+--- a/timemachine/fe/free_energy.py
++++ b/timemachine/fe/free_energy.py
+@@ -7,6 +7,7 @@
+ import jax
+ import numpy as np
+ from numpy.typing import NDArray
++from pymbar.utils import kln_to_kn
+ 
+ from timemachine.constants import BOLTZ
+ from timemachine.fe import model_utils, topology
+@@ -34,7 +35,14 @@
+ from timemachine.md.exchange.exchange_mover import get_water_idxs
+ from timemachine.md.hrex import HREX, HREXDiagnostics, ReplicaIdx, StateIdx, get_swap_attempts_per_iter_heuristic
+ from timemachine.md.states import CoordsVelBox
+-from timemachine.potentials import BoundPotential, HarmonicBond, Nonbonded, NonbondedInteractionGroup, SummedPotential
++from timemachine.potentials import (
++    BoundPotential,
++    HarmonicBond,
++    Nonbonded,
++    NonbondedInteractionGroup,
++    SummedPotential,
++    make_summed_potential,
++)
+ from timemachine.potentials.potential import get_bound_potential_by_type
+ from timemachine.utils import batches, pairwise_transform_and_combine
+ 
+@@ -163,6 +171,9 @@ def __post_init__(self):
+         assert self.ligand_idxs.dtype == np.int32 or self.ligand_idxs.dtype == np.int64
+         assert self.protein_idxs.dtype == np.int32 or self.protein_idxs.dtype == np.int64
+ 
++    def to_bound_impl(self, precision=np.float32):
++        return make_summed_potential(self.potentials).to_gpu(precision).bound_impl
++
+ 
+ @dataclass
+ class BarResult:
+@@ -268,6 +279,11 @@ def frames(self) -> List[StoredArrays]:
+     def boxes(self) -> List[NDArray]:
+         return [np.array(traj.boxes) for traj in self.trajectories]
+ 
++    def compute_u_kn(self) -> Tuple[NDArray, NDArray]:
++        """get MBAR input matrices u_kn and N_k"""
++
++        return compute_u_kn(self.trajectories, self.final_result.initial_states)
++
+ 
+ @dataclass
+ class HREXSimulationResult(SimulationResult):
+@@ -1120,6 +1136,97 @@ def compute_dense():
+     return U_kl
+ 
+ 
++def make_u_kl_fxn(trajs, initial_states):
++    """fxn(k, l) = "trajs[k] evaluated in ensembles[l]"
++
++    usage note: be careful of axis-ordering convention, see: https://github.com/proteneer/timemachine/issues/1100
++    """
++
++    # validate assumption that initial states all have compatible potentials / ensembles
++    kBTs = [BOLTZ * state.integrator.temperature for state in initial_states]
++    assert len(set(kBTs)) == 1
++
++    s_0 = initial_states[0]
++    sp = make_summed_potential(s_0.potentials)
++    K = len(initial_states)
++    P = len(sp.params)
++    all_params = np.zeros((K, P))
++    all_params[0] = sp.params
++    for i in range(1, K):
++        s = initial_states[i]
++        assert_ensembles_compatible(s_0, s)
++        assert_potentials_compatible(s_0.potentials, s.potentials)
++        all_params[i] = make_summed_potential(s.potentials).params
++
++    sp_gpu = sp.potential.to_gpu(np.float32)
++
++    def batch_U_fxn(xs, ps, bs, x_idxs, p_idxs):
++        Us = sp_gpu.unbound_impl.execute_batch_sparse(xs, ps, bs, x_idxs, p_idxs, False, False, True)[2]
++        return np.nan_to_num(Us, nan=+np.inf)
++
++    def u_kl(k, l):
++        coords = trajs[k].frames
++        boxes = trajs[k].boxes
++
++        params = np.array([all_params[l]])
++
++        coords_batch_idxs = np.arange(len(coords)).astype(np.uint32)
++        params_batch_idxs = np.zeros_like(coords_batch_idxs).astype(np.uint32)
++
++        Us = batch_U_fxn(coords, params, boxes, coords_batch_idxs, params_batch_idxs)
++
++        return Us / kBTs[l]
++
++    return u_kl
++
++
++def assert_ensembles_compatible(state_a: InitialState, state_b: InitialState):
++    """check that xvb from state_a can be swapped with xvb from state_b (up to timestep error),
++    with swap acceptance probability that depends only on U_a, U_b, kBT"""
++
++    # assert (A, B) have identical masses, temperature
++    intg_a = state_a.integrator
++    intg_b = state_b.integrator
++
++    assert (intg_a.masses == intg_b.masses).all()
++    assert intg_a.temperature == intg_b.temperature
++
++    # assert same pressure (or same volume)
++    assert (state_a.barostat is None) == (state_b.barostat is None), "should both be NVT or both be NPT"
++
++    if state_a.barostat and state_b.barostat:
++        # assert (A, B) are compatible NPT ensembles
++        baro_a: MonteCarloBarostat = state_a.barostat
++        baro_b: MonteCarloBarostat = state_b.barostat
++
++        assert baro_a.pressure == baro_b.pressure
++        assert baro_a.temperature == baro_b.temperature
++
++        # also, assert barostat and integrator are self-consistent
++        assert intg_a.temperature == baro_a.temperature
++
++    else:
++        # assert (A, B) are compatible NVT ensembles
++        assert (state_a.box0 == state_b.box0).all()
++
++
++def compute_u_kn(trajs, initial_states) -> Tuple[NDArray, NDArray]:
++    """makes K^2 calls to execute_batch_sparse"""
++
++    u_kl = make_u_kl_fxn(trajs, initial_states)
++    N_k = [len(traj.frames) for traj in trajs]
++    K = len(N_k)
++    assert len(initial_states) == K
++
++    u_kln = np.nan * np.zeros((K, K, max(N_k)))
++    for k in range(K):
++        for l in range(K):
++            u_kln[k, l, : N_k[k]] = u_kl(k, l)
++
++    u_kn = kln_to_kn(u_kln, N_k)
++    return u_kn, np.array(N_k)
++
++
+ def run_sims_hrex(
+     initial_states: Sequence[InitialState],
+     md_params: MDParams,
+@@ -1161,35 +1268,6 @@ def run_sims_hrex(
+ 
+     # TODO: to support replica exchange with variable temperatures,
+     #  consider modifying sample fxn to rescale velocities by sqrt(T_new/T_orig)
+-    def assert_ensembles_compatible(state_a: InitialState, state_b: InitialState):
+-        """check that xvb from state_a can be swapped with xvb from state_b (up to timestep error),
+-        with swap acceptance probability that depends only on U_a, U_b, kBT"""
+-
+-        # assert (A, B) have identical masses, temperature
+-        intg_a = state_a.integrator
+-        intg_b = state_b.integrator
+-
+-        assert (intg_a.masses == intg_b.masses).all()
+-        assert intg_a.temperature == intg_b.temperature
+-
+-        # assert same pressure (or same volume)
+-        assert (state_a.barostat is None) == (state_b.barostat is None), "should both be NVT or both be NPT"
+-
+-        if state_a.barostat and state_b.barostat:
+-            # assert (A, B) are compatible NPT ensembles
+-            baro_a: MonteCarloBarostat = state_a.barostat
+-            baro_b: MonteCarloBarostat = state_b.barostat
+-
+-            assert baro_a.pressure == baro_b.pressure
+-            assert baro_a.temperature == baro_b.temperature
+-
+-            # also, assert barostat and integrator are self-consistent
+-            assert intg_a.temperature == baro_a.temperature
+-
+-        else:
+-            # assert (A, B) are compatible NVT ensembles
+-            assert (state_a.box0 == state_b.box0).all()
+-
+     for s in initial_states[1:]:
+         assert_ensembles_compatible(initial_states[0], s)
+ 
+diff --git a/timemachine/optimize/protocol.py b/timemachine/optimize/protocol.py
+index 0213d90f07..6fd7f8cf29 100644
+--- a/timemachine/optimize/protocol.py
++++ b/timemachine/optimize/protocol.py
+@@ -7,8 +7,9 @@
+ 
+ Approach
+ --------
+-* Define a "thermodynamic distance" between two values of lambda in terms of work standard deviation:
+-    "thermodynamic_distance(prev_lam, next_lam) = max(forward_work_stddev, reverse_work_stddev)"
++* Define a "thermodynamic distance" between two values of lambda:
++    * option: work stddev: d(a, b) = max(work_stddev(a->b), work_stddev(b->a))
++    * option: pair overlap: d(a, b) = 1 - overlap(a, b)
+ * Compute a deterministic approximation of this distance by reweighting initial samples,
+     and make this reweighting approximation extremely cheap by linearly interpolating previously computed energies.
+ * Build a protocol "left to right" by repeatedly using bisection to place the next lambda window at a fixed
+@@ -39,6 +40,9 @@
+     * https://github.com/proteneer/timemachine/pull/437
+         Gradient-based optimization of high-dimensional protocols, using a reweighting-based estimate of a
+         a T.I.-tailored objective, stddev(du/dlambda).
++
++3. This is intended to be used in the context of some initial protocol, e.g. from bisection
++    * Bisection guarantees that overlap(lams[i],lams[i+1]) > threshold for all i, but does not minimize len(lams)
+ """
+ 
+ from typing import Callable, cast
+@@ -47,16 +51,22 @@
+ from jax import Array, jit
+ from jax import numpy as jnp
+ from jax import vmap
+-from jax.scipy.special import logsumexp
++from jax.scipy.special import logsumexp as _logsumexp
+ from jax.typing import ArrayLike
+ from scipy.optimize import bisect
+ 
++from timemachine.fe.reweighting import interpret_as_mixture_potential
++
++# performance bottleneck in several functions below
++logsumexp = jit(_logsumexp, static_argnames=["axis"])
++
++
+ Float = float
+ DistanceFxn = Callable[[Float, Float], Float]
+ WorkStddevEstimator = DistanceFxn
+ 
+ 
+-def rebalance_initial_protocol(
++def rebalance_initial_protocol_by_work_stddev(
+     lambdas_k: Array,
+     f_k: Array,
+     u_kn: Array,
+@@ -112,6 +122,7 @@ def log_weights_from_mixture(u_kn: ArrayLike, f_k: ArrayLike, N_k: ArrayLike) ->
+     interpret the collection of N = \sum_k N_k samples as coming from a
+     mixture of states p(x) = (1 / K) \sum_k e^-u_k / Z_k
+     """
++    # TODO: merge with timemachine/fe/reweighting.py::interpret_as_mixture_potential ?
+     f_k = jnp.asarray(f_k)
+     u_kn = jnp.asarray(u_kn)
+ 
+@@ -135,6 +146,10 @@ def vec_u_interp(lam: Float) -> Array:
+     return vec_u_interp
+ 
+ 
++# distance fxns: (1) max(work_stddev(a->b), work_stddev(b->a)), (2) 1 - overlap(a,b)
++
++
++# (1) work stddev
+ def construct_work_stddev_estimator(reference_log_weights_n: Array, vec_u: Callable) -> WorkStddevEstimator:
+     """Construct reweighted estimator for stddev from a collection of reference samples"""
+ 
+@@ -208,7 +223,142 @@ def max_work_stddev_distance(prev_lam, next_lam, max_step=0.25):
+     return max_work_stddev_distance
+ 
+ 
+-def greedily_optimize_protocol(distance_fxn: DistanceFxn, target_distance=0.5, max_iterations=1000) -> Array:
++# (2) pair overlap
++def reweighted_pair_overlap(u_n_A, u_n_B, u_n_ref):
++    """given arrays [u(x) for x in xs] (for u in {u_A, u_B, u_ref}),
++    estimate overlap(A, B) by reweighting from ref->A and ref->B
++
++    Notes
++    -----
++    * see sec. 3.4 of https://pubmed.ncbi.nlm.nih.gov/25808134/ for expression being approximated
++    * TODO: describe approximation approach
++    """
++    # reduced potentials -> unnormalized log probs
++    log_q_A = -u_n_A
++    log_q_B = -u_n_B
++    log_q_ref = -u_n_ref
++    log_N = jnp.log(len(log_q_ref))
++
++    # pick a normalization constant for ref
++    log_p_ref_n = log_q_ref - logsumexp(log_q_ref - log_N)
++
++    # normalize A and B wrt ref
++    log_p_A = log_q_A - logsumexp(log_q_A - log_p_ref_n - log_N)
++    log_p_B = log_q_B - logsumexp(log_q_B - log_p_ref_n - log_N)
++
++    log_prod_AB_n = log_p_A + log_p_B
++    # assert (log_prod_AB_n < jnp.inf).all()
++
++    log_p_mix_n = logsumexp(jnp.array([log_p_A, log_p_B]), axis=0) - jnp.log(2)
++    # assert (log_p_mix_n < jnp.inf).all()
++
++    log_denom = log_p_mix_n + log_p_ref_n
++    mask = log_denom > -jnp.inf  # mask out div by 0
++    log_f_n = jnp.where(mask, log_prod_AB_n - log_denom, 0.0)
++    # assert not jnp.isnan(log_f_n).any()
++
++    log_mean_f = logsumexp(log_f_n - jnp.log(sum(mask)))
++    overlap = jnp.exp(log_mean_f)
++    return overlap
++
++
++def make_one_minus_similarity_fxn(sim_fxn):
++    def one_minus_f(a, b):
++        return 1 - sim_fxn(a, b)
++
++    return one_minus_f
++
++
++def make_overlap_fxn(u_lam, src_u_n):
++    """Compose a reduced potential function u_lam with the reweighting approximation from reweighted_pair_overlap
++
++    Parameters
++    ----------
++    u_lam : function : scalar -> array of length N
++        u_lam(lam) = [u(xs[n], lam) for n in range(N)]
++
++    src_u_n : array
++        src_u_n = [u_src(xs[n]) for n in range(N)]
++
++    Returns
++    -------
++    overlap_fxn: (lam_a, lam_b) -> overlap_estimate
++    """
++
++    def overlap_fxn(lam_a, lam_b):
++        estimate = reweighted_pair_overlap(u_lam(lam_a), u_lam(lam_b), src_u_n)
++        clamped = jnp.clip(estimate, 0.0, 1.0)  # TODO: revert this line if estimates > 1 are avoided
++        return clamped
++
++    return overlap_fxn
++
++
++def make_fast_approx_overlap_fxn(lambdas, u_kn, f_k, N_k):
++    """WARNING: EXPERIMENTAL
++
++    Applies a sketchy performance optimization (linearly interpolating (lambdas, u_kn) to provide estimates of u_n(lam))
++
++    (Since the resulting estimates can sometimes exceed 1.0, they are clamped to the range [0.0, 1.0].)
++
++    Parameters
++    ----------
++    lambdas : [K] array
++        assumed sorted, and assumed to have lambdas[0] == 0, lambdas[-1] == 1
++    u_kn : [K, N] array
++        u_kn[k, n] = u(xs[n], lambdas[k])
++    f_k : [K] array
++        reduced free energy
++    N_k : [K] array of ints
++        num samples from each state
++
++    Returns
++    -------
++    overlap_fxn: (lam_a, lam_b) -> overlap_estimate
++    """
++    linear_u_lam = linear_u_kn_interpolant(lambdas, np.nan_to_num(u_kn, nan=np.inf))
++    mixture_u_n = interpret_as_mixture_potential(u_kn, f_k, N_k)
++
++    return make_overlap_fxn(linear_u_lam, mixture_u_n)
++
++
++def make_overlap_distance_fxn(u_lam, src_u_n):
++    """
++
++    Parameters
++    ----------
++    u_lam : function : scalar -> array of length N
++        u_lam(lam) = [u(xs[n], lam) for n in range(N)]
++    src_u_n : array
++        src_u_n = [u_src(xs[n]) for n in range(N)]
++
++    Returns
++    -------
++    dist_fxn: (lam_a, lam_b) -> (1 - overlap_estimate)
++    """
++
++    approx_overlap_fxn = make_overlap_fxn(u_lam, src_u_n)
++    approx_overlap_distance = make_one_minus_similarity_fxn(approx_overlap_fxn)
++    return approx_overlap_distance
++
++
++def make_fast_approx_overlap_distance_fxn(lambdas, u_kn, f_k, N_k):
++    """WARNING: EXPERIMENTAL
++
++    make a distance function d(a,b) = 1 - overlap(a,b)
++
++    where overlap(a,b) uses fast approximations: reweighting, based on linear interpolation of energies"""
++
++    fast_approx_overlap_fxn = make_fast_approx_overlap_fxn(lambdas, u_kn, f_k, N_k)
++    return make_one_minus_similarity_fxn(fast_approx_overlap_fxn)
++
++
++# optimization approach: specify [d(i,i+1) ~= target_distance]
++def greedily_optimize_protocol(
++    distance_fxn: DistanceFxn,
++    target_distance=0.5,
++    max_iterations=1000,
++    bisection_xtol=1e-4,
++) -> Array:
+     """Optimize a lambda protocol from "left to right"
+ 
+     Sequentially pick next_lam so that
+@@ -228,6 +378,7 @@ def greedily_optimize_protocol(distance_fxn: DistanceFxn, target_distance=0.5, m
+             f=lambda trial_lam: distance_fxn(prev_lam, trial_lam) - target_distance,
+             a=prev_lam,
+             b=1.0,
++            xtol=bisection_xtol,
+         )
+         protocol.append(next_lam)
+ 

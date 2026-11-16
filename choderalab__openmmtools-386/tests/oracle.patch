@@ -1,0 +1,281 @@
+diff --git a/docs/releasehistory.rst b/docs/releasehistory.rst
+index 24b8dadda..b09e1d342 100644
+--- a/docs/releasehistory.rst
++++ b/docs/releasehistory.rst
+@@ -8,11 +8,15 @@ New features
+ ------------
+ - Add ``GlobalParameterFunction`` that allows to enslave a ``GlobalParameter`` to an arbitrary function of controlling
+ variables (`#380 <https://github.com/choderalab/openmmtools/pull/380>`_).
++- Allow to ignore velocities when building the dict representation of a ``SamplerState``. This can be useful for example
++to save bandwidth when sending a ``SamplerState`` over the network and velocities are not required (`#386 <https://github.com/choderalab/openmmtools/pull/386>`_).
+ 
+ Enhancements
+ ------------
+ - New implementation of the exact PME handling that uses the parameter offset feature in OpenMM 7.3. This comes with a
+ considerable speed improvement over the previous implementation (`#380 <https://github.com/choderalab/openmmtools/pull/380>`_).
++- Exact PME is now the default for the ``alchemical_pme_treatment`` parameter in the constructor of
++``AbsoluteAchemicalFactory`` (`#386 <https://github.com/choderalab/openmmtools/pull/386>`_).
+ - It is now possible to have multiple composable states exposing the same attributes/getter/setter in a
+ ``CompoundThermodynamicState`` (`#380 <https://github.com/choderalab/openmmtools/pull/380>`_).
+ 
+diff --git a/openmmtools/alchemy.py b/openmmtools/alchemy.py
+index 040cc2eda..3c372ef83 100644
+--- a/openmmtools/alchemy.py
++++ b/openmmtools/alchemy.py
+@@ -616,7 +616,7 @@ class AbsoluteAlchemicalFactory(object):
+     # -------------------------------------------------------------------------
+ 
+     def __init__(self, consistent_exceptions=False, switch_width=1.0*unit.angstroms,
+-                 alchemical_pme_treatment='direct-space', alchemical_rf_treatment='switched',
++                 alchemical_pme_treatment='exact', alchemical_rf_treatment='switched',
+                  disable_alchemical_dispersion_correction=False, split_alchemical_forces=True):
+ 
+         self.consistent_exceptions = consistent_exceptions
+diff --git a/openmmtools/states.py b/openmmtools/states.py
+index c4d2dd95e..28686d6eb 100644
+--- a/openmmtools/states.py
++++ b/openmmtools/states.py
+@@ -2120,18 +2120,36 @@ def __getitem__(self, item):
+         sampler_state._collective_variables = None
+         return sampler_state
+ 
+-    def __getstate__(self):
+-        """Return a dictionary representation of the state."""
++    def __getstate__(self, ignore_velocities=False):
++        """Return a dictionary representation of the state.
++
++        Parameters
++        ----------
++        ignore_velocities : bool, optional
++            If True, velocities are not serialized. This can be useful for
++            example to save bandwidth when sending a ``SamplerState`` over
++            the network and velocities are not required (default is False).
++        """
++        velocities = None if ignore_velocities else self.velocities
+         serialization = dict(
+-            positions=self.positions, velocities=self.velocities,
++            positions=self.positions, velocities=velocities,
+             box_vectors=self.box_vectors, potential_energy=self.potential_energy,
+             kinetic_energy=self.kinetic_energy,
+             collective_variables=self.collective_variables
+         )
+         return serialization
+ 
+-    def __setstate__(self, serialization):
+-        """Set the state from a dictionary representation."""
++    def __setstate__(self, serialization, ignore_velocities=False):
++        """Set the state from a dictionary representation.
++
++        Parameters
++        ----------
++        ignore_velocities : bool, optional
++            If True and the ``SamplerState`` has already velocities
++            defined, this does not overwrite the velocities.
++        """
++        if ignore_velocities and '_velocities' in self.__dict__:
++            serialization['velocities'] = self.velocities
+         self._initialize(**serialization)
+ 
+     # -------------------------------------------------------------------------
+diff --git a/openmmtools/tests/test_alchemy.py b/openmmtools/tests/test_alchemy.py
+index e5ad763c0..37383ebfd 100644
+--- a/openmmtools/tests/test_alchemy.py
++++ b/openmmtools/tests/test_alchemy.py
+@@ -1278,7 +1278,8 @@ def define_regions(cls):
+     def generate_cases(cls):
+         """Generate all test cases in cls.test_cases combinatorially."""
+         cls.test_cases = dict()
+-        factory = AbsoluteAlchemicalFactory(alchemical_rf_treatment='switched')
++        direct_space_factory = AbsoluteAlchemicalFactory(alchemical_pme_treatment='direct-space',
++                                                         alchemical_rf_treatment='switched')
+         exact_pme_factory = AbsoluteAlchemicalFactory(alchemical_pme_treatment='exact')
+ 
+         # We generate all possible combinations of annihilate_sterics/electrostatics
+@@ -1324,7 +1325,7 @@ def generate_cases(cls):
+                     test_case_name += ', modified softcore parameters'
+ 
+                 # Pre-generate alchemical system.
+-                alchemical_system = factory.create_alchemical_system(test_system.system, test_region)
++                alchemical_system = direct_space_factory.create_alchemical_system(test_system.system, test_region)
+ 
+                 # Add test case.
+                 cls.test_cases[test_case_name] = (test_system, alchemical_system, test_region)
+@@ -1343,7 +1344,7 @@ def generate_cases(cls):
+             # of the reference system to allow comparisons.
+             if nonbonded_method == openmm.NonbondedForce.CutoffPeriodic:
+                 forcefactories.replace_reaction_field(test_system.system, return_copy=False,
+-                                                      switch_width=factory.switch_width)
++                                                      switch_width=direct_space_factory.switch_width)
+ 
+     def filter_cases(self, condition_func, max_number=None):
+         """Return the list of test cases that satisfy condition_func(test_case_name)."""
+diff --git a/openmmtools/tests/test_states.py b/openmmtools/tests/test_states.py
+index d851e4fe0..9759568c4 100644
+--- a/openmmtools/tests/test_states.py
++++ b/openmmtools/tests/test_states.py
+@@ -21,10 +21,24 @@
+ from openmmtools.states import *
+ 
+ 
++# =============================================================================
++# CONSTANTS
++# =============================================================================
++
++# We use CPU as OpenCL sometimes causes segfaults on Travis.
++DEFAULT_PLATFORM = openmm.Platform.getPlatformByName('CPU')
++DEFAULT_PLATFORM.setPropertyDefaultValue('DeterministicForces', 'true')
++
++
+ # =============================================================================
+ # UTILITY FUNCTIONS
+ # =============================================================================
+ 
++def create_default_context(thermodynamic_state, integrator):
++    """Shortcut to create a context from the thermodynamic state using the DEFAULT_PLATFORM."""
++    return thermodynamic_state.create_context(integrator, DEFAULT_PLATFORM)
++
++
+ def get_barostat_temperature(barostat):
+     """Backward-compatibly get barostat's temperature"""
+     try:  # TODO drop this when we stop openmm7.0 support
+@@ -579,8 +593,8 @@ def check_compatibility(state1, state2, is_compatible):
+             friction = 5.0/unit.picosecond
+             integrator1 = openmm.VerletIntegrator(time_step)
+             integrator2 = openmm.LangevinIntegrator(state2.temperature, friction, time_step)
+-            context1 = state1.create_context(integrator1)
+-            context2 = state2.create_context(integrator2)
++            context1 = create_default_context(state1, integrator1)
++            context2 = create_default_context(state2, integrator2)
+             assert state1.is_context_compatible(context2) is is_compatible
+             assert state2.is_context_compatible(context1) is is_compatible
+ 
+@@ -611,10 +625,10 @@ def test_method_apply_to_context(self):
+         state0 = ThermodynamicState(self.barostated_alanine, self.std_temperature)
+ 
+         langevin_integrator = openmm.LangevinIntegrator(self.std_temperature, friction, time_step)
+-        context = state0.create_context(langevin_integrator)
++        context = create_default_context(state0, langevin_integrator)
+ 
+         verlet_integrator = openmm.VerletIntegrator(1.0*unit.femtosecond)
+-        thermostated_context = state0.create_context(verlet_integrator)
++        thermostated_context = create_default_context(state0, verlet_integrator)
+ 
+         # Change context pressure.
+         barostat = state0._find_barostat(context.getSystem())
+@@ -670,7 +684,7 @@ def test_method_apply_to_context(self):
+         del thermostated_context, verlet_integrator
+ 
+         verlet_integrator = openmm.VerletIntegrator(time_step)
+-        nvt_context = state2.create_context(verlet_integrator)
++        nvt_context = create_default_context(state2, verlet_integrator)
+         with nose.tools.assert_raises(ThermodynamicsError) as cm:
+             state1.apply_to_context(nvt_context)
+         assert cm.exception.code == ThermodynamicsError.INCOMPATIBLE_ENSEMBLE
+@@ -682,7 +696,7 @@ def test_method_reduced_potential(self):
+         beta = 1.0 / (unit.MOLAR_GAS_CONSTANT_R * self.std_temperature)
+         state = ThermodynamicState(self.alanine_explicit, self.std_temperature)
+         integrator = openmm.VerletIntegrator(1.0*unit.femtosecond)
+-        context = state.create_context(integrator)
++        context = create_default_context(state, integrator)
+         context.setPositions(self.alanine_positions)
+         sampler_state = SamplerState.from_context(context)
+ 
+@@ -733,7 +747,7 @@ def test_method_reduced_potential_at_states(self):
+         for compatible_group in compatible_groups:
+             # Create context.
+             integrator = openmm.VerletIntegrator(2.0*unit.femtoseconds)
+-            context = compatible_group[0].create_context(integrator)
++            context = create_default_context(compatible_group[0], integrator)
+             if len(compatible_group) == 2:
+                 context.setPositions(self.alanine_positions)
+             else:
+@@ -794,7 +808,7 @@ def is_sampler_state_equal_context(sampler_state, context):
+     @staticmethod
+     def create_context(thermodynamic_state):
+         integrator = openmm.VerletIntegrator(1.0*unit.femtoseconds)
+-        return thermodynamic_state.create_context(integrator)
++        return thermodynamic_state.create_context(integrator, DEFAULT_PLATFORM)
+ 
+     def test_inconsistent_n_particles(self):
+         """Exception raised with inconsistent positions and velocities."""
+@@ -963,6 +977,26 @@ def test_operator_getitem(self):
+         assert sliced_sampler_state.kinetic_energy is None
+         assert sliced_sampler_state.potential_energy is None
+ 
++    def test_dict_representation(self):
++        """Setting the state of the object should work when ignoring velocities."""
++        alanine_vacuum_context = self.create_context(self.alanine_vacuum_state)
++        alanine_vacuum_context.setPositions(self.alanine_vacuum_positions)
++        alanine_vacuum_context.setVelocitiesToTemperature(300*unit.kelvin)
++
++        # Test precondition.
++        vacuum_sampler_state = SamplerState.from_context(alanine_vacuum_context)
++        old_velocities = vacuum_sampler_state.velocities
++        assert old_velocities is not None
++
++        # Get a dictionary representation without velocities.
++        serialization = vacuum_sampler_state.__getstate__(ignore_velocities=True)
++        assert serialization['velocities'] is None
++
++        # Do not overwrite velocities when setting a state.
++        serialization['velocities'] = np.random.rand(*vacuum_sampler_state.positions.shape) * unit.nanometer/unit.picosecond
++        vacuum_sampler_state.__setstate__(serialization, ignore_velocities=True)
++        assert np.all(vacuum_sampler_state.velocities == old_velocities)
++
+     def test_collective_variable(self):
+         """Test that CV calculation is working"""
+         # Setup the CV tests if we have a late enough OpenMM
+@@ -1216,7 +1250,7 @@ def test_method_standardize_system(self):
+         assert not compound_state.is_state_compatible(incompatible_state)
+ 
+         integrator = openmm.VerletIntegrator(2.0*unit.femtoseconds)
+-        context = incompatible_state.create_context(integrator)
++        context = create_default_context(incompatible_state, integrator)
+         assert not compound_state.is_context_compatible(context)
+ 
+     def test_method_apply_to_context(self):
+@@ -1227,7 +1261,7 @@ def test_method_apply_to_context(self):
+         self.DummyState.set_dummy_parameter(thermodynamic_state.system, dummy_parameter)
+ 
+         integrator = openmm.VerletIntegrator(2.0*unit.femtoseconds)
+-        context = thermodynamic_state.create_context(integrator)
++        context = create_default_context(thermodynamic_state, integrator)
+         barostat = ThermodynamicState._find_barostat(context.getSystem())
+         assert context.getParameter('dummy_parameter') == dummy_parameter
+         assert context.getParameter(barostat.Pressure()) == self.std_pressure / unit.bar
+@@ -1244,7 +1278,7 @@ def test_method_find_force_groups_to_update(self):
+         alanine_explicit = copy.deepcopy(self.alanine_explicit)
+         thermodynamic_state = ThermodynamicState(alanine_explicit, self.std_temperature)
+         compound_state = CompoundThermodynamicState(thermodynamic_state, [self.dummy_state])
+-        context = compound_state.create_context(openmm.VerletIntegrator(2.0*unit.femtoseconds))
++        context = create_default_context(compound_state, openmm.VerletIntegrator(2.0*unit.femtoseconds))
+ 
+         # No force group should be updated if the two states are identical.
+         assert compound_state._find_force_groups_to_update(context, compound_state, memo={}) == set()
+@@ -1616,7 +1650,7 @@ def test_apply_to_context(self):
+         """Test method GlobalParameterState.apply_to_context."""
+         system = self.diatomic_molecule_ts.system
+         integrator = openmm.VerletIntegrator(1.0*unit.femtosecond)
+-        context = self.diatomic_molecule_ts.create_context(integrator)
++        context = create_default_context(self.diatomic_molecule_ts, integrator)
+ 
+         def check_not_applicable(states, error, context):
+             for s in states:
+@@ -1854,7 +1888,7 @@ def test_compatibility_compound_state(self):
+ 
+         # Build all contexts for testing.
+         integrator = openmm.VerletIntegrator(2.0*unit.femtoseconds)
+-        contexts = [s.create_context(copy.deepcopy(integrator)) for s in compound_states]
++        contexts = [create_default_context(s, copy.deepcopy(integrator)) for s in compound_states]
+ 
+         for state_idx, (compound_state, context) in enumerate(zip(compound_states, contexts)):
+             # The state is compatible with itself.
+@@ -1921,7 +1955,7 @@ def test_reduced_potential_compound_state(self):
+         for compatible_group in compatible_groups:
+             # Create context.
+             integrator = openmm.VerletIntegrator(2.0*unit.femtoseconds)
+-            context = compatible_group[0].create_context(integrator)
++            context = create_default_context(compatible_group[0], integrator)
+             context.setPositions(positions)
+ 
+             # Compute with single-state method.

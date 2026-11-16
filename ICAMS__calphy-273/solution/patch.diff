@@ -1,0 +1,144 @@
+diff --git a/calphy/runner.py b/calphy/runner.py
+index 8459322..2dabfab 100644
+--- a/calphy/runner.py
++++ b/calphy/runner.py
+@@ -43,6 +43,7 @@
+ STICKY_TOKENS = frozenset({
+     "pair_style", "pair_coeff", "mass", "group", "compute", "variable",
+     "fix", "fix_modify", "thermo", "thermo_style", "echo", "dump",
++    "dump_modify",
+ })
+ ONE_SHOT_TOKENS = frozenset({
+     "run", "velocity", "displace_atoms", "change_box",
+@@ -188,7 +189,7 @@ def __init__(self):
+         self.computes = {}              # id -> command
+         self.variables = {}             # name -> command (position kept on redefine)
+         self.fixes = {}                 # id -> {"command": str, "fix_modify": [str]}
+-        self.dumps = {}                 # id -> command
++        self.dumps = {}                 # id -> {"command": str, "dump_modify": [str]}
+         self.thermo = None
+         self.thermo_style = None
+         self.echo = None
+@@ -227,7 +228,12 @@ def apply(self, cmd):
+         elif t == "unfix":
+             self.fixes.pop(tokens[1], None)
+         elif t == "dump":
+-            self.dumps[tokens[1]] = cmd
++            self.dumps[tokens[1]] = {"command": cmd, "dump_modify": []}
++        elif t == "dump_modify":
++            did = tokens[1]
++            if did not in self.dumps:
++                raise RunnerStateError("dump_modify references unknown dump id %r" % did)
++            self.dumps[did]["dump_modify"].append(cmd)
+         elif t == "undump":
+             self.dumps.pop(tokens[1], None)
+         elif t == "thermo":
+@@ -243,11 +249,15 @@ def apply(self, cmd):
+     # -- replay ------------------------------------------------------------- #
+     def check_replayable(self):
+         """Raise if the current state cannot be faithfully carried across a boundary."""
+-        if self.dumps:
+-            raise RunnerStateError(
+-                "dump(s) %s are live at a segment boundary; calphy must undump "
+-                "before a read" % sorted(self.dumps)
+-            )
++        # A live dump used to be refused here, because a replayed `dump`
++        # reopens its file in truncate mode and every frame written before
++        # the boundary would be silently lost. build_replay_header now
++        # re-emits each live dump followed by `dump_modify <id> append yes`,
++        # which makes the crossing faithful, so this is no longer fatal.
++        #
++        # This is what lets n_print_steps_equilibration work under the
++        # executable runner: its `deq` dump must stay open across the
++        # pressure-convergence and spring-constant stages, and both sync().
+         immediate = [n for n, c in self.variables.items() if "$(" in c]
+         if immediate:
+             raise RunnerStateError(
+@@ -272,6 +282,13 @@ def build_replay_header(self, segidx, restart_name):
+         for entry in self.fixes.values():
+             lines.append(_rewrite_replayed_fix(entry["command"], segidx))
+             lines.extend(entry["fix_modify"])
++        # Live dumps: re-open in APPEND mode so frames written in earlier
++        # segments survive. Without the dump_modify the replayed `dump`
++        # truncates its file and the trajectory silently restarts empty.
++        for did, entry in self.dumps.items():
++            lines.append(entry["command"])
++            lines.extend(entry["dump_modify"])
++            lines.append("dump_modify %s append yes" % did)
+         if self.thermo_style is not None:
+             lines.append(self.thermo_style)
+         if self.thermo is not None:
+diff --git a/tests/test_runner.py b/tests/test_runner.py
+index 0fcaadb..89d3d3d 100644
+--- a/tests/test_runner.py
++++ b/tests/test_runner.py
+@@ -228,15 +228,66 @@ def test_overlay_pair_block_replays_completely(tmp_path):
+     ]
+ 
+ 
+-def test_live_dump_at_sync_raises(tmp_path):
++def test_live_dump_crosses_boundary_in_append_mode(tmp_path):
++    """A dump left open across a segment boundary must be replayed with
++    `append yes`: a bare replayed `dump` reopens its file in truncate mode
++    and would silently discard every frame from the earlier segments.
++
++    This is what n_print_steps_equilibration needs -- its `deq` dump stays
++    open across pressure-convergence and spring-constant convergence, and
++    both of those sync().
++    """
+     run = make_runner(tmp_path)
+     feed(run, BOOT + ["dump d1 all custom 1 t.dat id x", "run 1"])
+-    run.sync()                          # seg 0 verbatim (dump still live in state)
++    run.sync()                          # seg 0 verbatim (dump still live)
+     run.command("run 1")
+-    with pytest.raises(RunnerStateError, match="dump"):
++    run.sync()                          # must NOT raise any more
++
++    lines = seg_lines(tmp_path, 1)
++    assert "dump d1 all custom 1 t.dat id x" in lines
++    assert "dump_modify d1 append yes" in lines
++    # the modify has to follow the dump that defines the id
++    assert lines.index("dump_modify d1 append yes") > \
++        lines.index("dump d1 all custom 1 t.dat id x")
++    # seg 0 must NOT append -- it is the segment that creates the file
++    assert "dump_modify d1 append yes" not in seg_lines(tmp_path, 0)
++
++
++def test_user_dump_modify_replays_before_append(tmp_path):
++    """A dump_modify issued by calphy is sticky and replays, ahead of the
++    runner's own append directive."""
++    run = make_runner(tmp_path)
++    feed(run, BOOT + ["dump d1 all custom 1 t.dat id x",
++                      "dump_modify d1 sort id", "run 1"])
++    run.sync()
++    run.command("run 1")
++    run.sync()
++
++    lines = seg_lines(tmp_path, 1)
++    assert lines.index("dump_modify d1 sort id") > \
++        lines.index("dump d1 all custom 1 t.dat id x")
++    assert lines.index("dump_modify d1 append yes") > \
++        lines.index("dump_modify d1 sort id")
++
++
++def test_dump_modify_unknown_id_raises(tmp_path):
++    run = make_runner(tmp_path)
++    feed(run, BOOT + ["dump_modify nosuch append yes"])
++    with pytest.raises(RunnerStateError, match="unknown dump id"):
+         run.sync()
+ 
+ 
++def test_undumped_dump_is_not_replayed(tmp_path):
++    """undump must drop the dump from the replay header entirely."""
++    run = make_runner(tmp_path)
++    feed(run, BOOT + ["dump d1 all custom 1 t.dat id x", "run 1", "undump d1"])
++    run.sync()
++    run.command("run 1")
++    run.sync()
++    lines = seg_lines(tmp_path, 1)
++    assert not [l for l in lines if l.startswith(("dump d1", "dump_modify d1"))]
++
++
+ def test_dump_undump_within_segment_is_fine(tmp_path):
+     run = make_runner(tmp_path)
+     feed(run, BOOT + ["dump d1 all custom 1 t.dat id x", "run 0", "undump d1"])

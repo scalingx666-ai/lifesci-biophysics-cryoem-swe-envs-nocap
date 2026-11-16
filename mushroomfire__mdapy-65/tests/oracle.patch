@@ -1,0 +1,327 @@
+diff --git a/docs/about/release-notes.md b/docs/about/release-notes.md
+index 517f9391..95144fcb 100644
+--- a/docs/about/release-notes.md
++++ b/docs/about/release-notes.md
+@@ -46,6 +46,10 @@
+   the atoms and summing to zero over the third, fitted with the second order from random
+   patterns. `ForceConstants` holds them as `third`, (n, nS, nS, 3, 3, 3), with
+   `cutoff_third` and `parameters_third`, and takes them as its fourth argument.
++- `Phonons.group_velocities(q, *, symmetry=None)` gives the group velocity of each mode in
++  Å/ps, from the derivative of the dynamical matrix, with modes of equal frequency set
++  apart along (1, 2, 3) and averaged over the rotations that keep the wave vector, as
++  phonopy does.
+ - `mdapy.lattice_dynamics.bond_stiffness(data, *, cutoff, degree=1)` fits springs along and
+   across bonds, of stiffnesses polynomial in the length for each pair of elements in each
+   shell, to the forces of displaced supercells of several crystals, after van de Walle and
+diff --git a/docs/user-guide/simulation/phonons.md b/docs/user-guide/simulation/phonons.md
+index 13857546..f2834638 100644
+--- a/docs/user-guide/simulation/phonons.md
++++ b/docs/user-guide/simulation/phonons.md
+@@ -95,10 +95,26 @@ $\mathbf a_i\cdot\mathbf b_j = 2\pi\delta_{ij}$.
+ | `force_constants` | (n, nS, 3, 3) float64 | force constants $\Phi$ in eV/Å² between each atom of the cell and each atom of the supercell (S cells, the cell itself first); read-only; [`ForceConstants`](force-constants.md) writes them for phonopy |
+ | `frequencies(q)` | (3n,) or (K, 3n) float64 | frequencies in THz at one or K wave vectors, ascending; imaginary ones negative |
+ | `modes(q)` | tuple of float64 and complex128 arrays | the frequencies, and the (3n, n, 3) or (K, 3n, n, 3) complex polarization vector of each mode |
++| `group_velocities(q, *, symmetry=None)` | (3n, 3) or (K, 3n, 3) float64 | the group velocity of each mode in Å/ps (THz Å), in the order of the frequencies |
+ | `band_structure(path, *, points=51, connected=False)` | `BandStructure` | the frequencies along a path |
+ | `dos(mesh=20, *, frequencies=None, sigma=None, projected=False)` | `PhononDOS` | the density of states |
+ | `thermal(temperatures, *, mesh=20)` | `ThermalProperties` | the thermodynamic properties of the vibrations |
+ 
++**Group velocities.** The velocity of a mode is the derivative of its angular
++frequency with respect to the wave vector, from the derivative of the dynamical
++matrix. Modes of the same frequency, within 1e-4 THz, share a space in which any basis
++is as good; their velocities are those of the basis in which the derivative of the
++dynamical matrix along the direction (1, 2, 3) is diagonal, as in
++[phonopy](https://phonopy.github.io/phonopy/). With `symmetry`, the velocities are
++averaged over the rotations of the crystal, found by spglib, that keep the wave vector
++itself, which makes those of such modes keep the symmetry of the crystal. Modes below
++1e-4 THz, the translations at Γ, have none.
++
++<!-- skip-test -->
++```python
++result.group_velocities([0.25, 0, 0.25])  # (3, 3) Å/ps
++```
++
+ **Band structures.** `path` is one of:
+ 
+ - `"auto"`: the standard path of the crystal from its symmetry, any crystal
+@@ -191,8 +207,8 @@ calculator that does not compute forces, a supercell that is not positive
+ integers or a matrix of integers with a positive determinant, a
+ displacement that is not positive, and `symmetry=True` without spglib;
+ `primitive_cell` for a box that is not
+-periodic. `frequencies` and `modes` raise it for wave vectors that are not
+-three numbers each; `band_structure` for an unknown lattice, a cell that
++periodic. `frequencies`, `modes` and `group_velocities` raise it for wave vectors that are
++not three numbers each, and `group_velocities` for `symmetry=True` without spglib; `band_structure` for an unknown lattice, a cell that
+ is not that lattice in the standard orientation, a section of fewer than
+ two wave vectors, or fewer than two points, and `ImportError` for `"auto"`
+ without seekpath; `dos` and `thermal` for a mesh or a `sigma` that is not
+diff --git a/src/mdapy/lattice_dynamics/_phonons.py b/src/mdapy/lattice_dynamics/_phonons.py
+index e08c1c9a..4fae0752 100644
+--- a/src/mdapy/lattice_dynamics/_phonons.py
++++ b/src/mdapy/lattice_dynamics/_phonons.py
+@@ -15,7 +15,7 @@
+ 
+ from mdapy import units
+ from mdapy._core import neighbor as _search
+-from mdapy.analysis._symmetry import _keeping, _Operations, _symmetry
++from mdapy.analysis._symmetry import _keeping, _Operations, _rotations, _symmetry
+ from mdapy.calculators._base import Calculator
+ from mdapy.core.box import Box
+ from mdapy.core.system import System
+@@ -32,6 +32,12 @@
+ _IMAGINARY = -1e-2
+ # frequencies closer than this in THz are taken as equal
+ _DEGENERATE = 1e-3
++# modes of a frequency closer than this in THz to another share their group
++# velocities, and those below it have none, as in phonopy
++_SAME_VELOCITY = 1e-4
++# a direction in which the derivative of the dynamical matrix sets apart the
++# modes of equal frequency, as phonopy's
++_APART = np.array([1.0, 2.0, 3.0]) / np.sqrt(14.0)
+ 
+ 
+ def _read_only(*arrays: np.ndarray | None) -> None:
+@@ -794,6 +800,25 @@ def __dynamical(self, q: np.ndarray) -> np.ndarray:
+         )
+         return 0.5 * (matrices + matrices.conj().transpose(0, 2, 1))
+ 
++    def __derivatives(self, q: np.ndarray) -> np.ndarray:
++        """(K, 3, 3n, 3n) derivatives of the dynamical matrices with respect
++        to the Cartesian wave vector, in eV Å/(Å² amu)."""
++        n = len(self.cell)
++        phase = np.exp(1j * (q @ self.__reciprocal) @ self.__vectors.T) * self.__weights
++        blocks = np.zeros((len(q), 3, n, n, 9), dtype=complex)
++        for a, b, pairs in self.__blocks:
++            for x in range(3):
++                weighted = 1j * phase[:, pairs] * self.__vectors[pairs, x]
++                blocks[:, x, a, b] = weighted @ self.__constants[pairs]
++        masses = np.sqrt(np.outer(self.__masses, self.__masses))
++        blocks /= masses[None, None, :, :, None]
++        matrices = (
++            blocks.reshape(len(q), 3, n, n, 3, 3)
++            .transpose(0, 1, 2, 4, 3, 5)
++            .reshape(len(q), 3, 3 * n, 3 * n)
++        )
++        return 0.5 * (matrices + matrices.conj().transpose(0, 1, 3, 2))
++
+     def __solve(self, q: np.ndarray, vectors: bool, chunk: int = 2048):
+         frequencies, modes = [], []
+         for start in range(0, len(q), chunk):
+@@ -854,6 +879,75 @@ def modes(self, q: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
+             return frequencies[0], vectors[0]
+         return frequencies, vectors
+ 
++    def group_velocities(
++        self, q: ArrayLike, *, symmetry: bool | None = None
++    ) -> np.ndarray:
++        """Group velocities of the phonons at wave vectors.
++
++        Parameters
++        ----------
++        q : array_like of float64
++            A wave vector or (K, 3) wave vectors, in units of the reciprocal
++            lattice vectors of the cell.
++        symmetry : bool, optional
++            Average the velocities over the rotations of the crystal, found
++            by spglib, that keep each wave vector: True, False, or by default
++            whenever spglib is installed.
++
++        Returns
++        -------
++        numpy.ndarray
++            (3n, 3) or (K, 3n, 3) float64 Cartesian group velocity of each
++            mode in Å/ps, the modes in the order of ``frequencies``; zero for
++            modes below 1e-4 THz.
++
++        Raises
++        ------
++        InvalidParameter
++            For wave vectors that are not three numbers each, or symmetry
++            True without spglib.
++        """
++        q, single = self.__wave_vectors(q)
++        cell = _in_periodic_box(self.cell) if self.__sheet else self.cell
++        rotations = _rotations(cell, symmetry)
++        inverse = np.linalg.inv(self.__reciprocal)
++        n3 = 3 * len(self.cell)
++        out = np.zeros((len(q), n3, 3))
++        for start in range(0, len(q), 512):
++            chunk = q[start : start + 512]
++            values, vectors = np.linalg.eigh(self.__dynamical(chunk))
++            frequencies = np.sign(values) * np.sqrt(np.abs(values)) * _THZ
++            derivatives = self.__derivatives(chunk)
++            along = np.einsum("x,kxij->kij", _APART, derivatives)
++            for k in range(len(chunk)):
++                v = np.zeros((n3, 3))
++                apart = np.flatnonzero(np.diff(frequencies[k]) >= _SAME_VELOCITY) + 1
++                for modes in np.split(np.arange(n3), apart):
++                    # modes of one frequency: the basis in which the derivative
++                    # along a direction of no symmetry is diagonal
++                    e = vectors[k][:, modes]
++                    _, turn = np.linalg.eigh(e.conj().T @ along[k] @ e)
++                    e = e @ turn
++                    v[modes] = np.einsum(
++                        "im,xij,jm->mx", e.conj(), derivatives[k], e
++                    ).real
++                # v = dω/dk = 2π dν/dk, with ν = c sqrt(λ)
++                moving = frequencies[k] > _SAME_VELOCITY
++                v[moving] *= (np.pi * _THZ**2 / frequencies[k][moving])[:, None]
++                v[~moving] = 0.0
++                if len(rotations) > 1:
++                    # the rotations that keep the wave vector, not moved back
++                    # by a reciprocal lattice vector
++                    wave = (chunk[k] - np.round(chunk[k])) @ self.__reciprocal
++                    kept = [
++                        r
++                        for r in rotations
++                        if np.abs((r @ wave - wave) @ inverse).max() < 1e-5
++                    ]
++                    v = np.mean([v @ r.T for r in kept], axis=0)
++                out[start + k] = v
++        return out[0] if single else out
++
+     def __in_plane(self, sections: list) -> list:
+         """The sections of a path that lie in the plane of a sheet, cut where
+         they leave it."""
+diff --git a/tests/lattice_dynamics/test_force_constants_phonopy.py b/tests/lattice_dynamics/test_force_constants_phonopy.py
+index 10fa9f39..e75d7e2e 100644
+--- a/tests/lattice_dynamics/test_force_constants_phonopy.py
++++ b/tests/lattice_dynamics/test_force_constants_phonopy.py
+@@ -165,3 +165,29 @@ def test_the_files_of_phonopy(crystal, potential, full, tmp_path):
+     write_FORCE_CONSTANTS(theirs.force_constants, path, theirs.primitive.p2s_map)
+     read = read_force_constants(path, cell, matrix)
+     np.testing.assert_allclose(read.second, result.force_constants, atol=1e-7)
++
++
++def test_group_velocities_of_phonopy(crystal, tmp_path):
++    """phonopy on the same force constants, with its symmetry: the same
++    velocities at any wave vector and at those of equal frequencies, to its
++    constants."""
++    from phonopy.file_IO import parse_FORCE_CONSTANTS
++
++    cell, matrix, result = crystal
++    path = tmp_path / "FORCE_CONSTANTS"
++    ForceConstants(cell, matrix, result.force_constants).write(path)
++    theirs = of_phonopy(cell, matrix, "P")
++    theirs.force_constants = parse_FORCE_CONSTANTS(path, theirs.primitive.p2s_map)
++    q = np.vstack(
++        [
++            np.random.default_rng(0).random((10, 3)) - 0.5,
++            [[0, 0, 0], [0.5, 0, 0], [0.5, 0.5, 0], [0.25, 0, 0], [0.5, 0.5, 0.5]],
++            [[0.1, 0.1, 0.1], [0.2, 0.0, 0.2], [1 / 3, 1 / 3, 0], [0, 0, 0.25]],
++        ]
++    )
++    theirs.run_qpoints(q, with_group_velocities=True)
++    expected = theirs.qpoints.group_velocities  # THz Å, which is Å/ps
++    found = result.group_velocities(q)
++    np.testing.assert_allclose(
++        found, expected, rtol=0, atol=1e-6 * np.abs(expected).max()
++    )
+diff --git a/tests/lattice_dynamics/test_group_velocities.py b/tests/lattice_dynamics/test_group_velocities.py
+new file mode 100644
+index 00000000..ade0fed0
+--- /dev/null
++++ b/tests/lattice_dynamics/test_group_velocities.py
+@@ -0,0 +1,102 @@
++# Copyright (c) 2022-2026, Yongchao Wu
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""Group velocities of phonons: springs of a simple cubic lattice in closed
++form, finite differences of the frequencies, and the symmetry of the
++crystal. phonopy on the same force constants is in
++test_force_constants_phonopy.py."""
++
++import sys
++
++import numpy as np
++import pytest
++
++import mdapy
++from mdapy.build import build_crystal
++from mdapy.elements import atomic_masses
++from mdapy.errors import InvalidParameter
++from mdapy.lattice_dynamics import phonons, primitive_cell
++from mdapy.lattice_dynamics._phonons import _THZ
++
++from calculators.test_testing import Harmonic
++
++
++def test_springs_of_a_simple_cubic_lattice():
++    """Each mode moves along an axis, of frequency 2 sqrt(k/m) |sin(k_α a/2)|:
++    its velocity is a sqrt(k/m) cos(k_α a/2) along the axis."""
++    a, k = 2.5, 1.3
++    cell = build_crystal("sc", a, elements="Ar")
++    result = phonons(cell, Harmonic(k=k, r0=a), displacement=1e-5, symmetry=False)
++    mass = atomic_masses(["Ar"])[0]
++    q = np.random.default_rng(0).random((20, 3)) - 0.5
++    omega = 2 * np.sqrt(k / mass) * np.abs(np.sin(np.pi * q))  # √(eV/(Å² amu))
++    speed = a * np.sqrt(k / mass) * np.cos(np.pi * q) * np.sign(q) * 2 * np.pi * _THZ
++    order = np.argsort(omega, axis=1)
++    expected = np.zeros((20, 3, 3))
++    for m in range(3):
++        axis = order[:, m]
++        expected[np.arange(20), m, axis] = speed[np.arange(20), axis]
++    np.testing.assert_allclose(result.group_velocities(q), expected, atol=1e-6)
++    np.testing.assert_allclose(result.group_velocities(q[0]), expected[0], atol=1e-6)
++
++
++@pytest.mark.parametrize("structure, a", [("fcc", 3.6), ("hcp", 2.55)])
++def test_finite_differences_of_the_frequencies(structure, a):
++    cell = build_crystal(structure, a, elements="Ar")
++    if structure == "fcc":
++        cell = primitive_cell(cell)
++    springs = Harmonic(k=0.7, r0=a / np.sqrt(2) if structure == "fcc" else a)
++    result = phonons(cell, springs, supercell=4, symmetry=False)
++    q = np.random.default_rng(1).random((6, 3)) - 0.5
++    reciprocal = 2 * np.pi * np.linalg.inv(cell.box.matrix).T
++    h = 1e-5
++    differences = np.zeros((6, 3 * len(cell), 3))
++    for x in range(3):
++        step = np.eye(3)[x] * h @ np.linalg.inv(reciprocal)
++        rise = result.frequencies(q + step) - result.frequencies(q - step)
++        differences[:, :, x] = 2 * np.pi * rise / (2 * h)
++    np.testing.assert_allclose(
++        result.group_velocities(q, symmetry=False), differences, atol=1e-6
++    )
++
++
++def test_the_symmetry_of_the_crystal():
++    """Γ: no velocity. A wave vector along z of hcp: the velocities along z,
++    each degenerate pair of modes the same. A sheet: in its plane."""
++    pytest.importorskip("spglib")
++    cell = build_crystal("hcp", 2.55, elements="Ar")
++    result = phonons(cell, Harmonic(k=0.7, r0=2.55), supercell=(4, 4, 3))
++    np.testing.assert_array_equal(result.group_velocities([0, 0, 0]), 0)
++    frequencies = result.frequencies([0, 0, 0.2])
++    v = result.group_velocities([0, 0, 0.2])
++    np.testing.assert_allclose(v[:, :2], 0, atol=1e-10)
++    pairs = np.flatnonzero(np.diff(frequencies) < 1e-6)
++    np.testing.assert_allclose(v[pairs], v[pairs + 1], atol=1e-10)
++    plain = result.group_velocities([0, 0, 0.2], symmetry=False)
++    np.testing.assert_allclose(plain[:, 2], v[:, 2], atol=1e-10)
++
++    side, height = 2.5, 10.0
++    plane = np.array(
++        [[side, 0, 0], [-side / 2, side * np.sqrt(3) / 2, 0], [0, 0, height]]
++    )
++    sheet = mdapy.System(
++        np.array([[0, 0, height / 2]]),
++        mdapy.Box(plane, pbc=(True, True, False)),
++        elements=["C"],
++    )
++    flat = phonons(sheet, Harmonic(k=2.0, r0=2.4), supercell=4)
++    velocities = flat.group_velocities([[0.1, 0.2, 0], [0.3, -0.1, 0]])
++    np.testing.assert_allclose(velocities[..., 2], 0, atol=1e-10)
++    assert np.abs(velocities[..., :2]).max() > 1
++
++
++def test_errors(monkeypatch):
++    cell = build_crystal("sc", 2.5, elements="Ar")
++    result = phonons(cell, Harmonic(k=1.0, r0=2.5), symmetry=False)
++    with pytest.raises(InvalidParameter, match="wave vector"):
++        result.group_velocities([0.1, 0.2])
++    monkeypatch.setitem(sys.modules, "spglib", None)
++    with pytest.raises(InvalidParameter, match="spglib"):
++        result.group_velocities([0.1, 0.2, 0.3], symmetry=True)

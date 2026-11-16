@@ -1,0 +1,390 @@
+diff --git a/scilink/knowledge/knowledge_base.py b/scilink/knowledge/knowledge_base.py
+index 1fc8d850..f21facc5 100644
+--- a/scilink/knowledge/knowledge_base.py
++++ b/scilink/knowledge/knowledge_base.py
+@@ -20,6 +20,31 @@
+ from scilink.utils.announce import announce_litellm
+ 
+ 
++def describe_error(e: BaseException) -> str:
++    """``type: message`` for a log line — never empty.
++
++    ``str(e)`` is empty for the failures that matter most here: FAISS's
++    Python wrapper rejects a query whose dimension differs from the
++    index's with a bare ``assert`` (``AssertionError()``), which rendered
++    as ``Dense KB retrieval failed ()`` and was undiagnosable (#631).
++    """
++    return f"{type(e).__name__}: {str(e) or repr(e)}"
++
++
++class EmbeddingDimensionMismatch(RuntimeError):
++    """A query (or new batch) embedding does not fit the dense index: the
++    index was built by a different embedding model than the one this
++    session embeds with. Named so the failure explains itself and the
++    caller's keyword fallback can say why it is running."""
++
++
++def _index_meta_path(index_path: str) -> Path:
++    """Provenance sidecar next to the FAISS index: which embedding model
++    built it and its dimension. Shares the index's stem so the planning
++    agent's ``default_kb_*`` copies carry it along."""
++    return Path(index_path).with_suffix(".meta.json")
++
++
+ class KnowledgeBase:
+     """
+     Handles embedding, retrieval, and repository structure mapping.
+@@ -87,6 +112,13 @@ def __init__(
+         self.index = None
+         self.chunks = []
+         self.sources: List[str | Dict[str, str]] = []
++        # Provenance of the loaded/built dense index (None = unrecorded,
++        # i.e. files written before the sidecar existed).
++        self.index_built_with: Optional[str] = None
++        # Why dense retrieval is off for this KB (model or dimension
++        # mismatch); ``retrieve`` then serves BM25 without embedding the
++        # query — one explanation, not a failed embedding call per query.
++        self._dense_disabled_reason: Optional[str] = None
+         
+         # Registry for Repo Maps: {'repo_name': 'tree_structure_string'}
+         # This stores the visual directory trees for any repo you ingest.
+@@ -156,7 +188,9 @@ def build(self, chunks: List[Dict[str, any]], batch_size: int = 100):
+                     # are kept, the dense index is dropped entirely (a
+                     # partial index would silently search a stale subset),
+                     # and the query path's existing BM25 tier takes over.
+-                    print(f"    - ❌ Error embedding batch {i//batch_size + 1}: {e}")
++                    print(f"    - ❌ Error embedding batch {i//batch_size + 1} "
++                          f"[{describe_error(e)}]")
++                    logging.debug("KB build embedding failure", exc_info=True)
+                     print(
+                         "  - ⚠️  Embeddings unavailable — building a "
+                         "KEYWORD-ONLY knowledge base (BM25 retrieval tier). "
+@@ -175,9 +209,28 @@ def build(self, chunks: List[Dict[str, any]], batch_size: int = 100):
+             self.index = faiss.IndexFlatL2(dimension)
+         else:
+             print("  - Appending to existing FAISS vector index...")
++            if dimension != self.index.d:
++                # FAISS would reject this with a message-less assert.
++                raise EmbeddingDimensionMismatch(self._mismatch_message(
++                    dimension, what="new document embeddings"))
+ 
+         self.index.add(embeddings_np)
+-        print("  - ✅ Knowledge base built successfully.")
++        self.index_built_with = self.embedding_model_name
++        self._dense_disabled_reason = None
++        print(f"  - ✅ Knowledge base built successfully "
++              f"({self.index.ntotal} vectors, {dimension}-d, "
++              f"'{self.embedding_model_name}').")
++
++    def _mismatch_message(self, got_dim: int, what: str) -> str:
++        built = (f"'{self.index_built_with}'" if self.index_built_with
++                 else "an unrecorded embedding model")
++        return (
++            f"{what} are {got_dim}-d but the dense index is "
++            f"{self.index.d}-d: the index was built with {built} and this "
++            f"session embeds with '{self.embedding_model_name}'. Start the "
++            f"session with the model that built the KB, or rebuild the KB "
++            f"with '{self.embedding_model_name}'."
++        )
+ 
+     def save(self, index_path: str, chunks_path: str, repo_map_path: str = None, sources_path: str = None):
+         """Saves the FAISS index, text chunks, and optionally the repo maps to disk."""
+@@ -186,6 +239,17 @@ def save(self, index_path: str, chunks_path: str, repo_map_path: str = None, sou
+         if self.index:
+             faiss.write_index(self.index, index_path)
+             print(f"  - FAISS index saved to {index_path}")
++            try:
++                with open(_index_meta_path(index_path), "w",
++                          encoding="utf-8") as f:
++                    json.dump({
++                        "embedding_model": (self.index_built_with
++                                            or self.embedding_model_name),
++                        "dimension": int(self.index.d),
++                        "vectors": int(self.index.ntotal),
++                    }, f, indent=2)
++            except Exception as e:  # noqa: BLE001 - provenance is advisory
++                print(f"  - ⚠️ Could not write index provenance: {e}")
+         
+         with open(chunks_path, 'w', encoding='utf-8') as f:
+             json.dump(self.chunks, f, indent=2)
+@@ -218,8 +282,11 @@ def load(self, index_path: str, chunks_path: str, repo_map_path: str = None, sou
+             return False
+ 
+         try:
++            self.index_built_with = None
++            self._dense_disabled_reason = None
+             if index_file.exists():
+                 self.index = faiss.read_index(index_path)
++                self._read_index_provenance(index_path)
+             else:
+                 # A keyword-only KB (built while embeddings were
+                 # unavailable) has chunks but no dense index — load it in
+@@ -251,10 +318,46 @@ def load(self, index_path: str, chunks_path: str, repo_map_path: str = None, sou
+             self.chunks = []
+             return False
+ 
++    def _read_index_provenance(self, index_path: str) -> None:
++        """Pick up the sidecar written by :meth:`save`; on a model mismatch
++        say so ONCE and switch this KB to keyword retrieval up front —
++        embedding every query only to fail on the index (empty
++        ``AssertionError``) was the silent degradation of #631."""
++        meta_file = _index_meta_path(index_path)
++        if not meta_file.exists():
++            return  # pre-sidecar files: the query-time dimension check covers it
++        try:
++            with open(meta_file, "r", encoding="utf-8") as f:
++                meta = json.load(f)
++        except Exception as e:  # noqa: BLE001
++            print(f"  - ⚠️ Unreadable index provenance {meta_file.name}: {e}")
++            return
++        self.index_built_with = meta.get("embedding_model") or None
++        session_model = self.embedding_model_name
++        if (self.index_built_with and session_model
++                and self.index_built_with != session_model):
++            self._dense_disabled_reason = (
++                f"the dense index was built with '{self.index_built_with}' "
++                f"but this session embeds with '{session_model}'")
++            msg = (f"⚠️  KB dense index was built with "
++                   f"'{self.index_built_with}' ({meta.get('dimension', '?')}-d); "
++                   f"this session embeds with '{session_model}', so dense "
++                   f"retrieval is OFF for this KB and keyword (BM25) search "
++                   f"is used. Start the session with embedding model "
++                   f"'{self.index_built_with}', or rebuild the KB with "
++                   f"'{session_model}'.")
++            print(f"  - {msg}")
++            logging.warning(msg)
++
+     def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+         """
+         Retrieves the most relevant document chunks for a given query.
+         """
++        reason = getattr(self, "_dense_disabled_reason", None)
++        if self.index and reason:
++            print(f"  - ℹ️  Dense retrieval off for this KB ({reason}) — "
++                  "retrieving via BM25.")
++            return self.retrieve_sparse(query, top_k=top_k)
+         if not self.index:
+             if self.chunks:
+                 # Keyword-only KB: the dense tier does not exist, so ANY
+@@ -288,7 +391,8 @@ def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+                     print(f"    - ❌ Rate limit hit on final attempt. Retrieval failed.")
+                     raise e # Re-raise the exception if all retries fail
+             except Exception as e:
+-                print(f"    - ❌ Error embedding query: {e}")
++                print(f"    - ❌ Error embedding query [{describe_error(e)}]")
++                logging.debug("KB query embedding failure", exc_info=True)
+                 raise e
+         
+         if response is None:
+@@ -300,6 +404,13 @@ def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+         if query_embedding.ndim == 3:
+             query_embedding = np.squeeze(query_embedding, axis=0)
+ 
++        if query_embedding.shape[1] != self.index.d:
++            # FAISS raises a bare AssertionError here — explain it, and
++            # stop embedding queries for an index they can never match.
++            self._dense_disabled_reason = self._mismatch_message(
++                query_embedding.shape[1], what="query embeddings")
++            raise EmbeddingDimensionMismatch(self._dense_disabled_reason)
++
+         distances, indices = self.index.search(query_embedding, top_k)
+         
+         # Retrieve valid chunks (filtering out potential index errors)
+diff --git a/scilink/knowledge/rag_engine.py b/scilink/knowledge/rag_engine.py
+index f0ca01c1..81cd3f10 100644
+--- a/scilink/knowledge/rag_engine.py
++++ b/scilink/knowledge/rag_engine.py
+@@ -153,20 +153,23 @@ def retrieve_context(kb: Any, query: str, top_k: int = 10, dedupe: bool = True)
+     if not (kb is not None and kb.index and kb.index.ntotal > 0):
+         return ""
+ 
++    from .knowledge_base import describe_error
++
+     try:
+         chunks = kb.retrieve(query, top_k=top_k)
+     except Exception as e:  # noqa: BLE001 - any retrieval failure degrades, never kills
++        logging.debug("dense KB retrieval failure", exc_info=True)
+         try:
+             chunks = kb.retrieve_sparse(query, top_k=top_k)
+             logging.warning(
+-                f"Dense KB retrieval failed ({e}); using keyword (BM25) "
+-                f"fallback — retrieved {len(chunks)} chunks without the "
+-                "embedding provider."
++                f"Dense KB retrieval failed [{describe_error(e)}]; using "
++                f"keyword (BM25) fallback — retrieved {len(chunks)} chunks "
++                "without the embedding provider."
+             )
+         except Exception as e2:  # noqa: BLE001
+             logging.warning(
+-                f"KB retrieval failed (dense: {e}; sparse: {e2}); "
+-                "proceeding without retrieved context."
++                f"KB retrieval failed (dense: {describe_error(e)}; sparse: "
++                f"{describe_error(e2)}); proceeding without retrieved context."
+             )
+             return ""
+     if dedupe:
+diff --git a/tests/test_kb_embedding_provenance.py b/tests/test_kb_embedding_provenance.py
+new file mode 100644
+index 00000000..ad175e06
+--- /dev/null
++++ b/tests/test_kb_embedding_provenance.py
+@@ -0,0 +1,159 @@
++"""#631 — a dense index queried with a different embedding model.
++
++Live: a Bedrock/Titan web session showed the dense path ("Retrieving top
++10 ...") and then "Dense KB retrieval failed ()" — an EMPTY message —
++before every TEA query fell back to BM25. The empty message is FAISS's
++Python wrapper rejecting a query whose dimension differs from the index's
++with a bare ``assert``: the index had been built by another embedding
++model (a named store KB built earlier, or the store manifest's model on
++the add-documents path) and nothing recorded that. Now the index carries
++its provenance, a mismatch is explained once and switches the KB to
++keyword retrieval up front, a legacy index without provenance gets a
++named dimension error instead of ``()``, and no query is embedded twice
++for an index it can never match.
++
++  conda run -n scilink python -m pytest tests/test_kb_embedding_provenance.py -v
++"""
++import json
++import logging
++
++import numpy as np
++import pytest
++
++from scilink.knowledge.knowledge_base import (
++    EmbeddingDimensionMismatch, KnowledgeBase, describe_error)
++from scilink.knowledge.rag_engine import retrieve_context
++
++CHUNKS = [
++    {"text": "Titanium coatings improve cathode cycling stability.",
++     "metadata": {"source": "a.pdf", "content_type": "text"}},
++    {"text": "Cost of alumina precursor per kilogram in 2025.",
++     "metadata": {"source": "b.pdf", "content_type": "text"}},
++    {"text": "Opentrons handoff limits throughput per day.",
++     "metadata": {"source": "c.pdf", "content_type": "text"}},
++]
++
++
++class FakeEmbedder:
++    def __init__(self, dim):
++        self.dim, self.calls = dim, 0
++
++    def embed_content(self, model, content, task_type=None):
++        self.calls += 1
++        items = content if isinstance(content, list) else [content]
++        return {"embedding": [np.random.default_rng(len(t)).random(self.dim).tolist()
++                              for t in items]}
++
++
++def make_kb(model, dim):
++    kb = KnowledgeBase.__new__(KnowledgeBase)
++    kb.embedding_client = FakeEmbedder(dim)
++    kb.embedding_model_name = model
++    kb.index = None
++    kb.chunks = []
++    kb.sources = []
++    kb.repo_maps = {}
++    kb.index_built_with = None
++    kb._dense_disabled_reason = None
++    return kb
++
++
++@pytest.fixture
++def built(tmp_path):
++    """A KB built by 'model-A' (4-d) and saved as the planning agent saves
++    its docs KB (default_kb_docs.* — the prefix the meta's cache copy globs)."""
++    kb = make_kb("model-A", 4)
++    kb.build(list(CHUNKS))
++    prefix = tmp_path / "default_kb_docs"
++    paths = (str(prefix.with_suffix(".faiss")), str(prefix.with_suffix(".json")),
++             str(prefix.with_suffix(".sources.json")))
++    kb.save(paths[0], paths[1], sources_path=paths[2])
++    return tmp_path, paths
++
++
++def _load(paths, model, dim):
++    kb = make_kb(model, dim)
++    assert kb.load(paths[0], paths[1], sources_path=paths[2])
++    return kb
++
++
++def test_save_records_index_provenance(built):
++    tmp_path, paths = built
++    meta = json.loads((tmp_path / "default_kb_docs.meta.json").read_text())
++    assert meta == {"embedding_model": "model-A", "dimension": 4, "vectors": 3}
++    # The sidecar shares the KB prefix, so the meta's kb_cache copy
++    # (glob "default_kb_*") carries the provenance along.
++    assert tmp_path / "default_kb_docs.meta.json" in set(tmp_path.glob("default_kb_*"))
++
++
++def test_same_model_keeps_dense_retrieval(built, caplog):
++    _, paths = built
++    kb = _load(paths, "model-A", 4)
++    assert kb.index_built_with == "model-A" and kb._dense_disabled_reason is None
++    with caplog.at_level(logging.WARNING):
++        ctx = retrieve_context(kb, "precursor cost", top_k=2)
++    assert ctx and kb.embedding_client.calls == 1    # dense: query embedded
++    assert "Dense KB retrieval failed" not in caplog.text
++
++
++def test_model_mismatch_is_explained_once_and_uses_keyword_search(built, caplog, capsys):
++    """The live shape, with provenance: no embedding call, no '()' message."""
++    _, paths = built
++    with caplog.at_level(logging.WARNING):
++        kb = _load(paths, "model-B", 3)
++    assert kb._dense_disabled_reason
++    assert "built with 'model-A'" in caplog.text
++    assert "embeds with 'model-B'" in caplog.text
++    caplog.clear()
++    with caplog.at_level(logging.WARNING):
++        ctx = retrieve_context(kb, "precursor cost per kilogram", top_k=2)
++        ctx2 = retrieve_context(kb, "Opentrons throughput", top_k=1)
++    assert "precursor" in ctx and "Opentrons" in ctx2
++    assert kb.embedding_client.calls == 0        # never embeds for this index
++    assert "Dense KB retrieval failed" not in caplog.text   # no failure — a mode
++    assert "retrieving via BM25" in capsys.readouterr().out
++
++
++def test_legacy_index_without_provenance_names_the_dimension_mismatch(built, caplog):
++    """Index files written before the sidecar existed: the first query
++    still has to embed, but the failure is named, and the KB stops
++    embedding queries for an index they can never match."""
++    tmp_path, paths = built
++    (tmp_path / "default_kb_docs.meta.json").unlink()
++    kb = _load(paths, "model-B", 3)
++    assert kb.index_built_with is None and kb._dense_disabled_reason is None
++    with caplog.at_level(logging.WARNING):
++        ctx = retrieve_context(kb, "precursor cost per kilogram", top_k=2)
++        retrieve_context(kb, "again", top_k=2)
++    assert "precursor" in ctx
++    assert "failed ()" not in caplog.text
++    assert "EmbeddingDimensionMismatch" in caplog.text
++    assert "3-d" in caplog.text and "4-d" in caplog.text
++    assert "embeds with 'model-B'" in caplog.text
++    assert kb.embedding_client.calls == 1        # second query: no re-embed
++
++
++def test_appending_with_another_model_is_a_named_error(built):
++    """Adding documents to a foreign index used to die with a bare
++    AssertionError from FAISS; now it says what is wrong."""
++    _, paths = built
++    kb = _load(paths, "model-B", 3)
++    kb._dense_disabled_reason = None             # force the append path
++    with pytest.raises(EmbeddingDimensionMismatch, match="new document embeddings are 3-d"):
++        kb.build([{"text": "more", "metadata": {"source": "d"}}])
++
++
++def test_describe_error_never_renders_empty():
++    assert describe_error(AssertionError()) == "AssertionError: AssertionError()"
++    assert describe_error(RuntimeError("boom")) == "RuntimeError: boom"
++
++
++def test_rebuild_after_mismatch_reenables_dense(built):
++    """A fresh build with the session's model clears the mismatch."""
++    _, paths = built
++    kb = _load(paths, "model-B", 3)
++    kb.index = None                              # rebuild from scratch
++    kb.chunks = []
++    kb.build(list(CHUNKS))
++    assert kb.index_built_with == "model-B" and kb._dense_disabled_reason is None
++    assert kb.retrieve("precursor", top_k=1)

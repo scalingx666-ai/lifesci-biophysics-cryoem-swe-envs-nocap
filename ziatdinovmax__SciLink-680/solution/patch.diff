@@ -1,0 +1,854 @@
+diff --git a/scilink/agents/sim_agents/base_analysis_agent.py b/scilink/agents/sim_agents/base_analysis_agent.py
+index a0959911..7466386c 100644
+--- a/scilink/agents/sim_agents/base_analysis_agent.py
++++ b/scilink/agents/sim_agents/base_analysis_agent.py
+@@ -556,7 +556,10 @@ def _execute_script(self, code: str, name: str) -> Dict[str, Any]:
+             msg = f"SyntaxError: {e.msg} (line {e.lineno})"
+             return {"ok": False, "status": "error", "message": msg,
+                     "concise_error": msg}
+-        slug = re.sub(r"[^0-9a-zA-Z]+", "_", name).strip("_") or "analysis"
++        # Capped: `name` embeds the free-text research goal, and an uncapped
++        # slug exceeds the 255-byte filename limit (ENAMETOOLONG).
++        slug = re.sub(r"[^0-9a-zA-Z]+", "_", name).strip("_")[:80].rstrip("_") \
++            or "analysis"
+         exec_result = self.executor.execute_script(
+             script_content=code, working_dir=str(self.output_dir))
+         if exec_result.get("status") == "success":
+diff --git a/scilink/agents/sim_agents/simulation_orchestrator.py b/scilink/agents/sim_agents/simulation_orchestrator.py
+index 672fcb7f..8db44efd 100644
+--- a/scilink/agents/sim_agents/simulation_orchestrator.py
++++ b/scilink/agents/sim_agents/simulation_orchestrator.py
+@@ -139,7 +139,11 @@ def _missing_(cls, value):
+   6. Submit the job to the HPC cluster (when connected), monitor
+      status, download results once complete.
+   7. Analyze the output, suggest fixes if the run failed.
+-  8. Generate a final report summarizing the full workflow.
++  8. For MD production runs, check observable convergence
++     (`check_observable_convergence`) — report which time-series
++     observables are not converged, with the evidence, and diagnose the
++     cause before changing the run.
++  9. Generate a final report summarizing the full workflow.
+ 
+ Users often iterate on one structure, then ask for variants (different
+ defect concentrations, supercell sizes, polymorphs, terminations). Reuse
+diff --git a/scilink/agents/sim_agents/simulation_orchestrator_tools.py b/scilink/agents/sim_agents/simulation_orchestrator_tools.py
+index 8fd0f8ba..f9bb35da 100644
+--- a/scilink/agents/sim_agents/simulation_orchestrator_tools.py
++++ b/scilink/agents/sim_agents/simulation_orchestrator_tools.py
+@@ -29,6 +29,87 @@
+ # read_document character cap — longer documents are truncated (~50k tokens).
+ _READ_DOC_MAX_CHARS = 200_000
+ 
++# Convergence-flag vocabulary emitted by time-series analysis skills. A tuple
++# (deterministic order), and every flag present on a property is inspected —
++# never just the first — so a mix like {converged: true, plateau_reached:
++# false} is judged the same way on every run.
++_CONVERGENCE_FLAG_KEYS = (
++    "plateau_reached", "converged", "linear_regime", "extreme_narrowing",
++)
++
++
++def _parse_flag_bool(value: Any):
++    """Strictly coerce a model-written convergence flag to a bool.
++
++    Real bools pass through; the strings ``"true"``/``"false"`` (any case) map
++    to a bool; anything else (a number, another string, ``None``) is
++    unparseable and returns ``None``. Never call ``bool()`` on a raw flag —
++    ``bool("False")`` is ``True``.
++    """
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, str):
++        s = value.strip().lower()
++        if s == "true":
++            return True
++        if s == "false":
++            return False
++    return None
++
++
++def _classify_convergence(result: Dict[str, Any]) -> Dict[str, Any]:
++    """Classify one analysis result as converged / not_converged / not_assessed.
++
++    Convergence is a claim about a time-series observable; plausibility is a
++    separate trust signal from the analysis verifier. Precedence:
++
++    1. ``verification.plausible is False`` -> ``not_converged`` (untrustworthy),
++       whatever the flags say. A verifier-rejected result can still arrive with
++       ``status="success"`` because the codegen engine returns the best attempt
++       on exhaustion, so the verdict must be honored here.
++    2. otherwise inspect every convergence flag PRESENT, parsed strictly:
++       - any present flag is ``False``          -> ``not_converged``
++       - >=1 present flag and all are ``True``  -> ``converged``
++       - no parseable flag present              -> ``not_assessed``
++
++    Returns the evidence dict (value/units/verification) plus ``state`` and,
++    when any flag was present, a ``flags`` map of ``{name: {raw, parsed}}``.
++    """
++    verification = result.get("verification") or {}
++    plausible = verification.get("plausible")
++
++    flags: Dict[str, Any] = {}
++    any_false = any_true = any_unparseable = False
++    for key in _CONVERGENCE_FLAG_KEYS:
++        if key in result:
++            parsed = _parse_flag_bool(result[key])
++            flags[key] = {"raw": result[key], "parsed": parsed}
++            if parsed is False:
++                any_false = True
++            elif parsed is True:
++                any_true = True
++            else:
++                any_unparseable = True
++
++    if plausible is False:
++        state = "not_converged"
++    elif any_false:
++        state = "not_converged"
++    elif any_true and not any_unparseable:
++        state = "converged"
++    else:
++        # No flag at all, or only unparseable ones — nothing to stand on.
++        state = "not_assessed"
++
++    evidence = {
++        k: v for k, v in result.items()
++        if k in ("value", "units", "verification")
++    }
++    evidence["state"] = state
++    if flags:
++        evidence["flags"] = flags
++    return evidence
++
+ 
+ def _extract_document_text(path: Path, ocr_model: Any = None) -> Dict[str, Any]:
+     """Kept as a name for callers; the implementation is the shared engine's."""
+@@ -2205,6 +2286,111 @@ def analyze_output(output_dir: str, research_goal: str,
+             required=["output_dir", "research_goal"],
+         )
+ 
++        # =====================================================================
++        # 9. CHECK OBSERVABLE CONVERGENCE (post-run analysis)
++        # =====================================================================
++        def check_observable_convergence(
++            output_dir: str, research_goal: str,
++        ) -> str:
++            from .simulation_analysis_agent import SimulationAnalysisAgent
++
++            try:
++                agent = SimulationAnalysisAgent(
++                    output_dir=output_dir,
++                    api_key=self.orch.api_key,
++                    base_url=self.orch.base_url,
++                    model_name=self.orch.model_name,
++                )
++                analysis = agent.run_analysis(research_goal, run_dir=output_dir)
++            except Exception as e:
++                return json.dumps({
++                    "status": "error",
++                    "message": f"Analysis failed: {e}",
++                })
++
++            if analysis.get("status") == "error":
++                return json.dumps({
++                    "status": "error",
++                    "message": analysis.get("message", "analysis returned error"),
++                })
++
++            results = analysis.get("results") or {}
++            properties = {}
++            unconverged = []
++            not_assessed = []
++
++            for prop, result in results.items():
++                if result.get("status") == "error":
++                    properties[prop] = {
++                        "state": "error",
++                        "message": result.get("message", ""),
++                    }
++                    continue
++
++                evidence = _classify_convergence(result)
++                properties[prop] = evidence
++                if evidence["state"] == "not_converged":
++                    unconverged.append(prop)
++                elif evidence["state"] == "not_assessed":
++                    not_assessed.append(prop)
++
++            # Diagnostic-only: report each property's state (converged /
++            # not_converged / not_assessed) with the evidence behind it, and no
++            # remedy — non-convergence has many causes (equilibration, state
++            # point, force field, sampling cadence, finite size), so the caller
++            # diagnoses from the evidence. Top-level `converged` means nothing
++            # was found not-converged/untrustworthy; `not_assessed` lists the
++            # properties that carried no convergence signal to judge.
++            out = {
++                "status": "success",
++                "converged": len(unconverged) == 0,
++                "properties": properties,
++                "unconverged": unconverged,
++                "not_assessed": not_assessed,
++                "skills_used": analysis.get("skills_used", []),
++                "data_kinds": analysis.get("data_kinds", []),
++            }
++            return json.dumps(out, default=str)
++
++        self._register_tool(
++            func=check_observable_convergence,
++            name="check_observable_convergence",
++            description=(
++                "Post-run convergence check for time-series observables. "
++                "Runs the simulation analysis agent on a finished run "
++                "directory and classifies each computed property as "
++                "'converged', 'not_converged', or 'not_assessed', with the "
++                "value, convergence flags, and verification reasoning as "
++                "evidence. A property is not_converged when the verifier "
++                "judged it implausible or any convergence flag is false; "
++                "not_assessed when it carried no convergence signal to judge "
++                "(e.g. a structural or single-point property). Diagnostic "
++                "only — it reports the finding, not a remedy; use the "
++                "evidence to judge whether a value is trustworthy and, if "
++                "not, why. Use after a successful simulation to check "
++                "computed observables (e.g. Green-Kubo viscosity)."
++            ),
++            parameters={
++                "output_dir": {
++                    "type": "string",
++                    "description": (
++                        "Absolute path to the finished run's output "
++                        "directory containing trajectory and/or thermo "
++                        "log files."
++                    ),
++                },
++                "research_goal": {
++                    "type": "string",
++                    "description": (
++                        "What the simulation was meant to compute — "
++                        "drives which analysis skills are selected and "
++                        "which convergence flags are checked."
++                    ),
++                },
++            },
++            required=["output_dir", "research_goal"],
++        )
++
+         # =====================================================================
+         # 12. SUBMIT VASP JOB
+         # =====================================================================
+diff --git a/tests/test_check_convergence_tool.py b/tests/test_check_convergence_tool.py
+new file mode 100644
+index 00000000..9a77d5d8
+--- /dev/null
++++ b/tests/test_check_convergence_tool.py
+@@ -0,0 +1,293 @@
++"""Tests for the check_observable_convergence orchestrator tool.
++
++Covers the strict three-state classifier (`_classify_convergence`) directly
++and the tool end-to-end with a monkeypatched SimulationAnalysisAgent. The
++classifier is the single source of truth — there is no separate mirror to
++drift.
++"""
++
++import json
++import sys
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++from scilink.agents.sim_agents.simulation_orchestrator_tools import (  # noqa: E402
++    _classify_convergence, _parse_flag_bool,
++)
++
++
++# ---------------------------------------------------------------------------
++# _parse_flag_bool — strict boolean coercion of model-written flags
++# ---------------------------------------------------------------------------
++
++class TestParseFlagBool:
++    def test_real_bools_pass_through(self):
++        assert _parse_flag_bool(True) is True
++        assert _parse_flag_bool(False) is False
++
++    def test_bool_strings_any_case(self):
++        assert _parse_flag_bool("true") is True
++        assert _parse_flag_bool("True") is True
++        assert _parse_flag_bool("FALSE") is False
++        assert _parse_flag_bool("  false  ") is False
++
++    def test_unparseable_is_none(self):
++        # The classic bug: bool("False") is True. These must NOT coerce.
++        for v in ("False?", "maybe", "yes", "", 0, 1, None, 0.0):
++            assert _parse_flag_bool(v) is None, v
++
++
++# ---------------------------------------------------------------------------
++# _classify_convergence — converged / not_converged / not_assessed
++# ---------------------------------------------------------------------------
++
++class TestClassify:
++    def _state(self, result):
++        return _classify_convergence(result)["state"]
++
++    def test_flag_true_converged(self):
++        assert self._state({"value": 0.89, "plateau_reached": True}) == "converged"
++
++    def test_flag_false_not_converged(self):
++        assert self._state({"value": 0.89, "plateau_reached": False}) == "not_converged"
++
++    def test_no_flag_no_verdict_not_assessed(self):
++        assert self._state({"value": 1.1, "units": "eV"}) == "not_assessed"
++
++    def test_no_flag_plausible_true_not_assessed(self):
++        assert self._state({
++            "value": 1.1, "verification": {"plausible": True},
++        }) == "not_assessed"
++
++    def test_string_true_flag_converged(self):
++        assert self._state({"value": 1.0, "plateau_reached": "true"}) == "converged"
++
++    # --- Maxim's review table (each row was reported as converged) ---
++
++    def test_row1_no_flag_implausible_not_converged(self):
++        # value:-0.4, no flag, verification.plausible:false
++        assert self._state({
++            "value": -0.4, "verification": {"plausible": False,
++                                            "reasoning": "negative"},
++        }) == "not_converged"
++
++    def test_row2_string_false_flag_not_converged(self):
++        # plateau_reached:"False" (a string) — bool("False") is True, so this
++        # must be parsed strictly.
++        assert self._state({"value": 0.5, "plateau_reached": "False"}) == "not_converged"
++
++    def test_row3_mixed_flags_not_converged_deterministic(self):
++        # converged:true + plateau_reached:false — every flag is read, so the
++        # false one wins regardless of dict/hash order. Run repeatedly to make
++        # the determinism explicit.
++        result = {"value": 0.5, "converged": True, "plateau_reached": False}
++        for _ in range(20):
++            assert self._state(dict(result)) == "not_converged"
++
++    # --- other edge cases ---
++
++    def test_plausible_false_overrides_true_flag(self):
++        assert self._state({
++            "value": 0.5, "plateau_reached": True,
++            "verification": {"plausible": False},
++        }) == "not_converged"
++
++    def test_unparseable_only_flag_not_assessed(self):
++        assert self._state({"value": 0.5, "plateau_reached": "maybe"}) == "not_assessed"
++
++    def test_true_plus_unparseable_not_assessed(self):
++        # A true flag can't be trusted when another present flag is unreadable.
++        assert self._state({
++            "value": 0.5, "converged": True, "plateau_reached": "maybe",
++        }) == "not_assessed"
++
++    def test_all_flags_true_converged(self):
++        assert self._state({
++            "value": 0.5, "converged": True, "plateau_reached": True,
++        }) == "converged"
++
++    def test_evidence_records_flags_and_verification(self):
++        ev = _classify_convergence({
++            "value": 0.89, "units": "mPa·s", "plateau_reached": False,
++            "verification": {"plausible": False, "reasoning": "x"},
++        })
++        assert ev["value"] == 0.89 and ev["units"] == "mPa·s"
++        assert ev["verification"]["reasoning"] == "x"
++        assert ev["flags"]["plateau_reached"]["parsed"] is False
++        assert ev["flags"]["plateau_reached"]["raw"] is False
++
++
++# ---------------------------------------------------------------------------
++# Tool integration tests (monkeypatched SimulationAnalysisAgent)
++# ---------------------------------------------------------------------------
++
++def _make_fake_orch(**overrides):
++    orch = MagicMock()
++    orch.api_key = overrides.get("api_key", "test-key")
++    orch.base_url = overrides.get("base_url", None)
++    orch.model_name = overrides.get("model_name", "claude-opus-4-6")
++    orch.base_dir = overrides.get("base_dir", "/tmp/test")
++    orch.mp_api_key = None
++    orch.futurehouse_api_key = None
++    orch.hpc_connection = None
++    orch.hpc_scheduler = None
++    orch.generated_structures = []
++    orch.default_calc_params = {}
++    orch.routing_decision = {}
++    orch.active_skill_and_domain = MagicMock(return_value=(None, None))
++    return orch
++
++
++def _build_tools(orch):
++    from scilink.agents.sim_agents.simulation_orchestrator_tools import (
++        SimulationOrchestratorTools,
++    )
++    return SimulationOrchestratorTools(orch)
++
++
++def _run_tool(tmp_path, results, research_goal="viscosity"):
++    """Invoke the tool with a monkeypatched analysis agent returning ``results``."""
++    orch = _make_fake_orch()
++    tools = _build_tools(orch)
++    analysis_result = {
++        "status": "success", "results": results,
++        "skills_used": ["viscosity_greenkubo"], "data_kinds": ["thermo_log"],
++    }
++    with patch(
++        "scilink.agents.sim_agents.simulation_analysis_agent"
++        ".SimulationAnalysisAgent"
++    ) as MockAgent:
++        MockAgent.return_value.run_analysis.return_value = analysis_result
++        raw = tools.functions_map["check_observable_convergence"](
++            output_dir=str(tmp_path), research_goal=research_goal,
++        )
++    return json.loads(raw)
++
++
++class TestToolIntegration:
++    def test_tool_registered(self):
++        tools = _build_tools(_make_fake_orch())
++        assert "check_observable_convergence" in tools.functions_map
++
++    def test_tool_returns_converged(self, tmp_path):
++        out = _run_tool(tmp_path, {
++            "shear_viscosity": {
++                "status": "success", "value": 0.89, "units": "mPa·s",
++                "plateau_reached": True,
++                "verification": {"plausible": True, "reasoning": "ok"},
++            },
++        })
++        assert out["status"] == "success"
++        assert out["converged"] is True
++        assert out["unconverged"] == [] and out["not_assessed"] == []
++        assert out["properties"]["shear_viscosity"]["state"] == "converged"
++
++    def test_tool_returns_unconverged(self, tmp_path):
++        out = _run_tool(tmp_path, {
++            "shear_viscosity": {
++                "status": "success", "value": 0.89, "units": "mPa·s",
++                "plateau_reached": False,
++                "verification": {"plausible": False, "reasoning": "no plateau"},
++            },
++        })
++        assert out["converged"] is False
++        assert out["unconverged"] == ["shear_viscosity"]
++        assert out["properties"]["shear_viscosity"]["state"] == "not_converged"
++        # Diagnostic-only: never prescribes a remedy.
++        assert "recommendation" not in out
++
++    def test_tool_row1_no_flag_implausible(self, tmp_path):
++        out = _run_tool(tmp_path, {
++            "shear_viscosity": {
++                "status": "success", "value": -0.4, "units": "mPa·s",
++                "verification": {"plausible": False, "reasoning": "negative"},
++            },
++        })
++        assert out["converged"] is False
++        assert out["unconverged"] == ["shear_viscosity"]
++        assert out["properties"]["shear_viscosity"]["state"] == "not_converged"
++
++    def test_tool_row2_string_false_flag(self, tmp_path):
++        out = _run_tool(tmp_path, {
++            "shear_viscosity": {
++                "status": "success", "value": 0.5, "units": "mPa·s",
++                "plateau_reached": "False",
++            },
++        })
++        assert out["converged"] is False
++        assert out["unconverged"] == ["shear_viscosity"]
++
++    def test_tool_row3_mixed_flags(self, tmp_path):
++        out = _run_tool(tmp_path, {
++            "shear_viscosity": {
++                "status": "success", "value": 0.5, "units": "mPa·s",
++                "converged": True, "plateau_reached": False,
++            },
++        })
++        assert out["converged"] is False
++        assert out["unconverged"] == ["shear_viscosity"]
++
++    def test_tool_dft_no_flags_not_assessed(self, tmp_path):
++        out = _run_tool(tmp_path, {
++            "band_gap": {
++                "status": "success", "value": 1.1, "units": "eV",
++                "verification": {"plausible": True, "reasoning": "ok"},
++            },
++        }, research_goal="band gap")
++        # Nothing was found not-converged, but the property carried no
++        # convergence signal, so it is surfaced as not_assessed — not silently
++        # reported converged.
++        assert out["converged"] is True
++        assert out["unconverged"] == []
++        assert out["not_assessed"] == ["band_gap"]
++        assert out["properties"]["band_gap"]["state"] == "not_assessed"
++        assert "recommendation" not in out
++
++    def test_tool_error_property_surfaced(self, tmp_path):
++        out = _run_tool(tmp_path, {
++            "shear_viscosity": {"status": "error", "message": "script crashed"},
++            "diffusion": {
++                "status": "success", "value": 2.3e-9, "units": "m²/s",
++                "converged": True,
++            },
++        })
++        assert out["properties"]["shear_viscosity"]["state"] == "error"
++        assert out["properties"]["diffusion"]["state"] == "converged"
++
++    def test_tool_handles_analysis_error(self, tmp_path):
++        orch = _make_fake_orch()
++        tools = _build_tools(orch)
++        with patch(
++            "scilink.agents.sim_agents.simulation_analysis_agent"
++            ".SimulationAnalysisAgent"
++        ) as MockAgent:
++            MockAgent.return_value.run_analysis.return_value = {
++                "status": "error", "message": "no recognized output", "results": {},
++            }
++            raw = tools.functions_map["check_observable_convergence"](
++                output_dir=str(tmp_path), research_goal="viscosity",
++            )
++        assert json.loads(raw)["status"] == "error"
++
++    def test_tool_handles_exception(self, tmp_path):
++        orch = _make_fake_orch()
++        tools = _build_tools(orch)
++        with patch(
++            "scilink.agents.sim_agents.simulation_analysis_agent"
++            ".SimulationAnalysisAgent"
++        ) as MockAgent:
++            MockAgent.side_effect = RuntimeError("boom")
++            raw = tools.functions_map["check_observable_convergence"](
++                output_dir=str(tmp_path), research_goal="viscosity",
++            )
++        out = json.loads(raw)
++        assert out["status"] == "error" and "boom" in out["message"]
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_convergence_live.py b/tests/test_convergence_live.py
+new file mode 100644
+index 00000000..8c4756ec
+--- /dev/null
++++ b/tests/test_convergence_live.py
+@@ -0,0 +1,280 @@
++"""
++Live tests for the observable-convergence loop (#447).
++
++Scenario A — proactive (LLM only, no LAMMPS):
++    A synthetic, completed LAMMPS run whose stress autocorrelation decays far
++    slower than the run length, so the Green-Kubo integral cannot plateau.
++    The prompt asks for the viscosity and whether it is trustworthy, WITHOUT
++    naming check_observable_convergence. Passes if the orchestrator calls the
++    tool on its own; the tool's verdict is reported but not asserted.
++
++Scenario B — loop (LLM + LAMMPS, run inside a SLURM allocation):
++    A real LJ-argon Green-Kubo run with a deliberately short first production.
++    Passes if the orchestrator runs, detects non-convergence, re-runs with more
++    sampling, and re-checks — i.e. run_simulation and
++    check_observable_convergence are each called at least twice, with a re-run
++    following an unconverged verdict.
++
++Run:
++    python tests/test_convergence_live.py --scenario proactive
++    python tests/test_convergence_live.py --scenario loop      # needs `lmp`
++    python tests/test_convergence_live.py --scenario all
++
++Env: SCILINK_API_KEY or ANTHROPIC_API_KEY; optional SCILINK_MODEL,
++SCILINK_BASE_URL.
++"""
++
++import argparse
++import json
++import math
++import os
++import random
++import shutil
++import sys
++import textwrap
++import time
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++DEFAULT_MODEL = "claude-opus-4-6"
++RUN_ROOT = REPO_ROOT / "tests" / "_simulate_runs" / "convergence_live"
++
++
++def _make_orch(base_dir: Path):
++    from scilink.agents.sim_agents import (
++        SimulationOrchestratorAgent, SimulationMode,
++    )
++    key = os.environ.get("SCILINK_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
++    if not key:
++        raise RuntimeError("Set SCILINK_API_KEY or ANTHROPIC_API_KEY.")
++    kwargs = dict(
++        base_dir=str(base_dir),
++        api_key=key,
++        model_name=os.environ.get("SCILINK_MODEL", DEFAULT_MODEL),
++        simulation_mode=SimulationMode.AUTONOMOUS,
++    )
++    if os.environ.get("SCILINK_BASE_URL"):
++        kwargs["base_url"] = os.environ["SCILINK_BASE_URL"]
++    return SimulationOrchestratorAgent(**kwargs)
++
++
++def _track(orch, names):
++    """Wrap tools so every call is logged in order: [(name, kwargs, result)]."""
++    log = []
++    for name in names:
++        fn = orch.tools.functions_map[name]
++
++        def wrapper(_fn=fn, _name=name, **kwargs):
++            t0 = time.time()
++            print(f"\n>>> [{_name}] called: {json.dumps(kwargs, default=str)[:400]}")
++            result = _fn(**kwargs)
++            print(f">>> [{_name}] returned in {time.time() - t0:.0f}s: "
++                  f"{str(result)[:600]}")
++            parsed = _parse(result)
++            for key in ("force_field", "error", "message"):
++                if key in parsed and str(parsed.get("status", "")).startswith(
++                        ("fail", "error")):
++                    print(f">>> [{_name}] {key}: "
++                          f"{json.dumps(parsed[key], default=str)[:1500]}")
++            log.append((_name, kwargs, result))
++            return result
++
++        orch.tools.functions_map[name] = wrapper
++    return log
++
++
++def _parse(result):
++    try:
++        return json.loads(result)
++    except (TypeError, ValueError):
++        return {}
++
++
++# ---------------------------------------------------------------------------
++# Scenario A — proactive
++# ---------------------------------------------------------------------------
++
++def _write_unconverged_log(run_dir: Path) -> None:
++    """LAMMPS `real`-units log whose stress ACF cannot decay within the run.
++
++    Off-diagonal stresses follow an AR(1) process with correlation time ~0.6x
++    the series length, so the stress ACF has not decayed within the usable lag
++    window. White noise would be wrong here: its ACF decays in one lag and the
++    integral plateaus at once.
++    """
++    random.seed(0)
++    run_dir.mkdir(parents=True, exist_ok=True)
++    thermo_every, n_steps = 10, 20000
++    n = n_steps // thermo_every + 1
++    phi = math.exp(-1.0 / (0.6 * n))
++    sigma = 300.0
++    innov = sigma * math.sqrt(1 - phi * phi)
++
++    comps = {k: random.gauss(0, sigma) for k in ("pxy", "pxz", "pyz", "dxx", "dyy")}
++    rows = ["Step Temp Press Pxx Pyy Pzz Pxy Pxz Pyz Volume"]
++    for i in range(n):
++        for k in comps:
++            comps[k] = phi * comps[k] + random.gauss(0, innov)
++        p0 = random.gauss(1.0, 50.0)
++        pxx, pyy = p0 + comps["dxx"], p0 + comps["dyy"]
++        pzz = 3 * p0 - pxx - pyy
++        rows.append(
++            f"{i * thermo_every} {random.gauss(94.4, 1.5):.2f} {p0:.3f} "
++            f"{pxx:.3f} {pyy:.3f} {pzz:.3f} {comps['pxy']:.3f} "
++            f"{comps['pxz']:.3f} {comps['pyz']:.3f} 17240.0"
++        )
++
++    deck = textwrap.dedent(f"""\
++        units real
++        atom_style atomic
++        read_data argon.data
++        pair_style lj/cut 10.0
++        pair_coeff 1 1 0.2381 3.405
++        timestep 2.0
++        fix 1 all nvt temp 94.4 94.4 200.0
++        thermo_style custom step temp press pxx pyy pzz pxy pxz pyz vol
++        thermo {thermo_every}
++        run {n_steps}
++    """)
++    (run_dir / "in.lammps").write_text(deck)
++    (run_dir / "log.lammps").write_text(
++        "LAMMPS (2 Aug 2023)\n" + deck + "\n".join(rows)
++        + "\nLoop time of 42.0 on 4 procs for 20000 steps with 256 atoms\n"
++        + "Total wall time: 0:00:42\n"
++    )
++
++
++def scenario_proactive() -> bool:
++    work = RUN_ROOT / "proactive"
++    shutil.rmtree(work, ignore_errors=True)
++    run_dir = work / "lammps_output"
++    _write_unconverged_log(run_dir)
++
++    orch = _make_orch(work / "sim")
++    assert "check_observable_convergence" in orch.tools.functions_map
++    log = _track(orch, ["analyze_output", "check_observable_convergence",
++                        "run_simulation"])
++    # Scenario A tests the decision, not a re-run: stub execution out.
++    orch.tools.functions_map["run_simulation"] = lambda **kw: json.dumps({
++        "status": "error",
++        "message": "Execution is disabled in this test session; report "
++                   "what you would do instead.",
++    })
++
++    response = orch.chat(
++        f"I finished an NVT production run of liquid argon (256 atoms, 94.4 K, "
++        f"LAMMPS real units) and the outputs are in {run_dir}. Compute the "
++        f"shear viscosity from it via Green-Kubo and tell me whether the value "
++        f"can be trusted for publication."
++    )
++    print("\n--- final response (last 1200 chars) ---\n" + response[-1200:])
++
++    conv_calls = [c for c in log if c[0] == "check_observable_convergence"]
++    verdicts = [_parse(c[2]) for c in conv_calls]
++    reported_unconverged = any(v.get("converged") is False for v in verdicts)
++    text = response.lower()
++    flags_problem = any(s in text for s in (
++        "not converged", "unconverged", "has not converged", "did not converge",
++        "no plateau", "not plateau", "plateau_reached", "not trustworthy",
++        "cannot be trusted", "not reliable", "extend"))
++
++    print("\n=== Scenario A results ===")
++    print(f"  tool call order            : {[c[0] for c in log]}")
++    print(f"  convergence tool called    : {bool(conv_calls)}")
++    print(f"  tool verdict unconverged   : {reported_unconverged}")
++    print(f"  response flags the problem : {flags_problem}")
++
++    # Pass = the orchestrator reached for the tool unprompted. The verdict
++    # itself comes from an LLM-written plateau detector on synthetic data, so
++    # it is reported, not asserted; scenario B tests acting on a verdict.
++    ok = bool(conv_calls)
++    if conv_calls and not reported_unconverged:
++        print("  NOTE: tool ran but did not report non-convergence — the "
++              "analysis script judged the synthetic integral as plateaued.")
++    print(f"  {'PASS' if ok else 'FAIL'}")
++    return ok
++
++
++# ---------------------------------------------------------------------------
++# Scenario B — loop with real LAMMPS
++# ---------------------------------------------------------------------------
++
++def scenario_loop() -> bool:
++    if not shutil.which("lmp") and not shutil.which("lmp_serial") \
++            and not shutil.which("lmp_mpi"):
++        print("SKIP: no LAMMPS binary on PATH (lmp / lmp_serial / lmp_mpi).")
++        return False
++    if not (os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID")):
++        print("WARN: not inside a SLURM allocation; run_simulation will only "
++              "execute locally if no HPC connection is configured.")
++
++    work = RUN_ROOT / "loop"
++    shutil.rmtree(work, ignore_errors=True)
++    orch = _make_orch(work / "sim")
++    # Two+ runs, each with analysis and checks, exceed the default tool cap.
++    orch.max_iterations = max(orch.max_iterations, 60)
++    log = _track(orch, ["run_simulation", "analyze_output",
++                        "check_observable_convergence"])
++
++    # Water, not LJ argon: the MD pipeline parameterizes liquids through
++    # OpenFF, which has no parameters for a bare noble-gas atom.
++    response = orch.chat(
++        "Compute the shear viscosity of liquid water (TIP3P) at 298 K and "
++        "1 atm via Green-Kubo in LAMMPS, using a small box of about 216 "
++        "water molecules. To save compute, start with a short NVT "
++        "production of only 20 ps after equilibration, logging the "
++        "pressure tensor every few steps. I need a converged value for a "
++        "paper, so don't report a number you can't stand behind."
++    )
++    print("\n--- final response (last 1500 chars) ---\n" + response[-1500:])
++
++    order = [c[0] for c in log]
++    runs = [i for i, c in enumerate(log) if c[0] == "run_simulation"]
++    checks = [(i, _parse(c[2])) for i, c in enumerate(log)
++              if c[0] == "check_observable_convergence"]
++    unconverged_idx = [i for i, v in checks if v.get("converged") is False]
++    rerun_after_unconverged = any(r > u for u in unconverged_idx for r in runs)
++    recheck_after_rerun = any(
++        ci > r for r in runs for u in unconverged_idx if r > u
++        for ci, _ in checks)
++    final = checks[-1][1] if checks else {}
++
++    print("\n=== Scenario B results ===")
++    print(f"  tool call order                 : {order}")
++    print(f"  run_simulation calls            : {len(runs)}")
++    print(f"  convergence checks              : {len(checks)}")
++    print(f"  saw an unconverged verdict      : {bool(unconverged_idx)}")
++    print(f"  re-ran after unconverged verdict: {rerun_after_unconverged}")
++    print(f"  re-checked after the re-run     : {recheck_after_rerun}")
++    print(f"  final verdict converged         : {final.get('converged')}")
++    for i, v in checks:
++        for prop, p in (v.get("properties") or {}).items():
++            print(f"    check@{i}: {prop} = {p.get('value')} {p.get('units')} "
++                  f"(state={p.get('state')})")
++
++    if not unconverged_idx and checks:
++        print("  NOTE: the first run already converged — the loop was not "
++              "exercised. Shorten the initial production and re-run.")
++    ok = bool(checks) and rerun_after_unconverged and recheck_after_rerun
++    print(f"  {'PASS' if ok else 'FAIL'}")
++    return ok
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--scenario", choices=["proactive", "loop", "all"],
++                    default="proactive")
++    args = ap.parse_args()
++
++    results = {}
++    if args.scenario in ("proactive", "all"):
++        results["proactive"] = scenario_proactive()
++    if args.scenario in ("loop", "all"):
++        results["loop"] = scenario_loop()
++
++    print("\n" + "=" * 60)
++    for k, v in results.items():
++        print(f"  {k:10s}: {'PASS' if v else 'FAIL'}")
++    sys.exit(0 if all(results.values()) else 1)
+diff --git a/tests/test_sim_base_analysis_agent.py b/tests/test_sim_base_analysis_agent.py
+index 658e6d4a..816abb2e 100644
+--- a/tests/test_sim_base_analysis_agent.py
++++ b/tests/test_sim_base_analysis_agent.py
+@@ -54,6 +54,13 @@ def test_execute_script_catches_syntax_error_before_run(self, agent):
+         r = agent._execute_script('print(json.dumps({"a": 1}))extra)', "t")
+         assert r["status"] == "error" and "SyntaxError" in r["concise_error"]
+ 
++    def test_execute_script_long_name_saves_capped_filename(self, agent):
++        name = "shear_viscosity for the research goal: " + "very long goal " * 30
++        r = agent._execute_script('print(\'{"status":"success","value":5}\')', name)
++        assert r["status"] == "success" and r["value"] == 5
++        saved = Path(r["code_path"])
++        assert saved.is_file() and len(saved.name) <= 83
++
+     def test_execute_script_reads_injected_globals(self, agent, tmp_path):
+         # compute_property injects DATA_FILES/OUTPUT_DIR; a script can read them.
+         data = tmp_path / "d.txt"
+diff --git a/tests/test_simulation_orchestrator.py b/tests/test_simulation_orchestrator.py
+index b961ffc9..e7245944 100644
+--- a/tests/test_simulation_orchestrator.py
++++ b/tests/test_simulation_orchestrator.py
+@@ -108,6 +108,9 @@ def _make_orch(model_name: str, base_dir: str, autonomy: str = "co-pilot"):
+     "read_document",
+     "list_generated_structures",
+     "analyze_output",
++    "check_observable_convergence",
++    "get_history_events",
++    "search_session_history",
+     "route_simulation",
+     "list_available_software",
+     # HPC tools

@@ -1,0 +1,488 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index aff89f54..16857a0f 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -278,6 +278,8 @@ kept only for sibling datasets that cannot be staged as one directory. A
+ fan-out branch that IS a datacube-series directory gets
+ `FANOUT_SERIES_BUDGET_FACTOR` × the default wall-clock budget (the raw-
+ instrument rule's shape), because the series mode is a multiple of one run.
++A swarm analysis item with a `data_path` gets the same per-branch budget
++(`resolve_branch_budget`); a caller's `item_time_budget_s` is taken as is.
+ Under AUTOPILOT delegation the regime-plan gate reaches the user through the
+ normal feedback channel, like the specialists' other plan gates.
+ 
+diff --git a/scilink/agents/exp_agents/_locked_exec.py b/scilink/agents/exp_agents/_locked_exec.py
+index 8e54c2a1..408817e1 100644
+--- a/scilink/agents/exp_agents/_locked_exec.py
++++ b/scilink/agents/exp_agents/_locked_exec.py
+@@ -188,8 +188,10 @@ def escalate_timeouts(attempt, *, base_timeout: int, timed_out, logger=None,
+     budget = TIMEOUT_ESCALATIONS if escalations is None else max(0, int(escalations))
+ 
+     def left():
++        # the seconds left as they are (the message says them), and as a
++        # limit (never under 1 s: a 0 s limit would be no run at all)
+         r = remaining_s() if callable(remaining_s) else remaining_s
+-        return None if r is None else max(1, int(r))
++        return (None, None) if r is None else (max(0, int(r)), max(1, int(r)))
+     # the FIRST limit is never clamped: the run budget is soft — a script that
+     # started finishes (RunBudget's promise) — only the retries are bounded
+     current = int(base_timeout)
+@@ -199,14 +201,14 @@ def left():
+         if not timed_out(out):
+             return out, current
+         grown = min(int(current * TIMEOUT_GROWTH), TIMEOUT_HARD_CAP_S)
+-        r = left()
++        r_said, r = left()
+         next_timeout = grown if r is None else min(grown, r)
+         if next_timeout <= current or esc >= budget:
+             if esc >= budget:
+                 why = (f"escalation budget exhausted ({budget} retr{'y' if budget == 1 else 'ies'})" if budget
+                        else "no escalation on this clock")
+             elif r is not None and next_timeout >= r:
+-                why = f"the time left ({r}s, the run's deadline or the loop's budget) allows no longer retry"
++                why = f"the time left ({r_said}s, the run's deadline or the loop's budget) allows no longer retry"
+             else:
+                 why = f"the {TIMEOUT_HARD_CAP_S}s cap allows no longer retry"
+             log.warning(f"    ⏱  Timed out at {current}s; {why} — handing the timeout to the correction loop.")
+diff --git a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+index 9ceb8aab..7ed18d0f 100644
+--- a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
++++ b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+@@ -4227,6 +4227,15 @@ def _run_attempt(self, ctx: QCItemContext) -> dict:
+                     _base_timeout = max(int(self.executor_timeout),
+                                         int(getattr(ctx, "locked_timeout_s", 0) or 0))
+                     ctx.timeout_used_s = None            # per attempt: a swallowed or failed run leaves none
++                    # A ladder retry of the SAME script (a locked replay reruns
++                    # it) starts from the limit it already timed out at, with
++                    # no further escalation: the policy has already granted it
++                    # every doubling it may have (#719).
++                    _script_key = hash(code_str)
++                    _reached = getattr(ctx, "timeout_reached_s", None)
++                    if _reached is None:
++                        _reached = ctx.timeout_reached_s = {}
++                    _again = _reached.get(_script_key)
+                     _run_deadline = state.get("_run_deadline")
+                     _loop_t0 = getattr(ctx, "loop_started", None)
+                     _loop_budget = getattr(self, "qc_time_budget_s", None)
+@@ -4242,6 +4251,13 @@ def _remaining_s():
+                             left.append(float(_loop_budget) - (_time_mod.monotonic() - _loop_t0))
+                         return min(left) if left else None
+ 
++                    if _again:
++                        # a rerun is a retry: what it adds over the base limit
++                        # is bounded by the time left, as any retry is
++                        _r = _remaining_s()
++                        _grant = int(_again) if _r is None else min(int(_again), max(1, int(_r)))
++                        _base_timeout = max(_base_timeout, _grant)
++
+                     def _attempt(_timeout_s: int):
+                         _scope_g, _scope_l = dict(global_scope), {}
+                         try:
+@@ -4283,7 +4299,9 @@ def _attempt(_timeout_s: int):
+                         timed_out=lambda out: isinstance(out, TimeoutError) and _sandbox_timeout(out),
+                         logger=self.logger, remaining_s=_remaining_s,
+                         # a live frame must fail fast: no escalation on the fast clock
+-                        escalations=0 if state.get("_strict_replay") else None)
++                        escalations=0 if state.get("_strict_replay") or _again else None)
++                    if isinstance(result_dict, TimeoutError) and _sandbox_timeout(result_dict):
++                        _reached[_script_key] = _timeout_used
+                     if isinstance(result_dict, Exception):
+                         # Raised here, without this wrapper's frame, so the
+                         # traceback the correction prompt shows is the script's
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index 5e8ec1fd..8ff5b323 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -355,6 +355,8 @@ def _ensure_stop_guard_installed() -> None:
+ # trend and synthesis — which is a multiple of a single-cube run. Scaled the
+ # same way (explicit branch_time_budget_s is never scaled).
+ FANOUT_SERIES_BUDGET_FACTOR = 2.0
++#: A branch's typed depth, the single delegation's ``depth`` keys.
++_BRANCH_DEPTH_KEYS = ("profile", "targets", "time_budget_s")
+ # In AUTONOMOUS mode there is no human to confirm, so the verdict IS the gate:
+ # proceed only on a confident 'complementary' read.
+ AUTONOMOUS_CONFIDENCE_THRESHOLD = 0.6
+@@ -1208,8 +1210,7 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+                          else _mesh_task(branch, companions))
+             # Typed per-branch depth (the single-delegation path's twin): the
+             # child applies it to every run_analysis call of the branch.
+-            _depth = {k: branch.get(k) for k in ("profile", "targets", "time_budget_s")
+-                      if branch.get(k)}
++            _depth = {k: branch.get(k) for k in _BRANCH_DEPTH_KEYS if branch.get(k)}
+             # The branch's wall-clock budget is NOT handed to the child as a
+             # run deadline: the fan-out's hard cancel already bounds the
+             # branch, and a run deadline counts human wait (an AUTOPILOT plan
+@@ -1503,6 +1504,7 @@ def resume_fanout(orch, retry_failed: bool = False) -> str:
+                 "metadata": e.get("metadata"),
+                 "_premeshed": True,
+                 "_resume": has_ckpt,
++                **(e.get("depth") or {}),
+             }
+             stop_ev = _threading.Event()
+             fut = pool.submit(_attributed_branch(_run_one_branch), orch,
+@@ -1729,6 +1731,9 @@ def run_fanout(orch, branches: List[dict],
+             # for the later fusion codegen. None -> branches byte-identical
+             # to pre-feature behavior.
+             "figure_style": (str(figure_style) if figure_style else None),
++            # The branch's typed depth (#718): read at the launch site and
++            # applied by the child to every run_analysis call of the branch.
++            **{k: b.get(k) for k in _BRANCH_DEPTH_KEYS if b.get(k)},
+         })
+     # Stash for fuse_delegations (a separate tool call): fusion codegen
+     # applies the same presentation preference to fusion_figure.png.
+@@ -1930,6 +1935,10 @@ def _companions_for(i):
+             # sibling INDICES too: labels can repeat within a group.
+             if b.get("_steering"):
+                 entry["steered_by"] = [p["label"] for p in b["_steering"]]
++            # As _delegate records it, and what a resumed branch runs under.
++            _depth = {k: b.get(k) for k in _BRANCH_DEPTH_KEYS if b.get(k)}
++            if _depth:
++                entry["depth"] = _depth
+             # Carry the input path/metadata so a later fuse_delegations can
+             # recognize this set as already gated (or re-gate a mixed set).
+             entry["data_path"] = b.get("data_path")
+diff --git a/scilink/agents/meta_agent/meta_orchestrator_tools.py b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+index 494b7c84..166e5628 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator_tools.py
++++ b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+@@ -853,7 +853,8 @@ def run_swarm(work_items: list, item_time_budget_s: float = None,
+                             "data_path": {"type": "string",
+                                           "description": "Optional, analysis items: the "
+                                                          "dataset path, used to estimate the "
+-                                                         "item's memory."},
++                                                         "item's memory and set its time "
++                                                         "budget."},
+                             "context": {"type": "object",
+                                         "description": "Optional context, as for a "
+                                                        "delegate_to_* call."},
+@@ -891,7 +892,10 @@ def run_swarm(work_items: list, item_time_budget_s: float = None,
+                 "item_time_budget_s": {
+                     "type": "number",
+                     "description": ("Optional per-item wall-clock budget in seconds "
+-                                    "(default 3600; <= 0 disables)."),
++                                    "(default 3600, or as a fan-out branch gets it: 2x for "
++                                    "a datacube-series directory, 3x for a raw-instrument "
++                                    "container; given, it applies to every item as is; "
++                                    "<= 0 disables)."),
+                 },
+                 "subscriptions": {
+                     "type": "array",
+diff --git a/scilink/agents/meta_agent/swarm.py b/scilink/agents/meta_agent/swarm.py
+index 7c466055..5df854f2 100644
+--- a/scilink/agents/meta_agent/swarm.py
++++ b/scilink/agents/meta_agent/swarm.py
+@@ -499,6 +499,16 @@ def run_swarm(orch, items: Any, item_time_budget_s: Optional[float] = None,
+     def launch(pool, item) -> Any:
+         entry = orch._open_delegation(item["mode"], item["task"], item.get("context"), None,
+                                       item["label"])
++        # The fan-out's per-branch rule (#700): a datacube series or a
++        # raw-instrument container gets its multiple of the default, so the
++        # same analysis is not cancelled sooner as a swarm item than as a
++        # fan-out branch. A budget the caller set is taken as is. Resolved
++        # before the ledger lock (it reads the data), as the fan-out does.
++        item_budget = (fo.resolve_branch_budget(
++            {"data_path": str(item["data_path"]), "label": item["label"],
++             "pattern": item.get("pattern")}, budget,
++            explicit=item_time_budget_s is not None)
++            if item["mode"] == "analysis" and item.get("data_path") else budget)
+         with orch._fanout_lock:          # new keys on a live entry: see _ledger_snapshot
+             entry["swarm"] = swarm_id
+             entry["parallel_group"] = swarm_id
+@@ -508,7 +518,7 @@ def launch(pool, item) -> Any:
+                 # As _delegate stamps it: a later fuse_delegations re-runs
+                 # its complementarity gate from the entries' data paths.
+                 entry["data_path"] = str(item["data_path"])
+-            entry["_budget_s"] = budget
++            entry["_budget_s"] = item_budget
+             # The item's own inputs, so a re-run (retract_finding's
+             # rerun_items) starts from what this one had.
+             if item.get("reads_board") is not None:
+diff --git a/tests/test_fanout_decline_and_retry.py b/tests/test_fanout_decline_and_retry.py
+index ab055a09..e33fd02b 100644
+--- a/tests/test_fanout_decline_and_retry.py
++++ b/tests/test_fanout_decline_and_retry.py
+@@ -311,3 +311,31 @@ def test_tools_expose_the_new_flags(tmp_path):
+     assert "force_rerun" in by_name["delegate_to_analyses"]["parameters"]["properties"]
+     assert "retry_failed" in by_name["resume_fanout"]["parameters"]["properties"]
+     assert "retry_failed=true" in by_name["delegate_to_analyses"]["description"]
++
++
++def test_a_retried_branch_keeps_its_own_depth(tmp_path, paths, monkeypatch):
++    """#718: a branch's own profile / targets / time_budget_s reach its child,
++    and a retried branch runs under them again (from its ledger entry)."""
++    seen = []
++
++    def factory(fail):
++        def fake_child(orch, base_dir, restore=False):
++            class C:
++                def run_task(self, task, context=None, autonomy=None, **kw):
++                    seen.append(kw)
++                    if fail and paths[1] in task:
++                        raise RuntimeError("synthetic branch failure")
++                    return {"status": "success", "summary": "ok",
++                            "key_findings": ["finding"], "files_produced": []}
++            return C()
++        return fake_child
++    meta = _autonomous(tmp_path)
++    monkeypatch.setattr(fo, "_llm_json", _verdict(paths))
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", factory(fail=True))
++    depth = {"profile": "quick", "targets": ["band position"], "time_budget_s": 120}
++    meta._run_fanout([dict(b, **depth) for b in _branches(paths)])
++    assert seen == [depth] * len(paths)
++    seen.clear()
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", factory(fail=False))
++    out = json.loads(meta._resume_fanout(retry_failed=True))
++    assert out["branches_retried"] == 1 and seen == [depth]
+diff --git a/tests/test_hs_timeout_escalation.py b/tests/test_hs_timeout_escalation.py
+index c40b8226..5b57d7e3 100644
+--- a/tests/test_hs_timeout_escalation.py
++++ b/tests/test_hs_timeout_escalation.py
+@@ -65,27 +65,44 @@ def attempt(t):
+     assert calls == [1] and used == 1
+ 
+ 
+-def _dynamic(tmp_path, monkeypatch, records, *, seconds=1, strict=False, deadline_s=None, model=None):
++def _dynamic(tmp_path, monkeypatch, records, *, seconds=1, deadline_s=None, model=None, qc_time_budget_s=None):
+     """The real dynamic-analysis controller on a supplied-script replay (no
+-    model call), under a short execution limit."""
+-    import time
++    model call), under a short execution limit; a deadline is stamped the way
++    analyze() stamps it (RunBudget)."""
++    from scilink.agents.exp_agents._stage_timing import RunBudget
+     from scilink.agents.exp_agents.controllers import hyperspectral_controllers as hc
+     monkeypatch.setenv("UNSAFE_EXECUTION_OK", "true")
+     plan = hc.SelectRefinementTargetController(hs._ExplodingModel(), hs.LOGGER, generation_config=None,
+                                                safety_settings=None, parse_fn=lambda r: ({}, None))
+     state = plan.execute(hs._replay_state(tmp_path, records))
+-    if strict:
+-        state["_strict_replay"] = True
+-    if deadline_s is not None:
+-        state["_run_deadline"] = time.monotonic() + deadline_s
++    RunBudget(deadline_s).stamp(state)
+     ctrl = hc.RunDynamicAnalysisController(model if model is not None else hs._ExplodingModel(), hs.LOGGER,
+                                            generation_config=None, safety_settings=None, parse_fn=lambda r: ({}, None),
+-                                           executor_timeout=seconds)
++                                           executor_timeout=seconds,
++                                           **({"qc_time_budget_s": qc_time_budget_s} if qc_time_budget_s else {}))
+     ctrl._review_required_output = lambda *a, **k: (True, "")
+     ctrl._check_result_visually = lambda *a, **k: (True, "")
+     return ctrl.execute(state)
+ 
+ 
++def _strict_frame(tmp_path, monkeypatch, script, *, seconds=1):
++    """A whole strict replay (a live frame) through analyze(): no model call;
++    returns the frame's dynamic-analysis records."""
++    from scilink.agents.exp_agents.hyperspectral_analysis_agent import HyperspectralAnalysisAgent
++    monkeypatch.setenv("UNSAFE_EXECUTION_OK", "true")
++    tmp_path.mkdir(parents=True, exist_ok=True)
++    np.save(tmp_path / "cube.npy", hs._peak_cube(seed=1))
++    prior = tmp_path / "anchor"
++    prior.mkdir(exist_ok=True)
++    (prior / "dynamic_analysis_records.json").write_text(json.dumps(hs._records(script)))
++    ag = HyperspectralAnalysisAgent(api_key="sk-dummy", model_name="claude-opus-4-6", output_dir=str(tmp_path / "out"),
++                                    enable_human_feedback=False, executor_timeout=seconds)
++    ag.model = hs._ExplodingModel()
++    ag.analyze(str(tmp_path / "cube.npy"), system_info=dict(hs.AXIS_OK), prior_analysis_paths=[str(prior)],
++               reuse_locked_script=True, strict_replay=True)
++    return json.loads((tmp_path / "out" / "dynamic_analysis_records.json").read_text())
++
++
+ def test_a_slow_hyperspectral_script_gets_more_time_and_a_replay_starts_from_it(tmp_path, monkeypatch):
+     state = _dynamic(tmp_path / "a", monkeypatch, hs._records(SLOW_SCRIPT), seconds=1)
+     [rec] = state["dynamic_analysis_records"]
+@@ -107,8 +124,7 @@ def test_a_strict_replay_fails_fast_and_a_deadline_is_never_run_past(tmp_path, m
+     import time
+     # strict (a live frame): the limit is the limit — one attempt, failed, no escalation
+     t0 = time.monotonic()
+-    state = _dynamic(tmp_path / "s", monkeypatch, hs._records(SLOW_SCRIPT), seconds=1, strict=True)
+-    [rec] = state["dynamic_analysis_records"]
++    [rec] = _strict_frame(tmp_path / "s", monkeypatch, SLOW_SCRIPT, seconds=1)
+     assert not rec["task_success"] and "timeout_used_s" not in rec and time.monotonic() - t0 < 4
+     # a deadline with 1.5 s left: the retry is clamped to it (1 s, then ~1 s), the script still too slow → failed,
+     # and nothing ran for the 2 s the policy would otherwise have granted
+@@ -125,8 +141,7 @@ def spy(attempt, *, base_timeout, timed_out, logger=None, **kw):
+         seen.append(out[1])
+         return out
+     monkeypatch.setattr(_locked_exec, "escalate_timeouts", spy)
+-    state = _dynamic(tmp_path / "o", monkeypatch, hs._records(OWN_TIMEOUT_SCRIPT), seconds=5, strict=True)
+-    [rec] = state["dynamic_analysis_records"]
++    [rec] = _strict_frame(tmp_path / "o", monkeypatch, OWN_TIMEOUT_SCRIPT, seconds=5)
+     assert not rec["task_success"] and seen == [5] and "timeout_used_s" not in rec
+ 
+ 
+@@ -288,21 +303,15 @@ def test_the_first_limit_is_never_clamped_and_the_loop_budget_bounds_retries(tmp
+     assert rec["task_success"] and rec["timeout_used_s"] == 5
+     # the loop's budget: a 1 s limit, a 1.5 s qc_time_budget_s, the 1.6 s script — the retry is clamped to
+     # what the budget leaves (~1 s), so it does not run at 2 s; failed, and quickly
+-    from scilink.agents.exp_agents.controllers import hyperspectral_controllers as hc
+-    orig_init = hc.RunDynamicAnalysisController.__init__
+-
+-    def tight(self, *a, **kw):
+-        orig_init(self, *a, **kw)
+-        self.qc_time_budget_s = 1.5
+-    monkeypatch.setattr(hc.RunDynamicAnalysisController, "__init__", tight)
+     t0 = time.monotonic()
+-    state = _dynamic(tmp_path / "g", monkeypatch, hs._records(SLOW_SCRIPT), seconds=1)
++    state = _dynamic(tmp_path / "g", monkeypatch, hs._records(SLOW_SCRIPT), seconds=1, qc_time_budget_s=1.5)
+     [rec] = state["dynamic_analysis_records"]
+     assert not rec["task_success"] and time.monotonic() - t0 < 6
+ 
+ 
+ def test_a_fan_out_child_gets_no_run_deadline_from_the_branch_budget(tmp_path):
+-    """Pins main: a fan-out child's run_task carries no time_budget_s. The
++    """A fan-out child's run_task carries no time_budget_s from the BRANCH
++    BUDGET, only the branch's own (#718). The
+     branch's wall-clock budget is the fan-out's hard cancel, not the child's
+     run deadline (which counts human wait where the branch budget does not,
+     and would expire a branch main completes); a stamp of the budget into the
+@@ -343,10 +352,108 @@ def fake_llm(orch, prompt, extra_parts=None):
+         assert all("time_budget_s" not in kw for kw in calls)             # the branch budget is the hard cancel only
+         calls.clear()
+         ag2 = MetaOrchestratorAgent(base_dir=str(tmp_path / "s2"), api_key="sk-dummy", meta_mode=MetaMode.AUTONOMOUS)
+-        out = json.loads(ag2._run_fanout([{"data_path": p, "task": f"Analyze {p}", "label": os.path.basename(p), "time_budget_s": 7}
++        out = json.loads(ag2._run_fanout([{"data_path": p, "task": f"Analyze {p}", "label": os.path.basename(p),
++                                           "time_budget_s": 7, "profile": "extract", "targets": ["peak position"]}
+                                           for p in paths], branch_time_budget_s=30))
+-        # main's normalisation (run_fanout → norm) carries no depth keys from the tool's branch dicts either:
+-        # the children's kwargs are the same with or without a branch time_budget_s — pinned as is
+-        assert out.get("status") == "success" and [kw.get("time_budget_s") for kw in calls] == [None, None]
++        # #718: a branch's OWN depth keys reach its child (the branch budget above still never does)
++        assert out.get("status") == "success"
++        assert calls == [{"time_budget_s": 7, "profile": "extract", "targets": ["peak position"]}] * 2
++        # and are on the ledger entry, which is what a resumed branch runs under
++        assert [e.get("depth") for e in ag2._delegation_ledger if e.get("fanout")] == \
++            [{"time_budget_s": 7, "profile": "extract", "targets": ["peak position"]}] * 2
+     finally:
+         fo._make_ephemeral_analysis_child, fo._llm_json = orig_child, orig_llm
++
++
++def test_a_ladder_retry_of_the_same_script_starts_where_it_timed_out(tmp_path, monkeypatch):
++    """#719: each ladder retry of the same locked script escalated again from
++    the base limit (1 -> 2 s, every time); a rerun of the SAME script now starts
++    from the limit it already reached, with no further escalation."""
++    seen = []
++    orig = _locked_exec.escalate_timeouts
++
++    def spy(attempt, *, base_timeout, timed_out, logger=None, **kw):
++        out = orig(attempt, base_timeout=base_timeout, timed_out=timed_out, logger=logger, **kw)
++        seen.append((base_timeout, kw.get("escalations"), out[1]))
++        return out
++    monkeypatch.setattr(_locked_exec, "escalate_timeouts", spy)
++    monkeypatch.setattr(_locked_exec, "TIMEOUT_HARD_CAP_S", 2)
++    orig_state = hs._replay_state
++    monkeypatch.setattr(hs, "_replay_state",
++                        lambda p, r=None: dict(orig_state(p, r), max_verification_iterations=2))
++    stuck = SLOW_SCRIPT.replace("time.sleep(1.6)", "time.sleep(5)")
++    state = _dynamic(tmp_path, monkeypatch, hs._records(stuck), seconds=1)
++    assert not state["dynamic_analysis_records"][0]["task_success"]
++    assert seen == [(1, None, 2), (2, 0, 2), (2, 0, 2)]
++
++
++def test_the_time_left_is_said_as_it_is():
++    """#719 log nit: the message said '1s' left when nothing was."""
++    import logging
++    msgs = []
++
++    class L:
++        def warning(self, m):
++            msgs.append(m)
++        info = debug = warning
++    _locked_exec.escalate_timeouts(lambda t: "slow", base_timeout=4, timed_out=lambda o: True,
++                                   logger=L(), remaining_s=0.2)
++    assert any("time left (0s" in m for m in msgs), msgs
++
++
++def test_what_this_change_leaves_alone(tmp_path, monkeypatch):
++    """Guard (#719): the same-script memory is for a sandbox TIMEOUT only. A
++    script that raises is retried from the base limit with the policy's full
++    escalation, every time; a script's own TimeoutError is not remembered; the
++    curve / image runner (stage_and_run_adaptive) climbs exactly as before."""
++    seen = []
++    orig = _locked_exec.escalate_timeouts
++
++    def spy(attempt, *, base_timeout, timed_out, logger=None, **kw):
++        out = orig(attempt, base_timeout=base_timeout, timed_out=timed_out, logger=logger, **kw)
++        seen.append((base_timeout, kw.get("escalations"), out[1]))
++        return out
++    monkeypatch.setattr(_locked_exec, "escalate_timeouts", spy)
++    orig_state = hs._replay_state
++    monkeypatch.setattr(hs, "_replay_state",
++                        lambda p, r=None: dict(orig_state(p, r), max_verification_iterations=2))
++    raises = SLOW_SCRIPT.replace("time.sleep(1.6)", "raise ValueError('bad shape')")
++    for name, script in (("raises", raises), ("own", OWN_TIMEOUT_SCRIPT)):
++        seen.clear()
++        state = _dynamic(tmp_path / name, monkeypatch, hs._records(script), seconds=1)
++        assert not state["dynamic_analysis_records"][0]["task_success"]
++        assert seen and set(seen) == {(1, None, 1)}, (name, seen)
++
++    class Exec:
++        timeout = 1
++
++        def __init__(self, outcomes):
++            self.outcomes, self.limits = list(outcomes), []
++
++        def execute_script(self, script, working_dir=None, timeout=None, **kw):
++            self.limits.append(timeout)
++            return self.outcomes.pop(0)
++    slow = {"status": "error", "message": "Script timed out after 1s"}
++    ok = {"status": "success", "stdout": ""}
++    bad = {"status": "error", "message": "ValueError: bad shape"}
++    for outcomes, limits in (([slow, slow, ok], [1, 2, 4]), ([bad], [1]), ([ok], [1])):
++        ex = Exec(outcomes)
++        _locked_exec.stage_and_run_adaptive(ex, "print(1)", np.zeros(4), tmp_path / f"run{len(limits)}{outcomes[-1]['status']}")
++        assert ex.limits == limits
++
++
++def test_a_rerun_of_the_same_script_keeps_the_runs_deadline(tmp_path, monkeypatch):
++    """#755 review: a rerun of a remembered script is a retry, so what the
++    memory adds over the base limit is bounded by the time left; only the
++    FIRST limit is unclamped. Started unclamped, the reruns ran seconds past a
++    deadline main keeps."""
++    import time
++    orig_state = hs._replay_state
++    monkeypatch.setattr(hs, "_replay_state",
++                        lambda p, r=None: dict(orig_state(p, r), max_verification_iterations=3))
++    monkeypatch.setattr(_locked_exec, "TIMEOUT_HARD_CAP_S", 4)
++    stuck = SLOW_SCRIPT.replace("time.sleep(1.6)", "time.sleep(30)")
++    t0 = time.monotonic()
++    state = _dynamic(tmp_path, monkeypatch, hs._records(stuck), seconds=1, deadline_s=9)
++    assert not state["dynamic_analysis_records"][0]["task_success"]
++    assert time.monotonic() - t0 < 9 + 1 + 0.9          # the deadline, plus main's one-base-limit grace
+diff --git a/tests/test_run_swarm.py b/tests/test_run_swarm.py
+index 0671f532..924832a4 100644
+--- a/tests/test_run_swarm.py
++++ b/tests/test_run_swarm.py
+@@ -254,6 +254,33 @@ def test_an_item_over_its_budget_is_cancelled(meta, monkeypatch, capsys):
+     assert "swarm item 'slow one' exceeded its wall-clock budget" in capsys.readouterr().out
+ 
+ 
++def test_a_datacube_series_item_gets_the_fan_out_branchs_budget(meta, monkeypatch, tmp_path):
++    """#700: a swarm item took a flat budget where the same analysis as a
++    fan-out branch gets its multiple (2x for a datacube series). Real
++    mechanism: the same slow worker on a cube-series directory and on a single
++    file, under a default budget it outruns and a doubled one it does not."""
++    import numpy as np
++    cubes = tmp_path / "cubes"
++    cubes.mkdir()
++    for n in "AB":
++        np.save(cubes / f"{n}.npy", np.zeros((4, 4, 8)))
++    single = tmp_path / "single.npy"
++    np.save(single, np.zeros((4, 4, 8)))
++    monkeypatch.setattr(swarm, "SWARM_ITEM_TIME_BUDGET_S", 0.6)
++    _workers(monkeypatch, lambda task: {"seconds": 0.9})
++    items = [{"mode": "analysis", "task": "series", "label": "cube series", "data_path": str(cubes)},
++             {"mode": "analysis", "task": "single", "label": "one cube", "data_path": str(single)}]
++    res = json.loads(swarm.run_swarm(meta, items))
++    assert {r["label"]: r["status"] for r in res["results"]} == {"cube series": "success", "one cube": "error"}
++    # a budget the caller gives is taken as is, for every item
++    res = json.loads(swarm.run_swarm(meta, items, item_time_budget_s=0.6))
++    assert {r["label"]: r["status"] for r in res["results"]} == {"cube series": "error", "one cube": "error"}
++    # the item's pattern scopes the folder, as it does for the memory estimate:
++    # one matching cube is not a series, so no multiple
++    res = json.loads(swarm.run_swarm(meta, [dict(items[0], pattern="A.npy"), items[1]]))
++    assert {r["label"]: r["status"] for r in res["results"]} == {"cube series": "error", "one cube": "error"}
++
++
+ def test_usage_is_charged_to_each_item_under_the_coordinators_session(meta, monkeypatch, tmp_path):
+     _workers(monkeypatch, lambda task: {"llm": 100})
+     led = UsageLedger(tmp_path / "usage.jsonl")

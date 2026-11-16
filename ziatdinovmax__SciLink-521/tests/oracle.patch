@@ -1,0 +1,1182 @@
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator.py b/scilink/agents/exp_agents/analysis_orchestrator.py
+index 7320915e6..0d7d32a1b 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator.py
+@@ -681,6 +681,7 @@ def __init__(
+             else self.MAX_TOOL_ITERATIONS
+         )
+         self._last_chat_hit_iter_cap = False
++        self._last_chat_error = None
+ 
+         # Restore from checkpoint if requested
+         if restore_checkpoint and self.checkpoint_path.exists():
+@@ -1368,6 +1369,7 @@ def chat(self, user_input: str) -> str:
+         _set_evlog(str(_P(self.base_dir) / "events.jsonl"))
+         self.message_count += 1
+         self._last_chat_hit_iter_cap = False
++        self._last_chat_error = None
+ 
+         # AUTO-CHECKPOINT: Every N messages
+         if self.message_count - self.last_checkpoint_message_count >= self.CHECKPOINT_INTERVAL:
+@@ -1392,10 +1394,14 @@ def chat(self, user_input: str) -> str:
+             
+         except Exception as e:
+             logging.error(f"Chat Error: {e}", exc_info=True)
+-            
++
+             print("  💾 Error detected - saving emergency checkpoint...")
+             self._auto_checkpoint()
+-            
++
++            # Flag the failure for run_task: the ❌ string preserves CLI/UI
++            # behavior, but a programmatic caller must see status="error",
++            # not a success whose summary happens to start with ❌.
++            self._last_chat_error = str(e)
+             return f"❌ Error: {e}\n\n(Emergency checkpoint saved to {self.checkpoint_path})"
+ 
+     def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+@@ -1471,6 +1477,12 @@ def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+                 if self._last_chat_hit_iter_cap:
+                     status = "error"
+                     error_msg: Optional[str] = summary_text
++                elif self._last_chat_error:
++                    # chat()'s emergency catch-all returned the "❌ Error: ..."
++                    # string as a normal reply; surface it as a failure instead
++                    # of a success whose summary starts with ❌.
++                    status = "error"
++                    error_msg = self._last_chat_error
+                 else:
+                     status = "success"
+                     error_msg = None
+diff --git a/scilink/agents/exp_agents/controllers/base_controllers.py b/scilink/agents/exp_agents/controllers/base_controllers.py
+index 72e80b322..b17124150 100644
+--- a/scilink/agents/exp_agents/controllers/base_controllers.py
++++ b/scilink/agents/exp_agents/controllers/base_controllers.py
+@@ -7,6 +7,46 @@
+ from ....hitl import request_human_feedback
+ 
+ 
++def run_plan_refinement_gate(controller, state: dict, *,
++                             refine_banner: str, max_banner: str) -> dict:
++    """Human-in-the-loop plan approval/refinement loop, shared across
++    modality planning controllers (curve fitting, image analysis).
++
++    Repeatedly shows the plan for approval (``controller._get_human_feedback``
++    sets ``_refine_requested`` / ``_refine_feedback`` on the state) and applies
++    ``controller._refine_plan`` until the user approves or
++    ``controller.max_iterations`` refinements have run. Skipped entirely when
++    human feedback is disabled or on a verbatim locked-script reuse turn
++    (#172), where the plan is foreordained and re-approving it is pointless
++    interruption.
++
++    The banner strings are passed in so each modality keeps its historical
++    console output byte-identical.
++    """
++    if not controller.enable_human_feedback or state.get("reuse_locked_script"):
++        return state
++
++    iteration = 0
++    while iteration < controller.max_iterations:
++        state = controller._get_human_feedback(state)
++        if state.pop("_refine_requested", False):
++            feedback = state.pop("_refine_feedback", "")
++            if feedback:
++                state.setdefault("human_feedback_log", []).append(str(feedback))
++            controller.logger.info(f"  Refining with feedback: {feedback}")
++            print(refine_banner)
++            state = controller._refine_plan(state, feedback)
++            iteration += 1
++        else:
++            break
++
++    if iteration >= controller.max_iterations:
++        controller.logger.warning("  Max iterations reached.")
++        print(max_banner)
++
++    return state
++
++
+ # Generic Tier-A synthesis re-entry instructions (issue #322). Deliberately
+ # modality-neutral: the payload critique + surfaced features carry the
+ # specifics. Revision only — the original analysis is never overwritten.
+diff --git a/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py b/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
+index 478a37363..346528006 100644
+--- a/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
++++ b/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
+@@ -38,6 +38,7 @@
+     DATA_NAME, CANDIDATES_DIR_NAME, atomic_np_save,
+ )
+ from .._qc_engine import CodegenQCEngine, QCEngineSpec, QCItemContext
++from .base_controllers import run_plan_refinement_gate
+ from ....utils.codegen_parse import parse_codegen_response
+ from ....utils.synthesis_parse import salvage_synthesis_from_response
+ from ....hitl import request_human_feedback
+@@ -2568,28 +2569,13 @@ def execute(self, state: dict) -> dict:
+             self.logger.info(f"  Approach: {state['analysis_approach']}")
+             self.logger.info(f"  Model: {state['physical_model']}")
+ 
+-            # On a verbatim locked-script reuse turn (#172) the plan is
+-            # foreordained to re-run the prior script unchanged, so re-approving
+-            # it is pointless interruption. Planning still ran above (downstream
+-            # stages need its fields); we only skip the display/approval gate.
+-            if self.enable_human_feedback and not state.get("reuse_locked_script"):
+-                iteration = 0
+-                while iteration < self.max_iterations:
+-                    state = self._get_human_feedback(state)
+-                    if state.pop("_refine_requested", False):
+-                        feedback = state.pop("_refine_feedback", "")
+-                        if feedback:
+-                            state.setdefault("human_feedback_log", []).append(str(feedback))
+-                        self.logger.info(f"  Refining with feedback: {feedback}")
+-                        print("\n🔄 Refining plan...\n")
+-                        state = self._refine_plan(state, feedback)
+-                        iteration += 1
+-                    else:
+-                        break
+-
+-                if iteration >= self.max_iterations:
+-                    self.logger.warning("  Max iterations reached.")
+-                    print("⚠️  Max refinements reached. Proceeding with current plan.")
++            # Human plan approval/refinement gate — shared implementation
++            # (the locked-script reuse skip, #172, lives inside the helper).
++            state = run_plan_refinement_gate(
++                self, state,
++                refine_banner="\n🔄 Refining plan...\n",
++                max_banner="⚠️  Max refinements reached. Proceeding with current plan.",
++            )
+ 
+             # Resolve + lock the column mapping (>2-col inputs only). It applies to
+             # every spectrum (column roles are a file-structure property), so store
+diff --git a/scilink/agents/exp_agents/controllers/image_analysis_controllers.py b/scilink/agents/exp_agents/controllers/image_analysis_controllers.py
+index 3f79fabd1..fbabcbf76 100644
+--- a/scilink/agents/exp_agents/controllers/image_analysis_controllers.py
++++ b/scilink/agents/exp_agents/controllers/image_analysis_controllers.py
+@@ -40,6 +40,7 @@
+     DATA_NAME, VIZ_NAME, CANDIDATES_DIR_NAME, atomic_np_save,
+ )
+ from .._qc_engine import CodegenQCEngine, QCEngineSpec, QCItemContext
++from .base_controllers import run_plan_refinement_gate
+ from ....utils.codegen_parse import parse_codegen_response
+ from ....utils.synthesis_parse import salvage_synthesis_from_response
+ from ....hitl import request_human_feedback
+@@ -1806,28 +1807,13 @@ def execute(self, state: dict) -> dict:
+             # Validate plan against actual images
+             state = self._validate_plan(state)
+ 
+-            # On a verbatim locked-script reuse turn (#172) the plan is
+-            # foreordained to re-run the prior script unchanged, so re-approving
+-            # it is pointless interruption. Planning still ran above (downstream
+-            # stages need its fields); we only skip the display/approval gate.
+-            if self.enable_human_feedback and not state.get("reuse_locked_script"):
+-                iteration = 0
+-                while iteration < self.max_iterations:
+-                    state = self._get_human_feedback(state)
+-                    if state.pop("_refine_requested", False):
+-                        feedback = state.pop("_refine_feedback", "")
+-                        if feedback:
+-                            state.setdefault("human_feedback_log", []).append(str(feedback))
+-                        self.logger.info(f"  Refining with feedback: {feedback}")
+-                        print("\nRefining plan...\n")
+-                        state = self._refine_plan(state, feedback)
+-                        iteration += 1
+-                    else:
+-                        break
+-
+-                if iteration >= self.max_iterations:
+-                    self.logger.warning("  Max iterations reached.")
+-                    print("Max refinements reached. Proceeding with current plan.")
++            # Human plan approval/refinement gate — shared implementation
++            # (the locked-script reuse skip, #172, lives inside the helper).
++            state = run_plan_refinement_gate(
++                self, state,
++                refine_banner="\nRefining plan...\n",
++                max_banner="Max refinements reached. Proceeding with current plan.",
++            )
+ 
+             self._lock_config(state)
+ 
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index 6fae21d82..eb10f3704 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -130,15 +130,86 @@ def _release_branch(key: str) -> None:
+     with _mem_cv:
+         _mem_running.pop(key, None)
+         _mem_cv.notify_all()
++
++
++# --- Cooperative branch cancellation ---------------------------------------
++# An over-budget branch used to be merely ABANDONED: its subprocesses were
++# killed and its ledger entry closed, but the thread itself kept burning API
++# quota, could still write into its session dir, and held its
++# memory-admission slot (released only when run_task returned). Cancellation
++# borrows the UI stop-button mechanism (``AgentStoppedError`` raised from a
++# stream write): while a fan-out runs, sys.stdout/stderr are wrapped by a
++# thread-aware guard that raises inside a branch thread once that branch's
++# stop event is set. Cooperative, not preemptive — a branch inside a single
++# long LLM call notices only on its next print; the ledger's timeout verdict
++# (#358) stands either way, so cancellation only shortens the waste.
++_branch_stop_events: Dict[int, "_threading.Event"] = {}
++_branch_stop_lock = _threading.Lock()
++
++
++def _register_branch_stop(event) -> None:
++    with _branch_stop_lock:
++        _branch_stop_events[_threading.get_ident()] = event
++
++
++def _unregister_branch_stop() -> None:
++    with _branch_stop_lock:
++        _branch_stop_events.pop(_threading.get_ident(), None)
++
++
++class _ThreadStopStream:
++    """Chained stdout/stderr wrapper: raises in cancelled branch threads.
++
++    Wraps whatever stream is current (the terminal, or the UI's TeeStream)
++    and delegates everything; the only added behavior is the per-thread stop
++    check, so coordinator output and healthy branches are unaffected.
++    """
++
++    def __init__(self, original):
++        self._original = original
++
++    def write(self, data: str) -> int:
++        ev = _branch_stop_events.get(_threading.get_ident())
++        if ev is not None and ev.is_set():
++            from ...ui.output_capture import AgentStoppedError
++            raise AgentStoppedError(
++                "fan-out branch cancelled (wall-clock budget exceeded)")
++        return self._original.write(data)
++
++    def flush(self) -> None:
++        self._original.flush()
++
++    def __getattr__(self, name: str):
++        return getattr(self._original, name)
++
++
++def _ensure_stop_guard_installed() -> None:
++    """Install the thread-aware stop guard on stdout/stderr (idempotent).
++
++    Deliberately never uninstalled: a cancelled-but-still-running branch
++    thread must keep hitting the guard AFTER the fan-out that abandoned it
++    returns — restoring the streams at fan-out end would disarm cancellation
++    for exactly the threads it exists to stop. The wrapper is transparent
++    for every non-cancelled thread, and the idempotence check prevents
++    stacking a second guard on re-entry.
++    """
++    if not isinstance(sys.stdout, _ThreadStopStream):
++        sys.stdout = _ThreadStopStream(sys.stdout)
++    if not isinstance(sys.stderr, _ThreadStopStream):
++        sys.stderr = _ThreadStopStream(sys.stderr)
++
++
+ _FANOUT_POLL_S = 5              # how often to check for finished branches
+ _FANOUT_HEARTBEAT_S = 60        # min gap between "still running" ticks
+ FANOUT_SOFT_CAP = 5             # warn / confirm beyond this many fused branches
+ FANOUT_HARD_CAP = 8             # refuse beyond this — cost/quality cliff
+ # Per-branch wall-clock budget (#358). A stuck branch (e.g. an analysis
+ # retry loop that keeps failing QC) must not hold the whole fan-out: on
+-# expiry the branch is recorded degraded and ABANDONED (its subprocesses are
+-# killed; the thread itself cannot be killed safely and may finish late,
+-# which is recorded for audit without changing the verdict). <= 0 disables.
++# expiry the branch is recorded degraded and CANCELLED — its subprocesses
++# are killed and its stop event fires, so the thread aborts cooperatively on
++# its next print (a thread cannot be killed preemptively and may still
++# finish a long in-flight LLM call late, which is recorded for audit
++# without changing the verdict). <= 0 disables.
+ FANOUT_BRANCH_TIME_BUDGET_S = 3600.0
+ # In AUTONOMOUS mode there is no human to confirm, so the verdict IS the gate:
+ # proceed only on a confident 'complementary' read.
+@@ -763,7 +834,7 @@ def _mesh_task(branch: dict, companions: List[dict]) -> str:
+ 
+ def _run_one_branch(orch, branch: dict, companions: List[dict],
+                     entry: dict, queue_channel=None,
+-                    branch_autonomy=None) -> None:
++                    branch_autonomy=None, stop_event=None) -> None:
+     """Execute a single fan-out branch into its preallocated ledger slot.
+ 
+     Each worker touches ONLY its own ``entry`` dict, so there is no shared
+@@ -786,6 +857,8 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+                   branch.get("label") or slug)
+     entry["_started_at"] = time.monotonic()
+     entry["_branch_tid"] = threading.get_ident()
++    if stop_event is not None:
++        _register_branch_stop(stop_event)
+     if queue_channel is not None:
+         from ...hitl import set_thread_channel
+         set_thread_channel(_BranchChannel(
+@@ -797,6 +870,12 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+     from ...session_events import append_event, set_thread_event_log
+     _branch_label = branch.get("branch_id") or branch.get("label") or slug
+     set_thread_event_log(Path(orch.base_dir) / "events.jsonl")
++    # Pre-assigned so the finally block can log even on the one path that
++    # propagates (a user-initiated AgentStoppedError re-raised below).
++    result: dict = {"status": "error",
++                    "error": "branch aborted before completion", "summary": "",
++                    "key_findings": [], "files_produced": [],
++                    "suggested_followups": [], "warnings": []}
+     try:
+         try:
+             from ..exp_agents.analysis_orchestrator import AnalysisMode
+@@ -812,7 +891,25 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+             result = {"status": "error", "error": str(e), "summary": "",
+                       "key_findings": [], "files_produced": [],
+                       "suggested_followups": [], "warnings": []}
++        except BaseException as e:
++            # A budget cancellation arrives as AgentStoppedError (raised from
++            # a stream write by _ThreadStopStream). Convert it to a clean
++            # cancelled result ONLY when it is THIS branch's own stop event —
++            # a user-initiated stop (the UI's global stop event) must stay
++            # unrecoverable and propagate.
++            from ...ui.output_capture import AgentStoppedError
++            if not (isinstance(e, AgentStoppedError)
++                    and stop_event is not None and stop_event.is_set()):
++                raise
++            logger.warning(f"fan-out branch {index} cancelled "
++                           "(wall-clock budget exceeded)")
++            result = {"status": "cancelled",
++                      "error": "branch cancelled after wall-clock budget",
++                      "summary": "", "key_findings": [], "files_produced": [],
++                      "suggested_followups": [], "warnings": []}
+     finally:
++        if stop_event is not None:
++            _unregister_branch_stop()
+         append_event(
+             "fanout_branch",
+             {"label": branch.get("label") or slug,
+@@ -1091,26 +1188,41 @@ def _companions_for(i):
+     if harmonize and len(run_branches) >= 2:
+         donor = run_branches[0]
+         donor_label = donor.get("label") or "donor"
++        # #519 hardening: steer the donor toward one self-contained
++        # run_analysis call — its approved script becomes the frozen
++        # pipeline, and a long multi-call workflow risks exhausting the
++        # turn budget before any record is approved. A nudge, not a gate.
++        donor["task"] = donor["task"] + (
++            "\n\nPIPELINE-DONOR NOTE: your approved analysis script will be "
++            "replayed verbatim on sibling datasets. Prefer completing this "
++            "analysis in ONE self-contained run_analysis call over a long "
++            "multi-step workflow.")
++        entries[0]["task"] = _mesh_task(donor, branch_companions[0])
+         print(f"  🧬 Harmonized mode: running pipeline donor '{donor_label}' "
+               "first (followers will replay its approved script)...")
+         _run_one_branch(orch, donor, branch_companions[0], entries[0],
+                         None, None)
+         follower_start = 1
++        # #519: search for approved records REGARDLESS of the donor
++        # delegation's top-level status. A donor can exhaust its iteration
++        # budget — or die after approval — and honestly report "error" while
++        # an approved, replayable script sits on disk; the records are the
++        # authority here (each is task_success-gated with the script
++        # attached). Only a donor with NO approved record falls back.
+         reuse_dir = None
+-        if entries[0].get("status") == "success":
+-            _donor_dir = (orch.fanout_dir
+-                          / f"{entries[0]['index']:02d}_{_slug(donor_label)}")
+-            _cands = sorted(_donor_dir.rglob("dynamic_analysis_records.json"),
+-                            key=lambda p: p.stat().st_mtime)
+-            for _c in reversed(_cands):
+-                try:
+-                    _recs = json.loads(_c.read_text(encoding="utf-8"))
+-                except Exception:  # noqa: BLE001 - keep looking
+-                    continue
+-                if any(isinstance(r, dict) and r.get("script")
+-                       and r.get("task_success") for r in _recs):
+-                    reuse_dir = _c.parent
+-                    break
++        _donor_dir = (orch.fanout_dir
++                      / f"{entries[0]['index']:02d}_{_slug(donor_label)}")
++        _cands = sorted(_donor_dir.rglob("dynamic_analysis_records.json"),
++                        key=lambda p: p.stat().st_mtime)
++        for _c in reversed(_cands):
++            try:
++                _recs = json.loads(_c.read_text(encoding="utf-8"))
++            except Exception:  # noqa: BLE001 - keep looking
++                continue
++            if any(isinstance(r, dict) and r.get("script")
++                   and r.get("task_success") for r in _recs):
++                reuse_dir = _c.parent
++                break
+         if reuse_dir is None:
+             msg = (f"harmonize requested but donor '{donor_label}' produced "
+                    "no approved replayable script — followers run "
+@@ -1120,6 +1232,12 @@ def _companions_for(i):
+             harmonized_info = {"donor": donor_label, "status": "fallback",
+                                "reason": "no approved donor script"}
+         else:
++            donor_partial = entries[0].get("status") != "success"
++            if donor_partial:
++                print(f"  🧬 Donor delegation degraded overall "
++                      f"(status: {entries[0].get('status')}) but produced an "
++                      "approved script — harmonizing on the approved record "
++                      "(partial donor, #519).")
+             print(f"  🧬 Donor script approved — followers will replay "
+                   f"{reuse_dir.name} verbatim.")
+             harm_block = (
+@@ -1140,6 +1258,11 @@ def _companions_for(i):
+                 "donor": donor_label, "status": "harmonized",
+                 "reuse_dir": str(reuse_dir),
+                 "followers": [b.get("label") for b in run_branches[1:]],
++                # Surfaced so fusion/readers can weigh a pipeline donated by
++                # a delegation that did not itself finish cleanly (#519).
++                **({"donor_partial": True,
++                    "donor_status": entries[0].get("status")}
++                   if donor_partial else {}),
+             }
+ 
+     # --- run concurrently; wiring per the mesh policy ---
+@@ -1166,14 +1289,17 @@ def _companions_for(i):
+         branch_autonomy = AnalysisMode[orch.meta_mode.name]
+ 
+     pool = ThreadPoolExecutor(max_workers=max_workers)
++    _ensure_stop_guard_installed()
+     try:
+-        fut_label, fut_entry = {}, {}
++        fut_label, fut_entry, fut_stop = {}, {}, {}
+         for i in range(follower_start, n_total):
++            stop_ev = _threading.Event()
+             fut = pool.submit(_run_one_branch, orch, run_branches[i],
+                               branch_companions[i], entries[i],
+-                              queue_channel, branch_autonomy)
++                              queue_channel, branch_autonomy, stop_ev)
+             fut_label[fut] = run_branches[i]["label"]
+             fut_entry[fut] = entries[i]
++            fut_stop[fut] = stop_ev
+         # Wait with a periodic heartbeat so the user can see the parallel run is
+         # alive (a slow branch can otherwise look like a hang). Each branch is
+         # announced as it finishes; the rest get a "still running" tick.
+@@ -1215,10 +1341,14 @@ def _companions_for(i):
+                     e["timed_out"] = True
+                     print(f"  ⏱️  analysis branch '{fut_label[f]}' exceeded "
+                           f"its wall-clock budget ({int(budget)}s) — "
+-                          "abandoning it (degraded, excluded from fusion).")
++                          "cancelling it (degraded, excluded from fusion).")
+                     logger.warning(
+                         f"fan-out branch {e['index']} ('{fut_label[f]}') "
+-                        f"abandoned after {int(budget)}s wall-clock budget")
++                        f"cancelled after {int(budget)}s wall-clock budget")
++                    # Fire the branch's stop event FIRST so its thread aborts
++                    # on its next print (releasing its memory-admission slot),
++                    # then kill any subprocess it is currently waiting on.
++                    fut_stop[f].set()
+                     tid = e.get("_branch_tid")
+                     if tid:
+                         try:
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index 99f0979a7..ddb33f7d7 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -1383,8 +1383,17 @@ def _sweep_interrupted_delegations(self) -> None:
+ 
+     def _close_delegation(self, entry: Dict[str, Any], result: dict) -> None:
+         """Finalize a provisional ledger entry with the child's result."""
++        # Derive status from the actual outcome rather than trusting the
++        # child's self-report: a result carrying an error is a failure even
++        # if labeled "success", and a missing status is not a success. Other
++        # explicit statuses ("interrupted", "cancelled") legitimately carry
++        # an error field and pass through unchanged. Keeps telemetry,
++        # summarize_session_state and fuse_delegations honest.
++        status = result.get("status")
++        if status is None or (status == "success" and result.get("error")):
++            status = "error"
+         entry.update({
+-            "status": result.get("status"),
++            "status": status,
+             "summary": result.get("summary", ""),
+             "key_findings": result.get("key_findings", []),
+             "files_produced": result.get("files_produced", []),
+diff --git a/scilink/agents/planning_agents/planning_orchestrator.py b/scilink/agents/planning_agents/planning_orchestrator.py
+index 6e380f0c2..467a743fc 100644
+--- a/scilink/agents/planning_agents/planning_orchestrator.py
++++ b/scilink/agents/planning_agents/planning_orchestrator.py
+@@ -736,6 +736,7 @@ def __init__(
+         # delegation result's status from success → error.
+         self.max_iterations = max_iterations
+         self._last_chat_hit_iter_cap = False
++        self._last_chat_error = None
+ 
+         # Custom tools / MCP state
+         self._tool_data_cache: Dict[tuple, Any] = {}
+@@ -1349,7 +1350,8 @@ def chat(self, user_input: str) -> str:
+         _set_evlog(str(_P(self.base_dir) / "events.jsonl"))
+         self.message_count += 1
+         self._last_chat_hit_iter_cap = False
+-        
++        self._last_chat_error = None
++
+         # AUTO-CHECKPOINT: Every 10 messages
+         if self.message_count - self.last_checkpoint_message_count >= 10:
+             print("  💾 Auto-checkpoint triggered (every 10 messages)...")
+@@ -1374,10 +1376,14 @@ def chat(self, user_input: str) -> str:
+             
+         except Exception as e:
+             logging.error(f"Chat Error: {e}", exc_info=True)
+-            
++
+             print("  💾 Error detected - saving emergency checkpoint...")
+             self._auto_checkpoint()
+-            
++
++            # Flag the failure for run_task: the ❌ string preserves CLI/UI
++            # behavior, but a programmatic caller must see status="error",
++            # not a success whose summary happens to start with ❌.
++            self._last_chat_error = str(e)
+             return f"❌ Error: {e}\n\n(Emergency checkpoint saved to {self.checkpoint_path})"
+ 
+     def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+@@ -1482,6 +1488,12 @@ def _snapshot_files() -> set:
+                 if self._last_chat_hit_iter_cap:
+                     status = "error"
+                     error_msg: Optional[str] = summary_text
++                elif self._last_chat_error:
++                    # chat()'s emergency catch-all returned the "❌ Error: ..."
++                    # string as a normal reply; surface it as a failure instead
++                    # of a success whose summary starts with ❌.
++                    status = "error"
++                    error_msg = self._last_chat_error
+                 else:
+                     status = "success"
+                     error_msg = None
+diff --git a/tests/test_fanout_branch_cancellation.py b/tests/test_fanout_branch_cancellation.py
+new file mode 100644
+index 000000000..5c9ecdc46
+--- /dev/null
++++ b/tests/test_fanout_branch_cancellation.py
+@@ -0,0 +1,203 @@
++"""Offline tests for cooperative fan-out branch cancellation
++
++Before this, an over-budget branch was merely ABANDONED: its subprocesses
++were killed and its ledger entry closed, but the thread kept burning API
++quota and held its memory-admission slot until run_task returned — a
++runaway branch could block *other* branches from admission. Now the budget
++path also fires a per-branch stop event; a thread-aware stdout/stderr guard
++raises ``AgentStoppedError`` inside that branch thread on its next print,
++so the branch aborts cooperatively and releases its slot.
++
++  conda run -n scilink python -m pytest tests/test_fanout_branch_cancellation.py -v
++"""
++import json
++import os
++import sys
++import threading
++import time
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import numpy as np
++import pytest
++
++import scilink.agents.meta_agent.fanout as fo
++from scilink.ui.output_capture import AgentStoppedError
++
++
++# ---------------------------------------------------------------- unit level
++
++
++def test_thread_stop_stream_raises_only_for_stopped_thread(capsys):
++    stream = fo._ThreadStopStream(sys.stdout)
++    stream.write("fine before registration\n")
++
++    ev = threading.Event()
++    fo._register_branch_stop(ev)
++    try:
++        stream.write("fine while event unset\n")
++        ev.set()
++        with pytest.raises(AgentStoppedError):
++            stream.write("must raise\n")
++    finally:
++        fo._unregister_branch_stop()
++    # After unregistration the same thread writes freely again.
++    stream.write("fine after unregistration\n")
++
++
++def test_other_threads_unaffected_by_a_stopped_branch():
++    ev = threading.Event()
++    ev.set()
++    errors = []
++
++    def branch():
++        fo._register_branch_stop(ev)
++        try:
++            stream = fo._ThreadStopStream(sys.stdout)
++            try:
++                stream.write("branch write\n")
++                errors.append("branch write did NOT raise")
++            except AgentStoppedError:
++                pass
++        finally:
++            fo._unregister_branch_stop()
++
++    t = threading.Thread(target=branch)
++    t.start()
++    t.join()
++    # The coordinator thread keeps writing through its own guard unharmed.
++    fo._ThreadStopStream(sys.stdout).write("coordinator write\n")
++    assert not errors
++
++
++def test_stop_guard_install_is_idempotent():
++    old_out, old_err = sys.stdout, sys.stderr
++    try:
++        fo._ensure_stop_guard_installed()
++        first_out = sys.stdout
++        assert isinstance(first_out, fo._ThreadStopStream)
++        fo._ensure_stop_guard_installed()
++        assert sys.stdout is first_out, "guard stacked a second layer"
++    finally:
++        sys.stdout, sys.stderr = old_out, old_err
++
++
++def test_user_stop_propagates_uncaught(tmp_path):
++    """AgentStoppedError NOT caused by the branch's own budget stop (i.e. a
++    user-initiated stop) must stay unrecoverable and propagate."""
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent)
++    meta = MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path))
++
++    class UserStoppedChild:
++        def run_task(self, task, context=None, autonomy=None):
++            raise AgentStoppedError("user clicked Stop")
++
++    orig = fo._make_ephemeral_analysis_child
++    fo._make_ephemeral_analysis_child = lambda orch, base_dir: UserStoppedChild()
++    try:
++        own_event = threading.Event()   # never set: not a budget cancel
++        with pytest.raises(AgentStoppedError):
++            fo._run_one_branch(meta, {"data_path": str(tmp_path),
++                                      "task": "t", "label": "L"},
++                               [], {"index": 0}, None, None, own_event)
++    finally:
++        fo._make_ephemeral_analysis_child = orig
++    # The branch's admission slot was still released on the way out.
++    assert not fo._mem_running
++
++
++# ---------------------------------------------------------- integration level
++
++
++def _install_fakes(behaviors):
++    """Fake child + gate/fusion LLM, mirroring tests/test_wallclock_budget.py."""
++    def fake_child(orch, base_dir):
++        class C:
++            def run_task(self, task, context=None, autonomy=None):
++                import re
++                m = re.search(r"PRIMARY dataset for THIS analysis: (\S+)", task)
++                beh = behaviors.get(m.group(1) if m else "", "good")
++                if beh == "chatty":
++                    # Prints in a loop: cancellable on any print. Runs ~20 s
++                    # if NOT cancelled — the test's wall clock is the proof
++                    # that cancellation actually stopped the thread.
++                    for _ in range(400):
++                        print("chatty branch still working...")
++                        time.sleep(0.05)
++                return {"status": "success", "summary": f"{beh} ok",
++                        "key_findings": ["finding"], "files_produced": []}
++        return C()
++    fo._make_ephemeral_analysis_child = fake_child
++
++    def fake_llm(orch, prompt, extra_parts=None):
++        if "SCRIPT CONTRACT" in prompt or "AUDITING a computed" in prompt:
++            return {"verdict": "accept", "issues": [],
++                    "refinement_instructions": "", "method": "qualitative",
++                    "rationale": "r", "script": ""}
++        if "complementary measurements of ONE system" in prompt:
++            return {"detailed_analysis": "fused", "scientific_claims": []}
++        return {"verdict": "complementary", "confidence": 0.9, "rationale": "r",
++                "join_axis": "T", "join_type": "shared_parameter_axis",
++                "fanout_set": list(behaviors), "redundant_clusters": [],
++                "unrelated": [], "excluded_notes": ""}
++    fo._llm_json = fake_llm
++
++
++def test_over_budget_branch_is_cancelled_not_abandoned(tmp_path):
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent, MetaMode)
++    # Pre-warm the worker-side lazy import (see test_wallclock_budget.py).
++    import scilink.agents.exp_agents.analysis_orchestrator  # noqa: F401
++
++    paths = [str(tmp_path / f"{n}.npy") for n in "AB"]
++    for p in paths:
++        np.save(p, np.zeros((8, 8)))
++    A, B = paths
++    behaviors = {A: "good", B: "chatty"}
++
++    ag = MetaOrchestratorAgent(base_dir=str(tmp_path), api_key="sk-dummy",
++                               meta_mode=MetaMode.AUTONOMOUS)
++    orig_child = fo._make_ephemeral_analysis_child
++    orig_llm = fo._llm_json
++    orig_poll = fo._FANOUT_POLL_S
++    _install_fakes(behaviors)
++    fo._FANOUT_POLL_S = 0.2
++    try:
++        t0 = time.monotonic()
++        out = json.loads(ag._run_fanout(
++            [{"data_path": p, "task": f"Analyze {p}",
++              "label": os.path.basename(p)} for p in paths],
++            branch_time_budget_s=0.5))
++        assert out.get("status") == "success"
++        assert out.get("branches_timed_out") == 1
++
++        cancelled = [e for e in ag._delegation_ledger
++                     if e.get("fanout") and e.get("timed_out")]
++        assert len(cancelled) == 1
++        # The ledger verdict is unchanged from #358: degraded, budget error.
++        assert cancelled[0]["status"] == "error"
++        assert "wall-clock budget" in (cancelled[0].get("error") or "")
++
++        # THE new behavior: the thread actually stopped. Its cancellation is
++        # recorded as a late result well before the ~20 s it would have run.
++        deadline = time.monotonic() + 5.0
++        while (cancelled[0].get("late_result") is None
++               and time.monotonic() < deadline):
++            time.sleep(0.1)
++        late = cancelled[0].get("late_result")
++        assert late is not None, "cancelled thread never wound down"
++        assert late.get("status") == "cancelled"
++        assert time.monotonic() - t0 < 10.0, (
++            "cancelled branch kept running to completion")
++
++        # ... and it released its memory-admission slot on the way out.
++        assert not fo._mem_running
++    finally:
++        fo._make_ephemeral_analysis_child = orig_child
++        fo._llm_json = orig_llm
++        fo._FANOUT_POLL_S = orig_poll
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_harmonize_partial_donor.py b/tests/test_harmonize_partial_donor.py
+new file mode 100644
+index 000000000..9a7072499
+--- /dev/null
++++ b/tests/test_harmonize_partial_donor.py
+@@ -0,0 +1,166 @@
++"""Offline tests for #519: harmonize accepts a partial-but-approved donor.
++
++The donor-script search was gated on the donor delegation's top-level
++``status == "success"``. A donor can exhaust its tool-iteration budget (or
++die after approval) and honestly report ``error`` while approved
++(``task_success``) dynamic-analysis records with a replayable script sit on
++disk — and the whole harmonized run then fell back to independent branches.
++Now the record search runs regardless of top-level status (the records are
++the authority); only a donor with NO approved record triggers the loud
++fallback, which these tests also pin.
++
++  conda run -n scilink python -m pytest tests/test_harmonize_partial_donor.py -v
++"""
++import json
++import os
++import time
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import numpy as np
++import pytest
++
++import scilink.agents.meta_agent.fanout as fo
++# Pre-warm the worker-side lazy import (see test_wallclock_budget.py).
++import scilink.agents.exp_agents.analysis_orchestrator  # noqa: F401
++from scilink.agents.meta_agent.meta_orchestrator import (
++    MetaOrchestratorAgent, MetaMode)
++
++CAPTURED_TASKS = []
++
++
++def _fake_llm(paths):
++    def fake(orch, prompt, extra_parts=None):
++        if "SCRIPT CONTRACT" in prompt or "AUDITING a computed" in prompt:
++            return {"verdict": "accept", "issues": [],
++                    "refinement_instructions": "", "method": "qualitative",
++                    "rationale": "r", "script": ""}
++        if "complementary measurements of ONE system" in prompt:
++            return {"detailed_analysis": "fused", "scientific_claims": []}
++        return {"verdict": "complementary", "confidence": 0.9, "rationale": "r",
++                "join_axis": "T", "join_type": "shared_parameter_axis",
++                "fanout_set": list(paths), "redundant_clusters": [],
++                "unrelated": [], "excluded_notes": ""}
++    return fake
++
++
++def _child_factory(donor_result, donor_writes_records):
++    """Donor = first branch to run; followers always succeed."""
++    seen = {"n": 0}
++
++    def fake_child(orch, base_dir):
++        class C:
++            def run_task(self, task, context=None, autonomy=None):
++                CAPTURED_TASKS.append(task)
++                seen["n"] += 1
++                if seen["n"] == 1:   # the donor (runs alone, first)
++                    if donor_writes_records:
++                        rdir = os.path.join(base_dir, "results", "an_fake")
++                        os.makedirs(rdir, exist_ok=True)
++                        with open(os.path.join(
++                                rdir, "dynamic_analysis_records.json"),
++                                "w") as fh:
++                            json.dump([{"target": "t", "task_success": True,
++                                        "required_outputs": [],
++                                        "script": "print(1)"}], fh)
++                    return dict(donor_result)
++                return {"status": "success", "summary": "ok",
++                        "key_findings": ["finding"], "files_produced": []}
++        return C()
++    return fake_child
++
++
++@pytest.fixture()
++def rig(tmp_path, monkeypatch):
++    paths = [str(tmp_path / f"{n}.npy") for n in "ABC"]
++    for p in paths:
++        np.save(p, np.zeros((8, 8)))
++    ag = MetaOrchestratorAgent(base_dir=str(tmp_path), api_key="sk-dummy",
++                               meta_mode=MetaMode.AUTONOMOUS)
++    monkeypatch.setattr(fo, "_llm_json", _fake_llm(paths))
++    CAPTURED_TASKS.clear()
++    return ag, paths
++
++
++def _branches(paths):
++    return [{"data_path": p, "task": f"Analyze {p}",
++             "label": os.path.basename(p)} for p in paths]
++
++
++def test_partial_donor_with_approved_records_still_harmonizes(rig, monkeypatch):
++    ag, paths = rig
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", _child_factory(
++        {"status": "error",
++         "error": "⚠️ Reached maximum tool iterations (20).",
++         "summary": "", "key_findings": [], "files_produced": []},
++        donor_writes_records=True))
++
++    out = json.loads(ag._run_fanout(_branches(paths), harmonize=True))
++    harm = out.get("harmonized") or {}
++    assert harm.get("status") == "harmonized", (
++        "partial donor with an approved script fell back to independent "
++        "branches — the #519 bug is back")
++    assert harm.get("donor_partial") is True
++    assert harm.get("donor_status") == "error"
++
++    # Followers really replay the approved script.
++    follower_tasks = CAPTURED_TASKS[1:]
++    assert len(follower_tasks) == 2
++    assert all("reuse_locked_script=true" in t and harm["reuse_dir"] in t
++               for t in follower_tasks)
++
++    # The donor's honest ledger verdict is NOT laundered by harmonization.
++    fan = [e for e in ag._delegation_ledger if e.get("fanout")]
++    assert fan[0]["status"] == "error"
++    stamped = [e for e in fan if e.get("harmonized_with")]
++    assert len(stamped) == 2
++
++
++def test_donor_with_no_approved_records_still_falls_back(rig, monkeypatch):
++    ag, paths = rig
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", _child_factory(
++        {"status": "error", "error": "everything failed", "summary": "",
++         "key_findings": [], "files_produced": []},
++        donor_writes_records=False))
++
++    out = json.loads(ag._run_fanout(_branches(paths), harmonize=True))
++    harm = out.get("harmonized") or {}
++    assert harm.get("status") == "fallback"
++    assert harm.get("reason") == "no approved donor script"
++    follower_tasks = CAPTURED_TASKS[1:]
++    assert follower_tasks and all(
++        "reuse_locked_script" not in t for t in follower_tasks)
++
++
++def test_successful_donor_not_marked_partial(rig, monkeypatch):
++    ag, paths = rig
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", _child_factory(
++        {"status": "success", "summary": "ok", "key_findings": ["f"],
++         "files_produced": []},
++        donor_writes_records=True))
++
++    out = json.loads(ag._run_fanout(_branches(paths), harmonize=True))
++    harm = out.get("harmonized") or {}
++    assert harm.get("status") == "harmonized"
++    assert "donor_partial" not in harm
++    assert "donor_status" not in harm
++
++
++def test_donor_task_carries_single_call_nudge(rig, monkeypatch):
++    ag, paths = rig
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", _child_factory(
++        {"status": "success", "summary": "ok", "key_findings": ["f"],
++         "files_produced": []},
++        donor_writes_records=True))
++
++    json.loads(ag._run_fanout(_branches(paths), harmonize=True))
++    assert "PIPELINE-DONOR NOTE" in CAPTURED_TASKS[0]
++    assert all("PIPELINE-DONOR NOTE" not in t for t in CAPTURED_TASKS[1:])
++    # The ledger records the actual (nudged) donor task.
++    fan = [e for e in ag._delegation_ledger if e.get("fanout")]
++    assert "PIPELINE-DONOR NOTE" in fan[0]["task"]
++
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_plan_refinement_gate.py b/tests/test_plan_refinement_gate.py
+new file mode 100644
+index 000000000..2e41bcce7
+--- /dev/null
++++ b/tests/test_plan_refinement_gate.py
+@@ -0,0 +1,105 @@
++"""Tests for the shared plan-refinement gate
++
++The human plan-approval loop was duplicated byte-for-byte in the curve
++fitting and image analysis planning controllers (same guard, same
++``while iteration < max_iterations``, same ``_refine_requested`` /
++``_refine_feedback`` pops); the verification loop was already shared via
++``_qc_engine.py`` and this was the leftover. It now lives once in
++``base_controllers.run_plan_refinement_gate``.
++
++  python -m pytest tests/test_plan_refinement_gate.py -v
++"""
++import logging
++import os
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++from scilink.agents.exp_agents.controllers.base_controllers import (
++    run_plan_refinement_gate)
++
++
++class FakeController:
++    """Feeds a scripted sequence of user decisions to the gate.
++
++    Each element of ``decisions`` is a feedback string (= "refine with
++    this") or None (= approve). The list running out counts as approval.
++    """
++
++    def __init__(self, decisions, max_iterations=3, enable=True):
++        self.enable_human_feedback = enable
++        self.max_iterations = max_iterations
++        self.logger = logging.getLogger("fake-controller")
++        self._decisions = list(decisions)
++        self.feedback_calls = 0
++        self.refined_with = []
++
++    def _get_human_feedback(self, state):
++        self.feedback_calls += 1
++        d = self._decisions.pop(0) if self._decisions else None
++        if d is not None:
++            state["_refine_requested"] = True
++            state["_refine_feedback"] = d
++        return state
++
++    def _refine_plan(self, state, feedback):
++        self.refined_with.append(feedback)
++        return state
++
++
++def _gate(ctrl, state):
++    return run_plan_refinement_gate(
++        ctrl, state, refine_banner="\nRefining plan...\n",
++        max_banner="Max refinements reached.")
++
++
++def test_immediate_approval_runs_no_refinement():
++    ctrl = FakeController([None])
++    state = _gate(ctrl, {})
++    assert ctrl.feedback_calls == 1
++    assert ctrl.refined_with == []
++    assert "_refine_requested" not in state
++
++
++def test_refine_until_approved_logs_feedback():
++    ctrl = FakeController(["sharper peaks", "wider window", None])
++    state = _gate(ctrl, {})
++    assert ctrl.refined_with == ["sharper peaks", "wider window"]
++    assert state["human_feedback_log"] == ["sharper peaks", "wider window"]
++    # The transient markers never leak into the state.
++    assert "_refine_requested" not in state
++    assert "_refine_feedback" not in state
++
++
++def test_max_iterations_caps_the_loop(capsys):
++    ctrl = FakeController(["a", "b", "c", "d"], max_iterations=2)
++    _gate(ctrl, {})
++    assert ctrl.refined_with == ["a", "b"]
++    assert "Max refinements reached." in capsys.readouterr().out
++
++
++def test_disabled_feedback_skips_gate():
++    ctrl = FakeController(["never asked"], enable=False)
++    _gate(ctrl, {})
++    assert ctrl.feedback_calls == 0
++
++
++def test_locked_script_reuse_skips_gate():
++    ctrl = FakeController(["never asked"])
++    _gate(ctrl, {"reuse_locked_script": True})
++    assert ctrl.feedback_calls == 0
++
++
++def test_both_controllers_use_the_shared_gate():
++    """The extraction is only done if both former copies now import it."""
++    from scilink.agents.exp_agents.controllers import (
++        base_controllers, curve_fitting_controllers, image_analysis_controllers)
++    assert (curve_fitting_controllers.run_plan_refinement_gate
++            is base_controllers.run_plan_refinement_gate)
++    assert (image_analysis_controllers.run_plan_refinement_gate
++            is base_controllers.run_plan_refinement_gate)
++
++
++if __name__ == "__main__":
++    import sys
++    import pytest
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_run_task_error_status.py b/tests/test_run_task_error_status.py
+new file mode 100644
+index 000000000..bb2f2661d
+--- /dev/null
++++ b/tests/test_run_task_error_status.py
+@@ -0,0 +1,118 @@
++"""Regression tests for honest delegation status.
++
++``chat()``'s emergency catch-all returns "❌ Error: ..." as a normal reply
++string, so ``run_task`` used to report ``status="success"`` for a turn that
++actually died — live sessions recorded such delegations as successes with
++zero files and summaries beginning ❌, and telemetry / fusion treated them
++as real results. Two layers now keep the ledger honest:
++
++  - child-side: ``chat()`` flags the failure (``_last_chat_error``) and
++    ``run_task`` flips the status (mirrors the #208 iteration-cap flag);
++  - meta-side: ``_close_delegation`` derives status from the outcome —
++    a result carrying an error, or missing a status, is never a success.
++
++  python -m pytest tests/test_run_task_error_status.py -v
++"""
++import os
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import pytest
++
++
++def _make(mode, tmp_path):
++    if mode == "analysis":
++        from scilink.agents.exp_agents.analysis_orchestrator import (
++            AnalysisOrchestratorAgent)
++        return AnalysisOrchestratorAgent(api_key="sk-dummy",
++                                         base_dir=str(tmp_path / "an"))
++    from scilink.agents.planning_agents.planning_orchestrator import (
++        PlanningOrchestratorAgent)
++    return PlanningOrchestratorAgent(api_key="sk-dummy",
++                                     data_dir=str(tmp_path),
++                                     base_dir=str(tmp_path / "pl"))
++
++
++@pytest.mark.parametrize("mode", ["analysis", "planning"])
++def test_chat_emergency_error_flips_status(mode, tmp_path):
++    orch = _make(mode, tmp_path)
++
++    def fake_chat(_prompt):
++        # What a real chat() turn looks like after its emergency catch-all
++        # fired: ❌ string returned as the reply, error flag set.
++        orch._last_chat_hit_iter_cap = False
++        orch._last_chat_error = "LLM call exploded"
++        return "❌ Error: LLM call exploded\n\n(Emergency checkpoint saved)"
++
++    orch.chat = fake_chat
++    result = orch.run_task("some task")
++
++    assert result["status"] == "error", (
++        f"{mode}: emergency chat error reported as {result['status']!r} — "
++        "the ❌-summary-as-success bug (#411 follow-up) is back")
++    assert "LLM call exploded" in (result.get("error") or "")
++
++
++@pytest.mark.parametrize("mode", ["analysis", "planning"])
++def test_chat_resets_error_flag_each_turn(mode, tmp_path):
++    """A stale error flag from a failed turn must not poison the next one."""
++    orch = _make(mode, tmp_path)
++    orch._last_chat_error = "stale failure from a previous turn"
++    orch.use_openai = False
++    orch._handle_litellm_chat = lambda _msg: "fine"
++    reply = orch.chat("hello")
++    assert "fine" in reply
++    assert orch._last_chat_error is None
++
++
++@pytest.mark.parametrize("mode", ["analysis", "planning"])
++def test_clean_completion_still_reports_success(mode, tmp_path):
++    orch = _make(mode, tmp_path)
++
++    def fake_chat(_prompt):
++        orch._last_chat_hit_iter_cap = False
++        orch._last_chat_error = None
++        return "All done."
++
++    orch.chat = fake_chat
++    result = orch.run_task("some task")
++    assert result["status"] == "success"
++    assert not result.get("error")
++
++
++# ---------------------------------------------------------------- meta side
++
++
++def _make_meta(tmp_path):
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent)
++    return MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path))
++
++
++def test_close_delegation_derives_status_from_outcome(tmp_path):
++    meta = _make_meta(tmp_path)
++
++    # A "success" carrying an error is a failure.
++    entry = {"index": 1}
++    meta._close_delegation(entry, {"status": "success",
++                                   "error": "❌ Error: it broke",
++                                   "summary": "❌ Error: it broke"})
++    assert entry["status"] == "error"
++
++    # A result with no status at all is not a success.
++    entry = {"index": 2}
++    meta._close_delegation(entry, {"summary": "??"})
++    assert entry["status"] == "error"
++
++    # A clean success stays a success; an explicit error stays an error.
++    entry = {"index": 3}
++    meta._close_delegation(entry, {"status": "success", "summary": "ok"})
++    assert entry["status"] == "success"
++    entry = {"index": 4}
++    meta._close_delegation(entry, {"status": "error", "error": "x"})
++    assert entry["status"] == "error"
++
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_wallclock_budget_live.py b/tests/test_wallclock_budget_live.py
+index 1114f8de6..52d9b07dc 100644
+--- a/tests/test_wallclock_budget_live.py
++++ b/tests/test_wallclock_budget_live.py
+@@ -113,6 +113,20 @@ def main():
+               and "wall-clock budget" in (noisy[0].get("error") or ""))
+         check("timed-out counted in the result",
+               out.get("branches_timed_out") == 1)
++        # Cooperative cancellation (#358 follow-up): the over-budget
++        # branch is now STOPPED, not just abandoned — its thread aborts on
++        # its next print and records a 'cancelled' late result, instead of
++        # churning to completion on the API bill. Grace period covers a
++        # long in-flight LLM call it cannot notice the stop during.
++        deadline = time.monotonic() + 240
++        while (noisy[0].get("late_result") is None
++               and time.monotonic() < deadline):
++            time.sleep(5)
++        late = noisy[0].get("late_result")
++        check("cancelled branch thread wound down shortly after expiry",
++              late is not None)
++        check("late result records the cancellation",
++              (late or {}).get("status") == "cancelled")
+     else:
+         # The branch may instead FINISH honestly (QC refusing + salvage) —
+         # also a valid bounded outcome; the budget just wasn't needed.

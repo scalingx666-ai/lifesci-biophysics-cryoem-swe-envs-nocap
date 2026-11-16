@@ -1,0 +1,362 @@
+diff --git a/src/python/espressomd/particle_data.py b/src/python/espressomd/particle_data.py
+index 9d943e0c583..be5768efc10 100644
+--- a/src/python/espressomd/particle_data.py
++++ b/src/python/espressomd/particle_data.py
+@@ -605,6 +605,14 @@ def vs_auto_relate_to(self, rel_to, override_cutoff_check=False,
+                 else:
+                     self.propagation |= Propagation.ROT_LANGEVIN
+ 
++    def _bond_sanity_checks(self, bond):
++        if self.id in bond[1:]:
++            raise Exception(
++                f"Bond partners {bond[1:]} include the particle {self.id} itself")
++        if len(set(bond[1:])) is not len(bond[1:]):
++            raise Exception(
++                f"Cannot add duplicate bond partners {bond[1:]} to particle {self.id}")
++
+     def add_verified_bond(self, bond):
+         """
+         Add a bond, the validity of which has already been verified.
+@@ -615,12 +623,7 @@ def add_verified_bond(self, bond):
+         bonds : ``Particle`` property containing a list of all current bonds held by ``Particle``.
+ 
+         """
+-        if self.id in bond[1:]:
+-            raise Exception(
+-                f"Bond partners {bond[1:]} include the particle {self.id} itself")
+-        if len(set(bond[1:])) is not len(bond[1:]):
+-            raise Exception(
+-                f"Cannot add duplicate bond partners {bond[1:]} to particle {self.id}")
++        self._bond_sanity_checks(bond)
+         self.call_method("add_bond",
+                          bond_id=bond[0]._bond_id,
+                          part_id=bond[1:])
+@@ -797,7 +800,7 @@ def update(self, new_properties):
+         Parameters
+         ----------
+         new_properties : :obj:`dict`
+-            Map particle property names to values. All properties except
++            New particle properties. All properties except
+             for the particle id can be changed.
+ 
+         Examples
+@@ -813,11 +816,30 @@ def update(self, new_properties):
+         [4. 5. 6.] 0.0 False
+ 
+         """
++        overrides = dict()
+         if "id" in new_properties:
+             raise RuntimeError("Cannot change particle id.")
+ 
+-        for k, v in new_properties.items():
+-            setattr(self, k, v)
++        if "propagation" in new_properties.keys():
++            overrides["propagation"] = int(new_properties["propagation"])
++        if "bonds" in new_properties:
++            bonds_ids, bonds_parts = [], []
++            bonds = new_properties["bonds"]
++            nlvl = nesting_level(bonds)
++            if nlvl not in (1, 2):
++                raise ValueError(
++                    "Bonds have to specified as lists of tuples/lists or a single list")
++            if nlvl == 1 and len(bonds) > 0:
++                bonds = [bonds]
++            for bond in bonds:
++                _bond = self.normalize_and_check_bond_or_throw_exception(bond)
++                self._bond_sanity_checks(_bond)
++                bonds_ids.append(_bond[0]._bond_id)
++                bonds_parts.append(_bond[1:])
++            overrides["bonds_ids"] = bonds_ids
++            overrides["bonds_parts"] = bonds_parts
++        return self.call_method(
++            "update_params", **(new_properties | overrides))
+ 
+     def convert_vector_body_to_space(self, vec):
+         """
+diff --git a/src/script_interface/particle_data/ParticleHandle.cpp b/src/script_interface/particle_data/ParticleHandle.cpp
+index 9590758cdc1..49f43427dc0 100644
+--- a/src/script_interface/particle_data/ParticleHandle.cpp
++++ b/src/script_interface/particle_data/ParticleHandle.cpp
+@@ -77,6 +77,36 @@ static void particle_checks(int p_id, Utils::Vector3d const &pos) {
+ #endif // __FAST_MATH__
+ }
+ 
++#ifdef ROTATION
++static auto const contradicting_arguments_quat = std::vector<
++    std::array<std::string, 3>>{{
++    {{"dip", "dipm",
++      "Setting 'dip' is sufficient as it defines the scalar dipole moment."}},
++    {{"quat", "director",
++      "Setting 'quat' is sufficient as it defines the director."}},
++    {{"dip", "quat",
++      "Setting 'dip' would overwrite 'quat'. Set 'quat' and 'dipm' instead."}},
++    {{"dip", "director",
++      "Setting 'dip' would overwrite 'director'. Set 'director' and "
++      "'dipm' instead."}},
++}};
++
++static void sanity_checks_rotation(VariantMap const &params) {
++  // if we are not constructing a particle from a checkpoint file,
++  // check the quaternion is not accidentally set twice by the user
++  if (not params.contains("__cpt_sentinel")) {
++    auto formatter =
++        boost::format("Contradicting particle attributes: '%s' and '%s'. %s");
++    for (auto const &[prop1, prop2, reason] : contradicting_arguments_quat) {
++      if (params.contains(prop1) and params.contains(prop2)) {
++        auto const err_msg = boost::str(formatter % prop1 % prop2 % reason);
++        throw std::invalid_argument(err_msg);
++      }
++    }
++  }
++}
++#endif // ROTATION
++
+ static uint8_t bitfield_from_flag(Utils::Vector3i const &flag) {
+   auto bitfield = static_cast<uint8_t>(0u);
+   if (flag[0])
+@@ -558,6 +588,36 @@ Variant ParticleHandle::do_call_method(std::string const &name,
+         [&]() { do_set_parameter(param_name, value); });
+     return {};
+   }
++  if (name == "update_params") {
++    // Set new properties
++    context()->parallel_try_catch([&]() {
++#ifdef ROTATION
++      sanity_checks_rotation(params);
++#endif
++      for (auto const &name : get_parameter_insertion_order()) {
++        if (params.contains(name) and name != "bonds") {
++          do_set_parameter(name, params.at(name));
++        }
++      }
++    });
++
++    // Set bonds
++    if (params.contains("bonds_ids")) {
++      // Remove old bonds
++      set_particle_property([&](Particle &p) { p.bonds().clear(); });
++      // Add new bonds
++      auto const bonds_ids = get_value<std::vector<int>>(params, "bonds_ids");
++      auto const bonds_partner_ids =
++          get_value<std::vector<std::vector<int>>>(params, "bonds_parts");
++      for (std::size_t i = 0; i < bonds_ids.size(); i += 1) {
++        std::vector<int> particle_ids = {m_pid};
++        std::ranges::copy(bonds_partner_ids[i],
++                          std::back_inserter(particle_ids));
++        ::add_bond(*get_system(), bonds_ids[i], particle_ids);
++        get_system()->on_particle_change();
++      }
++    }
++  }
+   if (name == "get_bond_by_id") {
+     if (not context()->is_head_node()) {
+       return {};
+@@ -740,21 +800,6 @@ Variant ParticleHandle::do_call_method(std::string const &name,
+   return {};
+ }
+ 
+-#ifdef ROTATION
+-static auto const contradicting_arguments_quat = std::vector<
+-    std::array<std::string, 3>>{{
+-    {{"dip", "dipm",
+-      "Setting 'dip' is sufficient as it defines the scalar dipole moment."}},
+-    {{"quat", "director",
+-      "Setting 'quat' is sufficient as it defines the director."}},
+-    {{"dip", "quat",
+-      "Setting 'dip' would overwrite 'quat'. Set 'quat' and 'dipm' instead."}},
+-    {{"dip", "director",
+-      "Setting 'dip' would overwrite 'director'. Set 'director' and "
+-      "'dipm' instead."}},
+-}};
+-#endif // ROTATION
+-
+ void ParticleHandle::do_construct(VariantMap const &params) {
+   auto const n_extra_args = params.size() - params.count("id") -
+                             params.count("__cell_structure") -
+@@ -799,20 +844,7 @@ void ParticleHandle::do_construct(VariantMap const &params) {
+   });
+ 
+ #ifdef ROTATION
+-  context()->parallel_try_catch([&]() {
+-    // if we are not constructing a particle from a checkpoint file,
+-    // check the quaternion is not accidentally set twice by the user
+-    if (not params.contains("__cpt_sentinel")) {
+-      auto formatter =
+-          boost::format("Contradicting particle attributes: '%s' and '%s'. %s");
+-      for (auto const &[prop1, prop2, reason] : contradicting_arguments_quat) {
+-        if (params.contains(prop1) and params.contains(prop2)) {
+-          auto const err_msg = boost::str(formatter % prop1 % prop2 % reason);
+-          throw std::invalid_argument(err_msg);
+-        }
+-      }
+-    }
+-  });
++  context()->parallel_try_catch([&]() { sanity_checks_rotation(params); });
+ #endif // ROTATION
+ 
+   // create a default-constructed particle
+diff --git a/testsuite/python/particle.py b/testsuite/python/particle.py
+index a0db9a35de2..3352d634411 100644
+--- a/testsuite/python/particle.py
++++ b/testsuite/python/particle.py
+@@ -44,6 +44,10 @@ class ParticleProperties(ut.TestCase):
+     system.bonded_inter.add(f1)
+     f2 = espressomd.interactions.FeneBond(k=1, d_r_max=2)
+     system.bonded_inter.add(f2)
++    f3 = espressomd.interactions.AngleHarmonic(phi0=0, bend=1)
++    system.bonded_inter.add(f3)
++    f4 = espressomd.interactions.Dihedral(mult=1, bend=1, phase=0)
++    system.bonded_inter.add(f4)
+ 
+     def setUp(self):
+         self.partcl = self.system.part.add(id=self.pid, pos=(0, 0, 0))
+@@ -258,10 +262,13 @@ def test_contradicting_properties_quat(self):
+                 {'dip': [1., 1., 1.], 'quat': [1., 1., 1., 1.]},
+                 {'dip': [1., 1., 1.], 'director': [1., 1., 1.]},
+             ]
+-        # check all methods that can instantiate particles
++        # check all methods that can instantiate or update particles
++        p = self.system.part.add(pos=[0., 0., 0.])
+         for kwargs in invalid_combinations:
+-            with self.assertRaises(ValueError):
++            with self.assertRaisesRegex(ValueError, "Contradicting particle attributes"):
+                 self.system.part.add(pos=[0., 0., 0.], **kwargs)
++            with self.assertRaisesRegex(ValueError, "Contradicting particle attributes"):
++                p.update(kwargs)
+ 
+     @utx.skipIfMissingFeatures(["ROTATION"])
+     def test_invalid_quat(self):
+@@ -293,7 +300,7 @@ def test_particle_selection(self):
+         self.assertEqual(len(res.id), len(charges))
+         for p in res:
+             np.testing.assert_allclose(
+-                (0.2, 0.3, 0.4), np.copy(p.pos), atol=1E-12)
++                np.copy(p.pos), (0.2, 0.3, 0.4), atol=1E-12)
+ 
+         # Two criteria
+         res = self.system.part.select(pos=(0.2, 0.3, 0.4), q=0)
+@@ -408,8 +415,7 @@ def test_parallel_property_setters(self):
+             pos=system.box_l * np.random.random((100, 3)))
+ 
+         # Copy individual properties of particle 0
+-        print(
+-            "If this test hangs, there is an mpi deadlock in a particle property setter.")
++        print("If this test hangs, there is an mpi deadlock in a particle property setter.")
+         for attr in espressomd.particle_data.particle_attributes:
+             # Uncomment to identify guilty property
+             # print(attr)
+@@ -436,11 +442,12 @@ def test_remove_particle(self):
+         self.assertEqual(len(p2.bonds), 0)
+ 
+     def test_bonds(self):
+-        """Tests bond addition and removal."""
++        """Tests bond addition, removal and update."""
+ 
+         p1 = self.system.part.by_id(self.pid)
+         p2 = self.system.part.add(pos=p1.pos)
+         p3 = self.system.part.add(pos=p1.pos)
++        p4 = self.system.part.add(pos=p1.pos)
+         inactive_bond = espressomd.interactions.FeneBond(k=1, d_r_max=2)
+         p2.add_bond([self.f1, p1])
+         with self.assertRaisesRegex(RuntimeError, "already exists on particle"):
+@@ -477,6 +484,36 @@ def test_bonds(self):
+         with self.assertRaisesRegex(Exception, r"Cannot add duplicate bond partners \(17, 17, 19\) to particle 18"):
+             p2.add_bond((active_dihedral_bond, p1, p1, p3))
+ 
++        # Test bond update
++        with self.assertRaisesRegex(Exception, "1st element of Bond has to be of type BondedInteraction or int"):
++            p2.update({"bonds": ("self.f1", p1)})
++        with self.assertRaisesRegex(ValueError, "Bond partners have to be of type integer or ParticleHandle"):
++            p2.update({"bonds": (self.f1, "1")})
++        with self.assertRaisesRegex(ValueError, r"Bond FeneBond\(.+?\) needs 1 partner"):
++            p2.update({"bonds": (self.f1, p1, p2)})
++        with self.assertRaisesRegex(Exception, "The bonded interaction has not yet been added to the list of active bonds in ESPResSo"):
++            p2.update({"bonds": (inactive_bond, p1)})
++        with self.assertRaisesRegex(Exception, "The bonded interaction has not yet been added to the list of active bonds in ESPResSo"):
++            p2.update({"bonds": (inactive_bond, p1)})
++        p2.update({"bonds": []})
++        with self.assertRaisesRegex(RuntimeError, "doesn't exist on particle"):
++            p2.delete_bond([self.f1, p1])
++        with self.assertRaisesRegex(ValueError, "Bond partners have to be of type integer or ParticleHandle"):
++            p2.delete_bond((self.f1, "p1"))
++
++        with self.assertRaisesRegex(Exception, r"Bond partners \(17, 18\) include the particle 18 itself"):
++            p2.update({"bonds": (self.f3, p1, p2)})
++        with self.assertRaisesRegex(Exception, r"Cannot add duplicate bond partners \(17, 17\) to particle 18"):
++            p2.update({"bonds": (self.f3, p1, p1)})
++        with self.assertRaisesRegex(Exception, r"Bond partners \(17, 18\) include the particle 18 itself"):
++            p2.update({"bonds": (self.f3, p1, p2)})
++        with self.assertRaisesRegex(ValueError, r"Bond AngleHarmonic\(.+?\) needs 2 partners"):
++            p2.update({"bonds": (self.f3, p1)})
++        p2.update({"bonds": (self.f4, p1, p3, p4)})
++        with self.assertRaisesRegex(RuntimeError, "doesn't exist on particle"):
++            p2.delete_bond([self.f1, p1])
++        p2.delete_bond((self.f4, p1, p3, p4))
++
+     def test_zz_remove_all(self):
+         for p in self.system.part.all():
+             p.remove()
+@@ -588,25 +625,52 @@ def test_to_dict(self):
+ 
+     def test_update(self):
+         self.system.part.clear()
+-        p = self.system.part.add(pos=0.5 * self.system.box_l)
++        p1 = self.system.part.add(pos=0.5 * self.system.box_l)
++        p2 = self.system.part.add(pos=p1.pos)
++        p3 = self.system.part.add(pos=p1.pos)
++        p4 = self.system.part.add(pos=p1.pos)
+         # cannot change id (to avoid corrupting caches in the core)
+         with self.assertRaisesRegex(RuntimeError, "Cannot change particle id"):
+-            p.update({'id': 1})
++            p1.update({"id": 1})
+         with self.assertRaisesRegex(RuntimeError, "Cannot change particle id"):
+-            self.system.part.all().update({'id': 1})
++            self.system.part.all().update({"id": 1})
++        # cannot change read-only properties
++        with self.assertRaisesRegex(RuntimeError, "Parameter 'pos_folded' is read-only"):
++            p1.update({"pos_folded": [1., 0., 0.]})
+         # check value change
+         new_pos = [1., 2., 3.]
+-        p.update({'pos': new_pos})
+-        np.testing.assert_almost_equal(p.pos, new_pos)
++        new_vel = [0.1, 0.2, 0.3]
++        p1.update({"pos": new_pos, "v": new_vel})
++        np.testing.assert_almost_equal(np.copy(p1.pos), new_pos)
++        np.testing.assert_almost_equal(np.copy(p1.v), new_vel)
+         # updating self should not change anything
+-        pdict = p.to_dict()
+-        del pdict['id']
+-        p.update(pdict)
+-        new_pdict = p.to_dict()
+-        del new_pdict['id']
++        pdict = p1.to_dict()
++        del pdict["id"]
++        p1.update(pdict)
++        new_pdict = p1.to_dict()
++        del new_pdict["id"]
+         self.assertEqual(str(new_pdict), str(pdict))
+         with self.assertRaisesRegex(RuntimeError, "Parameter 'test' is missing"):
+-            p.call_method("set_param_parallel", name="test")
++            p1.call_method("set_param_parallel", name="test")
++
++        # Check bonds were assigned correctly
++        new_bonds = ((self.f1, p2.id), (self.f2, p3.id),
++                     (self.f4, p2.id, p3.id, p4.id))
++        p1.update({"bonds": new_bonds})
++
++        def normalize_bond(bond):
++            return (type(bond[0]), bond[0].params, bond[1:])
++
++        # Compare bond type, bond parameters and partner ids
++        new_bonds = tuple(map(normalize_bond, new_bonds))
++        pdict["bonds"] = tuple(map(normalize_bond, p1.to_dict()["bonds"]))
++        self.assertEqual(new_bonds, pdict["bonds"])
++
++        new_bonds = (self.f4, p2.id, p3.id, p4.id)
++        p1.update({"bonds": new_bonds})
++        new_bonds = (normalize_bond(new_bonds),)
++        pdict["bonds"] = tuple(map(normalize_bond, p1.to_dict()["bonds"]))
++        self.assertEqual(new_bonds, pdict["bonds"])
+ 
+ 
+ if __name__ == "__main__":

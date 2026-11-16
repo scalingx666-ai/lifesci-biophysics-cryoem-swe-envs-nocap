@@ -1,0 +1,801 @@
+diff --git a/psiflow/free_energy/phonons.py b/psiflow/free_energy/phonons.py
+index 3db5b641..a73ddeb4 100644
+--- a/psiflow/free_energy/phonons.py
++++ b/psiflow/free_energy/phonons.py
+@@ -13,9 +13,15 @@
+ import psiflow
+ from psiflow.data import Dataset
+ from psiflow.geometry import Geometry, mass_weight
+-from psiflow.hamiltonians import Hamiltonian
+-from psiflow.sampling.optimize import setup_forces, setup_sockets
+-from psiflow.sampling.sampling import make_start_command, make_client_command
++from psiflow.hamiltonians import Hamiltonian, MixtureHamiltonian
++from psiflow.sampling.sampling import (
++    setup_sockets,
++    label_forces,
++    make_force_xml,
++    serialize_mixture,
++    make_start_command,
++    make_client_command
++)
+ from psiflow.utils.apps import multiply
+ from psiflow.utils.io import load_numpy, save_xml
+ from psiflow.utils import TMP_COMMAND, CD_COMMAND
+@@ -112,7 +118,6 @@ def _execute_ipi(
+         TMP_COMMAND,
+         CD_COMMAND,
+         command_start,
+-        "sleep 3s",
+         *commands_client,
+         "wait",
+         command_end,
+@@ -133,8 +138,10 @@ def compute_harmonic(
+     pos_shift: float = 0.01,
+     energy_shift: float = 0.00095,
+ ) -> AppFuture:
+-    hamiltonians_map, forces = setup_forces(hamiltonian)
+-    sockets = setup_sockets(hamiltonians_map)
++    hamiltonian: MixtureHamiltonian = 1 * hamiltonian
++    names = label_forces(hamiltonian)
++    sockets = setup_sockets(names)
++    forces = make_force_xml(hamiltonian, names)
+ 
+     initialize = ET.Element("initialize", nbeads="1")
+     start = ET.Element("file", mode="ase", cell_units="angstrom")
+@@ -168,11 +175,10 @@ def compute_harmonic(
+         input_future,
+         Dataset([state]).extxyz,
+     ]
+-    inputs += [h.serialize_function(dtype="float64") for h in hamiltonians_map.values()]
++    inputs += serialize_mixture(hamiltonian, dtype="float64")
+ 
+-    hamiltonian_names = list(hamiltonians_map.keys())
+     client_args = []
+-    for name in hamiltonian_names:
++    for name in names:
+         args = definition.get_client_args(name, 1, "vibrations")
+         client_args.append(args)
+     outputs = [
+@@ -184,7 +190,7 @@ def compute_harmonic(
+     resources = definition.wq_resources(1)
+ 
+     result = execute_ipi(
+-        hamiltonian_names,
++        names,
+         client_args,
+         command_server,
+         command_client,
+diff --git a/psiflow/hamiltonians.py b/psiflow/hamiltonians.py
+index c7c50baf..3faeb1b0 100644
+--- a/psiflow/hamiltonians.py
++++ b/psiflow/hamiltonians.py
+@@ -114,11 +114,12 @@ class MixtureHamiltonian(Hamiltonian):
+ 
+     def __init__(
+         self,
+-        hamiltonians: list[Hamiltonian],
+-        coefficients: list[float],
++        hamiltonians: Union[tuple, list][Hamiltonian],
++        coefficients: Union[tuple, list][float],
+     ) -> None:
+-        self.hamiltonians = hamiltonians
+-        self.coefficients = coefficients
++        assert len(hamiltonians) == len(coefficients)
++        self.hamiltonians = list(hamiltonians)
++        self.coefficients = list(coefficients)
+ 
+     def compute(  # override compute for efficient batching
+         self,
+diff --git a/psiflow/sampling/__init__.py b/psiflow/sampling/__init__.py
+index 145a4f6a..3e95469c 100644
+--- a/psiflow/sampling/__init__.py
++++ b/psiflow/sampling/__init__.py
+@@ -1,5 +1,5 @@
+ from .metadynamics import Metadynamics  # noqa: F401
+-from .optimize import optimize, optimize_dataset  # noqa: F401
++# from .optimize import optimize, optimize_dataset  # noqa: F401
+ from .output import SimulationOutput  # noqa: F401
+ from .sampling import sample  # noqa: F401
+ from .walker import ReplicaExchange  # noqa: F401
+diff --git a/psiflow/sampling/_ase.py b/psiflow/sampling/_ase.py
+new file mode 100644
+index 00000000..37c4a035
+--- /dev/null
++++ b/psiflow/sampling/_ase.py
+@@ -0,0 +1,193 @@
++"""
++Structure optimisation through ASE
++TODO: do we need to check for very large forces?
++TODO: what units are pressure?
++TODO: what to do when max_steps is reached before converging?
++TODO: timeout is duplicated code
++"""
++
++import os
++import json
++import warnings
++import signal
++import argparse
++from pathlib import Path
++from types import SimpleNamespace
++
++import ase
++import ase.io
++import numpy as np
++from ase.io.extxyz import save_calc_results
++from ase.calculators.calculator import Calculator, all_properties
++from ase.calculators.mixing import LinearCombinationCalculator
++from ase.optimize.precon import PreconLBFGS
++from ase.filters import FrechetCellFilter
++
++from psiflow.geometry import Geometry
++from psiflow.functions import function_from_json, EnergyFunction
++from psiflow.sampling.utils import TimeoutException, timeout_handler
++
++
++ALLOWED_MODES: tuple[str, ...] = ('full', 'fix_volume', 'fix_shape', 'fix_cell')
++FILE_OUT: str = 'out.xyz'
++FILE_TRAJ: str = 'out.traj'
++
++
++class FunctionCalculator(Calculator):
++    implemented_properties = ['energy', 'free_energy', 'forces', 'stress']
++
++    def __init__(self, function: EnergyFunction, **kwargs):
++        super().__init__(**kwargs)
++        self.function = function
++
++    def calculate(
++        self,
++        atoms=None,
++        properties=all_properties,
++        system_changes=None,
++    ):
++        super().calculate(atoms, properties, system_changes)
++        geometry = Geometry.from_atoms(self.atoms)
++        self.results = self.function(geometry)
++        self.results['free_energy'] = self.results['energy']                # required by optimiser
++
++
++def log_state(atoms: ase.Atoms) -> None:
++    """"""
++    def make_log(data: list[tuple[str]]):
++        """"""
++        txt = ['', 'Current atoms state:']
++        txt += [f'{_[0]:<15}: {_[1]:<25}[{_[2]}]' for _ in data]
++        txt += 'End', ''
++        print(*txt, sep='\n')
++
++    data = []
++    if atoms.calc:
++        energy, max_force = atoms.get_potential_energy(), np.linalg.norm(atoms.get_forces(), axis=0).max()
++    else:
++        energy, max_force = [np.nan] * 2
++    data += ('Energy', f'{energy:.2f}', 'eV'), ('Max. force', f'{max_force:.2E}', 'eV/A')
++
++    if not all(atoms.pbc):
++        make_log(data)
++        return
++
++    volume, cell = atoms.get_volume(), atoms.get_cell().cellpar().round(3)
++    data += ('Cell volume', f'{atoms.get_volume():.2f}', 'A^3'),
++    data += ('Box norms', str(cell[:3])[1:-1], 'A'), ('Box angles', str(cell[3:])[1:-1], 'degrees')
++
++    make_log(data)
++    return
++
++
++def get_dof_filter(atoms: ase.Atoms, mode: str, pressure: float) -> ase.Atoms | FrechetCellFilter:
++    """"""
++    if mode == 'fix_cell':
++        if pressure:
++            warnings.warn('Ignoring external pressure..')
++        return atoms
++    kwargs = {'mask': [True] * 6, 'scalar_pressure': pressure}      # enable cell DOFs
++    if mode == 'fix_shape':
++        kwargs['hydrostatic_strain'] = True
++    if mode == 'fix_volume':
++        kwargs['constant_volume'] = True
++        if pressure:
++            warnings.warn('Ignoring applied pressure during fixed volume optimisation..')
++    return FrechetCellFilter(atoms, **kwargs)
++
++
++def run(args: SimpleNamespace):
++    """"""
++    config = json.load(Path(args.input_config).open('r'))
++
++    atoms = ase.io.read(args.start_xyz)
++    if not any(atoms.pbc):
++        atoms.center(vacuum=0)              # optimiser mysteriously requires a nonzero unit cell
++        if config['mode'] != 'fix_cell':
++            config['mode'] = 'fix_cell'
++            warnings.warn('Molecular structure is not periodic. Ignoring cell..')
++
++    # construct calculator by combining hamiltonians
++    assert args.path_hamiltonian is not None
++    print('Making calculator from:', *config['forces'], sep='\n')
++    functions = [function_from_json(p) for p in args.path_hamiltonian]
++    calc = LinearCombinationCalculator(
++        [FunctionCalculator(f) for f in functions],
++        [float(h['weight']) for h in config['forces']]
++    )
++
++    atoms.calc = calc
++    dof = get_dof_filter(atoms, config['mode'], config['pressure'])
++    opt = PreconLBFGS(dof, trajectory=FILE_TRAJ if config['keep_trajectory'] else None)
++
++    print(f"pid: {os.getpid()}")
++    print(f"CPU affinity: {os.sched_getaffinity(os.getpid())}")
++    log_state(atoms)
++    try:
++        opt.run(fmax=config['f_max'], steps=config['max_steps'])
++    except TimeoutException:
++        print('OPTIMISATION TIMEOUT')
++        # TODO: what to do here?
++        return
++
++    log_state(atoms)
++    save_calc_results(atoms, calc_prefix='', remove_atoms_calc=True)
++    if not any(atoms.pbc):
++        atoms.cell = None               # remove meaningless cell
++    ase.io.write(FILE_OUT, atoms)
++    print('OPTIMISATION SUCCESSFUL')
++    return
++
++
++def clean(args: SimpleNamespace):
++    """"""
++    from psiflow.data.utils import _write_frames
++
++    geometry = Geometry.load(FILE_OUT)
++    _write_frames(geometry, outputs=[args.output_xyz])
++    if Path(FILE_TRAJ).is_file():
++        traj = [at for at in ase.io.trajectory.Trajectory(FILE_TRAJ)]
++        geometries = [Geometry.from_atoms(at) for at in traj]
++        _write_frames(*geometries, outputs=[args.output_traj])
++    print('FILES MOVED')
++    return
++
++
++def main():
++    signal.signal(signal.SIGTERM, timeout_handler)
++    parser = argparse.ArgumentParser()
++    subparsers = parser.add_subparsers(help='what to do', dest='action')
++    run_parser = subparsers.add_parser("run")
++    run_parser.set_defaults(func=run)
++    run_parser.add_argument(
++        "--path_hamiltonian",
++        action='extend',
++        nargs='*',
++        type=str,
++    )
++    run_parser.add_argument(
++        "--input_config",
++        type=str,
++        default=None,
++    )
++    run_parser.add_argument(
++        "--start_xyz",
++        type=str,
++        default=None,
++    )
++    clean_parser = subparsers.add_parser("clean")
++    clean_parser.set_defaults(func=clean)
++    clean_parser.add_argument(
++        "--output_xyz",
++        type=str,
++        default=None,
++    )
++    clean_parser.add_argument(
++        "--output_traj",
++        type=str,
++        default=None,
++    )
++    args = parser.parse_args()
++    args.func(args)
++
++
+diff --git a/psiflow/sampling/ase.py b/psiflow/sampling/ase.py
+new file mode 100644
+index 00000000..5bfca2b7
+--- /dev/null
++++ b/psiflow/sampling/ase.py
+@@ -0,0 +1,145 @@
++from __future__ import annotations  # necessary for type-guarding class methods
++
++from typing import Optional, Union
++
++import parsl
++import typeguard
++from parsl.app.app import bash_app, join_app
++from parsl.dataflow.futures import AppFuture, DataFuture
++
++import psiflow
++from psiflow.data import Dataset
++from psiflow.data.utils import write_frames
++from psiflow.geometry import Geometry
++from psiflow.hamiltonians import Hamiltonian
++from psiflow.utils.io import dump_json
++from psiflow.sampling.sampling import serialize_mixture, label_forces
++from psiflow.utils import TMP_COMMAND, CD_COMMAND
++
++from ._ase import ALLOWED_MODES
++
++EXECUTABLE = 'psiflow-ase-opt'      # not stored in ModelEvaluation (yet?)
++
++
++def _execute_ase(
++    command_launch: str,
++    inputs: list[DataFuture],
++    outputs: list[DataFuture],
++    env_vars: dict = {},
++    stdout: str = "",
++    stderr: str = "",
++    parsl_resource_specification: Optional[dict] = None,
++) -> str:
++    env_command = 'export ' + ' '.join([f"{name}={value}" for name, value in env_vars.items()])
++    command_start = ' '.join([
++        f'{command_launch} run --input_config={inputs[0].filepath} --start_xyz={inputs[1].filepath}',
++        *[f'--path_hamiltonian={future.filepath}' for future in inputs[2:]], '&'
++    ])
++    command_end = f'{command_launch} clean --output_xyz={outputs[0].filepath}'
++    if len(outputs) == 2:
++        command_end += f' --output_traj={outputs[1].filepath}'
++
++    command_list = [
++        TMP_COMMAND,
++        CD_COMMAND,
++        env_command,
++        command_start,
++        "wait",
++        command_end,
++    ]
++    return "\n".join(command_list)
++
++
++execute_ase = bash_app(_execute_ase, executors=["ModelEvaluation"])
++
++
++@typeguard.typechecked
++def optimize(
++    state: Union[Geometry, AppFuture],
++    hamiltonian: Hamiltonian,
++    mode: str = 'full',
++    steps: int = int(1e12),
++    keep_trajectory: bool = False,
++    pressure: float = 0,
++    f_max: float = 1e-3,
++) -> Union[AppFuture, tuple[AppFuture, Dataset]]:
++
++    assert mode in ALLOWED_MODES
++    assert steps > 0
++    assert f_max > 0
++
++    context = psiflow.context()
++    definition = context.definitions["ModelEvaluation"]
++
++    command_list = [EXECUTABLE]
++    if definition.max_simulation_time is not None:
++        max_time = 0.9 * (60 * definition.max_simulation_time)
++        command_list = ["timeout -s 15 {}s".format(max_time), *command_list]
++    command_launch = " ".join(command_list)
++
++    input_geometry = Dataset([state]).extxyz
++    hamiltonian = 1.0 * hamiltonian  # convert to mixture
++    names, coeffs = label_forces(hamiltonian), hamiltonian.coefficients
++    input_forces = serialize_mixture(hamiltonian, dtype="float64")          # double precision for MLPs
++    forces = [
++        dict(forcefield=n, weight=str(c), file=f.filename) for n, c, f in zip(names, coeffs, input_forces)
++    ]
++
++    config = dict(
++        task='ASE optimisation',
++        forces=forces,
++        mode=mode,
++        f_max=f_max,
++        pressure=pressure,
++        max_steps=steps,
++        keep_trajectory=keep_trajectory,
++    )
++    input_future = dump_json(
++        outputs=[context.new_file("input_", ".json")],
++        **config,
++    ).outputs[0]
++    inputs = [input_future, input_geometry, *input_forces]
++
++    outputs = [context.new_file("data_", ".xyz")]
++    if keep_trajectory:
++        outputs.append(context.new_file("opt_", ".xyz"))
++
++    result = execute_ase(
++        command_launch=command_launch,
++        env_vars=definition.env_vars,
++        inputs=inputs,
++        outputs=outputs,
++        stdout=parsl.AUTO_LOGNAME,
++        stderr=parsl.AUTO_LOGNAME,
++        parsl_resource_specification=definition.wq_resources(1),
++    )
++
++    final = Dataset(None, result.outputs[0])[-1]
++    if keep_trajectory:
++        trajectory = Dataset(None, result.outputs[1])
++        return final, trajectory
++    else:
++        return final
++
++
++@join_app
++@typeguard.typechecked
++def _optimize_dataset(
++    geometries: list[Geometry], *args, outputs: list = [], **kwargs
++) -> AppFuture:
++    assert not kwargs.get("keep_trajectory", False)
++    optimized = []
++    for geometry in geometries:
++        optimized.append(optimize(geometry, *args, **kwargs))
++    return write_frames(*optimized, outputs=[outputs[0]])
++
++
++@typeguard.typechecked
++def optimize_dataset(dataset: Dataset, *args, **kwargs) -> Dataset:
++    extxyz = _optimize_dataset(
++        dataset.geometries(),
++        *args,
++        outputs=[psiflow.context().new_file("data_", ".xyz")],
++        **kwargs,
++    ).outputs[0]
++    return Dataset(None, extxyz)
+diff --git a/psiflow/sampling/optimize.py b/psiflow/sampling/optimize.py
+index 2356fd03..61e472b7 100644
+--- a/psiflow/sampling/optimize.py
++++ b/psiflow/sampling/optimize.py
+@@ -114,7 +114,6 @@ def _execute_ipi(
+         CD_COMMAND,
+         env_command,
+         command_start,
+-        "sleep 3s",
+         *commands_client,
+         "wait",
+         command_end,
+diff --git a/psiflow/sampling/order.py b/psiflow/sampling/order.py
+index b1c1f924..fb8a4c9b 100644
+--- a/psiflow/sampling/order.py
++++ b/psiflow/sampling/order.py
+@@ -1,3 +1,6 @@
++"""
++TODO: these imports are outdated.. Is this module still used?
++"""
+ from __future__ import annotations  # necessary for type-guarding class methods
+ 
+ from functools import partial
+diff --git a/psiflow/sampling/sampling.py b/psiflow/sampling/sampling.py
+index 7dfa0ca0..71d28c68 100644
+--- a/psiflow/sampling/sampling.py
++++ b/psiflow/sampling/sampling.py
+@@ -2,13 +2,14 @@
+ 
+ import math
+ import xml.etree.ElementTree as ET
+-from typing import Optional, Union
++from typing import Optional, Union, Iterable
++from collections import defaultdict
+ 
+ import parsl
+ import typeguard
+ from parsl.app.app import bash_app
+ from parsl.data_provider.files import File
+-from parsl.dataflow.futures import AppFuture
++from parsl.dataflow.futures import AppFuture, DataFuture
+ 
+ import psiflow
+ from psiflow.data import Dataset
+@@ -31,23 +32,15 @@ def template(
+     total_hamiltonian = 1.0 * sum([w.hamiltonian for w in walkers], start=Zero())
+     assert not total_hamiltonian == Zero()
+ 
+-    # create string names for hamiltonians and sort
+-    names = []
+-    counts = {}
+-    for h in total_hamiltonian.hamiltonians:
+-        if h.__class__.__name__ not in counts:
+-            counts[h.__class__.__name__] = 0
+-        count = counts.get(h.__class__.__name__)
+-        counts[h.__class__.__name__] += 1
+-        names.append(h.__class__.__name__ + str(count))
+-    _, hamiltonians = zip(*sorted(zip(names, total_hamiltonian.hamiltonians)))
+-    _, coefficients = zip(*sorted(zip(names, total_hamiltonian.coefficients)))
+-    hamiltonians = list(hamiltonians)
+-    coefficients = list(coefficients)
+-    names = sorted(names)
++    # create string names for hamiltonians and sort     TODO: why sort?
++    names = label_forces(total_hamiltonian)
++    names, hamiltonians, coefficients = zip(
++        *sorted(zip(names, total_hamiltonian.hamiltonians, total_hamiltonian.coefficients))
++    )
+     assert MixtureHamiltonian(hamiltonians, coefficients) == total_hamiltonian
+     total_hamiltonian = MixtureHamiltonian(hamiltonians, coefficients)
+ 
++    # TODO: take care of ordering in weights_table (names <> total_hamiltonian.hamiltonians)
+     weights_header = tuple(names)
+     if walkers[0].npt:
+         weights_header = ("TEMP", "PRESSURE") + weights_header
+@@ -99,6 +92,53 @@ def template(
+     return hamiltonians_map, weights_table, plumed_list
+ 
+ 
++def label_forces(hamiltonian: MixtureHamiltonian) -> list[str]:
++    """Create unique string name for every hamiltonian"""
++    # TODO: move into class?
++    assert isinstance(hamiltonian, MixtureHamiltonian)
++    names, counts = [], defaultdict(lambda: 0)
++    for h in hamiltonian.hamiltonians:
++        name = h.__class__.__name__
++        names.append(f'{name}{counts[name]}')
++        counts[name] += 1
++    return names
++
++
++def make_force_xml(hamiltonian: MixtureHamiltonian, names: list[str]) -> ET.Element:
++    forces = ET.Element("forces")
++    for n, c in zip(names, hamiltonian.coefficients):
++        forces.append(ET.Element("force", forcefield=n, weight=str(c)))
++    return forces
++
++
++def serialize_mixture(hamiltonian: MixtureHamiltonian, **kwargs) -> list[DataFuture]:
++    # TODO: move into class?
++    return [h.serialize_function(**kwargs) for h in hamiltonian.hamiltonians]
++
++
++@typeguard.typechecked
++def setup_sockets(
++    hamiltonian_labels: Iterable[str],
++) -> list[ET.Element]:
++    sockets = []
++    for name in hamiltonian_labels:
++        ffsocket = ET.Element("ffsocket", mode="unix", name=name, pbc="False")
++        timeout = ET.Element("timeout")
++        timeout.text = str(
++            60 * psiflow.context().definitions["ModelEvaluation"].timeout
++        )
++        ffsocket.append(timeout)
++        exit_on = ET.Element("exit_on_disconnect")
++        exit_on.text = " TRUE "
++        ffsocket.append(exit_on)
++        address = ET.Element("address")  # placeholder
++        address.text = name.lower()
++        ffsocket.append(address)
++
++        sockets.append(ffsocket)
++    return sockets
++
++
+ @typeguard.typechecked
+ def setup_motion(walker: Walker, fix_com: bool) -> ET.Element:
+     timestep_element = ET.Element("timestep", units="femtosecond")
+@@ -196,29 +236,6 @@ def setup_forces(weights_header: tuple[str, ...]) -> ET.Element:
+     return forces
+ 
+ 
+-@typeguard.typechecked
+-def setup_sockets(
+-    hamiltonians_map: dict[str, Hamiltonian],
+-) -> list[ET.Element]:
+-    sockets = []
+-    for name in hamiltonians_map.keys():
+-        ffsocket = ET.Element("ffsocket", mode="unix", name=name, pbc="False")
+-        timeout = ET.Element("timeout")
+-        timeout.text = str(
+-            60 * psiflow.context().definitions["ModelEvaluation"].timeout
+-        )
+-        ffsocket.append(timeout)
+-        exit_on = ET.Element("exit_on_disconnect")
+-        exit_on.text = " TRUE "
+-        ffsocket.append(exit_on)
+-        address = ET.Element("address")  # placeholder
+-        address.text = name.lower()
+-        ffsocket.append(address)
+-
+-        sockets.append(ffsocket)
+-    return sockets
+-
+-
+ @typeguard.typechecked
+ def setup_ffplumed(nplumed: int) -> list[ET.Element]:
+     ffplumed = []
+@@ -487,7 +504,7 @@ def _sample(
+         verbosity=str(verbosity),
+         safe_stride=str(checkpoint_step),
+     )
+-    sockets = setup_sockets(hamiltonians_map)
++    sockets = setup_sockets(hamiltonians_map.keys())
+     for socket in sockets:
+         simulation.append(socket)
+     ffplumed = setup_ffplumed(len(plumed_list))
+diff --git a/psiflow/sampling/server.py b/psiflow/sampling/server.py
+index 2be50e63..aa42a81b 100644
+--- a/psiflow/sampling/server.py
++++ b/psiflow/sampling/server.py
+@@ -14,6 +14,7 @@
+ from ase.units import Bohr, Ha, _e, _hbar
+ 
+ from psiflow.geometry import Geometry
++from psiflow.sampling.utils import TimeoutException, timeout_handler
+ 
+ NONPERIODIC_CELL = 1000 * np.eye(3)
+ 
+@@ -307,14 +308,6 @@ def insert_addresses(input_xml):
+             address.text = str(Path.cwd() / address.text.strip())
+ 
+ 
+-class TimeoutException(Exception):
+-    pass
+-
+-
+-def timeout_handler(signum, frame):
+-    raise TimeoutException
+-
+-
+ def insert_data_start(input_xml, data_start):
+     for child in input_xml:
+         if child.tag == "system":
+diff --git a/psiflow/sampling/utils.py b/psiflow/sampling/utils.py
+index be436e98..c0fe378f 100644
+--- a/psiflow/sampling/utils.py
++++ b/psiflow/sampling/utils.py
+@@ -18,6 +18,14 @@ class ForceMagnitudeException(Exception):
+     pass
+ 
+ 
++class TimeoutException(Exception):
++    pass
++
++
++def timeout_handler(signum, frame):
++    raise TimeoutException
++
++
+ @typeguard.typechecked
+ def check_forces(
+     forces: np.ndarray,
+diff --git a/pyproject.toml b/pyproject.toml
+index 0cf25d64..b8c00b55 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -25,6 +25,7 @@ dependencies = [
+ psiflow-client = "psiflow.sampling.client:main"
+ psiflow-server = "psiflow.sampling.server:main"
+ psiflow-mace-train = "psiflow.models.mace_utils:main"
++psiflow-ase-opt = "psiflow.sampling._ase:main"
+ 
+ 
+ [project.optional-dependencies]
+diff --git a/tests/test_free_energy.py b/tests/test_free_energy.py
+index b706639e..fa986520 100644
+--- a/tests/test_free_energy.py
++++ b/tests/test_free_energy.py
+@@ -9,7 +9,7 @@
+ )
+ from psiflow.geometry import check_equality
+ from psiflow.hamiltonians import EinsteinCrystal, Harmonic, MACEHamiltonian
+-from psiflow.sampling import optimize
++from psiflow.sampling.ase import optimize
+ 
+ 
+ def test_integration_simple(dataset):
+@@ -18,8 +18,8 @@ def test_integration_simple(dataset):
+     geometry = optimize(
+         dataset[3],
+         einstein,
+-        steps=20000,
+-        ftol=1e-4,
++        mode='fix_cell',
++        f_max=1e-4,
+     )
+     hessian = compute_harmonic(
+         geometry,
+@@ -124,8 +124,8 @@ def test_dihydrogen(dataset_h2):
+     optimized = optimize(
+         geometry,
+         hamiltonian,
+-        steps=2000,
+-        ftol=1e-4,
++        mode='fix_cell',
++        f_max=1e-4,
+     ).result()
+     assert optimized.energy is not None
+     assert np.linalg.norm(optimized.per_atom.forces) < 1e-2
+diff --git a/tests/test_sampling.py b/tests/test_sampling.py
+index ab471701..e94fded1 100644
+--- a/tests/test_sampling.py
++++ b/tests/test_sampling.py
+@@ -8,7 +8,8 @@
+ from psiflow.geometry import check_equality
+ from psiflow.hamiltonians import EinsteinCrystal, PlumedHamiltonian
+ from psiflow.models import MACE
+-from psiflow.sampling import optimize, optimize_dataset
++from psiflow.sampling.optimize import optimize as optimize_ipi, optimize_dataset as optimize_dataset_ipi
++from psiflow.sampling.ase import optimize as optimize_ase, optimize_dataset as optimize_dataset_ase
+ from psiflow.sampling.metadynamics import Metadynamics
+ from psiflow.sampling.sampling import sample, template
+ from psiflow.sampling.server import parse_checkpoint
+@@ -466,23 +467,69 @@ def test_walker_serialization(dataset, tmp_path):
+             assert len(f.read()) > 0
+ 
+ 
+-def test_optimize(dataset):
++def test_optimize_ipi(dataset):
+     einstein = EinsteinCrystal(dataset[2], force_constant=10)
+-    final = optimize(dataset[0], einstein, steps=1000000).result()
++    final = optimize_ipi(dataset[0], einstein, steps=1000000).result()
+ 
+     assert np.allclose(
+         final.per_atom.positions,
+         dataset[2].result().per_atom.positions,
+         atol=1e-4,
+     )
+-    # assert np.allclose(
+-    #        final.cell,
+-    #        dataset[2].result().cell,
+-    #        atol=1e-4,
+-    #        )
+     assert np.allclose(final.energy, 0.0)  # einstein energy >= 0
+ 
+     # i-PI optimizer's curvature guess fails in optimum --> don't start in dataset[2]
+-    optimized = optimize_dataset(dataset[3:5], einstein, steps=1000000)
++    optimized = optimize_dataset_ipi(dataset[3:5], einstein, steps=1000000)
+     for g in optimized.geometries().result():
+         assert np.allclose(g.energy, 0.0)
++
++
++def test_optimize_ase(dataset):
++    # TODO: test applied_pressure?
++
++    einstein = EinsteinCrystal(dataset[2], force_constant=10)
++    final = optimize_ase(dataset[0], einstein, mode='fix_cell', f_max=1e-4).result()
++
++    assert np.allclose(
++        final.per_atom.positions,
++        dataset[2].result().per_atom.positions,
++        atol=1e-4,
++    )
++    assert np.allclose(final.energy, 0.0)  # einstein energy >= 0
++
++    optimized = optimize_dataset_ase(dataset[3:5], einstein, mode='fix_cell', f_max=1e-4)
++    for g in optimized.geometries().result():
++        assert np.allclose(g.energy, 0.0)
++
++    geom = dataset[0].result()
++    plumed_input = """
++    UNITS LENGTH=A ENERGY=kj/mol TIME=fs
++    CV: VOLUME
++    RESTRAINT ARG=CV AT=75 KAPPA=1
++    """
++    plumed_v = PlumedHamiltonian(plumed_input)
++    final = optimize_ase(geom, plumed_v, f_max=1e-8).result()
++    assert np.allclose(final.energy, 0.0) and np.allclose(final.volume, 75)
++
++    plumed_input = """
++    UNITS LENGTH=A ENERGY=kj/mol TIME=fs
++    cell: CELL
++    RESTRAINT ARG=cell.ax AT=3 KAPPA=1
++    RESTRAINT ARG=cell.ay AT=.2 KAPPA=1
++    RESTRAINT ARG=cell.az AT=.1 KAPPA=1
++    """
++    plumed_c = PlumedHamiltonian(plumed_input)
++    final = optimize_ase(geom, plumed_c, mode='fix_shape', f_max=1e-8).result()
++    ratio = geom.cell / final.cell
++    assert np.allclose(final.cell[0], [3, 0, 0])
++    assert np.allclose(ratio[ratio != 0], ratio[0, 0])          # check isotropic scaling (for nonzero components)
++
++    final = optimize_ase(geom, plumed_c, mode='fix_volume', f_max=1e-8).result()
++    assert np.allclose(final.cell[0], [3, .2, .1], atol=1e-4)
++    assert np.allclose(geom.volume, final.volume)
++
++    final = optimize_ase(geom, plumed_v + plumed_c, f_max=1e-8).result()
++    assert np.allclose(final.cell[0], [3, .2, .1], atol=1e-4)
++    assert np.allclose(final.volume, 75)
++
++

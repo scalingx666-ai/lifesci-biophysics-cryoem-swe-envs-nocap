@@ -1,0 +1,420 @@
+diff --git a/doc/sphinx/ek.rst b/doc/sphinx/ek.rst
+index 4a7d30f787e..d3cd0cb7b48 100644
+--- a/doc/sphinx/ek.rst
++++ b/doc/sphinx/ek.rst
+@@ -345,6 +345,11 @@ is available through :class:`~espressomd.io.vtk.VTKReader`::
+         ek_density = np.copy(ek_species[:, :, :].density)
+         np.testing.assert_allclose(vtk_density, ek_density, rtol=1e-10, atol=0.)
+ 
++The Poisson grid can be written to a file in either unstructured (``.vtu``) or
++structured (``.vti``) grid format. The latter doesn't require topology reconstruction.
++Both file formats can be read by :class:`~espressomd.io.vtk.VTKReader`.
++To enforce unstructured grid format, pass parameter ``force_pvtu=True``.
++
+ .. _Setting up EK boundary conditions:
+ 
+ Setting up boundary conditions
+diff --git a/doc/sphinx/io.rst b/doc/sphinx/io.rst
+index a0e10059065..28fc4632220 100644
+--- a/doc/sphinx/io.rst
++++ b/doc/sphinx/io.rst
+@@ -531,4 +531,11 @@ functionality is provided by the wrapper :class:`~espressomd.io.vtk.VTKReader`:
+     vtk_density = vtk_grids["density"]
+     print(vtk_density.shape)
+ 
+-For a self-contained example, please refer to :ref:`LB VTK output`.
++For self-contained examples, please refer to :ref:`LB VTK output` and
++:ref:`EK VTK output`.
++
++Some lattice-based methods support structured uniform grids. In this case,
++the file extension is ``.vti`` and each piece has absolute coordinates,
++making the reconstruction of the 3D grid trivial. The aforementioned
++VTK reader natively supports both structured and unstructured grid formats,
++and selects the correct reader backend based on the XML metadata.
+diff --git a/src/python/espressomd/electrokinetics.py b/src/python/espressomd/electrokinetics.py
+index caf68fb8c65..5f189335459 100644
+--- a/src/python/espressomd/electrokinetics.py
++++ b/src/python/espressomd/electrokinetics.py
+@@ -316,6 +316,10 @@ class VTKPoissonOutput(VTKOutputBase):
+         Path to the output VTK folder.
+     prefix : :obj:`str` (optional), default is 'simulation_step'
+         Prefix for VTK files.
++    force_pvtu : :obj:`bool` (optional), default is ``True``
++        Force parallel unstructured grid format (file extension: ``.vtu``).
++        If ``False``, uses parallel structured grid format if possible
++        (file extension: ``.vti``).
+ 
+     """
+     _so_name = "walberla::EKPoissonVTKHandle"
+@@ -870,6 +874,10 @@ class VTKOutput(VTKOutputBase):
+         Path to the output VTK folder.
+     prefix : :obj:`str` (optional), default is 'simulation_step'
+         Prefix for VTK files.
++    force_pvtu : :obj:`bool` (optional), default is ``True``
++        Force parallel unstructured grid format (file extension: ``.vtu``).
++        If ``False``, uses parallel structured grid format if possible
++        (file extension: ``.vti``).
+ 
+     """
+     _so_name = "walberla::EKVTKHandle"
+diff --git a/src/python/espressomd/io/vtk.py b/src/python/espressomd/io/vtk.py
+index 2572aaa9430..c05ccdbb1eb 100644
+--- a/src/python/espressomd/io/vtk.py
++++ b/src/python/espressomd/io/vtk.py
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (C) 2023 The ESPResSo project
++# Copyright (C) 2023-2025 The ESPResSo project
+ #
+ # This file is part of ESPResSo.
+ #
+@@ -21,24 +21,51 @@
+ import vtk
+ import vtk.util.numpy_support
+ 
++IMAGE_DATA_TYPE = "ImageData"
++UNSTRUCTURED_GRID_TYPE = "UnstructuredGrid"
++
+ 
+ class VTKReader:
+     """
+     Reader for VTK multi-piece uniform grids written in XML format.
+     """
+     error_tolerance = 1e-5  # VTK data is written with 1e-7 precision
++    type_map = {
++        IMAGE_DATA_TYPE: vtk.vtkXMLImageDataReader(),
++        UNSTRUCTURED_GRID_TYPE: vtk.vtkXMLUnstructuredGridReader(),
++    }
+ 
+     @classmethod
+-    def get_array_names(cls, reader):
++    def get_file_format(cls, filepath):
++        with open(str(filepath), "rb") as f:
++            line = f.readline().lstrip()
++            while not line.startswith(b"<VTKFile"):
++                line = f.readline()
++                if not line:
++                    break
++                line = line.lstrip()
++            if line.startswith(b"<VTKFile"):
++                for token in line.split():
++                    if token.startswith(b"type="):
++                        return token.split(b'"')[1].decode()
++            raise RuntimeError(f"File {filepath} is not a compliant XML file")
++
++    @staticmethod
++    def get_array_names(reader, type_name):
+         array_names = set()
+-        n_ghost_layers = reader.GetUpdateGhostLevel()
+-        n_pieces = reader.GetNumberOfPieces()
+-        for piece_index in range(n_pieces):
+-            reader.UpdatePiece(piece_index, n_pieces, n_ghost_layers)
+-            piece = reader.GetOutput()
+-            cell = piece.GetCellData()
+-            for i in range(cell.GetNumberOfArrays()):
+-                array_names.add(cell.GetArrayName(i))
++        if type_name == UNSTRUCTURED_GRID_TYPE:
++            n_ghost_layers = reader.GetUpdateGhostLevel()
++            n_pieces = reader.GetNumberOfPieces()
++            for piece_index in range(n_pieces):
++                reader.UpdatePiece(piece_index, n_pieces, n_ghost_layers)
++                piece = reader.GetOutput()
++                cell = piece.GetCellData()
++                for i in range(cell.GetNumberOfArrays()):
++                    array_names.add(cell.GetArrayName(i))
++        elif type_name == IMAGE_DATA_TYPE:
++            n_cells = reader.GetNumberOfCellArrays()
++            for i in range(n_cells):
++                array_names.add(reader.GetCellArrayName(i))
+         return array_names
+ 
+     @classmethod
+@@ -123,13 +150,23 @@ def reconstruct_array(cls, reader, array_name):
+         return data
+ 
+     def parse(self, filepath):
+-        reader = vtk.vtkXMLUnstructuredGridReader()
++        type_name = self.get_file_format(filepath)
++        if type_name not in self.type_map.keys():
++            raise NotImplementedError(
++                f"Unknown VTK file format '{type_name}' (supported "
++                f"file formats: {', '.join(self.type_map.keys())})")
++        reader = self.type_map[type_name]
+         reader.SetFileName(str(filepath))
+         reader.Update()
+ 
+         arrays = {}
+-        array_names = self.get_array_names(reader)
++        array_names = self.get_array_names(reader, type_name)
+         for array_name in sorted(array_names):
+-            arrays[array_name] = self.reconstruct_array(reader, array_name)
+-
++            if type_name == UNSTRUCTURED_GRID_TYPE:
++                arrays[array_name] = self.reconstruct_array(reader, array_name)
++            elif type_name == IMAGE_DATA_TYPE:
++                array = reader.GetOutput().GetCellData().GetArray(array_name)
++                shape = reader.GetOutput().GetDimensions() - np.copy([1, 1, 1])
++                arrays[array_name] = vtk.util.numpy_support.vtk_to_numpy(
++                    array).reshape(shape, order='F')
+         return arrays
+diff --git a/src/python/espressomd/lb.py b/src/python/espressomd/lb.py
+index 4ea5455bc86..414529c6bb5 100644
+--- a/src/python/espressomd/lb.py
++++ b/src/python/espressomd/lb.py
+@@ -665,6 +665,10 @@ class VTKOutput(VTKOutputBase):
+         Path to the output VTK folder.
+     prefix : :obj:`str` (optional), default is 'simulation_step'
+         Prefix for VTK files.
++    force_pvtu : :obj:`bool` (optional), default is ``True``
++        Force parallel unstructured grid format (file extension: ``.vtu``).
++        If ``False``, uses parallel structured grid format if possible
++        (file extension: ``.vti``).
+ 
+     """
+     _so_name = "walberla::LBVTKHandle"
+diff --git a/src/script_interface/walberla/VTKHandle.hpp b/src/script_interface/walberla/VTKHandle.hpp
+index 05625db2ec7..c2ade7e547f 100644
+--- a/src/script_interface/walberla/VTKHandle.hpp
++++ b/src/script_interface/walberla/VTKHandle.hpp
+@@ -47,6 +47,7 @@ class VTKHandleBase : public AutoParameters<VTKHandleBase<Field>> {
+ private:
+   int m_delta_N;
+   int m_obs_flag;
++  bool m_force_pvtu;
+   std::string m_identifier;
+   std::filesystem::path m_base_folder;
+   std::string m_prefix;
+@@ -116,6 +117,7 @@ class VTKHandleBase : public AutoParameters<VTKHandleBase<Field>> {
+         {"identifier", read_only, [this]() { return m_identifier; }},
+         {"base_folder", read_only, [this]() { return m_base_folder; }},
+         {"prefix", read_only, [this]() { return m_prefix; }},
++        {"force_pvtu", read_only, [this]() { return m_force_pvtu; }},
+         {"observables", read_only,
+          [this]() { return serialize_obs_flag(m_obs_flag); }},
+         {"execution_count", read_only,
+@@ -131,6 +133,7 @@ class VTKHandleBase : public AutoParameters<VTKHandleBase<Field>> {
+     m_identifier = get_value<std::string>(params, "identifier");
+     m_base_folder = get_value<std::filesystem::path>(params, "base_folder");
+     m_prefix = get_value<std::string>(params, "prefix");
++    m_force_pvtu = get_value_or<bool>(params, "force_pvtu", false);
+     auto const is_enabled = get_value<bool>(params, "enabled");
+     auto const execution_count = get_value<int>(params, "execution_count");
+     ObjectHandle::context()->parallel_try_catch([&]() {
+@@ -211,7 +214,7 @@ class VTKHandleBase : public AutoParameters<VTKHandleBase<Field>> {
+     auto instance = get_field_instance();
+     m_vtk_handle =
+         instance->create_vtk(m_delta_N, execution_count, m_obs_flag, m_units,
+-                             m_identifier, base_folder, m_prefix);
++                             m_identifier, base_folder, m_prefix, m_force_pvtu);
+     if (m_delta_N and not is_enabled) {
+       instance->switch_vtk(get_vtk_uid(), false);
+     }
+diff --git a/src/walberla_bridge/include/walberla_bridge/LatticeModel.hpp b/src/walberla_bridge/include/walberla_bridge/LatticeModel.hpp
+index 52826ed1ee3..eef1004a2bb 100644
+--- a/src/walberla_bridge/include/walberla_bridge/LatticeModel.hpp
++++ b/src/walberla_bridge/include/walberla_bridge/LatticeModel.hpp
+@@ -66,11 +66,13 @@ class LatticeModel {
+    *  @param identifier       Name of the VTK dataset
+    *  @param base_folder      Path to the VTK folder
+    *  @param prefix           Prefix of the VTK files
++   *  @param force_pvtu       Force parallel unstructured grid format
+    */
+   std::shared_ptr<VTKHandle>
+   create_vtk(int delta_N, int initial_count, int flag_observables,
+              units_map const &units_conversion, std::string const &identifier,
+-             std::string const &base_folder, std::string const &prefix);
++             std::string const &base_folder, std::string const &prefix,
++             bool force_pvtu);
+ 
+   /** @brief Write a VTK observable to disk.
+    *
+diff --git a/src/walberla_bridge/src/LatticeModel.cpp b/src/walberla_bridge/src/LatticeModel.cpp
+index f74e1accab6..aee74437c59 100644
+--- a/src/walberla_bridge/src/LatticeModel.cpp
++++ b/src/walberla_bridge/src/LatticeModel.cpp
+@@ -27,10 +27,12 @@
+ #include <memory>
+ #include <string>
+ 
+-std::shared_ptr<VTKHandle> LatticeModel::create_vtk(
+-    int delta_N, int initial_count, int flag_observables,
+-    units_map const &units_conversion, std::string const &identifier,
+-    std::string const &base_folder, std::string const &prefix) {
++std::shared_ptr<VTKHandle>
++LatticeModel::create_vtk(int delta_N, int initial_count, int flag_observables,
++                         units_map const &units_conversion,
++                         std::string const &identifier,
++                         std::string const &base_folder,
++                         std::string const &prefix, bool force_pvtu) {
+ 
+   using walberla::uint_c;
+ 
+@@ -45,8 +47,8 @@ std::shared_ptr<VTKHandle> LatticeModel::create_vtk(
+   auto const &blocks = get_lattice().get_blocks();
+   auto const write_freq = (delta_N) ? static_cast<unsigned int>(delta_N) : 1u;
+   auto vtk_obj = walberla::vtk::createVTKOutput_BlockData(
+-      blocks, identifier, uint_c(write_freq), uint_c(0), true, base_folder,
+-      prefix, true, true, true, true, uint_c(initial_count));
++      blocks, identifier, uint_c(write_freq), uint_c(0), force_pvtu,
++      base_folder, prefix, true, true, true, true, uint_c(initial_count));
+ 
+   // add filters
+   register_vtk_field_filters(*vtk_obj);
+diff --git a/src/walberla_bridge/tests/EKinWalberlaImpl_unit_tests.cpp b/src/walberla_bridge/tests/EKinWalberlaImpl_unit_tests.cpp
+index e84f7be02c1..b57178a9417 100644
+--- a/src/walberla_bridge/tests/EKinWalberlaImpl_unit_tests.cpp
++++ b/src/walberla_bridge/tests/EKinWalberlaImpl_unit_tests.cpp
+@@ -522,15 +522,15 @@ BOOST_DATA_TEST_CASE(vtk_exceptions,
+   auto const flag =
+       static_cast<std::underlying_type_t<OutputVTK>>(OutputVTK::density);
+   // cannot create the same observable twice
+-  ek->create_vtk(1u, 0u, flag, units, "density", "vtk_out", "step");
++  ek->create_vtk(1u, 0u, flag, units, "density", "vtk_out", "step", false);
+   BOOST_CHECK_THROW(
+-      ek->create_vtk(1u, 0u, flag, units, "density", "vtk_out", "step"),
++      ek->create_vtk(1u, 0u, flag, units, "density", "vtk_out", "step", false),
+       std::runtime_error);
+   // cannot manually call an automatic observable
+-  ek->create_vtk(1u, 0u, flag, units, "auto", "vtk_out", "step");
++  ek->create_vtk(1u, 0u, flag, units, "auto", "vtk_out", "step", false);
+   BOOST_CHECK_THROW(ek->write_vtk("vtk_out/auto"), std::runtime_error);
+   // cannot activate a manual observable
+-  ek->create_vtk(0u, 0u, flag, units, "manual", "vtk_out", "step");
++  ek->create_vtk(0u, 0u, flag, units, "manual", "vtk_out", "step", false);
+   BOOST_CHECK_THROW(ek->switch_vtk("vtk_out/manual", 0), std::runtime_error);
+   // cannot call or activate observables that haven't been registered yet
+   BOOST_CHECK_THROW(ek->write_vtk("unknown"), std::runtime_error);
+diff --git a/src/walberla_bridge/tests/LBWalberlaImpl_unit_tests.cpp b/src/walberla_bridge/tests/LBWalberlaImpl_unit_tests.cpp
+index 6be2914a08b..e53b2502fb8 100644
+--- a/src/walberla_bridge/tests/LBWalberlaImpl_unit_tests.cpp
++++ b/src/walberla_bridge/tests/LBWalberlaImpl_unit_tests.cpp
+@@ -594,15 +594,15 @@ BOOST_DATA_TEST_CASE(vtk_exceptions,
+   auto const flag =
+       static_cast<std::underlying_type_t<OutputVTK>>(OutputVTK::density);
+   // cannot create the same observable twice
+-  lb->create_vtk(1u, 0u, flag, units, "density", "vtk_out", "step");
++  lb->create_vtk(1u, 0u, flag, units, "density", "vtk_out", "step", false);
+   BOOST_CHECK_THROW(
+-      lb->create_vtk(1u, 0u, flag, units, "density", "vtk_out", "step"),
++      lb->create_vtk(1u, 0u, flag, units, "density", "vtk_out", "step", false),
+       std::runtime_error);
+   // cannot manually call an automatic observable
+-  lb->create_vtk(1u, 0u, flag, units, "auto", "vtk_out", "step");
++  lb->create_vtk(1u, 0u, flag, units, "auto", "vtk_out", "step", false);
+   BOOST_CHECK_THROW(lb->write_vtk("vtk_out/auto"), std::runtime_error);
+   // cannot activate a manual observable
+-  lb->create_vtk(0u, 0u, flag, units, "manual", "vtk_out", "step");
++  lb->create_vtk(0u, 0u, flag, units, "manual", "vtk_out", "step", false);
+   BOOST_CHECK_THROW(lb->switch_vtk("vtk_out/manual", 0), std::runtime_error);
+   // cannot call or activate observables that haven't been registered yet
+   BOOST_CHECK_THROW(lb->write_vtk("unknown"), std::runtime_error);
+diff --git a/testsuite/python/lattice_vtk.py b/testsuite/python/lattice_vtk.py
+index 52e041a8f81..8668165ebeb 100644
+--- a/testsuite/python/lattice_vtk.py
++++ b/testsuite/python/lattice_vtk.py
+@@ -105,6 +105,18 @@ def test_exceptions(self):
+         with self.assertRaisesRegex(RuntimeError, "This VTK object isn't attached to a lattice"):
+             label_unattached.write()
+ 
++    @utx.skipIfMissingModules("espressomd.io.vtk")
++    def test_exceptions_invalid_files(self):
++        with tempfile.TemporaryDirectory() as tmp_directory:
++            root = pathlib.Path(tmp_directory)
++            invalid_vtk_file = root / "invalid_file.vtu"
++            invalid_vtk_file.write_text(1000 * "\n    ")
++            with self.assertRaisesRegex(RuntimeError, "is not a compliant XML file"):
++                espressomd.io.vtk.VTKReader().parse(invalid_vtk_file)
++            invalid_vtk_file.write_text('<VTKFile type="UnknownGrid"/>')
++            with self.assertRaisesRegex(NotImplementedError, "Unknown VTK file format 'UnknownGrid'"):
++                espressomd.io.vtk.VTKReader().parse(invalid_vtk_file)
++
+ 
+ class TestLBVTK(TestVTK):
+ 
+@@ -308,12 +320,13 @@ def test_vtk(self):
+             actor.add_vtk_writer(vtk=vtk_obj)
+             vtk_obj.disable()
+             vtk_obj.enable()
++            self.assertFalse(vtk_obj.force_pvtu)
+ 
+             # prepare VTK Poisson
+             label_vtk_poisson_last_frame = f"test_vtk_{self.vtk_id}_poisson_end"  # nopep8
+             label_vtk_poisson_continuous = f"test_vtk_{self.vtk_id}_poisson_continuous"  # nopep8
+             path_vtk_poisson_last_frame = root / \
+-                label_vtk_poisson_last_frame / "simulation_step_0.vtu"
++                label_vtk_poisson_last_frame / "simulation_step_0.vti"
+             path_vtk_poisson_continuous = [
+                 root / label_vtk_poisson_continuous / f"simulation_step_{i}.vtu" for i in range(n_steps)]
+             filepaths_poisson = [
+@@ -321,8 +334,9 @@ def test_vtk(self):
+ 
+             vtk_obs_poisson = list(self.valid_obs_poisson)
+             vtk_obj_poisson = self.vtk_poisson_class(
+-                identifier=label_vtk_poisson_continuous, delta_N=1,
+-                observables=vtk_obs_poisson, base_folder=root)
++                identifier=label_vtk_poisson_continuous, force_pvtu=True,
++                observables=vtk_obs_poisson, base_folder=root, delta_N=1)
++            self.assertTrue(vtk_obj_poisson.force_pvtu)
+             self.solver.add_vtk_writer(vtk=vtk_obj_poisson)
+             vtk_obj_poisson.disable()
+             vtk_obj_poisson.enable()
+@@ -339,8 +353,9 @@ def test_vtk(self):
+             self.assertEqual(vtk_obj.valid_observables(), set(self.valid_obs))
+ 
+             vtk_obj_poisson = self.vtk_poisson_class(
+-                identifier=label_vtk_poisson_last_frame, delta_N=0, observables=vtk_obs_poisson,
+-                base_folder=root)
++                identifier=label_vtk_poisson_last_frame, force_pvtu=False,
++                observables=vtk_obs_poisson, base_folder=root, delta_N=0)
++            self.assertFalse(vtk_obj_poisson.force_pvtu)
+             self.solver.add_vtk_writer(vtk=vtk_obj_poisson)
+             vtk_obj_poisson.write()
+             self.assertEqual(sorted(vtk_obj_poisson.observables),
+@@ -357,7 +372,7 @@ def test_vtk(self):
+                              path_vtk_continuous[0].parent.with_suffix(".pvd"),
+                              path_vtk_poisson_last_frame.parent.with_suffix(
+                                  ".pvd"),
+-                             path_vtk_poisson_continuous[0].parent.with_suffix(".pvd"),]:
++                             path_vtk_poisson_continuous[0].parent.with_suffix(".pvd")]:
+                 self.assertTrue(
+                     filepath.exists(),
+                     f"VTK summary file \"{filepath}\" not written to disk")
+diff --git a/testsuite/python/save_checkpoint.py b/testsuite/python/save_checkpoint.py
+index f79748e0a22..4f49eb8fcfa 100644
+--- a/testsuite/python/save_checkpoint.py
++++ b/testsuite/python/save_checkpoint.py
+@@ -409,12 +409,12 @@
+     config.recursive_unlink(vtk_root / lb_vtk_auto_id)
+     config.recursive_unlink(vtk_root / lb_vtk_manual_id)
+     lb_vtk_auto = espressomd.lb.VTKOutput(
+-        identifier=lb_vtk_auto_id, delta_N=1,
++        identifier=lb_vtk_auto_id, delta_N=1, force_pvtu=False,
+         observables=('density', 'velocity_vector'), base_folder=str(vtk_root))
+     lbf.add_vtk_writer(vtk=lb_vtk_auto)
+     lb_vtk_auto.disable()
+     lb_vtk_manual = espressomd.lb.VTKOutput(
+-        identifier=lb_vtk_manual_id, delta_N=0,
++        identifier=lb_vtk_manual_id, delta_N=0, force_pvtu=True,
+         observables=('density',), base_folder=str(vtk_root))
+     lbf.add_vtk_writer(vtk=lb_vtk_manual)
+     lb_vtk_manual.write()
+diff --git a/testsuite/python/test_checkpoint.py b/testsuite/python/test_checkpoint.py
+index f2a81c86ad3..6e4b7226927 100644
+--- a/testsuite/python/test_checkpoint.py
++++ b/testsuite/python/test_checkpoint.py
+@@ -291,6 +291,7 @@ def test_lb_vtk(self):
+         self.assertEqual(vtk_auto.vtk_uid, key_auto)
+         self.assertEqual(vtk_auto.delta_N, 1)
+         self.assertFalse(vtk_auto.enabled)
++        self.assertFalse(vtk_auto.force_pvtu)
+         self.assertEqual(set(vtk_auto.observables),
+                          {"density", "velocity_vector"})
+         self.assertIn(
+@@ -300,6 +301,7 @@ def test_lb_vtk(self):
+         self.assertIsInstance(vtk_manual, espressomd.lb.VTKOutput)
+         self.assertEqual(vtk_manual.vtk_uid, key_manual)
+         self.assertEqual(vtk_manual.delta_N, 0)
++        self.assertTrue(vtk_manual.force_pvtu)
+         self.assertEqual(set(vtk_manual.observables), {"density"})
+         self.assertIn(f"write to '{key_manual}' on demand>", repr(vtk_manual))
+         # check file numbering when resuming VTK write operations

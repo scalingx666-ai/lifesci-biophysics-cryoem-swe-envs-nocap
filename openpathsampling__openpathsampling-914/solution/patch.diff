@@ -1,0 +1,206 @@
+diff --git a/openpathsampling/beta/hooks.py b/openpathsampling/beta/hooks.py
+index bca94c471..7481f334e 100644
+--- a/openpathsampling/beta/hooks.py
++++ b/openpathsampling/beta/hooks.py
+@@ -5,11 +5,17 @@
+ :class:`.PathSimulator` ``run`` method. They allow for additional
+ calculations or output at several points in the simulation.
+ """
++import re
+ import time
++import logging
+ import openpathsampling as paths
++from datetime import timedelta
+ from openpathsampling.netcdfplus import StorableNamedObject
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
+ class SimulationNotFoundError(RuntimeError):
+     """
+     Raised when a hook tries to access its parent simulation before knowing it.
+@@ -17,6 +23,14 @@ class SimulationNotFoundError(RuntimeError):
+     pass
+ 
+ 
++class GraciousKillError(RuntimeError):
++    """
++    Raised when a simulation reaches the maximum walltime.
++    """
++    # makes it easy to catch **only** the max walltime but fail on anything else
++    pass
++
++
+ def _self_or_sim_property_or_err(obj, prop_name, sim_prop_name=None):
+     # helper function to get values either from the hook or the parent sim
+     if sim_prop_name is None:
+@@ -346,3 +360,92 @@ def after_simulation(self, sim, hook_state):
+             refresh=False,
+             output_stream=self.output_stream
+         )
++
++
++class GraciousKillHook(PathSimulatorHook):
++    """
++    'Graciously' kill a simulation when the maximum walltime is reached.
++
++    If this hook is attached to PathSimulator, it will continously estimate
++    the runtime per step. After each step it checks if the next step would
++    exceed the maximum walltime, if so it syncs and closes the storage, then
++    it calls a custom/user provided function (if any) and finally raises a
++    'GraciousKillError' to end the simulation loop.
++
++    Example usage
++    -------------
++    ```
++    kill_hook = GraciousKillHook("3 minutes 34 seconds")
++    # sampler is a `PathSimulator`
++    sampler.attach_hook(kill_hook)
++    try:
++        sampler.run(2000)
++    except GraciousKillError:
++        print("Simulation ended due to maximum walltime reached")
++    ```
++    """
++
++    implemented_for = ["before_simulation", "after_step"]
++
++    def __init__(self, max_walltime, fuzziness=1, final_call=None):
++        """
++        Initialize a GraciousKillHook.
++
++        Parameters
++        ----------
++        max_walltime - str, maximum allowed walltime,
++                       e.g. `23 hours 20 minutes`
++        fuzziness - float (default=0.9), fraction to add to the time per step
++                    when estimating if the next step could exceed the maximum
++                    walltime, i.e. the default is to stop when the time left
++                    suffices for slighlty less than 2 steps
++        final_call - None or callable (default None), will be called when the
++                     simulation is killed, it must take one argument, the hook
++                     passes the step number of the step after which it killed
++                     the simulation
++        """
++        self.max_walltime = max_walltime
++        self._timedelta = self._get_timedelta(max_walltime).total_seconds()
++        logger.info("Parsed time string '{:s}' as a ".format(self.max_walltime)
++                    + "timedelta of {:d} seconds.".format(int(self._timedelta))
++                    )
++        self.fuzziness = fuzziness
++        self.final_call = final_call
++
++    def _get_timedelta(self, time_str):
++        # https://stackoverflow.com/questions/35545140
++        timespaces = {"days": 0}
++        for timeunit in "year month week day hour minute second".split():
++            content = re.findall(r"([0-9]*?)\s*?" + timeunit, time_str)
++            if content:
++                timespaces[timeunit + "s"] = int(content[0])
++        timespaces["days"] += (30 * timespaces.pop("months", 0)
++                               + 365 * timespaces.pop("years", 0)
++                               )
++        return timedelta(**timespaces)
++
++    def before_simulation(self, sim, **kwargs):
++        self._t_start = time.time()
++
++    def after_step(self, sim, step_number, step_info, state, results,
++                   hook_state):
++        now = time.time()
++        current_step, total_steps = step_info
++        running = now - self._t_start
++        # current_step is zero based, i.e. its a 'range'
++        per_step = running / (current_step + 1)
++        if (per_step * (1 + self.fuzziness) + running) > self._timedelta:
++            logger.info("Ending simulation because maximum walltime"
++                        + " ({:s}) ".format(self.max_walltime)
++                        + "would be surpassed during the next MCstep."
++                        )
++            if sim.storage is not None:
++                sim.storage.sync_all()
++                sim.storage.close()
++            if self.final_call is not None:
++                # call users custom exit function
++                self.final_call(step_number)
++            raise GraciousKillError("Maximum walltime "
++                                    + "({:s})".format(self.max_walltime)
++                                    + " reached."
++                                    )
+diff --git a/openpathsampling/tests/pathsimulators/test_hooks.py b/openpathsampling/tests/pathsimulators/test_hooks.py
+index 7987c0a68..63f241981 100644
+--- a/openpathsampling/tests/pathsimulators/test_hooks.py
++++ b/openpathsampling/tests/pathsimulators/test_hooks.py
+@@ -377,7 +377,7 @@ def test_before_step(self, nn, elapsed):
+         step_info = nn, n_steps
+         with patch("openpathsampling.beta.hooks.time.time",
+                    new=MagicMock(side_effect=[0, elapsed]),
+-                   ) as MockTime:
++                   ):
+             self.hook.before_simulation(self.simulation)  # start the hooks timer
+             self.hook.before_step(self.simulation, step_number=2,
+                                   step_info=step_info, state=None)
+@@ -415,3 +415,62 @@ def test_after_simulation(self):
+         self.hook.after_simulation(self.simulation, hook_state={})
+         contents = self.stream.getvalue()
+         assert contents == "DONE! Completed 2 Monte Carlo cycles.\n"
++
++
++class TestGraciousKillHook(object):
++    def setup(self):
++        self.final_call = MagicMock()
++        self.nocall_final_call = MagicMock()
++        self.simulation = MagicMock(storage=MagicMock(close=MagicMock(),
++                                                      sync_all=MagicMock()
++                                                      )
++                                    )
++        self.nocall_simulation = MagicMock(storage=MagicMock(close=MagicMock(),
++                                                             sync_all=MagicMock()
++                                                             )
++                                           )
++        self.kill_hook = GraciousKillHook("0 hours 20 second",
++                                          final_call=self.final_call
++                                          )
++        self.nokill_hook = GraciousKillHook("10 hours 2 seconds",
++                                            final_call=self.nocall_final_call
++                                            )
++
++    def test_kill(self):
++        s_num = 1  # step after which the simulation is killed
++        with patch("openpathsampling.beta.hooks.time.time",
++                   new=MagicMock(side_effect=[0, 10]),
++                   ):
++            # start the timer
++            self.kill_hook.before_simulation(self.simulation)
++            with pytest.raises(GraciousKillError):
++                self.kill_hook.after_step(sim=self.simulation,
++                                          step_number=s_num,
++                                          step_info=(0, 200),
++                                          state=None,
++                                          results=None,
++                                          hook_state=None
++                                          )
++        # now assert that everything got called
++        self.simulation.storage.sync_all.assert_called_once()
++        self.simulation.storage.close.assert_called_once()
++        self.final_call.assert_called_once_with(s_num)
++
++    def test_nokill(self):
++        s_num = 1  # step after which the simulation is not killed
++        with patch("openpathsampling.beta.hooks.time.time",
++                   new=MagicMock(side_effect=[0, 10]),
++                   ):
++            # start the timer
++            self.nokill_hook.before_simulation(self.simulation)
++            self.nokill_hook.after_step(sim=self.simulation,
++                                        step_number=s_num,
++                                        step_info=(0, 200),
++                                        state=None,
++                                        results=None,
++                                        hook_state=None
++                                        )
++        # now assert that everything got called
++        self.nocall_simulation.storage.sync_all.assert_not_called()
++        self.nocall_simulation.storage.close.assert_not_called()
++        self.nocall_final_call.assert_not_called()

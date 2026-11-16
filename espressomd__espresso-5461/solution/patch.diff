@@ -1,0 +1,304 @@
+diff --git a/src/core/cell_system/RegularDecomposition.cpp b/src/core/cell_system/RegularDecomposition.cpp
+index ebb6d0af06..cab3b43bc1 100644
+--- a/src/core/cell_system/RegularDecomposition.cpp
++++ b/src/core/cell_system/RegularDecomposition.cpp
+@@ -602,6 +602,11 @@ void RegularDecomposition::init_cell_interactions() {
+               return folded_linear_index(a) < folded_linear_index(b);
+             });
+ 
++        /* Number of images of each neighbor cell in the neighborhood; it can
++         * be larger than one if the global cell grid has less than three
++         * cells in a periodic direction. */
++        std::map<int, int> n_images;
++
+         /* Collect neighbors */
+         for (int p = lower_index[2]; p <= upper_index[2]; p++)
+           for (int q = lower_index[1]; q <= upper_index[1]; q++)
+@@ -613,6 +618,7 @@ void RegularDecomposition::init_cell_interactions() {
+                   continue;
+               }
+               neighbors.insert(Utils::Vector3i{r, q, p});
++              ++n_images[folded_linear_index(Utils::Vector3i{r, q, p})];
+             }
+ 
+         /* Red-black partition by global index. */
+@@ -626,6 +632,7 @@ void RegularDecomposition::init_cell_interactions() {
+          * we directly connect to the corresponding
+          * physical cell across the periodic boundary */
+         for (auto &neighbor : neighbors) {
++          auto const offset = neighbor - Utils::Vector3i{m, n, o};
+           if (one_mpi_rank) {
+             for (auto coord : {0u, 1u, 2u}) {
+               if (neighbor[coord] == -1) {
+@@ -643,8 +650,21 @@ void RegularDecomposition::init_cell_interactions() {
+           auto cell = &cells.at(
+               get_linear_index(local_index(neighbor), ghost_cell_grid));
+ 
+-          // Divide red and black neighbors
+-          if (ind2 > ind1) {
++          /* Divide red and black neighbors. If the neighbor is reached by a
++           * unique offset, the pair belongs to the cell from which the offset
++           * is positive in lexicographic order (z most significant), so that
++           * the pairs across periodic boundaries are spread evenly over the
++           * cells. Otherwise (several images, or a fully connected boundary)
++           * use the folded indices; both cells of a pair see the same number
++           * of images, so they always apply the same rule. */
++          auto const offset_is_positive =
++              (offset[2] > 0) or (offset[2] == 0 and offset[1] > 0) or
++              (offset[2] == 0 and offset[1] == 0 and offset[0] > 0);
++          auto const is_red =
++              (not fully_connected_boundary() and n_images.at(ind2) == 1)
++                  ? offset_is_positive
++                  : ind2 > ind1;
++          if (is_red) {
+             red_neighbors.push_back(cell);
+           } else {
+             black_neighbors.push_back(cell);
+diff --git a/src/core/unit_tests/CMakeLists.txt b/src/core/unit_tests/CMakeLists.txt
+index bfe79fcc9a..96c1500bd1 100644
+--- a/src/core/unit_tests/CMakeLists.txt
++++ b/src/core/unit_tests/CMakeLists.txt
+@@ -121,6 +121,16 @@ foreach(TEST_NUM_PROC 1 4)
+       HaloPlanValidator_test NUM_PROC ${TEST_NUM_PROC})
+   endif()
+ endforeach()
++espresso_unit_test_executable(
++  NAME RegularDecomposition_test SRC RegularDecomposition_test.cpp DEPENDS
++  espresso::core Kokkos::kokkos Boost::mpi MPI::MPI_CXX)
++foreach(TEST_NUM_PROC 1 2 3 4)
++  if(${TEST_NUM_PROC} LESS_EQUAL ${ESPRESSO_TEST_NP})
++    espresso_unit_test_register(
++      NAME RegularDecomposition_test_${TEST_NUM_PROC}_mpi_ranks TARGET
++      RegularDecomposition_test NUM_PROC ${TEST_NUM_PROC})
++  endif()
++endforeach()
+ espresso_unit_test(SRC TabulatedPotential_test.cpp DEPENDS espresso::core
+                    Kokkos::kokkos)
+ if(ESPRESSO_BUILD_WITH_WALBERLA)
+diff --git a/src/core/unit_tests/RegularDecomposition_test.cpp b/src/core/unit_tests/RegularDecomposition_test.cpp
+new file mode 100644
+index 0000000000..c6f96fc566
+--- /dev/null
++++ b/src/core/unit_tests/RegularDecomposition_test.cpp
+@@ -0,0 +1,127 @@
++/*
++ * Copyright (C) 2026 The ESPResSo project
++ *
++ * This file is part of ESPResSo.
++ *
++ * ESPResSo is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * ESPResSo is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#define BOOST_TEST_MODULE RegularDecomposition test
++#define BOOST_TEST_DYN_LINK
++
++#include <boost/test/unit_test.hpp>
++
++#include "EspressoCoreGlobalConfig.hpp"
++
++#include "BoxGeometry.hpp"
++#include "LocalBox.hpp"
++#include "cell_system/Cell.hpp"
++#include "cell_system/RegularDecomposition.hpp"
++#include "communication.hpp"
++
++#include <utils/Vector.hpp>
++#include <utils/index.hpp>
++
++#include <boost/mpi.hpp>
++#include <boost/mpi/collectives.hpp>
++
++#include <algorithm>
++#include <cstddef>
++#include <map>
++#include <optional>
++#include <utility>
++#include <vector>
++
++BOOST_TEST_GLOBAL_FIXTURE(EspressoCoreGlobalConfig);
++
++/* Red/black balance of the cell pairing: on a fully periodic global cell grid
++ * with at least three cells per direction, every cell owns (red) exactly half
++ * of its 26 neighbor cells, also across the periodic boundaries, and every
++ * pair of neighboring cells is owned by exactly one of its two cells, on one
++ * or several MPI ranks. */
++BOOST_AUTO_TEST_CASE(red_black_balance) {
++  auto const &node_grid = ::communicator.node_grid;
++  ::communicator.set_node_grid(node_grid);
++  // cells of size 1 (= interaction range), ceil(4 / node_grid) cells per
++  // rank and direction: a 4x4x4 global cell grid on 1, 2 and 4 ranks per
++  // direction, 6 cells per direction on 3 ranks
++  Utils::Vector3i local_cells_per_dir;
++  Utils::Vector3d box_l;
++  for (auto i : {0u, 1u, 2u}) {
++    local_cells_per_dir[i] = (4 + node_grid[i] - 1) / node_grid[i];
++    box_l[i] = node_grid[i] * local_cells_per_dir[i];
++  }
++  BoxGeometry box;
++  box.set_length(box_l);
++  for (auto i : {0u, 1u, 2u}) {
++    box.set_periodic(i, true);
++  }
++  auto const local_box = LocalBox::make_regular_decomposition(
++      box.length(), ::communicator.calc_node_index(), node_grid);
++  RegularDecomposition dd{::communicator.comm, 1., box, local_box,
++                          std::nullopt};
++
++  Utils::Vector3i global_grid;
++  for (auto i : {0u, 1u, 2u}) {
++    global_grid[i] = dd.cell_grid[i] * node_grid[i];
++    BOOST_REQUIRE_EQUAL(dd.cell_grid[i], local_cells_per_dir[i]);
++    BOOST_REQUIRE_GE(global_grid[i], 3);
++  }
++  auto const n_cells_global = global_grid[0] * global_grid[1] * global_grid[2];
++
++  // folded global linear index of a cell (local or ghost) of this rank
++  auto const global_index = [&](Cell const *cell) {
++    auto const idx = static_cast<int>(cell - dd.cells.data());
++    BOOST_REQUIRE(idx >= 0 and idx < static_cast<int>(dd.cells.size()));
++    Utils::Vector3i const ghost_pos{
++        idx % dd.ghost_cell_grid[0],
++        (idx / dd.ghost_cell_grid[0]) % dd.ghost_cell_grid[1],
++        idx / (dd.ghost_cell_grid[0] * dd.ghost_cell_grid[1])};
++    Utils::Vector3i pos;
++    for (auto i : {0u, 1u, 2u}) {
++      pos[i] = (ghost_pos[i] - 1 + dd.cell_offset[i] + global_grid[i]) %
++               global_grid[i];
++    }
++    return Utils::get_linear_index(pos, global_grid);
++  };
++
++  // unordered pairs as (smaller, larger) global index, flattened
++  std::vector<int> local_pairs;
++  for (auto cell : dd.local_cells()) {
++    BOOST_CHECK_EQUAL(cell->neighbors().red().size(), 13u);
++    BOOST_CHECK_EQUAL(cell->neighbors().black().size(), 13u);
++    auto const ind1 = global_index(cell);
++    for (auto neighbor : cell->neighbors().red()) {
++      auto const ind2 = global_index(neighbor);
++      BOOST_CHECK_NE(ind1, ind2);
++      local_pairs.push_back(std::min(ind1, ind2));
++      local_pairs.push_back(std::max(ind1, ind2));
++    }
++  }
++
++  std::vector<std::vector<int>> all_pairs;
++  boost::mpi::all_gather(::communicator.comm, local_pairs, all_pairs);
++  std::map<std::pair<int, int>, int> counts;
++  for (auto const &rank_pairs : all_pairs) {
++    for (std::size_t k = 0; k < rank_pairs.size(); k += 2) {
++      ++counts[{rank_pairs[k], rank_pairs[k + 1]}];
++    }
++  }
++  // 13 pairs per cell (26 neighbors, each pair counted once), every pair
++  // occurs exactly once
++  BOOST_CHECK_EQUAL(counts.size(),
++                    static_cast<std::size_t>(13 * n_cells_global));
++  BOOST_CHECK(std::ranges::all_of(
++      counts, [](auto const &kv) { return kv.second == 1; }));
++}
+diff --git a/testsuite/python/regular_decomposition.py b/testsuite/python/regular_decomposition.py
+index 22681ff261..9af7e0f266 100644
+--- a/testsuite/python/regular_decomposition.py
++++ b/testsuite/python/regular_decomposition.py
+@@ -21,6 +21,7 @@
+ import espressomd
+ import numpy as np
+ import itertools
++import tests_common
+ 
+ np.random.seed(42)
+ 
+@@ -330,6 +331,81 @@ def get_pairs():
+                 f"{[0, y_bot, z_hi]} and {[0, y_top, z_lo]} "
+                 f"(iteration {i})")
+ 
++    def restore_system_state(self, min_global_cut, skin, periodicity, box_l):
++        system = self.system
++        system.part.clear()
++        system.non_bonded_inter.reset()
++        system.periodicity = periodicity
++        system.box_l = box_l
++        system.min_global_cut = min_global_cut
++        system.cell_system.skin = skin
++
++    @utx.skipIfMissingFeatures("LENNARD_JONES")
++    def test_small_cell_grids(self):
++        """Check the cell pairing on systems with only one to four cells per
++        direction in the global cell grid, where several images of a cell
++        can be in the neighborhood of another cell: pairs must be found
++        exactly once and the forces must match the all-pairs (N-square)
++        result."""
++        system = self.system
++        # restore the global state even if an assertion fails
++        self.addCleanup(self.restore_system_state, system.min_global_cut,
++                        system.cell_system.skin, system.periodicity,
++                        system.box_l)
++        system.part.clear()
++        system.non_bonded_inter.reset()
++        system.min_global_cut = 0.
++        system.cell_system.skin = 0.4
++        system.non_bonded_inter[0, 0].lennard_jones.set_params(
++            epsilon=1., sigma=1., cutoff=2.5, shift="auto")
++        rng = np.random.default_rng(seed=42)
++        int_range = 2.9
++        node_grid = np.array(system.cell_system.node_grid)
++        # with the interaction range 2.9, a box length of 2.95, 6, 9, 12
++        # gives 1, 2, 3, 4 cells per direction in the global cell grid;
++        # with several MPI ranks it is split over the node grid, boxes
++        # with a local box smaller than the interaction range are skipped
++        cases = [([6., 6., 6.], 3 * [True]),
++                 ([9., 9., 9.], 3 * [True]),
++                 ([6., 9., 12.], 3 * [True]),
++                 ([6.5, 6.5, 9.5], 3 * [True]),
++                 ([12., 6., 9.], 3 * [True]),
++                 ([9., 12., 6.], 3 * [True]),
++                 ([2.95, 6., 12.], 3 * [True]),
++                 ([12., 9., 6.], [True, False, True]),
++                 ([6., 9., 12.], [False, False, False])]
++        n_cases = 0
++        for box_l, periodicity in cases:
++            if np.any(np.array(box_l) / node_grid < int_range):
++                continue
++            n_cases += 1
++            system.part.clear()
++            system.periodicity = periodicity
++            system.box_l = box_l
++            system.cell_system.set_regular_decomposition(
++                use_verlet_lists=True)
++            # jittered simple cubic lattice at density ~0.6
++            n = np.maximum(
++                1, (np.array(box_l) * 0.6**(1. / 3.)).astype(int))
++            grid = np.meshgrid(*[(np.arange(k) + 0.5) * (l / k)
++                                 for k, l in zip(n, box_l)], indexing="ij")
++            pos = np.reshape(grid, (3, -1)).T
++            pos += rng.uniform(-0.1, 0.1, pos.shape)
++            system.part.add(pos=pos)
++            tests_common.check_non_bonded_loop_trace(self, system)
++            system.integrator.run(0, recalc_forces=True)
++            f_rd = np.copy(system.part.all().f)
++            system.cell_system.set_regular_decomposition(
++                use_verlet_lists=False)
++            system.integrator.run(0, recalc_forces=True)
++            f_rd_cells = np.copy(system.part.all().f)
++            system.cell_system.set_n_square()
++            system.integrator.run(0, recalc_forces=True)
++            f_n2 = np.copy(system.part.all().f)
++            np.testing.assert_allclose(f_rd, f_n2, rtol=0., atol=1e-10)
++            np.testing.assert_allclose(f_rd_cells, f_n2, rtol=0., atol=1e-10)
++        self.assertGreater(n_cases, 0)
++
+     def test_fully_connected_boundary_periodicity_check(self):
+         """Check that setting up a fully connected boundary raises an error
+         when the boundary normal direction is non-periodic."""

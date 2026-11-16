@@ -1,0 +1,533 @@
+diff --git a/docs/react_web_ui.md b/docs/react_web_ui.md
+index 8f1f7c7e7..b247f0d94 100644
+--- a/docs/react_web_ui.md
++++ b/docs/react_web_ui.md
+@@ -170,6 +170,12 @@ rate limiting on sign-in (put the proxy's in front if internet-facing).
+   `delegations` SSE events as the ledger changes mid-turn, and survive
+   refresh and resume. The per-agent tool sequence and worker action
+   histories (already served by `/telemetry`) are the tab's next content.
++- **Skills tab** (all modes): upload custom skill `.md` files (saved under
++  the session's `custom_skills/`, registered with the agent for this
++  session, auto-selectable like built-ins) and browse the catalog — every
++  built-in bundle by domain with its one-line description, plus a
++  markdown viewer (frontmatter shown as a caption). Persistent memory
++  (graduated / auto-distilled skills under `~/.scilink`) is not here yet.
+ - **MCP tab** (all modes): connect MCP servers — a `stdio` command, an
+   SSE URL, or a streamable-HTTP URL with optional JSON headers — and
+   disconnect them; each server card lists the tools it registered. The
+@@ -210,8 +216,8 @@ rate limiting on sign-in (put the proxy's in front if internet-facing).
+   - deep links: the tab and selected file live in the URL hash, so a
+     refresh (or shared link) lands on the same file.
+ 
+-Not yet ported: simulate mode, the Skills tab, the Telemetry tab's per-agent
+-tool sequence (the `/telemetry` endpoint already serves it), vibes.
++Not yet ported: simulate mode, the Skills tab's persistent-memory section, the
++Telemetry tab's per-agent tool sequence (the `/telemetry` endpoint already serves it), vibes.
+ 
+ ## Architecture
+ 
+@@ -262,6 +268,9 @@ webui/ (Vite + React + TS)  ──REST + SSE──►  scilink/server/ (FastAPI)
+ | GET | `/sessions/{id}/thumb?path=&size=&cmap=` | PNG thumbnail; NPY/TIFF rendered as normalized heatmaps |
+ | GET | `/sessions/{id}/table?path=&limit=` | CSV/TSV/XLSX head as JSON columns+rows |
+ | GET | `/sessions/{id}/zip?path=` | zip a session subdirectory (or the whole session) |
++| GET | `/sessions/{id}/skills` | catalog: built-in bundles by domain with descriptions, the session's custom skills |
++| GET | `/sessions/{id}/skills/{domain}/{name}` | a skill's markdown (`domain` = catalog domain or `custom`) |
++| POST | `/sessions/{id}/skills` | multipart `.md` uploads → `custom_skills/`, registered with the agent |
+ | GET | `/sessions/{id}/tools` | connected MCP servers with their tools, other external tools, `mcp_supported` |
+ | POST | `/sessions/{id}/mcp` | connect an MCP server (`name`, `transport` stdio/sse/http, `command` or `url`, `headers`) |
+ | DELETE | `/sessions/{id}/mcp/{name}` | disconnect it |
+diff --git a/scilink/server/app.py b/scilink/server/app.py
+index cdbec5a7e..5dc614f3d 100644
+--- a/scilink/server/app.py
++++ b/scilink/server/app.py
+@@ -426,6 +426,43 @@ def get_tree(request: Request, session_id: str):
+         return build_tree(session.session_dir,
+                           new_since=session.turn_started_at)
+ 
++    # ── skills ───────────────────────────────────────────────────
++
++    @app.get("/api/v1/sessions/{session_id}/skills")
++    def get_skills(request: Request, session_id: str):
++        """The skill catalog: built-in bundles by domain (with their
++        one-line descriptions) and the custom skills registered on this
++        session's agent."""
++        from .skills_api import skill_catalog
++        return skill_catalog(_session_or_404(request, session_id).agent)
++
++    @app.get("/api/v1/sessions/{session_id}/skills/{domain}/{name}")
++    def get_skill_markdown(request: Request, session_id: str, domain: str, name: str):
++        """A skill's markdown — `domain` is a catalog domain, or `custom`."""
++        from fastapi.responses import PlainTextResponse
++
++        from .skills_api import SkillError, skill_markdown
++        session = _session_or_404(request, session_id)
++        try:
++            text = skill_markdown(session.agent, domain, name)
++        except SkillError as exc:
++            raise HTTPException(exc.status, str(exc))
++        return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
++
++    @app.post("/api/v1/sessions/{session_id}/skills")
++    def upload_skills(request: Request, session_id: str,
++                      files: list[UploadFile] = File(...)):
++        """Upload `.md` skill files: saved under the session's custom_skills/
++        and registered with the agent for the rest of the session (the
++        agents' selectors treat them like built-ins)."""
++        from .skills_api import SkillError, register_uploaded_skills
++        session = _session_or_404(request, session_id)
++        payload = [(f.filename or "", f.file.read()) for f in files]
++        try:
++            return register_uploaded_skills(session.agent, session.session_dir, payload)
++        except SkillError as exc:
++            raise HTTPException(exc.status, str(exc))
++
+     # ── tools / MCP ──────────────────────────────────────────────
+ 
+     @app.get("/api/v1/sessions/{session_id}/tools")
+diff --git a/scilink/server/skills_api.py b/scilink/server/skills_api.py
+new file mode 100644
+index 000000000..c59ff6734
+--- /dev/null
++++ b/scilink/server/skills_api.py
+@@ -0,0 +1,98 @@
++"""Skills tab: browse the skill catalog, view a skill's markdown, upload
++custom skills for the session.
++
++Thin over what exists: ``scilink.skills.loader`` lists and loads every
++built-in / user-root skill bundle (48 files load in ~30 ms, so the catalog
++is computed per request, no cache to invalidate), and every orchestrator
++has ``register_skill(path)`` which makes an uploaded ``.md`` selectable by
++the agents for the rest of the session (``_custom_skills``). Uploads land
++in ``<session>/custom_skills/``, the Streamlit tab's convention.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any, Dict, List, Sequence, Tuple
++
++_DESC_MAX = 400
++
++
++def _clip(text: Any) -> str:
++    s = " ".join(str(text or "").split())
++    return s if len(s) <= _DESC_MAX else s[:_DESC_MAX - 1] + "…"
++
++
++def skill_catalog(agent: Any) -> Dict[str, Any]:
++    """``{"builtin": [{domain, label, skills: [{name, description}]}],
++    "custom": [{name, path}], "skills_supported": bool}``."""
++    from scilink.skills.loader import list_all_skills, load_skill
++
++    builtin: List[Dict[str, Any]] = []
++    try:
++        domains = list_all_skills()
++    except Exception:  # noqa: BLE001 - a broken user skill root must not hide the tab
++        domains = {}
++    for domain, names in domains.items():
++        entries = []
++        for name in names:
++            desc = ""
++            try:
++                desc = _clip((load_skill(name, domain).get("meta") or {}).get("description"))
++            except Exception:  # noqa: BLE001 - one bad skill file degrades to no blurb
++                pass
++            entries.append({"name": name, "description": desc})
++        builtin.append({"domain": domain,
++                        "label": domain.replace("_", " ").title(),
++                        "skills": entries})
++    custom = [{"name": n, "path": str(p)}
++              for n, p in sorted((getattr(agent, "_custom_skills", None) or {}).items())]
++    return {"builtin": builtin, "custom": custom,
++            "skills_supported": callable(getattr(agent, "register_skill", None))}
++
++
++class SkillError(Exception):
++    def __init__(self, status: int, message: str) -> None:
++        super().__init__(message)
++        self.status = status
++
++
++def skill_markdown(agent: Any, domain: str, name: str) -> str:
++    """The markdown of a built-in skill (``domain/name``) or, with domain
++    ``custom``, of a skill registered on this session's agent."""
++    if domain == "custom":
++        path = (getattr(agent, "_custom_skills", None) or {}).get(name)
++        if not path or not Path(path).is_file():
++            raise SkillError(404, f"No custom skill named {name!r} in this session.")
++        return Path(path).read_text(encoding="utf-8", errors="replace")
++    from scilink.skills.loader import _resolve_skill_path
++    try:
++        return _resolve_skill_path(name, domain).read_text(encoding="utf-8", errors="replace")
++    except Exception as exc:  # noqa: BLE001
++        raise SkillError(404, f"No skill {domain}/{name}: {exc}")
++
++
++def register_uploaded_skills(agent: Any, session_dir: str,
++                             files: Sequence[Tuple[str, bytes]]) -> Dict[str, Any]:
++    """Save ``.md`` uploads under ``<session>/custom_skills/`` and register
++    each with the agent. Returns the registered names, per-file errors, and
++    the refreshed catalog. A file that fails to register is still saved
++    (the user can fix and re-upload) but reported."""
++    if not callable(getattr(agent, "register_skill", None)):
++        raise SkillError(400, "This session's agent does not take custom skills.")
++    dest_dir = Path(session_dir) / "custom_skills"
++    dest_dir.mkdir(parents=True, exist_ok=True)
++    registered: List[str] = []
++    errors: List[Dict[str, str]] = []
++    for name, blob in files:
++        base = Path(name).name
++        if not base or base.startswith(".") or Path(base).suffix.lower() != ".md":
++            errors.append({"file": name, "error": "A skill is a single .md file."})
++            continue
++        dest = dest_dir / base
++        dest.write_bytes(blob)
++        try:
++            registered.append(str(agent.register_skill(str(dest))))
++        except Exception as exc:  # noqa: BLE001 - report, keep going
++            errors.append({"file": base, "error": str(exc)})
++    return {"registered": registered, "errors": errors,
++            "catalog": skill_catalog(agent)}
+diff --git a/tests/test_web_server.py b/tests/test_web_server.py
+index e0299ebdf..6a5acec14 100644
+--- a/tests/test_web_server.py
++++ b/tests/test_web_server.py
+@@ -1078,3 +1078,53 @@ def test_mcp_header_env_expansion_only_when_local(tmp_path, monkeypatch):
+     connect_mcp(agent, name="b", transport="http", url="https://h",
+                 headers={"Authorization": "Bearer ${MY_TOK}"}, expand_env=False)
+     assert agent.calls[-1][4]["Authorization"] == "Bearer ${MY_TOK}"
++
++
++# ── Skills tab: catalog, markdown, upload + register ──────────────
++
++class _FakeSkillAgent:
++    def __init__(self):
++        self._custom_skills = {}
++        self.registered = []
++
++    def register_skill(self, path):
++        p = Path(path)
++        if p.stat().st_size == 0:
++            raise ValueError(f"Skill file is empty: {p}")
++        self._custom_skills[p.stem] = str(p)
++        self.registered.append(str(p))
++        return p.stem
++
++
++def test_skills_catalog_view_and_upload(client, tmp_path):
++    session, sdir = _fake_session(client, tmp_path)
++    session.agent = _FakeSkillAgent()
++    base = f"/api/v1/sessions/{sdir.name}"
++    cat = client.get(f"{base}/skills").json()
++    assert cat["skills_supported"] and cat["custom"] == []
++    domains = {d["domain"]: d for d in cat["builtin"]}
++    assert "curve_fitting" in domains and domains["curve_fitting"]["label"] == "Curve Fitting"
++    first = domains["curve_fitting"]["skills"][0]
++    assert first["name"] and isinstance(first["description"], str)
++    # built-in markdown is served as text/markdown
++    r = client.get(f"{base}/skills/curve_fitting/{first['name']}")
++    assert r.status_code == 200 and r.headers["content-type"].startswith("text/markdown")
++    assert r.text.strip()
++    assert client.get(f"{base}/skills/curve_fitting/no_such_skill").status_code == 404
++    assert client.get(f"{base}/skills/custom/nope").status_code == 404
++    # upload: .md saved under custom_skills/ and registered; bad files reported
++    md = b"---\ndescription: My XRD rules\n---\n## Overview\nMine.\n## Planning\nDo X.\n"
++    r = client.post(f"{base}/skills", files=[
++        ("files", ("my_xrd.md", md)), ("files", ("empty.md", b"")),
++        ("files", ("notes.txt", b"x"))])
++    assert r.status_code == 200, r.text
++    body = r.json()
++    assert body["registered"] == ["my_xrd"]
++    assert {e["file"] for e in body["errors"]} == {"empty.md", "notes.txt"}
++    assert (sdir / "custom_skills" / "my_xrd.md").read_bytes() == md
++    assert body["catalog"]["custom"] == [{"name": "my_xrd", "path": str(sdir / "custom_skills" / "my_xrd.md")}]
++    assert client.get(f"{base}/skills/custom/my_xrd").text == md.decode()
++    # an agent without register_skill: catalog still works, upload refused
++    session.agent = SimpleNamespace()
++    assert client.get(f"{base}/skills").json()["skills_supported"] is False
++    assert client.post(f"{base}/skills", files=[("files", ("a.md", b"# a"))]).status_code == 400
+diff --git a/webui/src/App.tsx b/webui/src/App.tsx
+index e388b059c..005d78ac3 100644
+--- a/webui/src/App.tsx
++++ b/webui/src/App.tsx
+@@ -21,6 +21,7 @@ import { AnalysisInset } from "./components/AnalysisInset";
+ import { DelegationsPanel } from "./components/DelegationsPanel";
+ import { LoginScreen } from "./components/LoginScreen";
+ import { ToolsPanel } from "./components/ToolsPanel";
++import { SkillsPanel } from "./components/SkillsPanel";
+ 
+ interface SessionState {
+   snapshot: SessionSnapshot | null;
+@@ -176,7 +177,7 @@ export default function App() {
+   const [busy, setBusy] = useState<string | null>(null); // init overlay text
+   const [startError, setStartError] = useState<string | null>(null);
+   const [serverStopped, setServerStopped] = useState(false);
+-  const [tab, setTab] = useState<"chat" | "files" | "telemetry" | "tools">("chat");
++  const [tab, setTab] = useState<"chat" | "files" | "telemetry" | "tools" | "skills">("chat");
+   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+   // Delegation the sidebar tree asked the Telemetry tab to expand.
+   const [focusDelegation, setFocusDelegation] = useState<number | null>(null);
+@@ -528,6 +529,13 @@ export default function App() {
+               >
+                 Files
+               </button>
++              <button
++                className={tab === "skills" ? "active" : ""}
++                onClick={() => setTab("skills")}
++                title="Upload custom skills; browse the skill catalog"
++              >
++                Skills
++              </button>
+               <button
+                 className={tab === "tools" ? "active" : ""}
+                 onClick={() => setTab("tools")}
+@@ -557,6 +565,9 @@ export default function App() {
+                 onSelect={setSelectedFile}
+               />
+             </div>
++            <div className="tab-body" hidden={tab !== "skills"}>
++              <SkillsPanel sessionId={session.id} active={tab === "skills"} />
++            </div>
+             <div className="tab-body" hidden={tab !== "tools"}>
+               <ToolsPanel
+                 sessionId={session.id}
+diff --git a/webui/src/api.ts b/webui/src/api.ts
+index 2a5829ee3..c70361f47 100644
+--- a/webui/src/api.ts
++++ b/webui/src/api.ts
+@@ -208,6 +208,12 @@ export interface FolderCheck {
+   subdirs: { path: string; n_files: number }[];
+ }
+ 
++export interface SkillCatalog {
++  builtin: { domain: string; label: string; skills: { name: string; description: string }[] }[];
++  custom: { name: string; path: string }[];
++  skills_supported: boolean;
++}
++
+ export interface ToolInventory {
+   external: { name: string; description: string }[];
+   mcp_servers: { name: string; transport: string; tools: string[] }[];
+@@ -340,6 +346,26 @@ export const api = {
+ 
+   delegations: (id: string) => req<DelegationView>(`/sessions/${id}/delegations`),
+ 
++  skills: (id: string) => req<SkillCatalog>(`/sessions/${id}/skills`),
++  skillMarkdown: async (id: string, domain: string, name: string) => {
++    const r = await fetch(
++      `${BASE}/sessions/${id}/skills/${encodeURIComponent(domain)}/${encodeURIComponent(name)}`,
++    );
++    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail ?? r.statusText);
++    return r.text();
++  },
++  uploadSkills: async (id: string, files: File[]) => {
++    const form = new FormData();
++    for (const f of files) form.append("files", f);
++    const r = await fetch(`${BASE}/sessions/${id}/skills`, { method: "POST", body: form });
++    if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
++    return r.json() as Promise<{
++      registered: string[];
++      errors: { file: string; error: string }[];
++      catalog: SkillCatalog;
++    }>;
++  },
++
+   tools: (id: string) => req<ToolInventory>(`/sessions/${id}/tools`),
+   connectMcp: (
+     id: string,
+diff --git a/webui/src/app.css b/webui/src/app.css
+index 9d6551dd9..f1a94492b 100644
+--- a/webui/src/app.css
++++ b/webui/src/app.css
+@@ -754,3 +754,20 @@ details.card iframe { width: 100%; height: 600px; border: none; background: #fff
+ .tool-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+ .tool-list { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
+ .tool-list li { margin: 3px 0; }
++
++/* ── Skills tab ─────────────────────────────────────────────── */
++.skills-panel { flex: 1; overflow: auto; padding: 16px 8%; position: relative; }
++.skill-domain { margin-top: 8px; }
++.skill-domain-head { font-size: 14px; font-weight: 600; color: var(--text); }
++.skill-row { display: flex; align-items: baseline; gap: 10px; padding: 4px 0 4px 18px; font-size: 13px; }
++.skill-row code { flex: 0 0 auto; }
++.skill-desc, .skill-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.skill-viewer {
++  position: fixed; top: 60px; right: 4%; bottom: 20px; width: min(720px, 60%); z-index: 30;
++  background: var(--bg-card); border: 1px solid var(--border-strong); border-radius: 10px;
++  box-shadow: 0 10px 30px rgba(0,0,0,0.35); display: flex; flex-direction: column;
++}
++.skill-viewer-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border); }
++.skill-viewer-body { overflow: auto; padding: 12px 16px; font-size: 13px; }
++.skill-front { white-space: pre-wrap; margin: 0 0 12px; padding: 8px 10px; border-left: 3px solid var(--border-strong); background: var(--bg-panel); border-radius: 4px; font-family: inherit; }
++
+diff --git a/webui/src/components/SkillsPanel.tsx b/webui/src/components/SkillsPanel.tsx
+new file mode 100644
+index 000000000..c83981c14
+--- /dev/null
++++ b/webui/src/components/SkillsPanel.tsx
+@@ -0,0 +1,165 @@
++import { useCallback, useEffect, useState } from "react";
++import { api, type SkillCatalog } from "../api";
++import { Dropzone } from "./Dropzone";
++import { MarkdownBody } from "./MarkdownBody";
++
++/** Skills tab — upload custom skills for this session and browse the
++ * catalog (built-in bundles by domain, plus what you uploaded), with a
++ * markdown viewer. Persistent memory (graduated / auto-distilled skills
++ * under ~/.scilink) is a separate surface, not this panel. */
++
++export function SkillsPanel({
++  sessionId,
++  active,
++}: {
++  sessionId: string;
++  active: boolean;
++}) {
++  const [cat, setCat] = useState<SkillCatalog | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [notes, setNotes] = useState<string[]>([]);
++  const [filter, setFilter] = useState("");
++  const [open, setOpen] = useState<Set<string>>(new Set());
++  const [viewing, setViewing] = useState<{ title: string; front: string; text: string } | null>(null);
++
++  const refresh = useCallback(() => {
++    api.skills(sessionId).then(setCat).catch((e) => setError(String(e)));
++  }, [sessionId]);
++
++  useEffect(() => {
++    if (active) refresh();
++  }, [active, refresh]);
++
++  const view = async (domain: string, name: string) => {
++    try {
++      const raw = await api.skillMarkdown(sessionId, domain, name);
++      // The YAML frontmatter (description, technique tags) is loader
++      // metadata, not prose: rendered as markdown its `---` fence turns the
++      // description into a title. Show it as a caption instead.
++      const m = /^---\n([\s\S]*?)\n---\n?/.exec(raw);
++      const front = m ? m[1].trim() : "";
++      setViewing({
++        title: `${domain === "custom" ? "custom" : domain} / ${name}`,
++        front,
++        text: m ? raw.slice(m[0].length) : raw,
++      });
++    } catch (e) {
++      setError(e instanceof Error ? e.message : String(e));
++    }
++  };
++
++  const q = filter.trim().toLowerCase();
++  const domains = (cat?.builtin ?? [])
++    .map((d) => ({
++      ...d,
++      skills: d.skills.filter(
++        (s) => !q || s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q)
++          || d.domain.toLowerCase().includes(q),
++      ),
++    }))
++    .filter((d) => d.skills.length > 0);
++  const total = (cat?.builtin ?? []).reduce((n, d) => n + d.skills.length, 0);
++
++  return (
++    <div className="skills-panel">
++      <section className="tools-section">
++        <h3>Custom skills</h3>
++        <p className="caption">
++          A skill is one markdown file with the sections the agents read:
++          Overview, Planning, Implementation, Interpretation, Validation.
++          Uploaded skills are selectable by the agents for this session only —
++          they are not saved to persistent memory.
++        </p>
++        {cat?.skills_supported === false ? (
++          <p className="caption warn">This session's agent does not take custom skills.</p>
++        ) : (
++          <Dropzone
++            label="Drop skill .md files here or click to browse"
++            accept=".md"
++            onFiles={async (files) => {
++              setError(null);
++              const r = await api.uploadSkills(sessionId, files);
++              setCat(r.catalog);
++              const msgs = r.errors.map((e) => `${e.file}: ${e.error}`);
++              setNotes(msgs);
++              if (r.registered.length === 0 && msgs.length) throw new Error(msgs.join("; "));
++              return r.registered.map((n) => `${n} (registered)`);
++            }}
++          />
++        )}
++        {notes.map((n) => (
++          <p key={n} className="caption warn">{n}</p>
++        ))}
++        {cat && cat.custom.length === 0 && <p className="caption">No custom skills in this session.</p>}
++        {cat?.custom.map((s) => (
++          <div key={s.name} className="skill-row">
++            <code>{s.name}</code>
++            <span className="caption skill-path" title={s.path}>{s.path.split("/").pop()}</span>
++            <button type="button" className="link-btn" onClick={() => void view("custom", s.name)}>
++              view
++            </button>
++          </div>
++        ))}
++      </section>
++
++      <section className="tools-section">
++        <h3>
++          Built-in skills <span className="caption">({total})</span>
++        </h3>
++        <input
++          type="text"
++          placeholder="Filter by name, description, or domain…"
++          value={filter}
++          onChange={(e) => setFilter(e.target.value)}
++        />
++        {error && <p className="caption warn">{error}</p>}
++        {domains.map((d) => {
++          const isOpen = open.has(d.domain) || Boolean(q);
++          return (
++            <div key={d.domain} className="skill-domain">
++              <button
++                type="button"
++                className="link-btn skill-domain-head"
++                onClick={() =>
++                  setOpen((prev) => {
++                    const next = new Set(prev);
++                    if (next.has(d.domain)) next.delete(d.domain);
++                    else next.add(d.domain);
++                    return next;
++                  })
++                }
++              >
++                {isOpen ? "▾" : "▸"} {d.label} <span className="caption">({d.skills.length})</span>
++              </button>
++              {isOpen &&
++                d.skills.map((s) => (
++                  <div key={s.name} className="skill-row">
++                    <code>{s.name}</code>
++                    <span className="caption skill-desc">{s.description}</span>
++                    <button type="button" className="link-btn" onClick={() => void view(d.domain, s.name)}>
++                      view
++                    </button>
++                  </div>
++                ))}
++            </div>
++          );
++        })}
++      </section>
++
++      {viewing && (
++        <div className="skill-viewer" role="dialog" aria-label={viewing.title}>
++          <div className="skill-viewer-head">
++            <strong>{viewing.title}</strong>
++            <button type="button" className="icon-btn" title="Close" onClick={() => setViewing(null)}>
++              ✕
++            </button>
++          </div>
++          <div className="skill-viewer-body md-body">
++            {viewing.front && <pre className="skill-front caption">{viewing.front}</pre>}
++            <MarkdownBody text={viewing.text} />
++          </div>
++        </div>
++      )}
++    </div>
++  );
++}

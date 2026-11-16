@@ -1,0 +1,1390 @@
+diff --git a/README.md b/README.md
+index b8bf8ef..da0a2ec 100644
+--- a/README.md
++++ b/README.md
+@@ -8,6 +8,79 @@ and Knot Theory descriptors of protein and RNA structures.
+ 
+ ---
+ 
++## What's new (unreleased)
++
++> **Results change.** Curvature and torsion change for every residue past the
++> first ~10 of each chain, and values near chain ends and breaks are now NaN.
++> Results from v0.1.8 and earlier are not comparable with results from this
++> version.
++
++### Correctness fixes
++- **Curvature and torsion no longer depend on the residue's position in the
++  chain.** The local Chebyshev fit in `calc_curvature_torsion` was done on the
++  raw curve parameter (the residue index). Past ~10 residues the fit lost rank
++  without warning, so values depended on where a residue sat in the chain, not
++  only on its local geometry: on an ideal α-helix, interior curvature ranged
++  0.35–0.51 instead of a constant 0.514. Each fitting window is now mapped to
++  [−1, 1], and the fit has full rank for any chain length.
++- **Chains are split at breaks.** A break is two consecutive Cα atoms more than
++  4.2 Å apart (missing residues, or residues dropped for a missing Cα). Each
++  segment gets its own spline, so no geometry is computed over a connection
++  that does not exist, and φ/ψ are `None` across the break. A single
++  `ChainBreakWarning` lists the breaks found:
++  ```python
++  import warnings
++  from melodia_py.geometryparser import ChainBreakWarning
++
++  with warnings.catch_warnings():
++      warnings.simplefilter("ignore", ChainBreakWarning)   # or "error"
++      df = mel.geometry_from_structure_file("structure.pdb")
++  ```
++  Breaks are detected from distances, not residue numbering, so a numbering
++  jump between bonded residues is not a break. RNA chains are not split yet.
++- **No more copied values at chain ends.** The first and last residue used to
++  repeat their neighbour's curvature and torsion, and the first and last three
++  residues shared one writhing value. A value is now computed only where its
++  whole window lies inside the chain or segment, and is `NaN` elsewhere:
++
++  | Quantity | Window | `NaN` at |
++  |---|---|---|
++  | curvature, torsion, arc_length | residues i−1 to i+1 | first and last residue |
++  | writhing | residues i−2 to i+2 | first two and last two residues |
++
++  The residue next to each end is computed, but is biased by the spline's end
++  condition (33% high on an ideal helix); from two residues in, the end has no
++  effect. Drop the `NaN` rows where a complete table is needed:
++  ```python
++  df = df.dropna(subset=["curvature", "torsion"])
++  ```
++- `bfactor_from_geo`, `cluster_alignment` and `clustering.superimposer` accept
++  `NaN` values: residues without a value keep the default B-factor, are left out
++  of the clustering and get the cluster label `-1`, so they never form or join
++  a conserved block.
++
++### Packaging
++- **`pip install melodia-py` now gives a working package.** `nglview`,
++  `ipywidgets`, `numba` and `joblib` were imported by `import melodia_py` but
++  not declared as dependencies, so the import failed in a clean environment.
++  `numba` (≥ 0.61, the first release supporting Python 3.13) and `joblib` are
++  now core dependencies. `nglview` and `ipywidgets` are only needed by the
++  structure viewers, which now import them when called; install them with the
++  new `viz` extra (or from conda-forge):
++  ```shell
++  pip install "melodia-py[viz]"
++  ```
++
++### Tests
++- A `tests/` suite covers these fixes (constant values along an ideal helix,
++  independence from residue numbering, chain breaks, chain ends, `NaN`
++  handling). Run it from a source install (see *From source* below):
++  ```shell
++  pytest
++  ```
++
++---
++
+ ## What's new in v0.1.8
+ 
+ ### MDAnalysis integration
+@@ -109,14 +182,17 @@ pip install melodia-py
+ 
+ | Extra | Installs | Enables |
+ |---|---|---|
+-| `fast` | numba, llvmlite | JIT-compiled writhing (~8× faster) |
+-| `parallel` | joblib | Multi-core model processing |
++| `viz` | nglview, ipywidgets | `view_putty()`, `view_cartoon()`, `view_tube()` in notebooks |
+ | `mdanalysis` | MDAnalysis | `geometry_from_mdanalysis()` for MD trajectories |
+ | `dev` | pytest, mypy, ruff, pre-commit | Development tools |
+ | `all` | all of the above | Everything |
+ 
++Numba (JIT-compiled writhing) and joblib (multi-core model processing) are
++installed with the core package. The former `fast` and `parallel` extras still
++work but add nothing.
++
+ ```shell
+-pip install "melodia-py[fast,parallel]"
++pip install "melodia-py[viz]"
+ ```
+ 
+ ### From source (recommended for development)
+diff --git a/melodia_py/clustering.py b/melodia_py/clustering.py
+index 144abff..5da6d3a 100644
+--- a/melodia_py/clustering.py
++++ b/melodia_py/clustering.py
+@@ -31,6 +31,8 @@
+ from sklearn.preprocessing import StandardScaler
+ from sklearn.cluster import AgglomerativeClustering
+ 
++from melodia_py.geometryparser import _UNCLUSTERED, _defined
++
+ warnings.filterwarnings('ignore', category=PDBConstructionWarning)
+ 
+ # ---------------------------------------------------------------------------
+@@ -246,7 +248,8 @@ def superimposer(
+     Conserved anchor regions are identified by agglomerative clustering on
+     (curvature, torsion) pairs, then refined by simulated annealing to
+     minimise the inter-structure RMSD. Optionally writes CSV coordinate files
+-    and superimposed PDB files.
++    and superimposed PDB files. A column with a residue whose curvature or
++    torsion is NaN (next to a chain end or break) is never conserved.
+ 
+     :param align: Geometry-annotated MultipleSeqAlignment
+     :param threshold: Agglomerative clustering distance threshold
+@@ -292,12 +295,17 @@ def superimposer(
+         tags: List[str] = []
+         for rec_id, position in id2pos.items():
+             record = align[position]
+-            if record.seq[i] != '-':
+-                xy.append([
+-                    record.letter_annotations['curvature'][i],
+-                    record.letter_annotations['torsion'][i],
+-                ])
++            curv = record.letter_annotations['curvature'][i]
++            tors = record.letter_annotations['torsion'][i]
++            # Residues too close to a chain end or break for curvature/torsion
++            # (NaN) are left out of the clustering and marked unclustered.
++            if record.seq[i] == '-':
++                continue
++            if _defined(curv, tors):
++                xy.append([curv, tors])
+                 tags.append(rec_id)
++            else:
++                record.letter_annotations['cluster'][i] = _UNCLUSTERED
+ 
+         if len(xy) > 1:
+             clusters = clustering.fit_predict(scaler.transform(xy))
+@@ -306,19 +314,19 @@ def superimposer(
+                 record = align[position]
+                 if rec_id in cluster_map:
+                     record.letter_annotations['cluster'][i] = cluster_map[rec_id]
+-        else:
+-            for position in id2pos.values():
+-                align[position].letter_annotations['cluster'][i] = 0
+ 
+     # ------------------------------------------------------------------
+     # Identify fully conserved columns (all structures in same cluster)
+     # ------------------------------------------------------------------
+     align_len = align.get_alignment_length()
+-    area = [
+-        1 if len({align[pos].letter_annotations['cluster'][i] for pos in id2pos.values()}) == 1
+-        else 0
++    column_labels = [
++        {align[pos].letter_annotations['cluster'][i] for pos in id2pos.values()}
+         for i in range(align_len)
+     ]
++    area = [
++        1 if len(labels) == 1 and _UNCLUSTERED not in labels else 0
++        for labels in column_labels
++    ]
+ 
+     # ------------------------------------------------------------------
+     # Find anchor regions (contiguous conserved runs ≥ _MIN_ANCHOR_LENGTH)
+diff --git a/melodia_py/geometryparser.py b/melodia_py/geometryparser.py
+index aa943aa..b5f5f22 100644
+--- a/melodia_py/geometryparser.py
++++ b/melodia_py/geometryparser.py
+@@ -29,6 +29,17 @@
+   - Division-by-zero guard in calc_writhing for colinear atom pairs.
+   - find_gaps is O(n) instead of O(n²).
+   - find_anomalies raises NotImplementedError instead of silently returning [].
++  - calc_curvature_torsion maps each fitting window to [-1, 1]. Fitting on
++    the raw curve parameter was rank deficient past t ~ 10, so curvature and
++    torsion depended on the residue's position in the chain.
++  - Chains are split at breaks (consecutive CA atoms more than 4.2 Å apart)
++    and each segment gets its own spline, so no geometry is computed over a
++    connection that does not exist; a ChainBreakWarning lists the breaks.
++    phi/psi are None across a break.
++  - Residues at the ends of a chain or segment no longer repeat their
++    neighbour's values: a value is NaN where its window does not fit inside
++    the segment (curvature, torsion and arc length at the first and last
++    residue; writhing at the first two and last two).
+ 
+ Performance
+   - calc_writhing inner double loop compiled to native code via Numba @njit.
+@@ -51,6 +62,7 @@
+ """
+ 
+ import math
++import warnings
+ import numpy as np
+ 
+ from Bio.PDB import Chain
+@@ -77,6 +89,15 @@
+ # Epsilon for cross-product norm guard (division-by-zero protection).
+ _NORM_EPS: float = 1e-10
+ 
++# Consecutive CA atoms further apart than this are not bonded (trans peptide
++# ~3.8 Å, cis ~2.9 Å): the chain is broken there.
++_MAX_CA_CA_DISTANCE: float = 4.2
++
++# Residues on each side of residue i that a quantity's window needs: the
++# Chebyshev fit and the arc length use [i-1, i+1], writhing [i-2, i+2].
++_CURVATURE_HALF_WINDOW: int = 1
++_WRITHING_HALF_WINDOW:  int = 2
++
+ 
+ # ---------------------------------------------------------------------------
+ # Numba-compiled writhing kernel
+@@ -194,6 +215,60 @@ def _warmup_jit() -> None:
+ _warmup_jit()
+ 
+ 
++def _defined(*values: Optional[float]) -> bool:
++    """
++    True if every value is a number: not None (alignment gap) and not NaN
++    (residue too close to a chain end or break for that quantity).
++    """
++    return all(v is not None and not math.isnan(v) for v in values)
++
++
++# Cluster label of a residue with NaN curvature/torsion in a clustered
++# alignment. Gaps keep label 0; this label never joins a conserved block.
++_UNCLUSTERED = -1
++
++
++# ---------------------------------------------------------------------------
++# Chain breaks
++# ---------------------------------------------------------------------------
++
++class ChainBreakWarning(UserWarning):
++    """A chain is broken; its geometry is computed separately on each side."""
++
++
++def _warn_breaks(breaks: List[Tuple[str, int, int, Any]]) -> None:
++    """
++    Emit one ChainBreakWarning listing every break found.
++
++    :param breaks: (chain_id, residue before, residue after, model id) per
++        break, for any number of chains and models
++    """
++    if not breaks:
++        return
++
++    models: Dict[Tuple[str, int, int], List[Any]] = defaultdict(list)
++    for chain_id, before, after, model in breaks:
++        models[(chain_id, before, after)].append(model)
++
++    def where(found: List[Any]) -> str:
++        if len(found) > 3:
++            return f'{len(found)} models'
++        return 'model ' + ', '.join(str(m) for m in found)
++
++    lines = [
++        f'chain {chain_id} between residues {before} and {after} ({where(found)})'
++        for (chain_id, before, after), found in models.items()
++    ]
++    warnings.warn(
++        f'Chain breaks (consecutive CA atoms more than {_MAX_CA_CA_DISTANCE} Å '
++        'apart): curvature, torsion, arc length and writhing are computed '
++        'separately on each side, and phi/psi are None across the break.\n  '
++        + '\n  '.join(lines),
++        ChainBreakWarning,
++        stacklevel=3,
++    )
++
++
+ # ---------------------------------------------------------------------------
+ # ResidueGeometry dataclass
+ # ---------------------------------------------------------------------------
+@@ -244,6 +319,9 @@ class GeometryParser:
+     arc_len     Arc length over a 3-residue window (adaptive quadrature)
+     writhing    Gauss writhing number over a 5-residue window (Numba JIT)
+     phi / psi   Backbone dihedral angles (protein only; None at termini)
++
++    Chains are split at breaks; at the ends of each chain or segment, values
++    whose window does not fit are NaN (see calc_segment_geometry).
+     """
+ 
+     # Supported RNA backbone atoms, in recommended order.
+@@ -370,6 +448,24 @@ def find_gaps(chain: Chain.Chain) -> List[Tuple[int, int]]:
+ 
+         return gaps
+ 
++    @staticmethod
++    def find_breaks(coords: Any) -> List[int]:
++        """
++        Find chain breaks from the backbone coordinates: consecutive CA atoms
++        more than _MAX_CA_CA_DISTANCE apart. Unlike find_gaps, this catches
++        missing residues whatever the numbering, and ignores numbering jumps
++        across residues that are bonded.
++
++        :param coords: (n, 3) CA coordinates in chain order
++        :return: Indices i where residue i starts a new segment
++        :rtype: list[int]
++        """
++        coords = np.asarray(coords, dtype=np.float64)
++        if len(coords) < 2:
++            return []
++        distances = np.linalg.norm(np.diff(coords, axis=0), axis=1)
++        return [int(i) + 1 for i in np.flatnonzero(distances > _MAX_CA_CA_DISTANCE)]
++
+     @staticmethod
+     def find_anomalies(chain: Chain.Chain) -> List[str]:
+         """
+@@ -401,9 +497,11 @@ def calc_curvature_torsion(
+         A natural cubic spline has C² continuity at knots (one per residue).
+         Its raw 3rd derivative is piecewise-constant and discontinuous at
+         every knot, making torsion estimates very sensitive to local kinks.
+-        Fitting a degree-10 Chebyshev polynomial over a ±1–3 residue window
++        Fitting a degree-10 Chebyshev polynomial over a ±1 residue window
+         smooths across knot boundaries and gives scientifically consistent
+-        curvature/torsion values that match the original implementation.
++        curvature/torsion values. The window is shifted inside [t[0], t[-1]]
++        near the chain ends and mapped to [-1, 1] before fitting, so the
++        result depends only on the local geometry, not on the value of *p*.
+ 
+         :param p: Curve parameter at which to evaluate
+         :param t: Full list of curve parameters (used to clamp the window)
+@@ -416,44 +514,38 @@ def calc_curvature_torsion(
+         mn = float(np.min(t))
+         mx = float(np.max(t))
+ 
+-        cxt = cyt = czt = None
+-
+-        for dt in range(1, 4):
+-            delta = float(dt)
+-            ini   = p - delta
+-            end   = p + delta
+-
+-            if ini < mn:
+-                offset = mn - ini
+-            elif end > mx:
+-                offset = mx - end
+-            else:
+-                offset = 0.0
+-
+-            ini += offset
+-            end += offset
++        ini = p - 1.0
++        end = p + 1.0
+ 
+-            # _CHEB_SAMPLE_COUNT is odd so p always lies at the window centre
+-            tp = np.linspace(ini, end, _CHEB_SAMPLE_COUNT)
++        if ini < mn:
++            offset = mn - ini
++        elif end > mx:
++            offset = mx - end
++        else:
++            offset = 0.0
+ 
+-            cxt, res_x = chebyshev.chebfit(tp, xt(tp), deg=10, full=True)
+-            cyt, res_y = chebyshev.chebfit(tp, yt(tp), deg=10, full=True)
+-            czt, res_z = chebyshev.chebfit(tp, zt(tp), deg=10, full=True)
++        ini += offset
++        end += offset
+ 
+-            if res_x[0].size != 0 and res_y[0].size != 0 and res_z[0].size != 0:
+-                break
++        # Fit on the window mapped to s in [-1, 1]. Chebyshev polynomials grow
++        # like s**10 outside [-1, 1], so fitting on the raw parameter makes the
++        # least-squares problem rank deficient once t is past ~10, and the
++        # derivatives then depend on the residue's index. Mapped, the fit has
++        # full rank for any t. By the chain rule, d^m/dt^m = d^m/ds^m / half**m.
++        centre = 0.5 * (ini + end)
++        half   = 0.5 * (end - ini)
+ 
+-        xt_d1 = chebyshev.chebval(p, chebyshev.chebder(cxt, m=1))
+-        yt_d1 = chebyshev.chebval(p, chebyshev.chebder(cyt, m=1))
+-        zt_d1 = chebyshev.chebval(p, chebyshev.chebder(czt, m=1))
++        # _CHEB_SAMPLE_COUNT is odd so p always lies at the window centre
++        tp = np.linspace(ini, end, _CHEB_SAMPLE_COUNT)
++        sp = (tp - centre) / half
++        s  = (p - centre) / half
+ 
+-        xt_d2 = chebyshev.chebval(p, chebyshev.chebder(cxt, m=2))
+-        yt_d2 = chebyshev.chebval(p, chebyshev.chebder(cyt, m=2))
+-        zt_d2 = chebyshev.chebval(p, chebyshev.chebder(czt, m=2))
++        # One least-squares fit for x, y and z (one column each)
++        coef = chebyshev.chebfit(sp, np.column_stack((xt(tp), yt(tp), zt(tp))), deg=10)
+ 
+-        xt_d3 = chebyshev.chebval(p, chebyshev.chebder(cxt, m=3))
+-        yt_d3 = chebyshev.chebval(p, chebyshev.chebder(cyt, m=3))
+-        zt_d3 = chebyshev.chebval(p, chebyshev.chebder(czt, m=3))
++        xt_d1, yt_d1, zt_d1 = chebyshev.chebval(s, chebyshev.chebder(coef, m=1)) / half
++        xt_d2, yt_d2, zt_d2 = chebyshev.chebval(s, chebyshev.chebder(coef, m=2)) / half ** 2
++        xt_d3, yt_d3, zt_d3 = chebyshev.chebval(s, chebyshev.chebder(coef, m=3)) / half ** 3
+ 
+         v1 = np.array([xt_d1, yt_d1, zt_d1])
+         v2 = np.array([xt_d2, yt_d2, zt_d2])
+@@ -536,6 +628,77 @@ def calc_writhing(
+             _NORM_EPS,
+         )
+ 
++    @staticmethod
++    def calc_segment_geometry(coords: Any, rna: bool) -> np.ndarray:
++        """
++        Compute curvature, torsion, arc length and writhing for every residue
++        of one unbroken segment.
++
++        A value is computed only where its whole window lies inside the
++        segment, and is NaN elsewhere: curvature, torsion and arc length use
++        residues i-1 to i+1, so the first and last residue get NaN; writhing
++        uses i-2 to i+2, so the first two and last two get NaN. The residue
++        next to each end is computed but biased by the natural spline's end
++        condition (zero second derivative at the end): on an ideal helix its
++        curvature is ~33% high; from two residues in, the end has no effect.
++        RNA writhing is 0.0.
++
++        :param coords: (n, 3) backbone coordinates of the segment
++        :param rna: True for an RNA segment
++        :return: (n, 4) array: curvature, torsion, arc length, writhing
++        :rtype: numpy.ndarray
++        """
++        coords = np.ascontiguousarray(coords, dtype=np.float64)
++        n = len(coords)
++        geometry = np.full((n, 4), np.nan)
++        if rna:
++            geometry[:, 3] = 0.0
++        if n <= 2 * _CURVATURE_HALF_WINDOW:
++            return geometry
++
++        t = list(range(n))
++        xt = CubicSpline(t, coords[:, 0], bc_type='natural')
++        yt = CubicSpline(t, coords[:, 1], bc_type='natural')
++        zt = CubicSpline(t, coords[:, 2], bc_type='natural')
++
++        x = np.ascontiguousarray(coords[:, 0])
++        y = np.ascontiguousarray(coords[:, 1])
++        z = np.ascontiguousarray(coords[:, 2])
++
++        h = _CURVATURE_HALF_WINDOW
++        for i in range(h, n - h):
++            geometry[i, 0:2] = GeometryParser.calc_curvature_torsion(
++                p=float(i), t=t, xt=xt, yt=yt, zt=zt
++            )
++            geometry[i, 2] = GeometryParser.calc_arc_length(p=float(i), xt=xt, yt=yt, zt=zt)
++
++        if not rna:
++            h = _WRITHING_HALF_WINDOW
++            for i in range(h, n - h):
++                geometry[i, 3] = _calc_writhing_jit(i, x, y, z, _NORM_EPS)
++
++        return geometry
++
++    @staticmethod
++    def calc_chain_geometry(coords: Any, breaks: List[int], rna: bool) -> np.ndarray:
++        """
++        Compute curvature, torsion, arc length and writhing for every residue
++        of a chain, separately on each segment between chain breaks, so no
++        spline or window spans a break.
++
++        :param coords: (n, 3) backbone coordinates in chain order
++        :param breaks: Indices where a new segment starts (see find_breaks)
++        :param rna: True for an RNA chain
++        :return: (n, 4) array: curvature, torsion, arc length, writhing
++        :rtype: numpy.ndarray
++        """
++        coords = np.asarray(coords, dtype=np.float64)
++        bounds = [0, *breaks, len(coords)]
++        return np.vstack([
++            GeometryParser.calc_segment_geometry(coords[start:stop], rna)
++            for start, stop in zip(bounds[:-1], bounds[1:])
++        ])
++
+     @staticmethod
+     def calc_geometry(
+         chain: Chain.Chain,
+@@ -567,10 +730,8 @@ def calc_geometry(
+                 if residue.id[0] == ' ':
+                     last_rna_pos = residue.id[1]
+ 
+-        t: List[float] = []
+-        x: List[float] = []
+-        y: List[float] = []
+-        z: List[float] = []
++        coords:    List[List[float]] = []
++        positions: List[int]         = []
+ 
+         residues:     Dict[int, ResidueGeometry] = {}
+         residues_map: Dict[int, int]             = {}
+@@ -593,10 +754,8 @@ def calc_geometry(
+                     f'- {residue.get_full_id()}'
+                 )
+ 
+-            t.append(float(num))
+-            x.append(float(coord[0]))
+-            y.append(float(coord[1]))
+-            z.append(float(coord[2]))
++            coords.append([float(c) for c in coord])
++            positions.append(pos)
+ 
+             residues[num] = ResidueGeometry(
+                 name=residue.get_resname(),
+@@ -607,41 +766,22 @@ def calc_geometry(
+             residues_map[pos] = num
+             num += 1
+ 
+-        # Fit backbone positions with a natural cubic spline
+-        xt = CubicSpline(t, x, bc_type='natural')
+-        yt = CubicSpline(t, y, bc_type='natural')
+-        zt = CubicSpline(t, z, bc_type='natural')
+-
+-        ini = 0
+-        end = len(t) - 1
+-
+-        for i, tp in enumerate(t):
+-            # Terminal residues use the nearest interior point for Chebyshev
+-            if ini < i < end:
+-                p_curv = tp
+-            elif i == ini:
+-                p_curv = t[1]
+-            else:
+-                p_curv = t[-2]
+-
+-            curvature, torsion = GeometryParser.calc_curvature_torsion(
+-                p=p_curv, t=t, xt=xt, yt=yt, zt=zt
+-            )
+-            arc_len  = GeometryParser.calc_arc_length(p=tp, xt=xt, yt=yt, zt=zt)
+-            writhing = (
+-                GeometryParser.calc_writhing(i=i, t=t, x=x, y=y, z=z)
+-                if not rna else 0.0
+-            )
++        breaks = [] if rna else GeometryParser.find_breaks(coords)
++        _warn_breaks([
++            (chain.id, positions[i - 1], positions[i], model)
++            for i in breaks
++        ])
+ 
+-            idx = int(tp)
+-            residues[idx].curvature = curvature
+-            residues[idx].torsion   = torsion
+-            residues[idx].arc_len   = arc_len
+-            residues[idx].writhing  = writhing
++        geometry = GeometryParser.calc_chain_geometry(coords, breaks, rna)
++        for idx, (curvature, torsion, arc_len, writhing) in enumerate(geometry):
++            residues[idx].curvature = float(curvature)
++            residues[idx].torsion   = float(torsion)
++            residues[idx].arc_len   = float(arc_len)
++            residues[idx].writhing  = float(writhing)
+ 
+         if not rna:
+             GeometryParser.calc_dihedral_angles(
+-                chain=chain, residues=residues, deg=deg
++                chain=chain, residues=residues, deg=deg, breaks=breaks
+             )
+ 
+         return residues, residues_map, rna
+@@ -684,19 +824,23 @@ def calc_dihedral_angles(
+         chain: Chain.Chain,
+         residues: Dict[int, ResidueGeometry],
+         deg: bool,
++        breaks: Optional[List[int]] = None,
+     ) -> None:
+         """
+         Compute backbone φ/ψ dihedral angles and store them in-place.
+ 
+-        Terminal residues correctly receive None:
+-          N-terminus → phi = None
+-          C-terminus → psi = None
++        Terminal residues correctly receive None, and so do residues next to
++        a chain break:
++          N-terminus, or first residue after a break → phi = None
++          C-terminus, or last residue before a break → psi = None
+ 
+         :param chain: BioPython Chain
+         :param residues: Residue geometry dict (mutated in place)
+         :param deg: Store angles in degrees when True
++        :param breaks: Indices where a new segment starts (see find_breaks)
+         """
+         residues_list = [res for res in chain if res.id[0] == ' ']
++        segment_starts = set(breaks or [])
+ 
+         for i, residue in enumerate(residues_list):
+             pos = residue.id[1]
+@@ -714,7 +858,7 @@ def calc_dihedral_angles(
+                 continue
+ 
+             phi: Optional[float] = None
+-            if i > 0:
++            if i > 0 and i not in segment_starts:
+                 try:
+                     p1  = residues_list[i - 1]['C'].get_coord()
+                     phi = GeometryParser.calc_dihedral_torsion(
+@@ -724,7 +868,7 @@ def calc_dihedral_angles(
+                     pass
+ 
+             psi: Optional[float] = None
+-            if i < len(residues_list) - 1:
++            if i < len(residues_list) - 1 and i + 1 not in segment_starts:
+                 try:
+                     p4  = residues_list[i + 1]['N'].get_coord()
+                     psi = GeometryParser.calc_dihedral_torsion(
+diff --git a/melodia_py/melodia_py.py b/melodia_py/melodia_py.py
+index 9697fd6..26e1245 100644
+--- a/melodia_py/melodia_py.py
++++ b/melodia_py/melodia_py.py
+@@ -15,25 +15,27 @@
+ # Author: Rinaldo Wander Montalvão, PhD
+ #
+ import os
+-from typing import Dict, List, Optional, Tuple, Any
++from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
+ 
+ import Bio.Align
+ import pandas as pd
+-import nglview as nv
+ import seaborn as sns
+ 
+-from ipywidgets import Box
+ from Bio import AlignIO
+ from Bio.PDB import PDBParser
+ from Bio.PDB.Structure import Structure
+ from joblib import Parallel, delayed
+ 
+-from melodia_py.geometryparser import GeometryParser
++from melodia_py.geometryparser import GeometryParser, _UNCLUSTERED, _defined, _warn_breaks
+ 
+ from sklearn.preprocessing import StandardScaler
+ from sklearn.cluster import AgglomerativeClustering
+ from importlib import resources as importlib_resources
+ 
++if TYPE_CHECKING:
++    # Optional (melodia-py[viz]); imported by the viewers when called.
++    from ipywidgets import Box
++
+ 
+ # ---------------------------------------------------------------------------
+ # Ramachandran bin definitions for PropensityTable.get_score
+@@ -172,6 +174,8 @@ def geometry_from_mdanalysis(
+     if not tasks:
+         return pd.DataFrame()
+ 
++    _warn_breaks(_task_breaks(tasks))
++
+     nested: List[List[dict]] = Parallel(n_jobs=n_jobs)(
+         delayed(_compute_model_geometry)(task, deg)
+         for task in tasks
+@@ -293,6 +297,7 @@ def _extract_mda_frame_data(
+             'coords':       coords,
+             'residue_meta': residue_meta,
+             'backbone':     backbone,
++            'breaks':       [] if rna else GeometryParser.find_breaks(coords),
+         })
+ 
+     if not chain_data:
+@@ -378,6 +383,7 @@ def _extract_model_data(
+             'coords':       coords,
+             'residue_meta': residue_meta,
+             'backbone':     backbone,
++            'breaks':       [] if rna else GeometryParser.find_breaks(coords),
+         })
+ 
+     if not chain_data:
+@@ -390,6 +396,20 @@ def _extract_model_data(
+     }
+ 
+ 
++def _task_breaks(tasks: List[dict]) -> List[Tuple[str, int, int, Any]]:
++    """
++    Chain breaks recorded by the extractors, as (chain_id, residue before,
++    residue after, model id) tuples for _warn_breaks.
++    """
++    return [
++        (chain['chain_id'], chain['residue_meta'][i - 1][1],
++         chain['residue_meta'][i][1], task['model_id'])
++        for task in tasks
++        for chain in task['chains']
++        for i in chain['breaks']
++    ]
++
++
+ # ---------------------------------------------------------------------------
+ # Worker function — processes all chains of one model (no BioPython objects)
+ # ---------------------------------------------------------------------------
+@@ -406,10 +426,7 @@ def _compute_model_geometry(task: dict, deg: bool) -> List[dict]:
+     :return: Flat list of per-residue record dicts for all chains
+     """
+     import numpy as np
+-    from scipy.interpolate import CubicSpline
+-    from melodia_py.geometryparser import (
+-        GeometryParser, _NORM_EPS, _calc_writhing_jit,
+-    )
++    from melodia_py.geometryparser import GeometryParser
+ 
+     model_id = task['model_id']
+     pdb_code = task['pdb_code']
+@@ -421,34 +438,14 @@ def _compute_model_geometry(task: dict, deg: bool) -> List[dict]:
+         coords       = chain['coords']
+         residue_meta = chain['residue_meta']
+         backbone     = chain['backbone']
++        breaks       = chain['breaks']
+ 
+         n_res = len(coords)
+-        t = list(range(n_res))
+-        x = [c[0] for c in coords]
+-        y = [c[1] for c in coords]
+-        z = [c[2] for c in coords]
+-
+-        xt = CubicSpline(t, x, bc_type='natural')
+-        yt = CubicSpline(t, y, bc_type='natural')
+-        zt = CubicSpline(t, z, bc_type='natural')
+-
+-        xa = np.ascontiguousarray(x, dtype=np.float64)
+-        ya = np.ascontiguousarray(y, dtype=np.float64)
+-        za = np.ascontiguousarray(z, dtype=np.float64)
+-
+-        ini, end = 0, n_res - 1
++        segment_starts = set(breaks)
++        geometry = GeometryParser.calc_chain_geometry(coords, breaks, rna)
+ 
+         for i, (resname, pos) in enumerate(residue_meta):
+-            p_curv = float(t[1]) if i == ini else (float(t[-2]) if i == end else float(i))
+-
+-            curvature, torsion = GeometryParser.calc_curvature_torsion(
+-                p=p_curv, t=t, xt=xt, yt=yt, zt=zt
+-            )
+-            arc_len  = GeometryParser.calc_arc_length(p=float(i), xt=xt, yt=yt, zt=zt)
+-            writhing = (
+-                float(_calc_writhing_jit(i, xa, ya, za, _NORM_EPS))
+-                if not rna else 0.0
+-            )
++            curvature, torsion, arc_len, writhing = (float(v) for v in geometry[i])
+ 
+             row: dict = {
+                 'id':         i,
+@@ -473,12 +470,13 @@ def _compute_model_geometry(task: dict, deg: bool) -> List[dict]:
+                     ca_coord = np.array(bb[1])
+                     c_coord  = np.array(bb[2])
+ 
+-                    if i > 0 and backbone[i - 1] is not None:
++                    if i > 0 and i not in segment_starts and backbone[i - 1] is not None:
+                         prev_c = np.array(backbone[i - 1][2])
+                         phi = GeometryParser.calc_dihedral_torsion(
+                             p1=prev_c, p2=n_coord, p3=ca_coord, p4=c_coord, deg=deg
+                         )
+-                    if i < n_res - 1 and backbone[i + 1] is not None:
++                    if (i < n_res - 1 and i + 1 not in segment_starts
++                            and backbone[i + 1] is not None):
+                         next_n = np.array(backbone[i + 1][0])
+                         psi = GeometryParser.calc_dihedral_torsion(
+                             p1=n_coord, p2=ca_coord, p3=c_coord, p4=next_n, deg=deg
+@@ -534,6 +532,8 @@ def proc_chains(
+     if not tasks:
+         return pd.DataFrame()
+ 
++    _warn_breaks(_task_breaks(tasks))
++
+     # Dispatch one task per model to the loky worker pool.
+     # Each worker processes all chains of its model sequentially.
+     nested: List[List[dict]] = Parallel(n_jobs=n_jobs)(
+@@ -553,10 +553,7 @@ def _compute_model_gp(task: dict, deg: bool) -> List[Tuple[str, dict]]:
+     Receives only plain dicts — no BioPython objects.
+     """
+     import numpy as np
+-    from scipy.interpolate import CubicSpline
+-    from melodia_py.geometryparser import (
+-        GeometryParser, ResidueGeometry, _NORM_EPS, _calc_writhing_jit,
+-    )
++    from melodia_py.geometryparser import GeometryParser, ResidueGeometry
+ 
+     model_id = task['model_id']
+     results  = []
+@@ -567,36 +564,16 @@ def _compute_model_gp(task: dict, deg: bool) -> List[Tuple[str, dict]]:
+         coords       = chain['coords']
+         residue_meta = chain['residue_meta']
+         backbone     = chain['backbone']
++        breaks       = chain['breaks']
+ 
+         n_res = len(coords)
+-        t = list(range(n_res))
+-        x = [c[0] for c in coords]
+-        y = [c[1] for c in coords]
+-        z = [c[2] for c in coords]
+-
+-        xt = CubicSpline(t, x, bc_type='natural')
+-        yt = CubicSpline(t, y, bc_type='natural')
+-        zt = CubicSpline(t, z, bc_type='natural')
+-
+-        xa = np.ascontiguousarray(x, dtype=np.float64)
+-        ya = np.ascontiguousarray(y, dtype=np.float64)
+-        za = np.ascontiguousarray(z, dtype=np.float64)
+-
+-        ini, end = 0, n_res - 1
++        segment_starts = set(breaks)
++        geometry = GeometryParser.calc_chain_geometry(coords, breaks, rna)
+         residues:     dict = {}
+         residues_map: dict = {}
+ 
+         for i, (resname, pos) in enumerate(residue_meta):
+-            p_curv = float(t[1]) if i == ini else (float(t[-2]) if i == end else float(i))
+-
+-            curvature, torsion = GeometryParser.calc_curvature_torsion(
+-                p=p_curv, t=t, xt=xt, yt=yt, zt=zt
+-            )
+-            arc_len  = GeometryParser.calc_arc_length(p=float(i), xt=xt, yt=yt, zt=zt)
+-            writhing = (
+-                float(_calc_writhing_jit(i, xa, ya, za, _NORM_EPS))
+-                if not rna else 0.0
+-            )
++            curvature, torsion, arc_len, writhing = (float(v) for v in geometry[i])
+ 
+             rg = ResidueGeometry(
+                 name=resname,
+@@ -615,12 +592,13 @@ def _compute_model_gp(task: dict, deg: bool) -> List[Tuple[str, dict]]:
+                     n_coord  = np.array(bb[0])
+                     ca_coord = np.array(bb[1])
+                     c_coord  = np.array(bb[2])
+-                    if i > 0 and backbone[i - 1] is not None:
++                    if i > 0 and i not in segment_starts and backbone[i - 1] is not None:
+                         prev_c = np.array(backbone[i - 1][2])
+                         rg.phi = GeometryParser.calc_dihedral_torsion(
+                             p1=prev_c, p2=n_coord, p3=ca_coord, p4=c_coord, deg=deg
+                         )
+-                    if i < n_res - 1 and backbone[i + 1] is not None:
++                    if (i < n_res - 1 and i + 1 not in segment_starts
++                            and backbone[i + 1] is not None):
+                         next_n = np.array(backbone[i + 1][0])
+                         rg.psi = GeometryParser.calc_dihedral_torsion(
+                             p1=n_coord, p2=ca_coord, p3=c_coord, p4=next_n, deg=deg
+@@ -666,6 +644,8 @@ def geometry_dict_from_structure(
+     if not tasks:
+         return {}
+ 
++    _warn_breaks(_task_breaks(tasks))
++
+     # Dispatch to workers — one task per model
+     nested: List[List[tuple]] = Parallel(n_jobs=n_jobs)(
+         delayed(_compute_model_gp)(task, deg)
+@@ -725,12 +705,14 @@ def _get_val(gp: GeometryParser, res_idx: int) -> float:
+             return res.custom
+         return 0.0
+ 
+-    # Determine global minimum for default fill
+-    min_value = min(
++    # Determine global minimum for default fill. Residues too close to a
++    # chain end or break for the value (NaN) keep the fill value.
++    values = [
+         _get_val(gp, res_idx)
+         for gp in geo.values()
+         for res_idx in gp.residues
+-    ) if attribute in ('curvature', 'torsion', 'custom') else 0.0
++    ] if attribute in ('curvature', 'torsion', 'custom') else []
++    min_value = min((v for v in values if _defined(v)), default=0.0)
+ 
+     for atom in structure.get_atoms():
+         if atom.is_disordered():
+@@ -746,14 +728,26 @@ def _get_val(gp: GeometryParser, res_idx: int) -> float:
+                 if het_flag[0] == ' ':
+                     key = f'{model.id}:{chain.id}'
+                     res_idx = geo[key].residues_map[sequence_id]
+-                    atom.set_bfactor(_get_val(geo[key], res_idx))
++                    value = _get_val(geo[key], res_idx)
++                    if _defined(value):
++                        atom.set_bfactor(value)
+ 
+ 
+ # ---------------------------------------------------------------------------
+ # NGL viewers
+ # ---------------------------------------------------------------------------
+ 
+-def _make_view(structure: Structure, representation: dict, width: int, height: int) -> Box:
++def _make_view(structure: Structure, representation: dict, width: int, height: int) -> 'Box':
++    try:
++        import nglview as nv
++        from ipywidgets import Box
++    except ImportError as exc:
++        raise ImportError(
++            "nglview and ipywidgets are required for the structure viewers. "
++            'Install them with:  pip install "melodia-py[viz]"  '
++            "(or conda install -c conda-forge nglview)"
++        ) from exc
++
+     view = nv.show_biopython(structure)
+     view.representations = [representation]
+     view.layout.width = '100%'
+@@ -764,7 +758,7 @@ def _make_view(structure: Structure, representation: dict, width: int, height: i
+     return box
+ 
+ 
+-def view_putty(structure: Structure, radius_scale: float = 1.0, width: int = 1200, height: int = 600) -> Box:
++def view_putty(structure: Structure, radius_scale: float = 1.0, width: int = 1200, height: int = 600) -> 'Box':
+     """Display PDB structure as a putty (tube-radius-by-bfactor) model."""
+     return _make_view(structure, {
+         'type': 'tube',
+@@ -778,7 +772,7 @@ def view_putty(structure: Structure, radius_scale: float = 1.0, width: int = 120
+     }, width, height)
+ 
+ 
+-def view_cartoon(structure: Structure, width: int = 1200, height: int = 600) -> Box:
++def view_cartoon(structure: Structure, width: int = 1200, height: int = 600) -> 'Box':
+     """Display PDB structure as a cartoon coloured by B-factor."""
+     return _make_view(structure, {
+         'type': 'cartoon',
+@@ -786,7 +780,7 @@ def view_cartoon(structure: Structure, width: int = 1200, height: int = 600) ->
+     }, width, height)
+ 
+ 
+-def view_tube(structure: Structure, width: int = 1200, height: int = 600) -> Box:
++def view_tube(structure: Structure, width: int = 1200, height: int = 600) -> 'Box':
+     """Display PDB structure as a tube coloured by B-factor."""
+     return _make_view(structure, {
+         'type': 'tube',
+@@ -1023,6 +1017,8 @@ def cluster_alignment(
+     """
+     Cluster alignment positions by structural similarity in (curvature, torsion)
+     space and annotate each structure record with a 'cluster' letter_annotation.
++    Residues with NaN curvature or torsion (next to a chain end or break) get
++    -1, like clusters removed by *long*, and never join a cluster.
+ 
+     :param align: Annotated MultipleSeqAlignment (mutated in place)
+     :param threshold: Agglomerative clustering distance threshold
+@@ -1054,12 +1050,17 @@ def cluster_alignment(
+         xy: List[List[float]] = []
+         tags: List[str] = []
+         for rec_id, record in structure_records.items():
+-            if record.seq[i] != '-':
+-                xy.append([
+-                    record.letter_annotations['curvature'][i],
+-                    record.letter_annotations['torsion'][i],
+-                ])
++            curv = record.letter_annotations['curvature'][i]
++            tors = record.letter_annotations['torsion'][i]
++            # Residues too close to a chain end or break for curvature/torsion
++            # (NaN) are left out of the clustering and marked unclustered.
++            if record.seq[i] == '-':
++                continue
++            if _defined(curv, tors):
++                xy.append([curv, tors])
+                 tags.append(rec_id)
++            else:
++                record.letter_annotations['cluster'][i] = _UNCLUSTERED
+ 
+         if len(xy) > 1:
+             clusters = clustering.fit_predict(scaler.transform(xy))
+@@ -1067,9 +1068,6 @@ def cluster_alignment(
+             for rec_id, record in structure_records.items():
+                 if rec_id in cluster_map:
+                     record.letter_annotations['cluster'][i] = cluster_map[rec_id]
+-        else:
+-            for record in structure_records.values():
+-                record.letter_annotations['cluster'][i] = 0
+ 
+     # Propagate consistent cluster labels across adjacent columns
+     last_cluster = max(
+@@ -1087,8 +1085,11 @@ def cluster_alignment(
+                 continue
+             ca = record.letter_annotations['cluster'][i]
+             cb = record.letter_annotations['cluster'][j]
+-            left.setdefault(ca, set()).add(k)
+-            right.setdefault(cb, set()).add(k)
++            # Unclustered residues keep their label and match nothing
++            if ca != _UNCLUSTERED:
++                left.setdefault(ca, set()).add(k)
++            if cb != _UNCLUSTERED:
++                right.setdefault(cb, set()).add(k)
+ 
+         for right_key, right_members in right.items():
+             found_key = next(
+@@ -1108,6 +1109,8 @@ def cluster_alignment(
+         last_cluster = 0
+         for j in idx:
+             cluster, ini, end, size = data[j]
++            if cluster == _UNCLUSTERED:
++                continue
+             new_label = -1 if size < 3 else last_cluster
+             for i in range(ini, end + 1):
+                 for record in align:
+diff --git a/pyproject.toml b/pyproject.toml
+index 1cc4be4..2685471 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -59,34 +59,43 @@ dependencies = [
+     "sty>=1.0",          # terminal colour output in show_align()
+     "importlib_resources>=6.4",
+     "dill>=0.4",
++    # Imported by the geometry code on every import of melodia_py:
++    "numba>=0.61",       # JIT writhing kernel; 0.61 is the first with Python 3.13
++    "joblib>=1.4",       # parallel processing across models (n_jobs)
+ ]
+ 
+ # ---------------------------------------------------------------------------
+ # Optional dependency groups
+ #
+ # Install with:
+-#   pip install melodia-py[fast]          # Numba JIT writhing
+-#   pip install melodia-py[parallel]      # joblib batch processing
++#   pip install melodia-py[viz]           # NGLView structure viewers (notebooks)
+ #   pip install melodia-py[mdanalysis]    # MDAnalysis trajectory support
+ #   pip install melodia-py[dev]           # testing + linting tools
+ #   pip install melodia-py[all]           # everything above
++#
++# fast and parallel are kept so existing install commands keep working;
++# numba and joblib are now core dependencies.
+ # ---------------------------------------------------------------------------
+ 
+ [project.optional-dependencies]
+ 
+ fast = [
+-    # Numba JIT compilation for calc_writhing_jit().
+-    # Note: install melodia-py as a wheel (pip install .), NOT as an egg,
+-    # so that Numba's cache locator can find the source file on disk.
+-    "numba>=0.59",
+-    "llvmlite>=0.42",    # pinned transitively by numba; listed explicitly
++    # Now a core dependency; kept for compatibility.
++    "numba>=0.61",
+ ]
+ 
+ parallel = [
+-    # joblib parallel batch processing via parse_structures().
++    # Now a core dependency; kept for compatibility.
+     "joblib>=1.4",
+ ]
+ 
++viz = [
++    # view_putty(), view_cartoon(), view_tube() in Jupyter notebooks.
++    # NGLView can be hard to install with pip; conda-forge works well.
++    "nglview>=3.1",
++    "ipywidgets>=8.1",
++]
++
+ mdanalysis = [
+     # Required by geometry_from_mdanalysis().
+     # Supports GROMACS (TPR+XTC), AMBER, CHARMM DCD, mmCIF, and all other
+@@ -104,8 +113,7 @@ dev = [
+ ]
+ 
+ all = [
+-    "melodia-py[fast]",
+-    "melodia-py[parallel]",
++    "melodia-py[viz]",
+     "melodia-py[mdanalysis]",
+     "melodia-py[dev]",
+ ]
+diff --git a/tests/test_chain_breaks.py b/tests/test_chain_breaks.py
+new file mode 100644
+index 0000000..f2419d9
+--- /dev/null
++++ b/tests/test_chain_breaks.py
+@@ -0,0 +1,127 @@
++"""Chains are split at breaks: no geometry is computed across a missing connection.
++
++A break is two consecutive CA atoms more than 4.2 A apart. Each side of a break
++must get exactly the geometry it would get as a chain of its own.
++"""
++
++import io
++import warnings
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++import pytest
++from Bio.PDB import PDBParser
++
++import melodia_py as mel
++from melodia_py.geometryparser import ChainBreakWarning, GeometryParser
++
++EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "2lj5.pdb"
++GEOMETRY = ["curvature", "torsion", "arc_length", "writhing"]
++
++
++def first_model_lines():
++    """ATOM records of the first model of 2LJ5 (76 residues, chain A, no breaks)."""
++    lines = []
++    with open(EXAMPLE) as f:
++        for line in f:
++            if line.startswith("ATOM"):
++                lines.append(line.rstrip("\n"))
++            elif line.startswith("ENDMDL"):
++                break
++    return lines
++
++
++def structure(lines, keep=lambda resseq: True):
++    pdb = "\n".join(line for line in lines if keep(int(line[22:26]))) + "\nEND\n"
++    return PDBParser(QUIET=True).get_structure("2lj5", io.StringIO(pdb))
++
++
++def geometry(s):
++    """Melodia geometry indexed by residue number, ChainBreakWarnings collected."""
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        df = mel.geometry_from_structure(s)
++    breaks = [w for w in caught if issubclass(w.category, ChainBreakWarning)]
++    return df.set_index("order"), breaks
++
++
++@pytest.fixture(scope="module")
++def lines():
++    return first_model_lines()
++
++
++def test_intact_chain_has_no_breaks(lines):
++    _, breaks = geometry(structure(lines))
++    assert breaks == []
++
++
++def test_each_side_of_a_break_is_computed_on_its_own(lines):
++    gapped, breaks = geometry(structure(lines, lambda r: not 36 <= r <= 40))
++    before, _ = geometry(structure(lines, lambda r: r <= 35))
++    after, _ = geometry(structure(lines, lambda r: r >= 41))
++
++    np.testing.assert_allclose(gapped.loc[1:35, GEOMETRY], before[GEOMETRY], rtol=0, atol=1e-12)
++    np.testing.assert_allclose(gapped.loc[41:76, GEOMETRY], after[GEOMETRY], rtol=0, atol=1e-12)
++
++    assert len(breaks) == 1
++    assert "chain A between residues 35 and 41" in str(breaks[0].message)
++
++
++def test_no_dihedrals_across_a_break(lines):
++    intact, _ = geometry(structure(lines))
++    gapped, _ = geometry(structure(lines, lambda r: not 36 <= r <= 40))
++
++    # the DataFrame stores None as NaN
++    assert pd.notna(intact.loc[35, "psi"]) and pd.notna(intact.loc[41, "phi"])
++    assert pd.isna(gapped.loc[35, "psi"])
++    assert pd.isna(gapped.loc[41, "phi"])
++    assert gapped.loc[35, "phi"] == pytest.approx(intact.loc[35, "phi"])
++    assert gapped.loc[41, "psi"] == pytest.approx(intact.loc[41, "psi"])
++
++
++def test_numbering_jump_without_missing_residues_is_not_a_break(lines):
++    # Renumber residues 41-76 to 141-176: same atoms, still bonded.
++    renumbered = [
++        line[:22] + f"{int(line[22:26]) + 100:4d}" + line[26:] if int(line[22:26]) > 40 else line
++        for line in lines
++    ]
++    intact, _ = geometry(structure(lines))
++    jumped, breaks = geometry(structure(renumbered))
++    assert breaks == []
++    np.testing.assert_allclose(jumped[GEOMETRY].to_numpy(), intact[GEOMETRY].to_numpy(), rtol=0, atol=0)
++
++
++def test_short_segments_get_nan(lines):
++    # Residues 30-31 (2 residues) and 34-37 (4 residues) between gaps: each value
++    # needs its window inside the segment (curvature/torsion/arc length i-1..i+1,
++    # writhing i-2..i+2).
++    gapped, _ = geometry(structure(lines, lambda r: r <= 27 or 30 <= r <= 31 or 34 <= r <= 37 or r >= 40))
++
++    assert gapped.loc[30:31, GEOMETRY].isna().all().all()
++
++    four = gapped.loc[34:37]
++    defined = four[["curvature", "torsion", "arc_length"]].notna().all(axis=1)
++    assert defined.tolist() == [False, True, True, False]
++    assert four["writhing"].isna().all()
++
++    # the segment ends at the breaks are segment ends like any other
++    assert gapped.loc[[27, 40], ["curvature", "torsion", "arc_length"]].isna().all().all()
++
++
++def test_all_entry_points_agree(lines):
++    s = structure(lines, lambda r: not 36 <= r <= 40)
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore", ChainBreakWarning)
++        df = mel.geometry_from_structure(s).set_index("order")
++        from_dict = mel.geometry_dict_from_structure(s)["0:A"]
++        from_class = GeometryParser(s[0]["A"])
++
++    for gp in (from_dict, from_class):
++        values = np.array([
++            [r.curvature, r.torsion, r.arc_len, r.writhing]
++            for _, r in sorted(gp.residues.items())
++        ])
++        np.testing.assert_allclose(values, df[GEOMETRY].to_numpy(), rtol=0, atol=0)
++        phi = [r.phi for _, r in sorted(gp.residues.items())]
++        assert phi[35] is None  # residue 41, first after the break
+diff --git a/tests/test_chain_ends.py b/tests/test_chain_ends.py
+new file mode 100644
+index 0000000..05462c0
+--- /dev/null
++++ b/tests/test_chain_ends.py
+@@ -0,0 +1,34 @@
++"""At the ends of a chain, values whose window does not fit are NaN, not copies.
++
++Curvature, torsion and arc length use residues i-1 to i+1, so the first and
++last residue have none; writhing uses i-2 to i+2, so the first two and last two
++have none. Every other residue is computed from its own window.
++"""
++
++import io
++
++import numpy as np
++from Bio.PDB import PDBParser
++
++import melodia_py as mel
++
++
++def helix_geometry(n):
++    """Melodia geometry of an ideal alpha helix CA trace (2.3 A, 100 deg, 1.5 A)."""
++    i = np.arange(n)
++    angle = np.radians(100.0 * i)
++    xyz = np.column_stack((2.3 * np.cos(angle), 2.3 * np.sin(angle), 1.5 * i))
++    pdb = "\n".join(
++        f"ATOM  {k + 1:5d}  CA  ALA A{k + 1:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C"
++        for k, (x, y, z) in enumerate(xyz)
++    )
++    structure = PDBParser(QUIET=True).get_structure("helix", io.StringIO(pdb + "\nEND\n"))
++    return mel.geometry_from_structure(structure).sort_values("order").reset_index(drop=True)
++
++
++def test_values_at_chain_ends_are_nan():
++    g = helix_geometry(20)
++    for column in ("curvature", "torsion", "arc_length"):
++        assert g[column].isna().tolist() == [True] + [False] * 18 + [True]
++    assert g["writhing"].isna().tolist() == [True] * 2 + [False] * 16 + [True] * 2
++
+diff --git a/tests/test_curvature_torsion.py b/tests/test_curvature_torsion.py
+new file mode 100644
+index 0000000..3637379
+--- /dev/null
++++ b/tests/test_curvature_torsion.py
+@@ -0,0 +1,66 @@
++"""Curvature and torsion depend only on the local geometry of the chain.
++
++An ideal alpha helix has the same geometry at every residue, so its interior
++residues must all get the same curvature and torsion, and neither the value of
++the curve parameter nor residues added before the first one may change them.
++"""
++
++import io
++
++import numpy as np
++import pytest
++from Bio.PDB import PDBParser
++from scipy.interpolate import CubicSpline
++
++import melodia_py as mel
++from melodia_py.geometryparser import GeometryParser
++
++
++def helix_ca(first, n):
++    """CA trace of an ideal alpha helix (radius 2.3 A, 100 deg and 1.5 A per residue)."""
++    i = np.arange(first, first + n)
++    angle = np.radians(100.0 * i)
++    return np.column_stack((2.3 * np.cos(angle), 2.3 * np.sin(angle), 1.5 * i))
++
++
++def helix_geometry(first, n):
++    """Melodia curvature and torsion of the helix residues first .. first + n - 1."""
++    lines = [
++        f"ATOM  {k + 1:5d}  CA  ALA A{k + 1:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C"
++        for k, (x, y, z) in enumerate(helix_ca(first, n))
++    ]
++    pdb = "\n".join(lines + ["END"])
++    structure = PDBParser(QUIET=True).get_structure("helix", io.StringIO(pdb))
++    df = mel.geometry_from_structure(structure)
++    return df.sort_values("order")[["curvature", "torsion"]].to_numpy()
++
++
++def test_constant_along_ideal_helix():
++    geometry = helix_geometry(0, 120)
++    interior = geometry[10:110]
++    assert np.ptp(interior[:, 0]) < 1e-3
++    assert np.ptp(interior[:, 1]) < 1e-3
++
++
++def test_unchanged_by_residues_added_at_start():
++    # The 120 residues of the first helix are the last 120 of the second; away from the
++    # first helix's start (natural-spline end effect) the values must agree.
++    geometry = helix_geometry(0, 120)
++    extended = helix_geometry(-30, 150)[30:]
++    np.testing.assert_allclose(extended[10:115], geometry[10:115], rtol=0, atol=1e-6)
++
++
++@pytest.mark.parametrize("shift", [10.0, 100.0, 1000.0])
++def test_unchanged_by_shifting_curve_parameter(shift):
++    ca = helix_ca(0, 40)
++    t = np.arange(40, dtype=float)
++
++    def curvature_torsion(t):
++        splines = [CubicSpline(t, ca[:, k], bc_type="natural") for k in range(3)]
++        return np.array(
++            [GeometryParser.calc_curvature_torsion(p, list(t), *splines) for p in t[1:-1]]
++        )
++
++    np.testing.assert_allclose(
++        curvature_torsion(t + shift), curvature_torsion(t), rtol=0, atol=1e-8
++    )
+diff --git a/tests/test_nan_values.py b/tests/test_nan_values.py
+new file mode 100644
+index 0000000..727224f
+--- /dev/null
++++ b/tests/test_nan_values.py
+@@ -0,0 +1,91 @@
++"""Functions that use curvature and torsion accept residues where they are NaN.
++
++Residues next to a chain end or break get NaN; the B-factor mapping and the
++alignment clustering must treat them as residues with no value, not fail,
++propagate NaN, or count them as conserved.
++"""
++
++import io
++import math
++import warnings
++from pathlib import Path
++
++import pytest
++from Bio.PDB import PDBParser
++
++import melodia_py as mel
++from melodia_py.geometryparser import ChainBreakWarning
++
++EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
++
++
++@pytest.fixture(scope="module")
++def short_segment_structure():
++    """2LJ5 model 1 without residues 3-5: residues 1-2 form a 2-residue segment."""
++    lines = []
++    with open(EXAMPLES / "2lj5.pdb") as f:
++        for line in f:
++            if line.startswith("ENDMDL"):
++                break
++            if line.startswith("ATOM") and not 3 <= int(line[22:26]) <= 5:
++                lines.append(line)
++    pdb = "".join(lines) + "END\n"
++    return PDBParser(QUIET=True).get_structure("2lj5", io.StringIO(pdb))
++
++
++def test_bfactor_from_geo_keeps_fill_value_for_nan(short_segment_structure):
++    s = short_segment_structure
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore", ChainBreakWarning)
++        geo = mel.geometry_dict_from_structure(s)
++        mel.bfactor_from_geo(s, "curvature", geo=geo)
++
++    curvature = [r.curvature for r in geo["0:A"].residues.values()]
++    assert math.isnan(curvature[0]) and math.isnan(curvature[1])
++    fill = min(c for c in curvature if not math.isnan(c))
++
++    bfactors = {
++        residue.id[1]: {atom.get_bfactor() for atom in residue}
++        for residue in s[0]["A"]
++    }
++    assert not any(math.isnan(b) for values in bfactors.values() for b in values)
++    assert bfactors[1] == {fill} and bfactors[2] == {fill}
++    assert bfactors[10] == {geo["0:A"].residues[6].curvature}  # residue 10 is the 7th left
++
++
++def test_cluster_alignment_skips_nan_residues(monkeypatch):
++    monkeypatch.chdir(EXAMPLES)
++    align = mel.parser_pir_file("model.ali")
++    record = next(r for r in align if r.description.startswith("structure"))
++    column = next(i for i, letter in enumerate(record.seq) if letter != "-")
++
++    # The same residue with no curvature/torsion, as for a too-short segment
++    for key in ("curvature", "torsion"):
++        values = list(record.letter_annotations[key])
++        values[column] = float("nan")
++        record.letter_annotations[key] = values
++    mel.cluster_alignment(align, threshold=1.1)
++
++    for clustered in align:
++        if clustered.description.startswith("structure"):
++            assert len(clustered.letter_annotations["cluster"]) == len(clustered.seq)
++
++
++@pytest.mark.parametrize("long", [False, True])
++def test_cluster_alignment_leaves_nan_residues_unclustered(monkeypatch, long):
++    monkeypatch.chdir(EXAMPLES)
++    align = mel.parser_pir_file("model.ali")
++    mel.cluster_alignment(align, threshold=1.1, long=long)
++
++    structures = [r for r in align if r.description.startswith("structure")]
++    for record in structures:
++        cluster = record.letter_annotations["cluster"]
++        curvature = record.letter_annotations["curvature"]
++        for i, letter in enumerate(record.seq):
++            if letter != "-" and math.isnan(curvature[i]):
++                assert cluster[i] == -1
++
++    # Column 0 has no value (NaN or gap) in any structure; it must not make
++    # the first residues look like a conserved block.
++    if long:
++        assert all(record.letter_annotations["cluster"][2] == -1 for record in structures)

@@ -1,0 +1,64 @@
+# Issue
+
+**Title:** Swarm stage 3: reactions
+
+## Description
+
+## Summary
+
+Stage 3 of the agent swarms (`docs/proposals/agent-swarms.md`, "Starting stage 3"): **the swarm reacts to what it finds, by rules you declare, with no model in the loop.**
+
+Until now a swarm ran the items you gave it and posted their findings on the board; deciding what to do next was a new turn. Now a swarm can carry *subscriptions* — "when a verified claim on this sample is posted, build the structure it names"; "when a verified recipe appears, replay it on the new spectrum" — and the coordinator applies them as items finish: it fills the follow-up from the finding (its text, its file path, its subject), starts it as an ordinary item under the same memory and time rules, and stamps on it *which finding caused it* and the whole causal chain. Everything is bounded by numbers you can read in the result: a finding fires a rule once, a rule fires at most `max_fires` times, a sample is re-triggered at most twice, and a loop — the same kind of step on the same sample twice in one chain — is refused with the reason recorded. Workers can *ask* for follow-ups (their suggestions are posted as `task_request` records) but never *start* them: a request becomes work only through a rule you declared. And a finding shown to be wrong can be withdrawn (`retract_finding`): everything that rested on it is marked tainted, leaves the default reads, and the delegations to redo are listed ready to run — nothing is re-run on its own.
+
+Live on Bedrock (Opus 4.8): a Raman temperature series posted its verified claims and recipe; the first claim fired a simulation that built and validated an anatase cell; the recipe fired a replay of the board's own copy on a new 600 K spectrum (R² 0.979, verdict good); the validated structure fired a quick single-spectrum check, whose claim would have fired the simulation again and was refused as a cycle; the replay's own recipe would have fired another replay and was refused as a cycle too (unplanned, and right); retracting the series' first claim tainted exactly the replay's four findings (it had read the claim) and nothing of the series.
+
+Builds on #707 (a reuse replays the series' locked recipe; a script file is a recipe — merged, c2c95f71), which the replay check exercises.
+
+## Technical description
+
+### `meta_agent/reactions.py` — pure functions
+- `normalize_subscriptions(raw)` → `{index, on: {kind, status (verified|provisional|any, default verified), subject?}, enqueue: {mode, label, task, …}, max_fires (default 1)}`; refused ones with reasons.
+- `matches(sub, record)`: equality on kind, status, normalised subject (NFKC / casefold / whitespace, as the board compares).
+- `fill(template, record, from_entry)`: one regex pass over a fixed vocabulary — `{finding.text}`, `{finding.path}`, `{finding.name}`, `{finding.value}`, `{finding.unit}`, `{finding.id}`, `{finding.kind}`, `{subject}`, `{analysis_id}`, `{from.label}`, `{from.index}`, `{from.mode}`; anything else stays literal; a substituted value is never re-expanded.
+- `hop(from_entry, record)` = `(mode of the poster, subject, kind, finding_id, index)`; `supersede_depth(board, record)`.
+- `decide(sub, record, from_entry, …)` → the item to launch with `caused_by`, `chain` (the trigger's chain + the new hop) and `subscription` on it, or the reason it is refused. Structural refusals first — a cycle (the same `(mode, subject, kind)` hop already in the chain), a record at supersede depth ≥ 2 on its subject — then the counters: `max_fires`, the per-subject cap, the swarm's `max_reactions` / `max_items`.
+
+### `swarm.py` — the coordinator reacts
+- `run_swarm(work_items, item_time_budget_s, subscriptions=None, budget=None)`; `budget = {max_items ≤ 8, max_reactions, max_triggers_per_subject (2)}` (`swarm_budget`).
+- After an item closes and its records are posted, `react()` applies every subscription to `entry["posted"]`; what fires goes through `launch()` like any other item (its own ledger entry, slug and worker directory, the capacity ceiling, memory admission, the item budget, the question queue). The fired entry carries `caused_by`, `chain`, `subscription`; a refusal is appended to the triggering entry's `refused_reactions` and to the result's with the chain. `_COORDINATOR_FIELDS` are stripped from a caller's initial items (a chain nobody enqueued would defeat the cycle check); `normalize_items(coordinator=True)` keeps them for fired items.
+- `_read_board` asks for `with_hazards=True`: a standing hazard on the subject reaches every reader whatever its `kinds` filter, and is stamped in `reads` like anything shown.
+- The result adds `fired` (index, label, mode, subject, subscription, caused_by, from_index, chain), `refused_reactions`, `task_requests` (each with the item it became or `null`), `subscriptions: {accepted, refused}`; a result row of a reaction carries `caused_by` / `chain` / `subscription`.
+
+### `board.py`
+- `records_for` posts a worker's `suggested_followups` as `task_request` records (provisional, not in `READ_KINDS`, at most 4 × 400 chars) for every mode.
+- `Board.fold` derives `tainted`: a record whose transitive `reads` reach a retracted or superseded record (with `tainted_by`); a correction's own `supersedes` link is not followed — it rests on what it corrects by design. Because it is derived from the log, a record posted *after* the retraction by a worker that had read the finding before is tainted too. `Board.dependents(fid)` is the inverse closure. Tainted records are out of every default read (status ≠ verified / provisional).
+- `Board.snapshot(…, with_hazards=False)`.
+- `retract_and_report(orch, finding_id, reason)`: the retraction posted as the coordinator (takes effect whoever the author was), the newly tainted records, their source delegations (from the records' own authors, stamped at post time) and `rerun_items` ready for `run_swarm` / `delegate_to_*`. It re-runs nothing: a retraction is a decision made between runs, and so is the re-run.
+
+### Tools and prompt
+- `run_swarm` takes `subscriptions` and `budget` (schema + description); new `retract_finding(finding_id, reason)`; `get_board` adds `withdrawn` (retracted / superseded / tainted on the subject) and the standing `task_requests`; one prompt paragraph names the three.
+
+### Deviations from "Starting stage 3", each on purpose (recorded in the proposal)
+- No worker supersedes its own earlier claim: no `run_task` result says "this replaces that", and inferring it from kind and subject would be the kind of reconstruction the stage-2 reviews taught against. The fold supports it for a caller that knows.
+- No automatic re-run of tainted sources inside a swarm: nothing inside a swarm retracts, so the re-run is the next swarm, with the items prepared.
+- The result's list is `refused_reactions` (reason, chain, finding) rather than `refused_cycles`; no would-be entry is opened for a refusal, it sits on the triggering entry.
+
+### Tests
+`tests/test_swarm_reactions.py` (11) drives the real coordinator, ledger and board with scripted workers whose results have the modes' real shapes: normalisation / matching / filling without a model; a verified claim fires once with cause and chain stamped and the second claim refused (`max_fires`), `max_fires: 2` fires twice; a two-item cycle refused and recorded with its chain; the subject cap, the item limit counting fired items, and a tighter budget; a task request as an item only through a subscription; a retraction taints exactly its dependents (transitively, a late post, a correction untouched, errors); the tool and `get_board`; a supersede chain of three stops the coordinator; a hazard reaches a reader that filtered it out (and a check is still refused everything); chains and causes survive a checkpoint; a swarm without subscriptions leaves the stage-2 ledger and board as they were. The stage-2 suites (`test_board.py` 31, `test_run_swarm.py` 19) run unchanged.
+
+### Verification
+- Full suite on the head against the `main` baseline: 24 failed / 29 errors, the same ids as `main`; no branch-only failure (3897 passed).
+- Live on Bedrock Opus 4.8 from a frozen snapshot (one swarm, two initial items, three subscriptions, `max_triggers_per_subject: 4`, 513 s): 18 of 19 checks passed by the script and the 19th was a mis-indexed check — it read the first cycle refusal, which was the unplanned replay→recipe one; the checkpoint shows the planned refusal exactly: the quick check's claim, `cycle: (analysis, 'TiO2 A7', claim) is already in this item's chain`, on its entry (`from_index 5`, `subscription 1`). What passed: the series posted two verified claims, a verified recipe and two task requests; S1 fired the simulation on the first claim, once, with a one-hop chain and the task filled from the claim's text; the simulation posted a verified structure (`structure validator: success`); S3 fired the quick check on it with a two-hop chain; S2 fired the replay with the board's copy under `swarm/recipes/…` named as the recipe file, the replay read the board (four ids stamped), ran the copy through the replay gate (`source: "…: raman_T300K.py (the script file named)"`, R² 0.979, `good`), its verdict reads "locked-script reuse passed the replay gate", and its findings carry its reads; the workers' suggestions are task requests, listed, none an item, none in a default read; every reaction is a ledger entry of the swarm with its subscription; `retract_finding` on the series' first claim tainted exactly the replay's four findings and nothing of the series, `rerun_items` names the replay delegation with its task, and `get_board` shows the withdrawn records with no tainted finding among the verified ones.
+
+### After the review (round 1)
+A reaction's cause is one of its reads, stamped at launch, so retracting the cause taints the reaction and what it caused in turn (live: the simulation and the check fired from the series' claim are tainted with the replay), and `independent_support` sees the coupling; a reaction caused by a withdrawn finding is `not_rerun`, and `rerun_items` carry the original `data_path`, `context`, `reads_board` and `check`; a delegation that read the withdrawn finding and posted nothing is offered again too. A person decides a retraction (the gate shows the finding, the reason and the dependents; Enter keeps it); with nobody at the gate a human-approved plan's claim is refused; retracting a retraction undoes it. The launch gate lists every subscription and the most items in all. A hazard is pinned through the newest-24 cut and rendered first, and a provisional hazard delivered unasked marks the read. `fill()` substitutes a worker's prose as quoted, labelled data. Typed `suggested_followups`, a correction not tainted by what it corrects, the per-subject cap clamped, the fold memoised and linear, refusals collapsed, `get_board`'s withdrawn with reason and who. Live: the chain re-run 21 of 22 (the failing clause, a `{}` dropped by a truthiness test, fixed and pinned) and an autopilot pass at both gates 9 of 9. Full suite: no branch-only failure.
+
+### After the review (round 2)
+Which retractions stand is decided newest first, so an undo of an undo works. A retraction records who decided it; with nobody at the gate the model may not undo a person's retraction nor withdraw a finding a human-approved record rests on (in addition to the approved finding itself). The undo gate shows the finding that would come back and what rests on it. Identifiers are one line in a filled task; a re-run of a reaction rests on its cause (`rests_on`, recorded as reads at launch); `max_reactions` is clamped to `max_items`. Full suite: no branch-only failure.
+
+### After the review (round 3)
+Every retraction is judged by its previewed effect (`Board.preview`, `_act_effects`): what it withdraws, taints and brings back, and which retractions flip. The gate shows exactly that, the autonomous refusals test it (so an undo of an undo — which withdraws again — is refused when a human-approved record rests on the finding, and a person's retraction is never flipped by the model), and the report lists it (`withdrawn`, `restored`, `tainted`, `effect`); an act that would change nothing is refused. `rests_on` is typed, bounded and ignored on a check; identifiers are bounded and `finding.value` quoted. Full suite: no branch-only failure.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `c2c95f718189`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

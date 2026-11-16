@@ -1,0 +1,989 @@
+diff --git a/scilink/agents/sim_agents/cluster_executor.py b/scilink/agents/sim_agents/cluster_executor.py
+index f9b3b073d..68a4bb1a5 100644
+--- a/scilink/agents/sim_agents/cluster_executor.py
++++ b/scilink/agents/sim_agents/cluster_executor.py
+@@ -217,6 +217,11 @@ def submit(
+ 
+         run_path = Path(run_dir)
+         run_path.mkdir(parents=True, exist_ok=True)
++        # Phases can share a run directory: clear the previous run's output
++        # files first, so a submit that fails at any later step, or a job that
++        # never starts, cannot report them as its own.
++        for name in (_STDOUT, _STDERR, _RC):
++            (run_path / name).unlink(missing_ok=True)
+ 
+         # Materialize inputs locally too — gives the local snapshot the inputs
+         # and serves as the upload source.
+@@ -227,6 +232,11 @@ def submit(
+         sched = self._resolve_scheduler()
+         remote_dir = self._remote_dir_for(run_dir)
+         self.conn.mkdir_p(remote_dir)
++        for name in (_STDOUT, _STDERR, _RC):   # and their remote copies
++            try:
++                self.conn.remove(f"{remote_dir}/{name}")
++            except Exception as exc:  # noqa: BLE001 — best-effort cleanup
++                logger.warning("ClusterExecutor: could not clear %s: %s", name, exc)
+ 
+         for name in (input_files or {}):
+             self.conn.upload(str(run_path / name), f"{remote_dir}/{name}")
+diff --git a/scilink/agents/sim_agents/molecular_qc_agent.py b/scilink/agents/sim_agents/molecular_qc_agent.py
+index e479aee09..2a1488a97 100644
+--- a/scilink/agents/sim_agents/molecular_qc_agent.py
++++ b/scilink/agents/sim_agents/molecular_qc_agent.py
+@@ -34,6 +34,71 @@
+ from ._deprecation import normalize_params
+ 
+ 
++def resolve_run_order(result: dict) -> Optional[str]:
++    """Record which input file(s) the engine runs, and in what order.
++
++    Reads the reply's ``run_order`` (or its ``entry_file``; a single input
++    file needs neither). One deck sets ``entry_file``. Several decks become
++    ``phases``, one per deck in ``run_order``, each with its own deck plus
++    every file ``run_order`` does not list (support files, written alongside),
++    so the refinement loop runs, checks and fixes each deck in turn.
++
++    Updates ``result`` in place, adding a ``warnings`` entry when files are
++    left unrun or ``run_order`` overrides ``entry_file``. Returns None, or the
++    reason the reply does not say what to run, so the caller can ask for the
++    order or fail generation instead of launching with no input file.
++    """
++    from .refinement import single_entry
++
++    files = result["input_files"]
++    order = result.get("run_order")
++    declared = result.get("entry_file")
++    if order is None:
++        entry = single_entry(files, declared)
++        if not entry:
++            return (f"the reply has {len(files)} input files "
++                    f"({', '.join(sorted(files))}) but no run_order saying "
++                    f"which of them the engine runs, and in what order")
++        order = [entry]
++    if isinstance(order, str):
++        order = [order]
++    if (not isinstance(order, list) or not order
++            or not all(isinstance(n, str) and n for n in order)):
++        return f"run_order must be a non-empty list of file names, got {order!r}"
++    missing = [n for n in order if n not in files]
++    if missing:
++        return (f"run_order names {', '.join(missing)}, which "
++                f"{'is' if len(missing) == 1 else 'are'} not in input_files "
++                f"({', '.join(sorted(files))})")
++    if len(set(order)) != len(order):
++        return f"run_order lists a file more than once: {order}"
++
++    warnings = []
++    unrun = sorted(n for n in files if n not in order)
++    if unrun:
++        warnings.append(f"not in run_order, so written alongside each run but "
++                        f"never run: {', '.join(unrun)}")
++    if declared and declared not in order[:1]:
++        warnings.append(f"entry_file {declared} was replaced by run_order "
++                        f"({', '.join(order)})")
++    if warnings:
++        # a new list: callers may pass a shallow copy of the reply
++        result["warnings"] = list(result.get("warnings") or []) + warnings
++
++    result["run_order"] = order
++    if len(order) == 1:
++        result["entry_file"] = order[0]
++        result.pop("phases", None)
++        return None
++    support = {n: c for n, c in files.items() if n not in order}
++    result.pop("entry_file", None)
++    result["phases"] = [
++        {"name": n, "entry_file": n, "input_files": {n: files[n], **support}}
++        for n in order
++    ]
++    return None
++
++
+ class MolecularQCAgent:
+     """Molecular (finite-system) quantum-chemistry agent.
+ 
+@@ -194,17 +259,57 @@ def _build_prompt(self, structure_content: str, request: str,
+             f'    "<filename>": "<full file content>"\n'
+             f"    ...\n"
+             f"  }},\n"
++            f'  "run_order": ["<filename>", ...],\n'
+             f'  "notes": "<any caveats, assumptions, or recommendations>"\n'
+             f"}}\n"
+             f"```\n\n"
+             f"Pick the canonical filenames the {software.upper()} engine "
+-            f"expects (e.g. a single ``job.nw`` deck for NWChem, ``run.py`` "
+-            f"for PySCF, ``orca.inp`` for ORCA). Filenames are case-sensitive."
++            f"expects (e.g. ``job.nw`` decks for NWChem, ``run.py`` "
++            f"for PySCF, ``orca.inp`` for ORCA). Filenames are case-sensitive.\n\n"
++            f"``run_order`` lists the deck(s) the engine runs, in order; each "
++            f"finishes in the same directory before the next starts, and "
++            f"unlisted files (e.g. a basis-set file) are written alongside."
+         )
+         if skill_parts:
+             return "\n\n".join(skill_parts) + "\n\n---\n\n" + base
+         return base
+ 
++    def _ask_run_order(self, prompt: str, result: dict, problem: str) -> dict:
++        """Ask the model once for ``run_order`` over the files it returned.
++
++        Sets ``result["run_order"]`` when the answer is usable. Returns a
++        record of the request: what was asked, and ``outcome`` "fixed" or
++        "failed" with the ``reason``.
++        """
++        names = sorted(result["input_files"])
++        decks = "\n\n".join(f"### {n}\n```\n{result['input_files'][n]}\n```"
++                             for n in names)
++        record = {"asked": problem}
++        self.logger.warning("reply does not say what to run (%s); asking for "
++                            "run_order", problem)
++        try:
++            response = self.model.generate_content(
++                f"{prompt}\n\n---\n\nYour reply returned these input files:"
++                f"\n\n{decks}\n\nbut {problem}. Reply with ONLY a JSON "
++                f'object {{"run_order": [...]}} listing which of these files '
++                f"the engine runs, in order. Do not change or resend the files.",
++                generation_config=self.generation_config,
++            )
++            answer = self._parse_response(response.text)
++        except Exception as e:
++            return {**record, "outcome": "failed",
++                    "reason": f"the request failed ({e})"}
++        order = answer.get("run_order") if isinstance(answer, dict) else None
++        if order is None:
++            return {**record, "outcome": "failed",
++                    "reason": "the answer had no run_order"}
++        trial = {**result, "run_order": order}
++        second = resolve_run_order(trial)
++        if second:
++            return {**record, "outcome": "failed", "reason": second}
++        result["run_order"] = order
++        return {**record, "outcome": "fixed", "run_order": order}
++
+     def _parse_response(self, response_text: str) -> dict:
+         """Robustly parse LLM response, handling common formatting issues."""
+         text = response_text.strip()
+@@ -264,8 +369,10 @@ def generate_inputs(self, structure_file: str,
+             status      : "success" or "error"
+             software    : echo of the software argument
+             input_files : {filename: content} for every input file
+-            entry_file  : the deck/script the refinement loop runs (set
+-                          when a single input file is produced)
++            entry_file  : the deck/script the refinement loop runs (one deck)
++            phases      : one {name, entry_file, input_files} per deck, in
++                          run order (several decks; see resolve_run_order)
++            run_order   : the deck filename(s), in the order they run
+             notes       : optional caveats / recommendations from the LLM
+             message     : present on error only
+         """
+@@ -309,6 +416,13 @@ def generate_inputs(self, structure_file: str,
+                 "raw_result": result,
+             }
+ 
++        # A reply that does not say which deck runs is asked once for the
++        # order of the files it returned; the decks themselves are kept.
++        problem = resolve_run_order(dict(result))
++        if problem:
++            result["run_order_repair"] = self._ask_run_order(
++                prompt, result, problem)
++
+         # ── pre-submit syntax pass (engine-neutral, advisory) ─────────
+         # Ask the active engine's skill bundle for its syntax checker/fixer
+         # via the registry. The agent never names an engine or imports a
+@@ -343,11 +457,21 @@ def generate_inputs(self, structure_file: str,
+         except Exception as exc:
+             self.logger.warning("input syntax check failed: %s", exc)
+ 
+-        # Record the entry deck/script so the refinement loop knows what to
+-        # run. Single-file engines (NWChem deck, PySCF script) are the common
+-        # case; multi-file callers can override downstream.
+-        if "entry_file" not in result and len(result["input_files"]) == 1:
+-            result["entry_file"] = next(iter(result["input_files"]))
++        # Record what the refinement loop runs: one entry deck, or ordered
++        # phases when the calculation is split into decks. Without this a
++        # multi-deck reply ran the engine with no input file at all.
++        problem = resolve_run_order(result)
++        if problem:
++            repair = result.get("run_order_repair") or {}
++            if repair.get("reason"):
++                problem = (f"{problem}; asked once for run_order, but "
++                           f"{repair['reason']}")
++            return {
++                "status": "error",
++                "message": problem,
++                "raw_result": result,
++                "run_order_repair": repair or None,
++            }
+ 
+         # ── deterministic geometry-consistency check (fail loud) ──────
+         # The deck's inline geometry is LLM-transcribed from the structure; a
+diff --git a/scilink/agents/sim_agents/refinement.py b/scilink/agents/sim_agents/refinement.py
+index 4f25add62..1ea4f77cc 100644
+--- a/scilink/agents/sim_agents/refinement.py
++++ b/scilink/agents/sim_agents/refinement.py
+@@ -226,6 +226,10 @@ def run(
+     ) -> Dict[str, Any]:
+         run_path = Path(run_dir)
+         run_path.mkdir(parents=True, exist_ok=True)
++        # A run that times out or fails to launch writes no stdout: clear the
++        # previous run's files so it is never reported as this run's output.
++        for name in (self.STDOUT_FILE, self.STDERR_FILE, self.RETURNCODE_FILE):
++            (run_path / name).unlink(missing_ok=True)
+ 
+         for name, contents in (input_files or {}).items():
+             (run_path / name).write_text(contents, encoding="utf-8")
+@@ -1138,6 +1142,55 @@ def _member_context(ctx: RefinementContext) -> RefinementContext:
+     return replace(ctx, cycle=0, history=[])
+ 
+ 
++def single_entry(input_files: Any, entry_file: Optional[str] = None) -> str:
++    """The file a run executes: the declared ``entry_file``, else the only
++    input file, else ``""`` (an empty ``entry_file`` counts as undeclared)."""
++    if entry_file:
++        return entry_file
++    if isinstance(input_files, dict) and len(input_files) == 1:
++        return next(iter(input_files))
++    return ""
++
++
++# Per-phase stdout copies live in a subfolder of the run directory, where the
++# engine readers (which list the run directory's own files) never see them.
++PHASE_LOG_DIR = "phase_logs"
++
++
++def _shared_run_dirs(stages: List["Stage"]) -> set:
++    """Run directories that more than one sequential phase of the campaign
++    uses: a legacy multi-phase stage, or staged steps that are each their own
++    one-phase stage in the same directory."""
++    counts: Dict[str, int] = {}
++    for stage in stages:
++        if stage.parallel or stage.kind == "combine":
++            continue
++        for ph in stage.phases:
++            counts[ph.run_dir] = counts.get(ph.run_dir, 0) + 1
++    return {d for d, n in counts.items() if n > 1}
++
++
++def _keep_phase_log(phase: Phase, index: int) -> None:
++    """Copy a phase's stdout log to ``phase_logs/<NN>_<phase>.run_stdout.log``.
++
++    Phases that share a run directory each rewrite ``run_stdout.log``, so
++    without a copy only the last phase's output is left (for an engine like
++    NWChem, stdout is the whole output). The executor clears
++    ``run_stdout.log`` before each run, so a phase that produced no output
++    leaves nothing to copy.
++    """
++    src = Path(phase.run_dir) / LocalExecutor.STDOUT_FILE
++    if not src.is_file():
++        return
++    dst = (Path(phase.run_dir) / PHASE_LOG_DIR
++           / f"{index:02d}_{Path(phase.name).name}.{LocalExecutor.STDOUT_FILE}")
++    try:
++        dst.parent.mkdir(exist_ok=True)
++        shutil.copyfile(src, dst)
++    except OSError as e:
++        logger.warning("could not keep the log of phase %s: %s", phase.name, e)
++
++
+ def run_campaign(
+     stages: List[Stage],
+     executor: Executor,
+@@ -1177,6 +1230,14 @@ def run_campaign(
+         single-chain result), and the full ``history``.
+     """
+     runnable = [s for s in stages if s.phases]
++    # Phase logs from an earlier attempt in a reused directory are not this
++    # campaign's.
++    for stage in runnable:
++        if not stage.parallel and stage.kind != "combine":
++            for rdir in {ph.run_dir for ph in stage.phases}:
++                shutil.rmtree(Path(rdir) / PHASE_LOG_DIR, ignore_errors=True)
++    shared_dirs = _shared_run_dirs(runnable)
++    log_index: Dict[str, int] = {}
+     if not runnable:
+         return {"status": "failed", "error": "no phases to run",
+                 "stages": [], "phases": [], "history": ctx.history}
+@@ -1214,6 +1275,9 @@ def run_campaign(
+             status = "success"
+             for ph in stage.phases:
+                 rec = _refine_phase(ph, executor, run_critic, policy, ctx)
++                if ph.run_dir in shared_dirs:
++                    log_index[ph.run_dir] = log_index.get(ph.run_dir, 0) + 1
++                    _keep_phase_log(ph, log_index[ph.run_dir])
+                 flat.append(rec)
+                 members.append(rec)
+                 if rec["status"] != "success":
+diff --git a/scilink/agents/sim_agents/simulation_pipeline.py b/scilink/agents/sim_agents/simulation_pipeline.py
+index 12980d88d..c6ac37ec6 100644
+--- a/scilink/agents/sim_agents/simulation_pipeline.py
++++ b/scilink/agents/sim_agents/simulation_pipeline.py
+@@ -831,6 +831,16 @@ def _run_workflow_once(
+         result["input_generation"] = {"status": "error", "message": str(e)}
+         return result
+     result["input_generation"] = gen_result
++    # Caveats from generation (e.g. files left unrun) belong with the run's
++    # other warnings, where the user and the model see them.
++    gen_warnings = list(gen_result.get("warnings") or [])
++    repair = gen_result.get("run_order_repair") or {}
++    if repair.get("outcome") == "fixed":
++        gen_warnings.append("the first reply did not say which input file "
++                            "runs; the run order came from one follow-up "
++                            f"request ({', '.join(repair.get('run_order', []))})")
++    if gen_warnings:
++        result.setdefault("warnings", []).extend(gen_warnings)
+     if gen_result.get("status") not in (None, "success"):
+         result["final_status"] = "failed_input_generation"
+         return result
+@@ -918,6 +928,15 @@ def _run_workflow_once(
+         base_inputs = _collect_input_files(gen_result)
+         if specs and base_inputs:
+             try:
++                from .refinement import single_entry
++                entry = single_entry(base_inputs, gen_result.get("entry_file"))
++                if gen_result.get("phases"):
++                    raise _ConvergenceSkipped(
++                        "the run has several decks (phases) and no single "
++                        "deck to sweep")
++                if not entry and "{script}" in run_command:
++                    raise _ConvergenceSkipped(
++                        "the input generation did not say which file runs")
+                 from .convergence import converge_parameters as _run_convergence
+                 from ...skills._shared._registry import get_tool_function
+                 _set = get_tool_function("set_convergence_param",
+@@ -929,7 +948,6 @@ def _run_workflow_once(
+                                              active_skills=[software])
+                 except Exception:
+                     _get = None  # engine without a getter: no ladder floor
+-                entry = gen_result.get("entry_file")
+ 
+                 def _run_ladder(param, members, _entry=entry):
+                     dirs: Dict[Any, str] = {}
+@@ -945,9 +963,8 @@ def _run_ladder(param, members, _entry=entry):
+                         if os.path.isdir(rdir):
+                             shutil.rmtree(rdir, ignore_errors=True)
+                         os.makedirs(rdir, exist_ok=True)
+-                        cmd = (run_command.format(script=_entry)
+-                               if _entry and "{script}" in run_command
+-                               else run_command)
++                        cmd = _fill_script(run_command, _entry,
++                                           "parameter convergence")
+                         executor.run(member_inputs, cmd, rdir)
+                         dirs[setting] = rdir
+                     return dirs
+@@ -993,6 +1010,14 @@ def _run_ladder(param, members, _entry=entry):
+                     logger.info("Convergence ladders floored at base deck values: %s",
+                                 pc.floors)
+                 result["steps_completed"].append("parameter_convergence")
++            except _ConvergenceSkipped as e:
++                # Requested but not applicable: say so where the user and the
++                # model see it, not as an error.
++                logger.warning("Parameter convergence skipped: %s", e)
++                result["parameter_convergence"] = {
++                    "status": "skipped", "message": str(e)}
++                result.setdefault("warnings", []).append(
++                    f"Parameter convergence was requested but skipped: {e}.")
+             except Exception as e:  # convergence is best-effort; never break the run
+                 logger.warning("Parameter convergence skipped: %s", e)
+                 result["parameter_convergence"] = {
+@@ -1036,7 +1061,13 @@ def _run_ladder(param, members, _entry=entry):
+     from .refinement import RefinementContext, policy_for, run_campaign
+     from .critics import RunCritic
+ 
+-    stages = _collect_stages(gen_result, output_dir, run_command)
++    try:
++        stages = _collect_stages(gen_result, output_dir, run_command)
++    except ValueError as e:
++        logger.error("cannot build the run: %s", e)
++        result["refinement"] = {"status": "failed", "error": str(e)}
++        result["final_status"] = "refinement_failed"
++        return result
+     ctx = RefinementContext(
+         research_goal=user_request, scale=scale, engine=run_engine,
+         skill=run_skill, domain=run_domain, autonomy=autonomy,
+@@ -1172,6 +1203,25 @@ def _record_pseudopotential_provenance(result: Dict[str, Any],
+     result["pseudopotentials"] = {**record, "used": used}
+ 
+ 
++class _ConvergenceSkipped(Exception):
++    """Parameter convergence does not apply to this run (reason in the message)."""
++
++
++def _fill_script(template: str, entry: str, phase_name: str) -> str:
++    """``template`` with ``{script}`` replaced by the phase's entry file.
++
++    Raises ValueError when the template needs a file name and the phase has
++    none: the engine would otherwise be launched with no input file.
++    """
++    if "{script}" not in template:
++        return template
++    if not entry:
++        raise ValueError(
++            f"phase {phase_name!r} has no entry file for the run command "
++            f"{template!r}; the input generation must say which file runs")
++    return template.format(script=entry)
++
++
+ def _collect_phases(
+     gen_result: Dict[str, Any], run_dir: str, run_command_template: str
+ ) -> list:
+@@ -1195,12 +1245,12 @@ def _collect_phases(
+     """
+     from .refinement import Phase
+ 
++    from .refinement import single_entry
++
+     phases_spec = gen_result.get("phases")
+     if not phases_spec:
+-        entry = gen_result.get("entry_file")
+         input_files = gen_result.get("input_files") or {}
+-        if entry is None and len(input_files) == 1:
+-            entry = next(iter(input_files))
++        entry = single_entry(input_files, gen_result.get("entry_file"))
+         phases_spec = [{
+             "name": "production",
+             "input_files": input_files,
+@@ -1210,11 +1260,7 @@ def _collect_phases(
+     phases = []
+     for spec in phases_spec:
+         entry = spec.get("entry_file") or ""
+-        cmd = (
+-            run_command_template.format(script=entry)
+-            if "{script}" in run_command_template
+-            else run_command_template
+-        )
++        cmd = _fill_script(run_command_template, entry, spec.get("name", "run"))
+         phases.append(Phase(
+             name=spec.get("name", "run"),
+             input_files=spec.get("input_files") or {},
+@@ -1265,18 +1311,16 @@ def _collect_stages(
+         phases = _collect_phases(gen_result, run_dir, run_command_template)
+         return [Stage(name="run", phases=phases, parallel=False)]
+ 
+-    def _command(entry: str, override) -> str:
+-        template = override or run_command_template
+-        if "{script}" in template:
+-            return template.format(script=entry or "")
+-        return template
++    from .refinement import single_entry
+ 
+     def _phase(spec: Dict[str, Any], rdir: str) -> "Phase":
+-        entry = spec.get("entry_file") or ""
++        entry = single_entry(spec.get("input_files") or {}, spec.get("entry_file"))
++        name = spec.get("name", "run")
+         return Phase(
+-            name=spec.get("name", "run"),
++            name=name,
+             input_files=spec.get("input_files") or {},
+-            run_command=_command(entry, spec.get("run_command")),
++            run_command=_fill_script(
++                spec.get("run_command") or run_command_template, entry, name),
+             run_dir=str(rdir),
+             entry_file=entry or "",
+         )
+diff --git a/scilink/hpc/connection.py b/scilink/hpc/connection.py
+index e6908f791..171c0d1ad 100644
+--- a/scilink/hpc/connection.py
++++ b/scilink/hpc/connection.py
+@@ -237,6 +237,13 @@ def download(
+     def stat(self, path: str) -> paramiko.SFTPAttributes:
+         return self.sftp.stat(path)
+ 
++    def remove(self, path: str) -> None:
++        """Delete a remote file; a file that is not there is not an error."""
++        try:
++            self.sftp.remove(path)
++        except FileNotFoundError:   # paramiko's missing-file error
++            pass
++
+     def mkdir_p(self, path: str) -> None:
+         """Remote equivalent of ``mkdir -p``."""
+         self.run(f"mkdir -p {_q(path)}")
+diff --git a/tests/test_cluster_executor.py b/tests/test_cluster_executor.py
+index 9be7283c1..626203a4a 100644
+--- a/tests/test_cluster_executor.py
++++ b/tests/test_cluster_executor.py
+@@ -53,6 +53,9 @@ def home_dir(self):
+     def mkdir_p(self, path):
+         self.mkdirs.append(path)
+ 
++    def remove(self, path):
++        self._remote.pop(path, None)
++
+     def upload(self, local, remote):
+         self.uploads.append((local, remote))
+         self._remote[remote] = Path(local).read_text()
+@@ -119,6 +122,42 @@ def cancel(self, job_id):
+ 
+ # ── ClusterExecutor.run ───────────────────────────────────────
+ 
++class TestStaleRemoteOutput:
++    def test_a_job_that_writes_nothing_does_not_report_the_previous_rc(self, tmp_path):
++        # Sequential phases share a remote dir (named after the run dir).
++        conn = FakeConn()
++        run_dir = str(tmp_path / "run")
++        first = ClusterExecutor(conn, scheduler=FakeScheduler(conn),
++                                remote_root="/scratch", poll_interval=0, timeout=100)
++        assert first.run({"a.nw": "A"}, "nwchem a.nw", run_dir)["returncode"] == 0
++        # The second job never writes its output files (e.g. killed before
++        # the wrapper's redirect) and the scheduler reports no exit code.
++        silent = FakeScheduler(conn, rc_written=None, exit_code=None)
++        second = ClusterExecutor(conn, scheduler=silent, remote_root="/scratch",
++                                 poll_interval=0, timeout=100)
++        result = second.run({"b.nw": "B"}, "nwchem b.nw", run_dir)
++        assert result["returncode"] is None
++        assert not (Path(run_dir) / _STDOUT).exists()
++
++    def test_a_submit_that_fails_early_leaves_no_previous_rc(self, tmp_path):
++        run_dir = tmp_path / "run"
++        run_dir.mkdir()
++        (run_dir / _RC).write_text("0")          # left by the previous phase
++        (run_dir / _STDOUT).write_text("previous phase\n")
++
++        class Down(FakeConn):
++            def connect(self, *a, **k):
++                raise ConnectionError("cluster unreachable")
++
++        conn = Down(connected=False)
++        ex = ClusterExecutor(conn, scheduler=FakeScheduler(conn),
++                             remote_root="/scratch", poll_interval=0, timeout=100)
++        with pytest.raises(ConnectionError):
++            ex.submit({"b.nw": "B"}, "nwchem b.nw", str(run_dir))
++        assert not (run_dir / _RC).exists()
++        assert not (run_dir / _STDOUT).exists()
++
++
+ class TestClusterExecutorRun:
+     def test_full_flow_uploads_submits_polls_downloads(self, tmp_path):
+         conn = FakeConn()
+diff --git a/tests/test_qc_run_order.py b/tests/test_qc_run_order.py
+new file mode 100644
+index 000000000..c52a84085
+--- /dev/null
++++ b/tests/test_qc_run_order.py
+@@ -0,0 +1,427 @@
++"""Multi-deck molecular QC runs: which deck runs, in what order, and the logs.
++
++A reply with several decks (e.g. hcn.nw, hnc.nw, ts.nw) used to set no
++entry file, so the run command's ``{script}`` was filled with nothing and the
++engine started with no input file. No LLM, engine or API key needed.
++"""
++
++import os
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++from scilink.agents.sim_agents.molecular_qc_agent import resolve_run_order  # noqa: E402
++from scilink.agents.sim_agents.refinement import (  # noqa: E402
++    AutonomousPolicy, Executor, LocalExecutor, Phase, RefinementContext, Stage,
++    run_campaign,
++)
++from scilink.agents.sim_agents.simulation_pipeline import (  # noqa: E402
++    _collect_phases, _collect_stages, _fill_script,
++)
++
++
++# ── resolve_run_order ────────────────────────────────────────────────────
++
++def test_single_deck_needs_no_run_order():
++    r = {"input_files": {"job.nw": "task scf"}}
++    assert resolve_run_order(r) is None
++    assert r["entry_file"] == "job.nw"
++    assert "phases" not in r
++
++
++def test_several_decks_become_phases_in_run_order():
++    r = {"input_files": {"ts.nw": "T", "hcn.nw": "A", "hnc.nw": "B",
++                         "basis.lib": "L"},
++         "run_order": ["hcn.nw", "hnc.nw", "ts.nw"]}
++    assert resolve_run_order(r) is None
++    assert "entry_file" not in r
++    assert [p["entry_file"] for p in r["phases"]] == ["hcn.nw", "hnc.nw", "ts.nw"]
++    # each phase gets its own deck plus the unlisted support file
++    assert r["phases"][0]["input_files"] == {"hcn.nw": "A", "basis.lib": "L"}
++    assert r["phases"][2]["input_files"] == {"ts.nw": "T", "basis.lib": "L"}
++
++
++def test_run_order_of_one_with_support_file_sets_entry():
++    r = {"input_files": {"job.nw": "J", "basis.lib": "L"}, "run_order": ["job.nw"]}
++    assert resolve_run_order(r) is None
++    assert r["entry_file"] == "job.nw"
++
++
++def test_explicit_entry_file_still_honoured():
++    r = {"input_files": {"job.nw": "J", "basis.lib": "L"}, "entry_file": "job.nw"}
++    assert resolve_run_order(r) is None
++    assert r["entry_file"] == "job.nw"
++
++
++def test_run_order_as_a_bare_string():
++    r = {"input_files": {"job.nw": "J", "x.lib": "L"}, "run_order": "job.nw"}
++    assert resolve_run_order(r) is None
++    assert r["entry_file"] == "job.nw"
++
++
++@pytest.mark.parametrize("reply, needle", [
++    ({"input_files": {"a.nw": "1", "b.nw": "2"}}, "no run_order"),
++    ({"input_files": {"a.nw": "1"}, "run_order": ["b.nw"]}, "b.nw"),
++    ({"input_files": {"a.nw": "1"}, "run_order": []}, "non-empty"),
++    ({"input_files": {"a.nw": "1"}, "run_order": [3]}, "non-empty"),
++    ({"input_files": {"a.nw": "1", "b.nw": "2"}, "run_order": ["a.nw", "a.nw"]},
++     "more than once"),
++])
++def test_unusable_replies_are_refused(reply, needle):
++    problem = resolve_run_order(reply)
++    assert problem and needle in problem
++
++
++# ── the run command never gets an empty file name ────────────────────────
++
++def test_fill_script_refuses_empty_entry():
++    assert _fill_script("nwchem {script}", "job.nw", "p") == "nwchem job.nw"
++    assert _fill_script("mpirun vasp_std", "", "p") == "mpirun vasp_std"
++    with pytest.raises(ValueError, match="no entry file"):
++        _fill_script("nwchem {script}", "", "p")
++
++
++def test_phases_get_one_command_per_deck():
++    r = {"input_files": {"hcn.nw": "A", "hnc.nw": "B"},
++         "run_order": ["hcn.nw", "hnc.nw"]}
++    resolve_run_order(r)
++    phases = _collect_phases(r, "/tmp/x", "nwchem {script}")
++    assert [p.run_command for p in phases] == ["nwchem hcn.nw", "nwchem hnc.nw"]
++    assert all(p.run_dir == "/tmp/x" for p in phases)
++
++
++def test_old_multi_file_reply_is_refused_not_run_empty():
++    # The pre-fix shape: two decks, no entry_file, no phases.
++    r = {"input_files": {"a.nw": "1", "b.nw": "2"}}
++    with pytest.raises(ValueError, match="no entry file"):
++        _collect_stages(r, "/tmp/x", "nwchem {script}")
++
++
++def _pipeline(tmp_path, monkeypatch, gen):
++    from scilink.agents.sim_agents import critics, refinement, simulation_pipeline as sp
++    monkeypatch.setattr(sp, "_generate_inputs", lambda **kw: gen)
++    monkeypatch.setattr(critics, "RunCritic", lambda **kw: object())
++    seen = {}
++
++    def fake_run_campaign(stages, executor, run_critic, policy, ctx,
++                          pre_run_verdict=None):
++        seen["commands"] = [p.run_command for s in stages for p in s.phases]
++        return {"status": "success"}
++
++    monkeypatch.setattr(refinement, "run_campaign", fake_run_campaign)
++    (tmp_path / "mol.xyz").write_text("1\n\nH 0 0 0\n")
++    out = sp._run_workflow_once(
++        "water", scale="molecular_qc", software="nwchem",
++        structure_file=str(tmp_path / "mol.xyz"), output_dir=str(tmp_path),
++        validate=False, executor=_LogWriter(), run_command="nwchem {script}")
++    return out, seen
++
++
++def test_pipeline_fails_a_reply_with_no_entry_instead_of_launching(tmp_path, monkeypatch):
++    gen = {"status": "success", "input_files": {"a.nw": "1", "b.nw": "2"}}
++    out, seen = _pipeline(tmp_path, monkeypatch, gen)
++    assert "commands" not in seen          # the campaign never started
++    assert out["final_status"] == "refinement_failed"
++    assert "no entry file" in out["refinement"]["error"]
++
++
++def test_pipeline_runs_each_deck_of_a_multi_deck_reply(tmp_path, monkeypatch):
++    gen = {"status": "success", "input_files": {"a.nw": "1", "b.nw": "2"},
++           "run_order": ["b.nw", "a.nw"]}
++    resolve_run_order(gen)
++    out, seen = _pipeline(tmp_path, monkeypatch, gen)
++    assert seen["commands"] == ["nwchem b.nw", "nwchem a.nw"]
++    assert out["final_status"] == "success"
++
++
++# ── each phase's log survives the next phase ─────────────────────────────
++
++class _LogWriter(Executor):
++    """Writes run_stdout.log as the engine would: the deck name it ran."""
++
++    def run(self, input_files, run_command, run_dir):
++        Path(run_dir).mkdir(parents=True, exist_ok=True)
++        (Path(run_dir) / LocalExecutor.STDOUT_FILE).write_text(
++            f"ran {run_command}\n")
++        return {"status": "completed", "output_dir": run_dir, "returncode": 0}
++
++
++class _Good:
++    def assess(self, *a, **kw):
++        return {"status": "success", "run_status": "succeeded",
++                "verdict": "good", "suggested_fixes": None}
++
++
++def _ctx():
++    return RefinementContext(
++        research_goal="g", scale="molecular_qc", engine="nwchem",
++        skill="nwchem", domain="molecular_qc", autonomy="autonomous",
++        max_cycles=1)
++
++
++def _decks(d, names):
++    return [Phase(name=n, input_files={n: "x"}, run_command=f"nwchem {n}",
++                  run_dir=d, entry_file=n) for n in names]
++
++
++def _kept(d):
++    return sorted(p.name for p in (Path(d) / "phase_logs").glob("*")) \
++        if (Path(d) / "phase_logs").is_dir() else []
++
++
++def test_each_phase_log_is_kept_in_run_order(tmp_path):
++    names = ("hcn.nw", "hnc.nw", "ts.nw")
++    out = run_campaign([Stage(name="run", phases=_decks(str(tmp_path), names))],
++                       _LogWriter(), _Good(), AutonomousPolicy(), _ctx())
++    assert out["status"] == "success"
++    kept = _kept(tmp_path)
++    assert kept == ["01_hcn.nw.run_stdout.log", "02_hnc.nw.run_stdout.log",
++                    "03_ts.nw.run_stdout.log"]
++    for k, n in zip(kept, names):
++        assert (tmp_path / "phase_logs" / k).read_text() == f"ran nwchem {n}\n"
++    assert (tmp_path / "run_stdout.log").read_text() == "ran nwchem ts.nw\n"
++
++
++def test_staged_steps_sharing_a_directory_keep_their_logs_too(tmp_path):
++    # MD-style campaign: each step is its own one-phase stage, one directory.
++    d = str(tmp_path)
++    stages = [Stage(name=n, phases=_decks(d, [n])) for n in ("equil.in", "prod.in")]
++    run_campaign(stages, _LogWriter(), _Good(), AutonomousPolicy(), _ctx())
++    assert _kept(d) == ["01_equil.in.run_stdout.log", "02_prod.in.run_stdout.log"]
++
++
++def test_a_directory_used_once_gets_no_copy(tmp_path):
++    run_campaign([Stage(name="run", phases=_decks(str(tmp_path), ["job.nw"]))],
++                 _LogWriter(), _Good(), AutonomousPolicy(), _ctx())
++    assert sorted(os.listdir(tmp_path)) == ["run_stdout.log"]
++
++
++class _NeverStarts(_LogWriter):
++    """The second deck produces nothing (e.g. a cluster job that never ran):
++    the executor clears the previous run's files and writes none."""
++
++    def __init__(self):
++        self.n = 0
++
++    def run(self, input_files, run_command, run_dir):
++        self.n += 1
++        for name in ("run_stdout.log", "run_stderr.log", "run_returncode.txt"):
++            (Path(run_dir) / name).unlink(missing_ok=True)
++        if self.n == 1:
++            return super().run(input_files, run_command, run_dir)
++        return {"status": "completed", "output_dir": run_dir, "returncode": None}
++
++
++def test_a_phase_with_no_output_gets_no_copy_of_the_previous_log(tmp_path):
++    run_campaign([Stage(name="run", phases=_decks(str(tmp_path), ["a.nw", "b.nw"]))],
++                 _NeverStarts(), _Good(), AutonomousPolicy(), _ctx())
++    assert _kept(tmp_path) == ["01_a.nw.run_stdout.log"]
++
++
++def test_the_engine_reader_never_reads_a_kept_copy_as_the_current_run(tmp_path):
++    # Deck 2 produced nothing: the only log left is deck 1's kept copy, and
++    # NWChem's reader must not parse it as deck 2's output.
++    from scilink.skills.molecular_qc.nwchem.nwchem_output import snapshot_run
++    run_campaign([Stage(name="run", phases=_decks(str(tmp_path), ["a.nw", "b.nw"]))],
++                 _NeverStarts(), _Good(), AutonomousPolicy(), _ctx())
++    snap = snapshot_run(str(tmp_path))
++    assert not any("a.nw" in f for f in snap["files_found"])
++    assert "No NWChem output" in snap["headline"]
++
++
++def test_logs_left_by_an_earlier_attempt_are_cleared(tmp_path):
++    old = tmp_path / "phase_logs"
++    old.mkdir()
++    (old / "01_old.nw.run_stdout.log").write_text("stale\n")
++    run_campaign([Stage(name="run", phases=_decks(str(tmp_path), ["job.nw"]))],
++                 _LogWriter(), _Good(), AutonomousPolicy(), _ctx())
++    assert not old.exists()
++
++
++def test_launch_failure_leaves_no_earlier_output(tmp_path, monkeypatch):
++    from scilink.agents.sim_agents import refinement
++    ex = LocalExecutor(timeout=30)
++    ex.run({}, "echo first", str(tmp_path))
++    assert (tmp_path / "run_stdout.log").read_text().strip() == "first"
++
++    def cannot_launch(*a, **k):
++        raise OSError("no such engine")
++
++    monkeypatch.setattr(refinement, "run_engine", cannot_launch)
++    out = ex.run({}, "nwchem job.nw", str(tmp_path))
++    assert out["status"] == "error"
++    assert not (tmp_path / "run_stdout.log").exists()
++    assert (tmp_path / "run_returncode.txt").read_text() == "launch_error"
++
++
++def test_timeout_leaves_no_earlier_output(tmp_path):
++    ex = LocalExecutor(timeout=30)
++    ex.run({}, "echo first", str(tmp_path))
++    ex.timeout = 1
++    out = ex.run({}, "sleep 10", str(tmp_path))
++    assert out["status"] == "error"
++    assert not (tmp_path / "run_stdout.log").exists()
++    assert (tmp_path / "run_returncode.txt").read_text() == "timeout"
++
++
++# ── the agent itself, with a canned LLM reply ────────────────────────────
++
++_WATER = "3\nwater\nO 0 0 0.117\nH 0 0.757 -0.469\nH 0 -0.757 -0.469\n"
++_DECK = ("start {n}\ngeometry\n O 0 0 0.117\n H 0 0.757 -0.469\n"
++         " H 0 -0.757 -0.469\nend\nbasis\n * library 6-31g*\nend\n"
++         "task dft energy\n")
++
++
++def _agent_reply(tmp_path, monkeypatch, *replies, prompts=None):
++    """Run generate_inputs with canned LLM replies, one per call (the last
++    repeats); ``prompts`` collects the prompts sent."""
++    from scilink.agents.sim_agents.molecular_qc_agent import MolecularQCAgent
++    agent = MolecularQCAgent(api_key="dummy", base_url="http://localhost:0")
++    sent = prompts if prompts is not None else []
++
++    class _Resp:
++        def __init__(self, k):
++            self.text = str(k)
++
++    def generate(prompt, **kw):
++        sent.append(prompt)
++        return _Resp(min(len(sent), len(replies)) - 1)
++
++    monkeypatch.setattr(agent.model, "generate_content", generate)
++    monkeypatch.setattr(agent, "_parse_response", lambda text: dict(replies[int(text)]))
++    xyz = tmp_path / "water.xyz"
++    xyz.write_text(_WATER)
++    return agent.generate_inputs(structure_file=str(xyz), request="energies")
++
++
++def test_agent_builds_phases_from_run_order(tmp_path, monkeypatch):
++    r = _agent_reply(tmp_path, monkeypatch, {
++        "input_files": {"gas.nw": _DECK.format(n="gas"), "solv.nw": _DECK.format(n="solv")},
++        "run_order": ["gas.nw", "solv.nw"]})
++    assert r["status"] == "success", r.get("message")
++    assert [p["entry_file"] for p in r["phases"]] == ["gas.nw", "solv.nw"]
++
++
++def test_agent_refuses_several_decks_without_run_order(tmp_path, monkeypatch):
++    r = _agent_reply(tmp_path, monkeypatch, {
++        "input_files": {"gas.nw": _DECK.format(n="gas"), "solv.nw": _DECK.format(n="solv")}})
++    assert r["status"] == "error"
++    assert "run_order" in r["message"]
++
++
++_TWO = {"gas.nw": _DECK.format(n="gas"), "solv.nw": _DECK.format(n="solv")}
++
++
++def test_agent_asks_only_for_the_order_and_keeps_the_decks(tmp_path, monkeypatch):
++    prompts = []
++    r = _agent_reply(tmp_path, monkeypatch,
++                     {"input_files": _TWO},
++                     {"run_order": ["solv.nw", "gas.nw"]},
++                     prompts=prompts)
++    assert r["status"] == "success", r.get("message")
++    assert [p["entry_file"] for p in r["phases"]] == ["solv.nw", "gas.nw"]
++    assert r["input_files"] == _TWO                      # decks kept as returned
++    assert len(prompts) == 2
++    assert "### gas.nw" in prompts[1] and "start solv" in prompts[1]   # decks shown
++    assert "Do not change" in prompts[1]
++    assert r["run_order_repair"]["outcome"] == "fixed"
++
++
++def test_a_failed_repair_reports_its_own_reason(tmp_path, monkeypatch):
++    prompts = []
++    r = _agent_reply(tmp_path, monkeypatch, {"input_files": _TWO},
++                     {"run_order": ["gas.nw", "missing.nw"]}, prompts=prompts)
++    assert r["status"] == "error"
++    assert "no run_order" in r["message"] and "missing.nw" in r["message"]
++    assert r["run_order_repair"]["outcome"] == "failed"
++    assert len(prompts) == 2
++
++
++def test_a_repair_answer_without_run_order_is_reported(tmp_path, monkeypatch):
++    r = _agent_reply(tmp_path, monkeypatch, {"input_files": _TWO}, {"notes": "?"})
++    assert r["status"] == "error" and "the answer had no run_order" in r["message"]
++
++
++def test_a_usable_reply_costs_one_call(tmp_path, monkeypatch):
++    prompts = []
++    r = _agent_reply(tmp_path, monkeypatch,
++                     {"input_files": {"job.nw": _DECK.format(n="job")}},
++                     prompts=prompts)
++    assert r["status"] == "success" and r["entry_file"] == "job.nw"
++    assert len(prompts) == 1
++
++
++# ── caveats on the result, and one single-file rule ─────────────────────
++
++def test_unrun_files_are_reported():
++    r = {"input_files": {"a.nw": "1", "b.nw": "2"}, "run_order": ["a.nw"]}
++    assert resolve_run_order(r) is None
++    assert r["entry_file"] == "a.nw"
++    assert any("never run: b.nw" in w for w in r["warnings"])
++
++
++def test_an_overridden_entry_file_is_reported():
++    r = {"input_files": {"a.nw": "1", "b.nw": "2"}, "entry_file": "b.nw",
++         "run_order": ["a.nw", "b.nw"]}
++    assert resolve_run_order(r) is None
++    assert any("entry_file b.nw was replaced" in w for w in r["warnings"])
++
++
++def test_a_checking_copy_does_not_touch_the_replys_warnings():
++    r = {"input_files": {"a.nw": "1", "b.nw": "2"}, "run_order": ["a.nw"],
++         "warnings": ["from the model"]}
++    resolve_run_order(dict(r))
++    assert r["warnings"] == ["from the model"]
++
++
++def test_an_empty_entry_file_means_undeclared_everywhere():
++    from scilink.agents.sim_agents.refinement import single_entry
++    one = {"job.nw": "x"}
++    assert single_entry(one, "") == "job.nw"
++    r = {"input_files": dict(one), "entry_file": ""}
++    assert resolve_run_order(r) is None and r["entry_file"] == "job.nw"
++    phases = _collect_phases({"input_files": one, "entry_file": ""}, "/tmp/x",
++                             "nwchem {script}")
++    assert phases[0].run_command == "nwchem job.nw"
++
++
++def test_convergence_skip_is_recorded_as_skipped(tmp_path, monkeypatch):
++    from scilink.agents.sim_agents import critics, refinement, simulation_pipeline as sp
++    gen = {"status": "success", "input_files": {"a.nw": "1", "b.nw": "2"},
++           "run_order": ["a.nw", "b.nw"]}
++    resolve_run_order(gen)
++    monkeypatch.setattr(sp, "_generate_inputs", lambda **kw: gen)
++    monkeypatch.setattr(sp, "_convergence_specs", lambda *a, **k: [{"param": "x"}])
++    monkeypatch.setattr(critics, "RunCritic", lambda **kw: object())
++    monkeypatch.setattr(refinement, "run_campaign",
++                        lambda *a, **k: {"status": "success"})
++    (tmp_path / "mol.xyz").write_text("1\n\nH 0 0 0\n")
++    out = sp._run_workflow_once(
++        "water", scale="molecular_qc", software="nwchem",
++        structure_file=str(tmp_path / "mol.xyz"), output_dir=str(tmp_path),
++        validate=False, executor=_LogWriter(), run_command="nwchem {script}",
++        converge_parameters=True)
++    assert out["parameter_convergence"]["status"] == "skipped"
++    assert "several decks" in out["parameter_convergence"]["message"]
++    assert any("convergence was requested but skipped" in w for w in out["warnings"])
++
++
++def test_generation_caveats_reach_the_runs_warnings(tmp_path, monkeypatch):
++    gen = {"status": "success", "input_files": {"a.nw": "1", "b.nw": "2"},
++           "run_order": ["a.nw"],
++           "run_order_repair": {"outcome": "fixed", "run_order": ["a.nw"]}}
++    resolve_run_order(gen)
++    out, _ = _pipeline(tmp_path, monkeypatch, gen)
++    assert any("never run: b.nw" in w for w in out["warnings"])
++    assert any("one follow-up request" in w for w in out["warnings"])
++
++
++def test_a_staged_step_with_one_file_needs_no_entry_file():
++    stages = _collect_stages(
++        {"stages": [{"name": "s1", "input_files": {"in.x": "1"}}]},
++        "/tmp/x", "engine {script}")
++    assert stages[0].phases[0].run_command == "engine in.x"

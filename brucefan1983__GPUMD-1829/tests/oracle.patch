@@ -1,0 +1,972 @@
+diff --git a/src/main_nep/fitness.cu b/src/main_nep/fitness.cu
+index 7ff659e97..edb06ccdd 100644
+--- a/src/main_nep/fitness.cu
++++ b/src/main_nep/fitness.cu
+@@ -27,6 +27,7 @@ Get the fitness
+ #include "utilities/nep_parameters.cuh"
+ #include <algorithm>
+ #include <chrono>
++#include <cmath>
+ #include <ctime>
+ #include <iostream>
+ #include <random>
+@@ -129,6 +130,21 @@ Fitness::Fitness(Parameters& para, Potential& potential) : potential(potential)
+ 
+   potential.initialize(para, N, Nc, deviceCount);
+ 
++  fitness_L1.resize(para.population_size * (para.num_types + 1));
++  fitness_L2.resize(para.population_size * (para.num_types + 1));
++  fitness_energy.resize(para.population_size * (para.num_types + 1));
++  fitness_force.resize(para.population_size * (para.num_types + 1));
++  fitness_virial.resize(para.population_size * (para.num_types + 1));
++  fitness_charge.resize(para.population_size * (para.num_types + 1));
++  fitness_bec.resize(para.population_size * (para.num_types + 1));
++  fitness_ediff.resize(para.population_size, 0.0f);
++  cost_L1reg.resize(para.population_size);
++  cost_L2reg.resize(para.population_size);
++
++  gpuSetDevice(0);
++  gpu_cost_L1reg.resize(para.population_size);
++  gpu_cost_L2reg.resize(para.population_size);
++
+   if (para.prediction == 0) {
+     fid_loss_out = my_fopen("loss.out", "a");
+     fprintf(fid_loss_out, "# format_version 1\n");
+@@ -166,16 +182,67 @@ Fitness::~Fitness()
+   }
+ }
+ 
++void Fitness::print_training_header(const Parameters& para)
++{
++  if (para.model_type == 0 || para.model_type == 3) {
++    if (!(para.charge_mode || para.charge_vdw)) {
++      printf(
++        "%-8s %-11s %-11s %-11s %-13s %-13s %-13s %-13s %-13s %-13s",
++        "Step",
++        "Total-Loss",
++        "L1Reg-Loss",
++        "L2Reg-Loss",
++        "RMSE-E-Train",
++        "RMSE-F-Train",
++        "RMSE-V-Train",
++        "RMSE-E-Test",
++        "RMSE-F-Test",
++        "RMSE-V-Test");
++      if (para.has_ediff_combinations) {
++        printf(" %-13s %-13s", "RMSE-D-Train", "RMSE-D-Test");
++      }
++      printf("\n");
++    } else {
++      printf(
++        "%-8s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s",
++        "Step",
++        "Total",
++        "L1Reg",
++        "L2Reg",
++        "E-Train",
++        "F-Train",
++        "V-Train",
++        "Q-Train",
++        "Z-Train",
++        "E-Test",
++        "F-Test",
++        "V-Test",
++        "Q-Test",
++        "Z-Test");
++      if (para.has_ediff_combinations) {
++        printf(" %-9s %-9s", "D-Train", "D-Test");
++      }
++      printf("\n");
++    }
++  } else {
++    printf(
++      "%-8s %-11s %-11s %-11s %-13s %-13s\n",
++      "Step",
++      "Total-Loss",
++      "L1Reg-Loss",
++      "L2Reg-Loss",
++      "RMSE-P-Train",
++      "RMSE-P-Test");
++  }
++}
++
+ void Fitness::compute(
+   const int generation,
+   Parameters& para,
+   const float* population,
+-  float* fitness_energy,
+-  float* fitness_force,
+-  float* fitness_virial,
+-  float* fitness_charge,
+-  float* fitness_bec,
+-  float* fitness_ediff)
++  const float* gpu_population,
++  const int* gpu_type_of_variable,
++  float* fitness_total)
+ {
+   int deviceCount;
+   CHECK(gpuGetDeviceCount(&deviceCount));
+@@ -224,6 +291,90 @@ void Fitness::compute(
+       }
+     }
+   }
++
++  regularize_NEP4(para, gpu_population, gpu_type_of_variable, fitness_total);
++}
++
++static __global__ void gpu_find_L1_L2_NEP4(
++  const int number_of_variables,
++  const int g_num_types,
++  const int g_type,
++  const int* g_type_of_variable,
++  const float* g_population,
++  float* gpu_cost_L1reg,
++  float* gpu_cost_L2reg)
++{
++  int bid = blockIdx.x;
++  int tid = threadIdx.x;
++  __shared__ float s_cost_L1reg[1024];
++  __shared__ float s_cost_L2reg[1024];
++  s_cost_L1reg[tid] = 0.0f;
++  s_cost_L2reg[tid] = 0.0f;
++  for (int v = tid; v < number_of_variables; v += blockDim.x) {
++    const float para = g_population[bid * number_of_variables + v];
++    if ((g_type_of_variable[v] == g_type) && (g_type != g_num_types) ||
++        (g_type_of_variable[v] != g_type) && (g_type == g_num_types))  {
++      s_cost_L1reg[tid] += abs(para);
++      s_cost_L2reg[tid] += para * para;
++    }
++  }
++  __syncthreads();
++
++  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
++    if (tid < offset) {
++      s_cost_L1reg[tid] += s_cost_L1reg[tid + offset];
++      s_cost_L2reg[tid] += s_cost_L2reg[tid + offset];
++    }
++    __syncthreads();
++  }
++
++  if (tid == 0) {
++    gpu_cost_L1reg[bid] = s_cost_L1reg[0];
++    gpu_cost_L2reg[bid] = s_cost_L2reg[0];
++  }
++}
++
++void Fitness::regularize_NEP4(
++  Parameters& para,
++  const float* gpu_population,
++  const int* gpu_type_of_variable,
++  float* fitness_total)
++{
++  const int population_size = para.population_size;
++  const int number_of_variables = para.number_of_variables;
++  gpuSetDevice(0); // normally use GPU-0
++
++  for (int t = 0; t <= para.num_types; ++t) {
++    float num_variables = float(para.number_of_variables) / para.num_types;
++    if (t == para.num_types) {
++      num_variables = para.number_of_variables;
++    }
++
++    gpu_find_L1_L2_NEP4<<<population_size, 1024>>>(
++      number_of_variables,
++      para.num_types,
++      t,
++      gpu_type_of_variable,
++      gpu_population,
++      gpu_cost_L1reg.data(),
++      gpu_cost_L2reg.data());
++    GPU_CHECK_KERNEL
++
++    gpu_cost_L1reg.copy_to_host(cost_L1reg.data());
++    gpu_cost_L2reg.copy_to_host(cost_L2reg.data());
++
++    for (int p = 0; p < population_size; ++p) {
++      float cost_L1 = para.lambda_1 * cost_L1reg[p] / num_variables;
++      float cost_L2 = para.lambda_2 * sqrt(cost_L2reg[p] / num_variables);
++      fitness_total[p + t * population_size] =
++        cost_L1 + cost_L2 + fitness_energy[p + t * population_size] +
++        fitness_force[p + t * population_size] + fitness_virial[p + t * population_size] +
++        fitness_charge[p + t * population_size] + fitness_bec[p + t * population_size] +
++        fitness_ediff[p];
++      fitness_L1[p + t * population_size] = cost_L1;
++      fitness_L2[p + t * population_size] = cost_L2;
++    }
++  }
+ }
+ 
+ void Fitness::output(
+@@ -431,11 +582,13 @@ void Fitness::report_error(
+   Parameters& para,
+   const int generation,
+   const float loss_total,
+-  const float loss_L1,
+-  const float loss_L2,
++  const int best_index,
+   float* elite)
+ {
+   if (0 == (generation + 1) % para.output_interval) {
++    const int fitness_index = para.num_types * para.population_size + best_index;
++    const float loss_L1 = fitness_L1[fitness_index];
++    const float loss_L2 = fitness_L2[fitness_index];
+     int batch_id = generation % num_batches;
+     potential.find_force(para, elite, train_set[batch_id], false, 1);
+     float energy_shift_per_structure;
+diff --git a/src/main_nep/fitness.cuh b/src/main_nep/fitness.cuh
+index 79d17dad6..8ed9f1414 100644
+--- a/src/main_nep/fitness.cuh
++++ b/src/main_nep/fitness.cuh
+@@ -32,22 +32,19 @@ public:
+   ~Fitness();
+   Fitness(const Fitness&) = delete;
+   Fitness& operator=(const Fitness&) = delete;
++  void print_training_header(const Parameters& para);
+   void compute(
+     const int generation,
+     Parameters& para,
+-    const float*,
+-    float*,
+-    float*,
+-    float*,
+-    float*,
+-    float*,
+-    float* fitness_ediff);
++    const float* population,
++    const float* gpu_population,
++    const int* gpu_type_of_variable,
++    float* fitness_total);
+   void report_error(
+     Parameters& para,
+     const int generation,
+     const float loss_total,
+-    const float loss_L1,
+-    const float loss_L2,
++    const int best_index,
+     float* elite);
+   void predict(Parameters& para, float* elite);
+   void get_save_potential_label(Parameters& para, const int generation, std::string& filename);
+@@ -62,6 +59,23 @@ protected:
+   Potential& potential;
+   std::vector<std::vector<Dataset>> train_set;
+   std::vector<Dataset> test_set;
++  std::vector<float> fitness_L1;
++  std::vector<float> fitness_L2;
++  std::vector<float> fitness_energy;
++  std::vector<float> fitness_force;
++  std::vector<float> fitness_virial;
++  std::vector<float> fitness_charge;
++  std::vector<float> fitness_bec;
++  std::vector<float> fitness_ediff;
++  std::vector<float> cost_L1reg;
++  std::vector<float> cost_L2reg;
++  GPU_Vector<float> gpu_cost_L1reg;
++  GPU_Vector<float> gpu_cost_L2reg;
++  void regularize_NEP4(
++    Parameters& para,
++    const float* gpu_population,
++    const int* gpu_type_of_variable,
++    float* fitness_total);
+   void output(
+     bool is_stress,
+     int num_components,
+diff --git a/src/main_nep/snes.cu b/src/main_nep/snes.cu
+index 4cb346659..332f9c7d9 100644
+--- a/src/main_nep/snes.cu
++++ b/src/main_nep/snes.cu
+@@ -51,20 +51,10 @@ SNES::SNES(Parameters& para)
+   int num = number_of_variables / para.num_types;
+   eta_sigma = (3.0f + std::log(num * 1.0f)) / (5.0f * sqrt(num * 1.0f)) / 2.0f;
+   fitness_total.resize(population_size * (para.num_types + 1));
+-  fitness_L1.resize(population_size * (para.num_types + 1));
+-  fitness_L2.resize(population_size * (para.num_types + 1));
+-  fitness_energy.resize(population_size * (para.num_types + 1));
+-  fitness_force.resize(population_size * (para.num_types + 1));
+-  fitness_virial.resize(population_size * (para.num_types + 1));
+-  fitness_charge.resize(population_size * (para.num_types + 1));
+-  fitness_bec.resize(population_size * (para.num_types + 1));
+-  fitness_ediff.resize(population_size, 0.0f);
+   index.resize(population_size * (para.num_types + 1));
+   population.resize(N);
+   mu.resize(number_of_variables);
+   sigma.resize(number_of_variables);
+-  cost_L1reg.resize(population_size);
+-  cost_L2reg.resize(population_size);
+   utility.resize(population_size);
+   type_of_variable.resize(number_of_variables, para.num_types);
+   initialize_rng(para.seed);
+@@ -75,8 +65,6 @@ SNES::SNES(Parameters& para)
+   gpu_utility.resize(population_size);
+   gpu_sigma.resize(number_of_variables);
+   gpu_mu.resize(number_of_variables);
+-  gpu_cost_L1reg.resize(population_size);
+-  gpu_cost_L2reg.resize(population_size);
+   gpu_s.resize(N);
+   gpu_population.resize(N);
+   curand_states.resize(N);
+@@ -397,56 +385,7 @@ void SNES::train(Parameters& para, Fitness* fitness_function)
+   printf("Started training.\n");
+   print_line_2();
+ 
+-  if (para.model_type == 0 || para.model_type == 3) {
+-    if (!(para.charge_mode || para.charge_vdw)) {
+-      printf(
+-        "%-8s %-11s %-11s %-11s %-13s %-13s %-13s %-13s %-13s %-13s",
+-        "Step",
+-        "Total-Loss",
+-        "L1Reg-Loss",
+-        "L2Reg-Loss",
+-        "RMSE-E-Train",
+-        "RMSE-F-Train",
+-        "RMSE-V-Train",
+-        "RMSE-E-Test",
+-        "RMSE-F-Test",
+-        "RMSE-V-Test");
+-      if (para.has_ediff_combinations) {
+-        printf(" %-13s %-13s", "RMSE-D-Train", "RMSE-D-Test");
+-      }
+-      printf("\n");
+-    } else {
+-      printf(
+-        "%-8s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s",
+-        "Step",
+-        "Total",
+-        "L1Reg",
+-        "L2Reg",
+-        "E-Train",
+-        "F-Train",
+-        "V-Train",
+-        "Q-Train",
+-        "Z-Train",
+-        "E-Test",
+-        "F-Test",
+-        "V-Test",
+-        "Q-Test",
+-        "Z-Test");
+-      if (para.has_ediff_combinations) {
+-        printf(" %-9s %-9s", "D-Train", "D-Test");
+-      }
+-      printf("\n");
+-    }
+-  } else {
+-    printf(
+-      "%-8s %-11s %-11s %-11s %-13s %-13s\n",
+-      "Step",
+-      "Total-Loss",
+-      "L1Reg-Loss",
+-      "L2Reg-Loss",
+-      "RMSE-P-Train",
+-      "RMSE-P-Test");
+-  }
++  fitness_function->print_training_header(para);
+ 
+   for (int n = 0; n < maximum_generation; ++n) {
+     create_population();
+@@ -454,14 +393,9 @@ void SNES::train(Parameters& para, Fitness* fitness_function)
+       n,
+       para,
+       population.data(),
+-      fitness_energy.data(),
+-      fitness_force.data(),
+-      fitness_virial.data(),
+-      fitness_charge.data(),
+-      fitness_bec.data(),
+-      fitness_ediff.data());
+-
+-    regularize_NEP4(para);
++      gpu_population.data(),
++      gpu_type_of_variable.data(),
++      fitness_total.data());
+ 
+     sort_population(para);
+ 
+@@ -470,8 +404,7 @@ void SNES::train(Parameters& para, Fitness* fitness_function)
+       para,
+       n,
+       fitness_total[para.num_types * population_size + 0], // already sorted, hence 0
+-      fitness_L1[para.num_types * population_size + best_index],
+-      fitness_L2[para.num_types * population_size + best_index],
++      best_index,
+       population.data() + number_of_variables * best_index);
+ 
+     update_mu_and_sigma();
+@@ -570,82 +503,6 @@ void SNES::create_population()
+   gpu_population.copy_to_host(population.data());
+ }
+ 
+-static __global__ void gpu_find_L1_L2_NEP4(
+-  const int number_of_variables,
+-  const int g_num_types,
+-  const int g_type,
+-  const int* g_type_of_variable,
+-  const float* g_population,
+-  float* gpu_cost_L1reg,
+-  float* gpu_cost_L2reg)
+-{
+-  int bid = blockIdx.x;
+-  int tid = threadIdx.x;
+-  __shared__ float s_cost_L1reg[1024];
+-  __shared__ float s_cost_L2reg[1024];
+-  s_cost_L1reg[tid] = 0.0f;
+-  s_cost_L2reg[tid] = 0.0f;
+-  for (int v = tid; v < number_of_variables; v += blockDim.x) {
+-    const float para = g_population[bid * number_of_variables + v];
+-    if ((g_type_of_variable[v] == g_type) && (g_type != g_num_types) || 
+-        (g_type_of_variable[v] != g_type) && (g_type == g_num_types))  {
+-      s_cost_L1reg[tid] += abs(para);
+-      s_cost_L2reg[tid] += para * para;
+-    }
+-  }
+-  __syncthreads();
+-
+-  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+-    if (tid < offset) {
+-      s_cost_L1reg[tid] += s_cost_L1reg[tid + offset];
+-      s_cost_L2reg[tid] += s_cost_L2reg[tid + offset];
+-    }
+-    __syncthreads();
+-  }
+-
+-  if (tid == 0) {
+-    gpu_cost_L1reg[bid] = s_cost_L1reg[0];
+-    gpu_cost_L2reg[bid] = s_cost_L2reg[0];
+-  }
+-}
+-
+-void SNES::regularize_NEP4(Parameters& para)
+-{
+-  gpuSetDevice(0); // normally use GPU-0
+-
+-  for (int t = 0; t <= para.num_types; ++t) {
+-    float num_variables = float(para.number_of_variables) / para.num_types;
+-    if (t == para.num_types) {
+-      num_variables = para.number_of_variables;
+-    }
+-
+-    gpu_find_L1_L2_NEP4<<<population_size, 1024>>>(
+-      number_of_variables,
+-      para.num_types,
+-      t,
+-      gpu_type_of_variable.data(),
+-      gpu_population.data(),
+-      gpu_cost_L1reg.data(),
+-      gpu_cost_L2reg.data());
+-    GPU_CHECK_KERNEL
+-
+-    gpu_cost_L1reg.copy_to_host(cost_L1reg.data());
+-    gpu_cost_L2reg.copy_to_host(cost_L2reg.data());
+-
+-    for (int p = 0; p < population_size; ++p) {
+-      float cost_L1 = para.lambda_1 * cost_L1reg[p] / num_variables;
+-      float cost_L2 = para.lambda_2 * sqrt(cost_L2reg[p] / num_variables);
+-      fitness_total[p + t * population_size] =
+-        cost_L1 + cost_L2 + fitness_energy[p + t * population_size] +
+-        fitness_force[p + t * population_size] + fitness_virial[p + t * population_size] +
+-        fitness_charge[p + t * population_size] + fitness_bec[p + t * population_size] +
+-        fitness_ediff[p];
+-      fitness_L1[p + t * population_size] = cost_L1;
+-      fitness_L2[p + t * population_size] = cost_L2;
+-    }
+-  }
+-}
+-
+ static void insertion_sort(float array[], int index[], int n)
+ {
+   for (int i = 1; i < n; i++) {
+diff --git a/src/main_nep/snes.cuh b/src/main_nep/snes.cuh
+index 38bbe7b5f..07b51b52a 100644
+--- a/src/main_nep/snes.cuh
++++ b/src/main_nep/snes.cuh
+@@ -41,20 +41,10 @@ protected:
+ 
+   std::vector<int> index;
+   std::vector<float> fitness_total;
+-  std::vector<float> fitness_L1;
+-  std::vector<float> fitness_L2;
+-  std::vector<float> fitness_energy;
+-  std::vector<float> fitness_force;
+-  std::vector<float> fitness_virial;
+-  std::vector<float> fitness_charge;
+-  std::vector<float> fitness_bec;
+-  std::vector<float> fitness_ediff; // one value per member, the same for every type
+   std::vector<float> population;
+   std::vector<float> mu;
+   std::vector<float> sigma;
+   std::vector<float> utility;
+-  std::vector<float> cost_L1reg;
+-  std::vector<float> cost_L2reg;
+   std::vector<int> type_of_variable;
+ 
+   GPU_Vector<gpurandState> curand_states;
+@@ -65,8 +55,6 @@ protected:
+   GPU_Vector<float> gpu_s;
+   GPU_Vector<float> gpu_sigma;
+   GPU_Vector<float> gpu_mu;
+-  GPU_Vector<float> gpu_cost_L1reg;
+-  GPU_Vector<float> gpu_cost_L2reg;
+ 
+   void train(Parameters& para, Fitness* fitness_function);
+   void predict(Parameters& para, Fitness* fitness_function);
+@@ -76,8 +64,6 @@ protected:
+   void calculate_utility();
+   void find_type_of_variable(Parameters& para);
+   void create_population();
+-  void regularize(Parameters&);
+-  void regularize_NEP4(Parameters& para);
+   void sort_population(Parameters& para);
+   void update_mu_and_sigma();
+   void output_mu_and_sigma(Parameters& para, const char* filename);
+diff --git a/tests_regression/CONTRACT_SUITES.md b/tests_regression/CONTRACT_SUITES.md
+index be6575b32..1bcebe00a 100644
+--- a/tests_regression/CONTRACT_SUITES.md
++++ b/tests_regression/CONTRACT_SUITES.md
+@@ -1,10 +1,10 @@
+ # Durable behavior-contract diagnostics
+ 
+-`full` is the only acceptance suite. It runs all 254 manifest cases and then
++`full` is the only acceptance suite. It runs all 255 manifest cases and then
+ evaluates all 25 cross-case relations for their declared roles:
+ 
+ ```text
+-Summary: 254 passed, 0 failed; relations: 25 passed, 0 failed, 0 skipped
++Summary: 255 passed, 0 failed; relations: 25 passed, 0 failed, 0 skipped
+ ```
+ 
+ The 23 focused suites are diagnostic views of the same manifest. They may skip
+diff --git a/tests_regression/README.md b/tests_regression/README.md
+index f260865d0..a2c26dbc1 100644
+--- a/tests_regression/README.md
++++ b/tests_regression/README.md
+@@ -38,12 +38,12 @@ regression-specific inputs self-contained.
+ 
+ ## Acceptance contract
+ 
+-`full` is the only acceptance suite. It contains all 254 cases and evaluates
++`full` is the only acceptance suite. It contains all 255 cases and evaluates
+ all 25 cross-case relations after the cases pass. Every case and relation runs
+ for both the baseline and candidate, using the same expectations. A successful run ends with:
+ 
+ ```text
+-Summary: 254 passed, 0 failed; relations: 25 passed, 0 failed, 0 skipped
++Summary: 255 passed, 0 failed; relations: 25 passed, 0 failed, 0 skipped
+ ```
+ 
+ Focused suites are diagnostic subsets only. A focused result is not a
+@@ -68,7 +68,7 @@ python3 tests_regression/run_regression.py \
+   --suite full --keep-all
+ ```
+ 
+-The intended self-comparison result is 254 passing cases and 25 passing
++The intended self-comparison result is 255 passing cases and 25 passing
+ relations. A failure requires inspecting the diagnostic or numerical delta;
+ using the same executable does not bypass any check or guarantee bitwise
+ GPU reproducibility. After self-comparison, use the accepted and candidate
+@@ -160,7 +160,7 @@ suites exist only to isolate a failure:
+ | `training` | NEP, qNEP, vdW, charge-vdW, and tensorial-NEP training paths |
+ | `prediction` | NEP prediction from an existing model over multiple batches |
+ | `pppm` | spacing, mesh sizing, resource lifecycle, and related existing qNEP cases |
+-| `full` | all 254 cases and all 25 relations |
++| `full` | all 255 cases and all 25 relations |
+ 
+ For example, a focused rerun may help diagnose a full-suite failure:
+ 
+@@ -190,11 +190,20 @@ checks and numerical bounds.
+ Cases default to `program: gpumd`. Training and prediction cases declare
+ `program: nep`, which causes the runner to stage their input as `nep.in` and select the NEP executable
+ pair. GPUMD cases continue to use `run.in` and the original executable pair.
+-Training inputs are deliberately minimal: model type, batch size, 10 generations,
++The model-coverage training inputs are deliberately minimal: model type, batch size, 10 generations,
+ `output_interval 10`, and only model-selection keywords that are required to enter
+ qNEP, vdW, charge-vdW, dipole, or polarizability paths. `loss.out`, `nep.txt`, and
+ `nep.restart` are byte-exact regression outputs.
+ 
++The energy-difference case adds `lambda_d 0.1` and uses `output_interval 1`.
++Four PbTe structures carry `name` labels; their physical data are unchanged.
++Two weighted energy differences occupy two of the three training batches, leaving
++one batch without a combination. The same structures also serve as the test set
++to exercise reporting. A semantic check requires positive energy-difference RMSE
++for the selected combinations and zero training RMSE in the empty batch at
++generations 3, 6, and 9. Test-set prediction files are also compared; only
++`force_test.out` uses the force-rounding bounds described below.
++
+ The prediction case reuses the fixed model from `examples/nep_prediction/nep.txt`
+ and the PbTe training fixture, split into three batches. It compares
+ `energy_train.out`, `virial_train.out`, and `stress_train.out` byte for byte.
+diff --git a/tests_regression/cases/training/nep_pbte_ediff.in b/tests_regression/cases/training/nep_pbte_ediff.in
+new file mode 100644
+index 000000000..6f8f595f8
+--- /dev/null
++++ b/tests_regression/cases/training/nep_pbte_ediff.in
+@@ -0,0 +1,6 @@
++type 2 Pb Te
++cutoff 8 5 7 6
++batch 9
++generation 10
++output_interval 1
++lambda_d 0.1
+diff --git a/tests_regression/fixtures/training/pbte.xyz b/tests_regression/fixtures/training/pbte.xyz
+index 95ae7acad..e893d9150 100644
+--- a/tests_regression/fixtures/training/pbte.xyz
++++ b/tests_regression/fixtures/training/pbte.xyz
+@@ -1,5 +1,5 @@
+ 250
+-energy=-937.191 config_type=nep2xyz pbc="T T T" Lattice="0.0 16.42598 16.42598 16.42598 0.0 16.42598 16.42598 16.42598 0.0" Properties=species:S:1:pos:R:3:force:R:3
++energy=-937.191 config_type=nep2xyz pbc="T T T" Lattice="0.0 16.42598 16.42598 16.42598 0.0 16.42598 16.42598 16.42598 0.0" Properties=species:S:1:pos:R:3:force:R:3 name=pbte_01
+ Te 3.391217 3.024926 3.37478 0.07834588 0.3368932 -0.1323393
+ Te 3.111386 6.409187 6.132068 0.2087532 0.8042674 0.5025407
+ Te 3.474296 9.558125 9.768056 -1.073536 0.2146508 0.01524496
+@@ -251,7 +251,7 @@ Pb 25.90497 19.67781 19.96284 0.4844853 -0.1513241 -0.05144824
+ Pb 25.87921 23.09364 23.24783 0.3955803 -0.336112 -0.298943
+ Pb 26.14758 26.22983 26.30005 0.7435387 0.3336235 0.1674997
+ 250
+-energy=-944.7615 config_type=nep2xyz pbc="T T T" Lattice="0.0 16.42598 16.42598 16.42598 0.0 16.42598 16.42598 16.42598 0.0" Properties=species:S:1:pos:R:3:force:R:3
++energy=-944.7615 config_type=nep2xyz pbc="T T T" Lattice="0.0 16.42598 16.42598 16.42598 0.0 16.42598 16.42598 16.42598 0.0" Properties=species:S:1:pos:R:3:force:R:3 name=pbte_02
+ Te 3.228683 3.036488 3.695815 0.1754132 1.239348 -0.543367
+ Te 3.092949 6.525393 6.561176 0.5888577 0.3044107 0.2080718
+ Te 3.179211 9.966263 9.842441 0.610849 -0.1057422 -0.05542158
+@@ -503,7 +503,7 @@ Pb 26.24015 19.68032 19.75332 0.1323259 0.4120677 -0.03913109
+ Pb 26.32765 22.96912 23.07756 -0.04885086 0.3690228 0.02248466
+ Pb 26.53565 26.36612 26.52471 -0.06025131 -0.07020741 0.06370474
+ 250
+-energy=-937.267 config_type=nep2xyz pbc="T T T" Lattice="0.0 16.42598 16.42598 16.42598 0.0 16.42598 16.42598 16.42598 0.0" Properties=species:S:1:pos:R:3:force:R:3
++energy=-937.267 config_type=nep2xyz pbc="T T T" Lattice="0.0 16.42598 16.42598 16.42598 0.0 16.42598 16.42598 16.42598 0.0" Properties=species:S:1:pos:R:3:force:R:3 name=pbte_03
+ Te 3.235595 3.001152 3.168519 -0.08096291 0.6495501 0.2729057
+ Te 3.284158 6.58861 6.736504 -0.1919027 0.00131456 -0.1453883
+ Te 3.361156 10.00784 10.1045 -0.2220483 -0.1555396 -0.4141614
+@@ -755,7 +755,7 @@ Pb 26.49778 19.94103 19.99514 0.1241203 -0.2219258 -0.06420224
+ Pb 26.20675 23.22885 22.99932 0.2035752 -0.1381549 0.1278686
+ Pb 26.40263 26.86704 26.54046 -0.1294065 -0.967039 -0.1303914
+ 250
+-energy=-945.3533 config_type=nep2xyz pbc="T T T" Lattice="0.0 16.42598 16.42598 16.42598 0.0 16.42598 16.42598 16.42598 0.0" Properties=species:S:1:pos:R:3:force:R:3
++energy=-945.3533 config_type=nep2xyz pbc="T T T" Lattice="0.0 16.42598 16.42598 16.42598 0.0 16.42598 16.42598 16.42598 0.0" Properties=species:S:1:pos:R:3:force:R:3 name=pbte_04
+ Te 3.223871 3.355744 3.073386 0.2058761 -0.07524134 0.2295388
+ Te 3.295983 6.596473 6.730949 -0.6832645 0.08168897 -0.1940939
+ Te 3.387999 10.09448 9.778726 0.02738318 -0.6503337 0.1354731
+diff --git a/tests_regression/fixtures/training/pbte_ediff.in b/tests_regression/fixtures/training/pbte_ediff.in
+new file mode 100644
+index 000000000..6ba2a2a17
+--- /dev/null
++++ b/tests_regression/fixtures/training/pbte_ediff.in
+@@ -0,0 +1,2 @@
++pbte_01 - pbte_02 w=0.5
++pbte_03 - pbte_04 w=2
+diff --git a/tests_regression/manifest.json b/tests_regression/manifest.json
+index f0d2cd5e9..ffaa8cf8d 100644
+--- a/tests_regression/manifest.json
++++ b/tests_regression/manifest.json
+@@ -460,6 +460,22 @@
+         }
+       ]
+     },
++    "training_pbte_ediff": {
++      "stage": [
++        {
++          "source": "package:fixtures/training/pbte.xyz",
++          "target": "train.xyz"
++        },
++        {
++          "source": "package:fixtures/training/pbte.xyz",
++          "target": "test.xyz"
++        },
++        {
++          "source": "package:fixtures/training/pbte_ediff.in",
++          "target": "ediff.in"
++        }
++      ]
++    },
+     "training_tnep": {
+       "stage": [
+         {
+@@ -5951,6 +5967,53 @@
+       ],
+       "timeout_s": 900
+     },
++    {
++      "id": "train_nep_pbte_ediff",
++      "program": "nep",
++      "description": "NEP energy-difference loss across batches with and without combinations, including test-set reporting",
++      "suites": [
++        "training",
++        "full"
++      ],
++      "fixture": "training_pbte_ediff",
++      "input": "package:cases/training/nep_pbte_ediff.in",
++      "covers": [
++        "training:nep",
++        "training:energy-difference",
++        "boundary:ttt",
++        "batch:multi",
++        "batch:no-energy-difference"
++      ],
++      "expect": "success",
++      "stdout_contains": "ediff.in: 2 combinations, 2 in train.xyz, 2 in test.xyz (2 in both), 0 skipped.",
++      "outputs": [
++        "loss.out",
++        "nep.txt",
++        "nep.restart",
++        "energy_test.out",
++        "force_test.out",
++        "virial_test.out",
++        "stress_test.out"
++      ],
++      "comparisons": {
++        "force_test.out": {
++          "mode": "numeric",
++          "rtol": 1e-05,
++          "atol": 2e-07,
++          "reason": "Test-set reporting uses the same single-precision atomic force accumulation and six-significant-digit output as predict_nep_pbte_batch. Apply its force-only rounding bounds, in eV/angstrom."
++        }
++      },
++      "post_checks": [
++        {
++          "name": "nep_energy_difference",
++          "output": "loss.out",
++          "generations": 10,
++          "batches": 3,
++          "empty_batch": 2
++        }
++      ],
++      "timeout_s": 900
++    },
+     {
+       "id": "train_qnep1_pbte_full",
+       "program": "nep",
+diff --git a/tests_regression/post_checks.py b/tests_regression/post_checks.py
+index d04c6ee4a..50c16c758 100644
+--- a/tests_regression/post_checks.py
++++ b/tests_regression/post_checks.py
+@@ -256,9 +256,40 @@ def _check_msd_from_xyz(spec: Mapping[str, Any], workdir: Path) -> Dict[str, Any
+     return {"trajectories": len(spec["trajectories"]), "max_abs": max_abs}
+ 
+ 
++def _check_nep_energy_difference(spec: Mapping[str, Any], workdir: Path) -> Dict[str, Any]:
++    path = workdir / spec["output"]
++    headers = [
++        line.split()[2:] for line in path.read_text().splitlines()
++        if line.startswith("# columns ")
++    ]
++    if len(headers) != 1:
++        raise PostCheckError("loss.out: expected one columns header")
++    columns = headers[0]
++    required = ("generation", "rmse_ediff_train", "rmse_ediff_test")
++    if any(columns.count(name) != 1 for name in required):
++        raise PostCheckError("loss.out: missing or duplicate energy-difference columns")
++    data = _loadtxt(path)
++    if data.shape != (spec["generations"], len(columns)) or not np.all(np.isfinite(data)):
++        raise PostCheckError("loss.out: invalid shape or non-finite values")
++    generation = data[:, columns.index("generation")]
++    if not np.array_equal(generation, np.arange(1, spec["generations"] + 1)):
++        raise PostCheckError("loss.out: expected one row per generation")
++    train = data[:, columns.index("rmse_ediff_train")]
++    test = data[:, columns.index("rmse_ediff_test")]
++    empty = (generation - 1) % spec["batches"] == spec["empty_batch"]
++    if not np.any(empty) or not np.any(~empty):
++        raise PostCheckError("loss.out: must cover batches with and without combinations")
++    if np.any(train[empty] != 0):
++        raise PostCheckError("loss.out: energy-difference loss must be zero in the empty batch")
++    if np.any(train[~empty] <= 0) or np.any(test <= 0):
++        raise PostCheckError("loss.out: energy-difference loss must be positive for these combinations")
++    return {"rows": int(data.shape[0]), "empty_batch_rows": int(np.count_nonzero(empty))}
++
++
+ CHECKS = {
+     "active_uncertainty": _check_active_uncertainty,
+     "msd_from_xyz": _check_msd_from_xyz,
++    "nep_energy_difference": _check_nep_energy_difference,
+ }
+ 
+ 
+@@ -285,6 +316,9 @@ def validate_spec(spec: Any, owner: str) -> None:
+         "msd_from_xyz": {
+             "name", "output", "window", "trajectories", "rtol", "atol",
+         },
++        "nep_energy_difference": {
++            "name", "output", "generations", "batches", "empty_batch",
++        },
+     }
+     required = required_by_name[name]
+     missing = required - set(spec)
+@@ -295,11 +329,21 @@ def validate_spec(spec: Any, owner: str) -> None:
+         raise ValueError(f"{owner} has unknown key(s): {sorted(unknown)}")
+ 
+     for tolerance in ("rtol", "atol"):
++        if tolerance not in spec:
++            continue
+         value = spec[tolerance]
+         if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+             raise ValueError(f"{owner}.{tolerance} must be a finite non-negative number")
+ 
+-    if name == "active_uncertainty":
++    if name == "nep_energy_difference":
++        _relative_path(spec["output"], f"{owner}.output")
++        for key in ("generations", "batches"):
++            if not isinstance(spec[key], int) or isinstance(spec[key], bool) or spec[key] <= 0:
++                raise ValueError(f"{owner}.{key} must be a positive integer")
++        empty = spec["empty_batch"]
++        if not isinstance(empty, int) or isinstance(empty, bool) or not 0 <= empty < spec["batches"]:
++            raise ValueError(f"{owner}.empty_batch must be a valid zero-based batch index")
++    elif name == "active_uncertainty":
+         for key in ("observers", "check_interval"):
+             if not isinstance(spec[key], int) or isinstance(spec[key], bool) or spec[key] <= 0:
+                 raise ValueError(f"{owner}.{key} must be a positive integer")
+diff --git a/tests_regression/test_manifest.py b/tests_regression/test_manifest.py
+index 998041964..e42c2d574 100644
+--- a/tests_regression/test_manifest.py
++++ b/tests_regression/test_manifest.py
+@@ -244,7 +244,7 @@ def test_package_fixture_hashes_are_pinned():
+         "fixtures/potentials/graphene_tersoff_1988_params.txt":
+             "baf64d6b7f5bbfc32f7af38b64b601af9ce4b4417e8e6c2af320d00610f4f9ef",
+         "fixtures/training/pbte.xyz":
+-            "3b9f1d55fe61def164ab87370dce66b760d6740d3c1cc35ec6bc3db057572c5c",
++            "374154710cda7bb2d5ad6a05fbe4cfdc93b70910226d192705bd84654f7f8ed7",
+         "fixtures/training/pbte_water_mixed.xyz":
+             "78cda019ae1243eda4764afc98b53abe287e4a84f2aeaf2c53d37a01b0c04743",
+         "fixtures/training/tnep_120.xyz":
+@@ -290,11 +290,11 @@ def test_training_cases_use_nep_program_and_minimal_inputs():
+     training_cases = [
+         case for case in manifest["cases"] if "training" in case["suites"]
+     ]
+-    assert len(training_cases) == 22
++    assert len(training_cases) == 23
+     assert all(case.get("program") == "nep" for case in training_cases)
+     assert all("full" in case["suites"] for case in training_cases)
+     assert all(
+-        case["outputs"] == ["loss.out", "nep.txt", "nep.restart"]
++        case["outputs"][:3] == ["loss.out", "nep.txt", "nep.restart"]
+         for case in training_cases
+     )
+     assert all("stage" not in case for case in training_cases)
+@@ -319,7 +319,13 @@ def test_training_cases_use_nep_program_and_minimal_inputs():
+             fields for fields in commands if fields[0] == "output_interval"
+         )
+         assert generation == ["generation", "10"], case["id"]
+-        assert output_interval == ["output_interval", "10"], case["id"]
++        interval = "1" if case["id"] == "train_nep_pbte_ediff" else "10"
++        assert output_interval == ["output_interval", interval], case["id"]
++        expected_outputs = ["loss.out", "nep.txt", "nep.restart"]
++        if case["id"] == "train_nep_pbte_ediff":
++            expected_outputs += ["energy_test.out", "force_test.out", "virial_test.out", "stress_test.out"]
++            assert ["lambda_d", "0.1"] in commands
++        assert case["outputs"] == expected_outputs, case["id"]
+ 
+     mixed_cases = [case for case in training_cases if case["id"].endswith("_mixed")]
+     assert len(mixed_cases) == 4
+@@ -339,6 +345,27 @@ def test_training_cases_use_nep_program_and_minimal_inputs():
+         assert "batch 61" in input_path.read_text(encoding="utf-8"), case["id"]
+ 
+ 
++def test_energy_difference_fixture_preserves_pbte_data():
++    path = PACKAGE_ROOT / "fixtures/training/pbte.xyz"
++    text = path.read_text()
++    names = re.findall(r" name=(pbte_\d+)$", text, re.MULTILINE)
++    assert names == ["pbte_01", "pbte_02", "pbte_03", "pbte_04"]
++    original = re.sub(r" name=pbte_0[1-4](?=\n)", "", text)
++    assert hashlib.sha256(original.encode()).hexdigest() == (
++        "3b9f1d55fe61def164ab87370dce66b760d6740d3c1cc35ec6bc3db057572c5c"
++    )
++    frames = runner.post_checks.read_extxyz(path)
++    assert len(frames) == 25
++    for a, b in ((0, 1), (2, 3)):
++        left, right = frames[a], frames[b]
++        assert left["natoms"] == right["natoms"] == 250
++        for species in ("Pb", "Te"):
++            assert sum(left["arrays"]["species"] == species) == 125
++            assert sum(right["arrays"]["species"] == species) == 125
++        assert not (left["arrays"]["pos"] == right["arrays"]["pos"]).all()
++        assert abs(float(left["fields"]["energy"]) - float(right["fields"]["energy"])) > 1
++
++
+ def test_behavior_contract_cases_are_full_differential_cases():
+     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+     cases = {case["id"]: case for case in manifest["cases"]}
+@@ -452,14 +479,13 @@ def test_parsing_validation_cases_match_the_accepted_baseline():
+ 
+ 
+ 
+-def test_semantic_postchecks_preserve_byte_exact_cross_version_outputs():
++def test_semantic_postchecks_preserve_cross_version_comparisons():
+     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+     post_checked = [case for case in manifest["cases"] if case.get("post_checks")]
+     assert post_checked
+     for case in post_checked:
+-        # Semantic tolerances are independent post-processing oracles only.
+-        # Baseline/candidate output comparison stays byte-exact.
+-        assert case.get("comparisons", {}) == {}
++        expected = {"force_test.out"} if case["id"] == "train_nep_pbte_ediff" else set()
++        assert set(case.get("comparisons", {})) == expected
+         assert "role_expectations" not in case
+         assert case.get("compare_cross_version", True) is True
+ 
+@@ -492,6 +518,9 @@ def test_numeric_exceptions_are_explicit_per_output():
+         )
+     }
+     expected = {
++        "train_nep_pbte_ediff": {
++            "force_test.out": (1e-5, 2e-7),
++        },
+         "predict_nep_pbte_batch": {
+             "force_train.out": (1e-5, 2e-7),
+         },
+@@ -555,10 +584,11 @@ def test_numeric_exceptions_are_explicit_per_output():
+         test_package_fixture_hashes_are_pinned,
+         test_successful_nep_cases_declare_neighbor_output,
+         test_training_cases_use_nep_program_and_minimal_inputs,
++        test_energy_difference_fixture_preserves_pbte_data,
+         test_behavior_contract_cases_are_full_differential_cases,
+         test_default_runtime_consumers_are_full_cases,
+         test_parsing_validation_cases_match_the_accepted_baseline,
+-        test_semantic_postchecks_preserve_byte_exact_cross_version_outputs,
++        test_semantic_postchecks_preserve_cross_version_comparisons,
+         test_regression_has_no_dependency_on_migrated_gpumd_test_directories,
+         test_numeric_exceptions_are_explicit_per_output,
+     )
+diff --git a/tests_regression/test_post_checks.py b/tests_regression/test_post_checks.py
+index 079837674..a5ba3bd58 100644
+--- a/tests_regression/test_post_checks.py
++++ b/tests_regression/test_post_checks.py
+@@ -8,6 +8,45 @@
+ 
+ 
+ class PostCheckTests(unittest.TestCase):
++    def test_nep_energy_difference_batches(self):
++        spec = {
++            "name": "nep_energy_difference", "output": "loss.out",
++            "generations": 10, "batches": 3, "empty_batch": 2,
++        }
++        post_checks.validate_spec(spec, "spec")
++        data = np.column_stack([np.arange(1, 11), np.ones(10), np.full(10, 2.0)])
++        data[[2, 5, 8], 1] = 0
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            path = root / "loss.out"
++            header = "columns generation rmse_ediff_train rmse_ediff_test"
++            np.savetxt(path, data, header=header)
++            result = post_checks.run([spec], root)
++            self.assertEqual(result[0]["metrics"], {"rows": 10, "empty_batch_rows": 3})
++            for row, column, value in ((2, 1, 1), (0, 1, 0), (0, 2, 0), (1, 0, 1), (0, 1, np.nan)):
++                with self.subTest(row=row, column=column, value=value):
++                    altered = data.copy()
++                    altered[row, column] = value
++                    np.savetxt(path, altered, header=header)
++                    with self.assertRaises(post_checks.PostCheckError):
++                        post_checks.run([spec], root)
++            np.savetxt(path, data[:-1], header=header)
++            with self.assertRaises(post_checks.PostCheckError):
++                post_checks.run([spec], root)
++            np.savetxt(path, data)
++            with self.assertRaises(post_checks.PostCheckError):
++                post_checks.run([spec], root)
++
++    def test_nep_energy_difference_spec(self):
++        spec = {
++            "name": "nep_energy_difference", "output": "loss.out",
++            "generations": 10, "batches": 3, "empty_batch": 2,
++        }
++        for key, value in (("generations", 0), ("batches", True), ("empty_batch", 3), ("empty_batch", -1)):
++            with self.subTest(key=key, value=value):
++                with self.assertRaises(ValueError):
++                    post_checks.validate_spec(dict(spec, **{key: value}), "spec")
++
+     def test_extxyz_parser_and_msd_reference(self):
+         with tempfile.TemporaryDirectory() as tmp:
+             root = Path(tmp)

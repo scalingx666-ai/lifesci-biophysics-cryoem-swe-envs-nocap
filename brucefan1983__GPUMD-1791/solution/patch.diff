@@ -1,0 +1,549 @@
+diff --git a/.gitignore b/.gitignore
+index 869640c65..995fc44ce 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -30,3 +30,5 @@ __pycache__/
+ .hypothesis/
+ README.gnep.md
+ push-to-both.sh
++
++src/.wpe_obj/
+diff --git a/src/force/force.cu b/src/force/force.cu
+index c09fa298c..200126bf9 100644
+--- a/src/force/force.cu
++++ b/src/force/force.cu
+@@ -26,6 +26,9 @@ The driver class calculating force and related quantities.
+ #include "eam_alloy.cuh"
+ #include "fcp.cuh"
+ #include "force.cuh"
++#ifdef GPUMD_WPE_ENABLED
++#include "wpe_adapter.cuh"
++#endif
+ #include "ilp_nep.cuh"
+ #include "ilp_tmd_sw.cuh"
+ #include "ilp_tersoff.cuh"
+@@ -193,6 +196,24 @@ void Force::parse_potential(
+   const int number_of_atoms,
+   const RunInput& run_input)
+ {
++#ifdef GPUMD_WPE_ENABLED
++  if (tokens.size() != 2u) {
++    PRINT_INPUT_ERROR(
++      "Wisevolve Potential Engine integration supports exactly one potential file and no additional potential parameters.\n");
++  }
++  if (!potentials.empty()) {
++    PRINT_INPUT_ERROR(
++      "Wisevolve Potential Engine integration supports exactly one potential. Use standard GPUMD for multiple potentials.\n");
++  }
++  (void)box;
++  (void)run_input;
++  std::unique_ptr<Potential> wpe_potential(new WpePotential(
++    tokens[1].c_str(), number_of_atoms));
++  wpe_potential->N1 = 0;
++  wpe_potential->N2 = number_of_atoms;
++  potentials.push_back(std::move(wpe_potential));
++  return;
++#else
+   const int num_param = tokens.size();
+   if (num_param != 2 && num_param != 3) {
+     PRINT_INPUT_ERROR("potential should have 1 or 2 parameters.\n");
+@@ -232,8 +253,20 @@ void Force::parse_potential(
+   if (potentials.size() > 1 && has_non_nep) {
+     PRINT_INPUT_ERROR("Multiple potentials may only be used with NEP potentials.\n");
+   }
++#endif
+ }
+ 
++#ifdef GPUMD_WPE_ENABLED
++void Force::wpe_process_command(
++  const std::vector<std::string>& tokens,
++  const int current_number_of_atoms)
++{
++  WpeStageInfo stage{};
++  if (wpe_stage_state_.process_command(tokens, current_number_of_atoms, stage))
++    gpumd_wpe_activate_stage(potentials, stage);
++}
++#endif
++
+ int Force::get_number_of_types(FILE* fid_potential)
+ {
+   int num_of_types;
+diff --git a/src/force/force.cuh b/src/force/force.cuh
+index 3bc8877cb..ead8ca3d2 100644
+--- a/src/force/force.cuh
++++ b/src/force/force.cuh
+@@ -18,6 +18,9 @@
+ #include "model/box.cuh"
+ #include "model/group.cuh"
+ #include "potential.cuh"
++#ifdef GPUMD_WPE_ENABLED
++#include "wpe_stage.cuh"
++#endif
+ #include "utilities/common.cuh"
+ #include <memory>
+ #include <stdio.h>
+@@ -58,6 +61,12 @@ public:
+     GPU_Vector<double>& mass_per_atom,
+     int* position_image = nullptr);
+ 
++#ifdef GPUMD_WPE_ENABLED
++  void wpe_process_command(
++    const std::vector<std::string>& tokens,
++    int current_number_of_atoms);
++#endif
++
+   void finalize();
+ 
+   int get_number_of_types(FILE* fid_potential);
+@@ -69,6 +78,9 @@ public:
+   Potential& get_potential(const int index);
+ 
+ private:
++#ifdef GPUMD_WPE_ENABLED
++  WpeGpumdStageState wpe_stage_state_;
++#endif
+   std::unique_ptr<Potential> create_potential(
+     const std::vector<std::string>& tokens,
+     FILE* fid_potential,
+diff --git a/src/lib/wpe/wisevolve_potential_api.h b/src/lib/wpe/wisevolve_potential_api.h
+new file mode 100644
+index 000000000..80843a3ad
+--- /dev/null
++++ b/src/lib/wpe/wisevolve_potential_api.h
+@@ -0,0 +1,190 @@
++/*
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Portions copyright 2017-2026 Zheyong Fan and respective contributors.
++ * Copyright (c) 2026 Wisevolve.
++ *
++ * This license applies only to this public WPE interface header. It does not
++ * grant rights to the Wisevolve Potential Engine implementation.
++ */
++
++#pragma once
++
++/*
++ * Wisevolve Potential Engine (WPE) C API.
++ *
++ * This interface is the dedicated GPUMD/WPE integration boundary. It is not a
++ * generic GPUMD potential-backend ABI.
++ *
++ * Binary compatibility is carried by the shared-library SONAME
++ * (libwisevolve_potential.so.1). Public records keep struct_size so fields can
++ * be appended without adding a separate API/ABI version field to each call.
++ *
++ * Contract:
++ *   - pure C ABI exported by libwisevolve_potential.so
++ *   - opaque WPE context
++ *   - no GPUMD C++ types cross this header
++ *   - stage activation receives only high-level run facts
++ *   - bind provides stable GPUMD-owned input/output surfaces
++ *   - WPE owns execution policy, including virial routing
++ *   - compute(context) is the hot path
++ */
++
++#include <stdint.h>
++#include <stddef.h>
++
++#if defined(__GNUC__) || defined(__clang__)
++#define WPE_API __attribute__((visibility("default")))
++#else
++#define WPE_API
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct WpeContext WpeContext;
++
++typedef enum WpeStatus {
++  WPE_OK = 0,
++  WPE_ERR_INVALID_ARGUMENT = 1,
++  WPE_ERR_UNSUPPORTED_MODEL = 2,
++  WPE_ERR_CUDA = 3,
++  WPE_ERR_NEIGHBOR_CAPACITY = 4,
++  WPE_ERR_INTERNAL = 5
++} WpeStatus;
++
++typedef struct WpeInfo {
++  uint32_t struct_size;
++  uint32_t reserved0;
++  const char* name;
++  const char* version;
++  const char* provider;
++  const char* library_soname;
++
++  /* Optional release metadata. NULL means not published for this release. */
++  const char* project_url;
++  const char* citation;
++  const char* citation_doi;
++} WpeInfo;
++
++typedef enum WpeQnepKspaceMethod {
++  WPE_QNEP_KSPACE_PPPM = 0,
++  WPE_QNEP_KSPACE_EWALD = 1
++} WpeQnepKspaceMethod;
++
++typedef enum WpeStageKind {
++  WPE_STAGE_RUN = 1,
++  WPE_STAGE_MINIMIZE = 2,
++  WPE_STAGE_PHONON = 3,
++  WPE_STAGE_COHESIVE = 4,
++  WPE_STAGE_ELASTIC = 5
++} WpeStageKind;
++
++enum WpeStageFactBits {
++  WPE_STAGE_HAS_SYSTEM_VIRIAL_CONSUMER = 1ull << 0,
++  WPE_STAGE_HAS_ATOM_VIRIAL_CONSUMER = 1ull << 1,
++  WPE_STAGE_HAS_HNEMD = 1ull << 2,
++  WPE_STAGE_HAS_HNEMDEC = 1ull << 3,
++  WPE_STAGE_NEED_CHARGE_OUTPUT = 1ull << 4,
++  WPE_STAGE_NEED_BEC_OUTPUT = 1ull << 5,
++  WPE_STAGE_HAS_MC = 1ull << 6,
++  WPE_STAGE_MINIMIZE_BOX_CHANGE = 1ull << 7,
++  WPE_STAGE_PIMD_ECO_CONFIGURATION = 1ull << 8
++};
++
++typedef struct WpeStageInfo {
++  uint32_t struct_size;
++  uint32_t stage_kind;
++  uint32_t reserved0;
++  uint32_t reserved1;
++  const char* ensemble_name;
++  uint64_t facts;
++  int32_t number_of_atoms;
++  uint32_t pimd_beads;
++  uint32_t qnep_kspace_method;
++  uint32_t dftd3_enabled;
++  const char* dftd3_functional;
++  float dftd3_rc_potential;
++  float dftd3_rc_coordination_number;
++  uint32_t reserved2;
++  uint32_t reserved3;
++} WpeStageInfo;
++
++typedef struct WpeCreateInfo {
++  uint32_t struct_size;
++  uint32_t reserved0;
++  const char* potential_path;
++  int32_t number_of_atoms;
++  uint32_t reserved1;
++} WpeCreateInfo;
++
++/* Generic model metadata required by the open Potential facade. Execution
++ * routing and capabilities remain private to the closed backend. */
++typedef struct WpeCreateResult {
++  uint32_t struct_size;
++  uint32_t reserved0;
++  double cutoff;
++} WpeCreateResult;
++
++typedef struct WpeBinding {
++  uint32_t struct_size;
++  int32_t number_of_atoms;
++  uint32_t reserved0;
++  uint32_t reserved1;
++
++  const void* position_device;       /* double[3N], GPUMD SoA */
++  const void* type_device;           /* int[N] */
++
++  void* force_device;                /* double[3N], host-prepared output */
++  void* potential_device;            /* double[N], host-prepared output */
++  void* atomic_virial_device;        /* double[9N], host-prepared/zeroed output */
++  void* total_virial_device;         /* optional double[6]; NULL = WPE-owned scratch */
++
++  const double* box_h18_host;        /* borrowed Box::cpu_h */
++  const int32_t* pbc_x_host;
++  const int32_t* pbc_y_host;
++  const int32_t* pbc_z_host;
++
++  void* charge_device;               /* float[N] or NULL */
++  void* bec_device;                  /* float[9N] or NULL */
++} WpeBinding;
++
++/*
++ * ABI 1 minimum accepted struct sizes. These values are frozen for SONAME 1.
++ * Future ABI-1-compatible fields may only be appended; these V1 minimums
++ * must never be advanced to include appended fields.
++ */
++#define WPE_INFO_V1_MIN_SIZE \
++  ((uint32_t)(offsetof(WpeInfo, library_soname) + sizeof(const char*)))
++#define WPE_CREATE_INFO_V1_MIN_SIZE \
++  ((uint32_t)(offsetof(WpeCreateInfo, reserved1) + sizeof(uint32_t)))
++#define WPE_CREATE_RESULT_V1_MIN_SIZE \
++  ((uint32_t)(offsetof(WpeCreateResult, cutoff) + sizeof(double)))
++#define WPE_STAGE_INFO_V1_MIN_SIZE \
++  ((uint32_t)(offsetof(WpeStageInfo, reserved3) + sizeof(uint32_t)))
++#define WPE_BINDING_V1_MIN_SIZE \
++  ((uint32_t)(offsetof(WpeBinding, bec_device) + sizeof(void*)))
++
++WPE_API WpeStatus wpe_get_info(WpeInfo* info);
++
++WPE_API WpeStatus wpe_create(
++  const WpeCreateInfo* info,
++  WpeCreateResult* result,
++  WpeContext** context);
++
++WPE_API WpeStatus wpe_activate_stage(
++  WpeContext* context,
++  const WpeStageInfo* stage);
++
++WPE_API WpeStatus wpe_bind(
++  WpeContext* context,
++  const WpeBinding* binding);
++
++WPE_API WpeStatus wpe_compute(WpeContext* context);
++
++WPE_API void wpe_destroy(WpeContext* context);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/main_gpumd/run.cu b/src/main_gpumd/run.cu
+index e06a7325d..0e21c16a3 100644
+--- a/src/main_gpumd/run.cu
++++ b/src/main_gpumd/run.cu
+@@ -318,6 +318,10 @@ void Run::parse_one_keyword(
+   if (num_param > max_num_param)
+     PRINT_INPUT_ERROR("The number of parameters should be less than 32.\n");
+ 
++#ifdef GPUMD_WPE_ENABLED
++  force.wpe_process_command(tokens, atom.number_of_atoms);
++#endif
++
+   if (tokens[0] == "potential") {
+     force.parse_potential(tokens, box, atom.type.size(), run_input);
+   } else if (tokens[0] == "minimize") {
+diff --git a/src/makefile_wpe b/src/makefile_wpe
+new file mode 100644
+index 000000000..f65e0a7e5
+--- /dev/null
++++ b/src/makefile_wpe
+@@ -0,0 +1,225 @@
++###########################################################
++# Makefile for GPUMD with Wisevolve Potential Engine (WPE)
++#
++# Build from src/:
++#
++#   make -f makefile_wpe \
++#     WPE_ROOT=/path/to/wpe \
++#     WPE_SO_ROOT=/path/to/wpe.so
++#
++# Output:
++#
++#   gpumd-wpe
++###########################################################
++
++.DEFAULT_GOAL := all
++
++
++###########################################################
++# required WPE paths
++###########################################################
++
++ifneq ($(MAKECMDGOALS),clean)
++
++ifeq ($(strip $(WPE_ROOT)),)
++$(error WPE_ROOT is required. Set WPE_ROOT=/path/to/wpe)
++endif
++
++ifeq ($(strip $(WPE_SO_ROOT)),)
++$(error WPE_SO_ROOT is required. Set WPE_SO_ROOT=/path/to/wpe.so)
++endif
++
++endif
++
++WPE_INCLUDE = $(WPE_ROOT)/include
++WPE_INTEGRATION = $(WPE_ROOT)/integration/gpumd
++WPE_LIBDIR = $(WPE_SO_ROOT)/lib
++WPE_LIB = $(WPE_LIBDIR)/libwisevolve_potential.so
++
++WPE_GPUMD_API = lib/wpe/wisevolve_potential_api.h
++WPE_EXTERNAL_API = $(WPE_INCLUDE)/wisevolve_potential_api.h
++
++WPE_ADAPTER = $(WPE_INTEGRATION)/wpe_adapter.cu
++WPE_STAGE = $(WPE_INTEGRATION)/wpe_stage.cu
++
++ifneq ($(MAKECMDGOALS),clean)
++
++ifeq ($(wildcard $(WPE_ROOT)),)
++$(error WPE_ROOT does not exist: $(WPE_ROOT))
++endif
++
++ifeq ($(wildcard $(WPE_SO_ROOT)),)
++$(error WPE_SO_ROOT does not exist: $(WPE_SO_ROOT))
++endif
++
++ifeq ($(wildcard $(WPE_ADAPTER)),)
++$(error Missing WPE GPUMD adapter: $(WPE_ADAPTER))
++endif
++
++ifeq ($(wildcard $(WPE_STAGE)),)
++$(error Missing WPE GPUMD stage integration: $(WPE_STAGE))
++endif
++
++ifeq ($(wildcard $(WPE_EXTERNAL_API)),)
++$(error Missing WPE API header: $(WPE_EXTERNAL_API))
++endif
++
++ifeq ($(wildcard $(WPE_LIB)),)
++$(error Missing WPE shared library: $(WPE_LIB))
++endif
++
++endif
++
++
++###########################################################
++# runtime library path
++###########################################################
++
++# WPE_SO_ROOT determines both link-time and runtime lookup.
++ifeq ($(filter /%,$(WPE_LIBDIR)),)
++WPE_RPATH = $$ORIGIN/$(WPE_LIBDIR)
++else
++WPE_RPATH = $(WPE_LIBDIR)
++endif
++
++
++###########################################################
++# compiler flags
++###########################################################
++
++ifdef OS
++$(error WPE integration currently supports Linux/CUDA builds only)
++endif
++
++CC = nvcc
++CUDA_ARCH ?= -arch=sm_60
++
++WARN_FLAGS = -Wall -Wextra
++WARN_FLAGS += -Wno-sign-compare -Wno-unused-parameter
++WARN_FLAGS += -Wnull-dereference -Wstringop-overflow -Wstringop-truncation -Wrestrict
++WARN_FLAGS += -Wduplicated-cond -Wduplicated-branches -Wlogical-op
++WARN_FLAGS += -Wsequence-point -Wswitch-default
++WARN_FLAGS += -Wcast-align -Wcast-qual -Wvla
++WARN_FLAGS += -Wformat -Wformat-security -Wformat-overflow -Wformat-truncation
++
++WPE_NVCC_FLAGS ?= -Wno-deprecated-gpu-targets
++
++CFLAGS = -std=c++14 -O3 $(CUDA_ARCH) -Xcompiler="$(WARN_FLAGS)"
++CFLAGS += -DGPUMD_WPE_ENABLED=1 $(WPE_NVCC_FLAGS)
++
++INC = -I./ -Iforce -Ilib/wpe -I"$(WPE_INTEGRATION)"
++
++LDFLAGS =
++LIBS = -lcublas -lcusolver -lcufft
++
++
++###########################################################
++# source files
++###########################################################
++
++SOURCES_GPUMD =                   \
++	$(wildcard main_gpumd/*.cu)   \
++	$(wildcard minimize/*.cu)     \
++	$(wildcard phonon/*.cu)       \
++	$(wildcard integrate/*.cu)    \
++	$(wildcard mc/*.cu)           \
++	$(wildcard force/*.cu)        \
++	$(wildcard measure/*.cu)      \
++	$(wildcard model/*.cu)        \
++	$(wildcard utilities/*.cu)
++
++
++###########################################################
++# object files
++###########################################################
++
++OBJDIR = .wpe_obj
++
++OBJ_GPUMD = $(patsubst %.cu,$(OBJDIR)/%.o,$(SOURCES_GPUMD))
++
++WPE_ADAPTER_OBJ = $(OBJDIR)/wpe/wpe_adapter.o
++WPE_STAGE_OBJ = $(OBJDIR)/wpe/wpe_stage.o
++
++OBJECTS = $(OBJ_GPUMD) $(WPE_ADAPTER_OBJ) $(WPE_STAGE_OBJ)
++
++
++###########################################################
++# headers
++###########################################################
++
++HEADERS =                         \
++	$(wildcard utilities/*.cuh)   \
++	$(wildcard main_gpumd/*.cuh)  \
++	$(wildcard integrate/*.cuh)   \
++	$(wildcard mc/*.cuh)          \
++	$(wildcard minimize/*.cuh)    \
++	$(wildcard force/*.cuh)       \
++	$(wildcard measure/*.cuh)     \
++	$(wildcard model/*.cuh)       \
++	$(wildcard phonon/*.cuh)      \
++	$(wildcard $(WPE_INTEGRATION)/*.cuh) \
++	$(WPE_GPUMD_API)
++
++
++###########################################################
++# validation
++###########################################################
++
++.PHONY: all check-wpe clean
++
++check-wpe:
++	@cmp -s "$(WPE_GPUMD_API)" "$(WPE_EXTERNAL_API)" || { \
++		echo "ERROR: GPUMD and WPE copies of wisevolve_potential_api.h differ"; \
++		exit 2; \
++	}
++
++$(OBJECTS): | check-wpe
++
++
++###########################################################
++# executable
++###########################################################
++
++all: gpumd-wpe
++
++gpumd-wpe: $(OBJECTS)
++	$(CC) $(LDFLAGS) $(OBJECTS) \
++		-L"$(WPE_LIBDIR)" \
++		-Xlinker --no-as-needed \
++		-lwisevolve_potential \
++		-Xlinker -rpath \
++		-Xlinker '$(WPE_RPATH)' \
++		-o $@ $(LIBS)
++	@echo =================================================
++	@echo The gpumd-wpe executable is successfully compiled!
++	@echo =================================================
++
++
++###########################################################
++# GPUMD object rules
++###########################################################
++
++$(OBJDIR)/%.o: %.cu $(HEADERS)
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) $(INC) -c $< -o $@
++
++
++###########################################################
++# WPE integration object rules
++###########################################################
++
++$(WPE_ADAPTER_OBJ): $(WPE_ADAPTER) $(HEADERS)
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) $(INC) -c $< -o $@
++
++$(WPE_STAGE_OBJ): $(WPE_STAGE) $(HEADERS)
++	@mkdir -p $(dir $@)
++	$(CC) $(CFLAGS) $(INC) -c $< -o $@
++
++
++###########################################################
++# clean up
++###########################################################
++
++clean:
++	rm -rf $(OBJDIR) gpumd-wpe

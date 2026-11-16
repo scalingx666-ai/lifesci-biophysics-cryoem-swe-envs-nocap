@@ -1,0 +1,530 @@
+diff --git a/cryosparc/api.pyi b/cryosparc/api.pyi
+index 61ed1bdc..4f826a57 100644
+--- a/cryosparc/api.pyi
++++ b/cryosparc/api.pyi
+@@ -2254,6 +2254,7 @@ class APIClient:
+     def login(
+         self,
+         *,
++        expires_in: float = 1209600,
+         username: str,
+         password: str,
+         grant_type: Optional[str] = ...,
+diff --git a/cryosparc/auth.py b/cryosparc/auth.py
+new file mode 100644
+index 00000000..83a45277
+--- /dev/null
++++ b/cryosparc/auth.py
+@@ -0,0 +1,114 @@
++"""
++Functions and classes for performing and storing user authentication operations.
++"""
++
++from datetime import datetime, timezone
++from functools import lru_cache
++from pathlib import Path
++from typing import Dict, Optional
++from warnings import warn
++
++from pydantic import AwareDatetime, BaseModel, RootModel, ValidationError, field_validator
++
++from .models.auth import Token
++from .platform import user_config_path
++from .util import first
++
++
++@lru_cache(maxsize=1)
++def get_default_auth_config_path():
++    return user_config_path() / "cryosparc-tools" / "auth.json"
++
++
++class AuthSession(BaseModel):
++    """
++    A cryosparc-tools CLI session from a successful call to
++    ``python -m cryosparc.tools login``.
++    """
++
++    token: Token
++    expires: AwareDatetime
++
++
++class UserAuthSessions(RootModel):
++    """
++    Dictionary of CLI login sessions for a single instance organized by user ID.
++    Only one session is allowed per-user.
++    """
++
++    root: Dict[str, AuthSession]
++
++    @field_validator("root", mode="after")
++    @classmethod
++    def remove_expired_tokens(cls, value: Dict[str, AuthSession]):
++        now = datetime.now(timezone.utc)
++        return {k: v for k, v in value.items() if v.expires > now}
++
++
++class InstanceAuthSessions(RootModel):
++    """
++    Dictionary of CLI multiple user sessions for multiple instances,
++    organized by instance URL. Stored in ~/.config directory.
++
++    Example:
++
++        >>> {
++        ...     "https://cryosparc.example.com": {
++        ...         "ali@example.com": {
++        ...             "token": {
++        ...                 "access_token": "abc123",
++        ...                 "token_type": "bearer"
++        ...             },
++        ...             "expires": "2025-01-31T12:00:00.000000Z"
++        ...         }
++        ...     }
++        ... }
++    """
++
++    root: Dict[str, UserAuthSessions]
++
++    @classmethod
++    def load(cls, path: Optional[Path] = None):
++        """
++        Read all auth tokens from the given path. Loads from the
++        user config directory if path is unspecified.
++        """
++        if not path:
++            path = get_default_auth_config_path()
++        try:
++            return cls.model_validate_json(path.read_bytes())
++        except FileNotFoundError:
++            if path != get_default_auth_config_path():
++                warn(f"Sessions file at {path} does not exist; load result is empty")
++            return cls({})
++        except ValidationError as err:
++            warn(str(err))
++            warn(f"Sessions stored at {path} are invalid; load result is empty")
++            return cls({})
++
++    def save(self, path: Optional[Path] = None):
++        """
++        Write all auth tokens to the given path. Writes to the user config
++        directory if path is unspecified.
++        """
++        if not path:
++            path = get_default_auth_config_path()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(self.model_dump_json(indent=4))
++
++    def find(self, url: str, email: Optional[str] = None) -> Optional[AuthSession]:
++        """
++        Find the first available token for the given instance URL and email.
++        If an email is not specified, returns the first existing session
++        """
++        if url in self.root:
++            user_sessions = self.root[url]
++            return first(sess for e, sess in user_sessions.root.items() if not email or e == email)
++
++    def insert(self, url: str, email: str, token: Token, expires: AwareDatetime):
++        """
++        Add or replace a new token for the given instance and user email.
++        """
++        if url not in self.root:
++            self.root[url] = UserAuthSessions({})
++        self.root[url].root[email] = AuthSession(token=token, expires=expires)
+diff --git a/cryosparc/cli.py b/cryosparc/cli.py
+new file mode 100644
+index 00000000..c55c7355
+--- /dev/null
++++ b/cryosparc/cli.py
+@@ -0,0 +1,102 @@
++import hashlib
++import os
++import sys
++from argparse import ArgumentParser, ArgumentTypeError, Namespace
++from datetime import datetime, timedelta, timezone
++from getpass import getpass
++
++from . import __version__
++from .api import APIClient
++from .auth import InstanceAuthSessions, get_default_auth_config_path
++from .constants import API_SUFFIX
++from .errors import APIError
++
++
++def run(name: str = "cryosparc.tools"):
++    """
++    Run command line interface.
++    """
++    parser = ArgumentParser(prog=name)
++    parser.add_argument("-v", "--version", action="version", version=f"cryosparc-tools {__version__}")
++    subparsers = parser.add_subparsers(help="Command help")
++
++    # Login command
++    parser_login = subparsers.add_parser(
++        "login",
++        help=f"log in to CryoSPARC and save authentication token to {get_default_auth_config_path()} "
++        "for repeated script runs",
++    )
++    parser_login.add_argument(
++        "--url",
++        type=str,
++        required=False,
++        help="CryoSPARC web URL, e.g., http://localhost:39000",
++    )
++    parser_login.add_argument("--email", type=str, required=False, help="login email, prompts when unspecified")
++    parser_login.add_argument("--password", type=str, required=False, help="login password, prompts when unspecified")
++    parser_login.add_argument(
++        "--expires",
++        type=valid_expiration_time,
++        help="token expiration date in format YYYY-MM-DD, cannot be more than one year in the future, "
++        "defaults to 14 days from now.",
++        required=False,
++    )
++    parser_login.set_defaults(func=login)
++
++    args = parser.parse_args()
++    args.func(args)
++
++
++def login(args: Namespace):
++    """
++    Log in to CryoSPARC via command line.
++    """
++    expires_in = 60 * 60 * 24 * 14
++    if args.expires:
++        expires_in = args.expires
++    if not args.url:
++        args.url = input("CryoSPARC URL: ").strip()
++    if not args.email:
++        args.email = input("Email: ").strip()
++    if not args.password:
++        args.password = getpass("Password: ")
++
++    sessions = InstanceAuthSessions.load()
++
++    expiration_date = datetime.now().replace(microsecond=0) + timedelta(seconds=expires_in)
++    try:
++        api = APIClient(f"{args.url}{API_SUFFIX}")
++        token = api.login(
++            grant_type="password",
++            username=args.email,
++            password=hashlib.sha256(args.password.encode()).hexdigest(),
++            expires_in=expires_in,
++        )
++    except APIError as err:
++        print(err, file=sys.stderr)
++        print("Login failed!", file=sys.stderr)
++        os._exit(1)
++
++    sessions.insert(args.url, args.email, token, expiration_date.astimezone(timezone.utc))
++    sessions.save()
++    print(
++        f"Success! Login token for {args.url} ({args.email}) saved to {get_default_auth_config_path()}, "
++        f"will expire at {expiration_date}"
++    )
++
++
++def valid_expiration_time(date_str: str) -> float:
++    """
++    Returns the expiration time of a token if it is within the next year.
++    """
++    try:
++        expires_at = datetime.strptime(date_str, "%Y-%m-%d")
++    except ValueError:
++        raise ArgumentTypeError(f"Not a valid date: '{date_str}'. Format should be YYYY-MM-DD.")
++    min_expires_in = 1
++    max_expires_in = 60 * 60 * 24 * 365
++    now = datetime.now()
++    expires_in = (expires_at - now).total_seconds()
++    if not (min_expires_in <= expires_in <= max_expires_in):
++        raise ArgumentTypeError(f"Not a valid expiration date: '{date_str}'. Must within the next year")
++    return expires_in
+diff --git a/cryosparc/constants.py b/cryosparc/constants.py
+index 5c5c5e30..370ecb60 100644
+--- a/cryosparc/constants.py
++++ b/cryosparc/constants.py
+@@ -7,3 +7,10 @@
+ """
+ Bytes in 8 mebibytes
+ """
++
++# TODO: Correct suffix when app updates
++# API_SUFFIX = "/api/cmd_spm"
++API_SUFFIX = ""
++"""
++Path to API for CryoSPARC app URL
++"""
+diff --git a/cryosparc/platform.py b/cryosparc/platform.py
+new file mode 100644
+index 00000000..3ab04ad6
+--- /dev/null
++++ b/cryosparc/platform.py
+@@ -0,0 +1,109 @@
++import os
++import sys
++from functools import lru_cache
++from pathlib import Path
++from typing import Callable
++
++__all__ = ("user_config_path",)
++
++
++def user_config_path() -> Path:
++    """
++    config directory tied to the user, e.g. ``~/.config`` or ``$XDG_CONFIG_HOME``
++    """
++    if sys.platform == "win32":
++        path = os.path.normpath(get_win_appdata_folder())
++    else:
++        path = os.environ.get("XDG_CONFIG_HOME", "")
++        if not path.strip():
++            path = os.path.expanduser("~/.config")
++    return Path(path)
++
++
++# Windows platform directory code code adapted from platformdirs package
++# https://github.com/tox-dev/platformdirs/blob/4.3.6/src/platformdirs/windows.py
++# MIT License
++# Copyright (c) 2010-202x The platformdirs developers
++#
++# Permission is hereby granted, free of charge, to any person obtaining a copy
++# of this software and associated documentation files (the "Software"), to deal
++# in the Software without restriction, including without limitation the rights
++# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++# copies of the Software, and to permit persons to whom the Software is
++# furnished to do so, subject to the following conditions:
++#
++# The above copyright notice and this permission notice shall be included in all
++# copies or substantial portions of the Software.
++#
++# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++# SOFTWARE.
++
++
++def get_win_appdata_folder_from_env_vars() -> str:
++    """Get folder from environment variables."""
++    env_var_name = "APPDATA"
++    result = os.environ.get(env_var_name)
++    if result is None:
++        raise ValueError(f"Unset environment variable: {env_var_name}")
++    return result
++
++
++def get_win_appdata_folder_from_registry() -> str:
++    """
++    Get folder from the registry.
++
++    This is a fallback technique at best. I'm not sure if using the registry for these guarantees us the correct answer
++    for all CSIDL_* names.
++
++    """
++    shell_folder_name = "AppData"
++    if sys.platform != "win32":
++        # only needed for type checker to know that this code runs only on Windows
++        raise NotImplementedError
++
++    import winreg
++
++    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
++    directory, _ = winreg.QueryValueEx(key, shell_folder_name)
++    return str(directory)
++
++
++def get_win_appdata_folder_via_ctypes() -> str:
++    """Get folder with ctypes."""
++    import ctypes
++
++    csidl_const = 26  # for APPDATA
++    buf = ctypes.create_unicode_buffer(1024)
++    windll = getattr(ctypes, "windll")
++    windll.shell32.SHGetFolderPathW(None, csidl_const, None, 0, buf)
++
++    # Downgrade to short path name if it has high-bit chars.
++    if any(ord(c) > 255 for c in buf):
++        buf2 = ctypes.create_unicode_buffer(1024)
++        if windll.kernel32.GetShortPathNameW(buf.value, buf2, 1024):
++            buf = buf2
++    return buf.value
++
++
++def _pick_get_win_appdata_folder() -> Callable[[], str]:
++    try:
++        import ctypes
++    except ImportError:
++        pass
++    else:
++        if hasattr(ctypes, "windll"):
++            return get_win_appdata_folder_via_ctypes
++    try:
++        import winreg  # noqa: F401
++    except ImportError:
++        return get_win_appdata_folder_from_env_vars
++    else:
++        return get_win_appdata_folder_from_registry
++
++
++get_win_appdata_folder = lru_cache(maxsize=None)(_pick_get_win_appdata_folder())
+diff --git a/cryosparc/tools.py b/cryosparc/tools.py
+index b87994ff..08374b26 100644
+--- a/cryosparc/tools.py
++++ b/cryosparc/tools.py
+@@ -34,6 +34,8 @@
+ 
+ from . import __version__, model_registry, mrc, registry, stream_registry
+ from .api import APIClient
++from .auth import InstanceAuthSessions
++from .constants import API_SUFFIX
+ from .controllers import as_output_slot
+ from .controllers.job import ExternalJobController, JobController
+ from .controllers.project import ProjectController
+@@ -170,9 +172,9 @@ def __init__(
+         if host and base_port:
+             if base_url:
+                 raise TypeError("Cannot specify host and base_port when base_url is specified")
+-            self.base_url = f"http://{host}:{int(base_port) + 2}"
++            self.base_url = f"http://{host}:{int(base_port) + 2}"  # TODO: use base_port + 0 when this works
+         elif base_url:
+-            self.base_url = f"{base_url}/api"  # app forwards to api service (TODO)
++            self.base_url = base_url
+         else:
+             raise TypeError("Must specify either base_url or host + base_port")
+ 
+@@ -181,24 +183,29 @@ def __init__(
+             auth = (email, sha256(password.encode()).hexdigest())
+         elif license:
+             auth = ("cryosparc", sha256(license.encode()).hexdigest())
+-        # TODO: also load auth from config profile
++        elif session := InstanceAuthSessions.load().find(self.base_url, email):
++            auth = session.token.access_token
+         else:
+             raise ValueError(
+-                "CryoSPARC authentication not provided. "
++                f"CryoSPARC authentication not provided or expired for {self.base_url}. "
++                "If required, create a new session with command\n\n"
++                "    python -m cryosparc.tools login\n\n"
+                 "Please see documentation at https://tools.cryosparc.com for instructions."
+             )
+ 
+         tools_major_minor_version = ".".join(__version__.split(".")[:2])  # e.g., 4.1.0 -> 4.1
+         try:
+-            self.api = APIClient(self.base_url, auth=auth, timeout=timeout)
++            self.api = APIClient(f"{self.base_url}/{API_SUFFIX}", auth=auth, timeout=timeout)
+             assert self.user  # trigger user profile fetch
+             cs_version = self.api.config.get_version()
+         except Exception as e:
+             raise RuntimeError(
+-                f"Could not connect to CryoSPARC at {base_url} due to error:\n{e}\n"
+-                "Please ensure your credentials are correct and that you are "
++                f"Could not connect to CryoSPARC at {self.base_url} due to error:\n{e}\n"
++                "Please ensure your credentials are valid and that you are "
+                 "connecting to a CryoSPARC version compatible with "
+-                f"cryosparc-tools {tools_major_minor_version}. "
++                f"cryosparc-tools {tools_major_minor_version}.\n\n"
++                "If required, create a new session with command\n\n"
++                "    python -m cryosparc.tools login\n\n"
+                 "Please see the documentation at https://tools.cryosparc.com for details."
+             ) from e
+ 
+@@ -1060,3 +1067,9 @@ def lowpass2(arr: "NDArray", psize_A: float, cutoff_resolution_A: float = 0.0, o
+ 
+     result = n.fft.irfft2(farr)
+     return trimarray(result, shape) if result.shape != shape else result
++
++
++if __name__ == "__main__":
++    from .cli import run
++
++    run()
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 4d04eaec..d238f7f0 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -12,6 +12,7 @@
+ from cryosparc.controllers.project import ProjectController
+ from cryosparc.dataset import Dataset as BaseDataset
+ from cryosparc.dataset import Row
++from cryosparc.models.auth import Token
+ from cryosparc.models.job import Job
+ from cryosparc.models.job_spec import (
+     Connection,
+@@ -236,9 +237,10 @@ def mock_user():
+ 
+ 
+ @pytest.fixture
+-def cs(mock_user, monkeypatch):
++def mock_api_client_class(mock_user, monkeypatch):
+     monkeypatch.setattr(APIClient, "__call__", mock.Mock(return_value=None))
+     APIClient.health = mock.Mock(return_value="OK")
++    APIClient.login = mock.Mock(return_value=Token(access_token="abc123", token_type="bearer"))
+     APIClient.users = mock.MagicMock()
+     APIClient.config = mock.MagicMock()
+     APIClient.projects = mock.MagicMock()
+@@ -246,6 +248,11 @@ def cs(mock_user, monkeypatch):
+     APIClient.jobs = mock.MagicMock()
+     APIClient.users.me.return_value = mock_user
+     APIClient.config.get_version.return_value = "develop"
++    return APIClient
++
++
++@pytest.fixture
++def cs(mock_api_client_class):
+     return CryoSPARC("https://cryosparc.example.com", email="structura@example.com", password="password")
+ 
+ 
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+new file mode 100644
+index 00000000..21bde976
+--- /dev/null
++++ b/tests/test_cli.py
+@@ -0,0 +1,47 @@
++import subprocess
++from argparse import Namespace
++from pathlib import Path
++from unittest import mock
++
++import pytest
++
++from cryosparc import auth, cli
++from cryosparc.tools import CryoSPARC
++
++
++@pytest.fixture
++def user_config_path(monkeypatch, tmp_path):
++    monkeypatch.setattr(auth, "user_config_path", mock.Mock(return_value=tmp_path))
++    return tmp_path
++
++
++@pytest.fixture
++def mock_auth_path(mock_api_client_class, user_config_path: Path):
++    cli.login(
++        Namespace(
++            url="https://cryosparc.example.com", email="structura@example.com", password="password123", expires=None
++        )
++    )
++    return user_config_path / "cryosparc-tools" / "auth.json"
++
++
++def test_cli_login(mock_api_client_class, mock_auth_path):
++    assert mock_auth_path.is_file()
++    mock_api_client_class.login.assert_called_once()
++
++
++def test_cli_login_auth(mock_user, mock_api_client_class, mock_auth_path):
++    cs = CryoSPARC("https://cryosparc.example.com", email="structura@example.com")
++    mock_api_client_class.__call__.assert_called_with(auth="abc123")  # called with token
++    assert cs.user == mock_user
++    assert cs.test_connection()
++
++
++def test_has_cli_help():
++    output = subprocess.check_output(["python", "-m", "cryosparc.tools", "--help"])
++    assert output.startswith(b"usage: cryosparc.tools")
++
++
++def test_has_cli_login_help():
++    output = subprocess.check_output(["python", "-m", "cryosparc.tools", "login", "--help"])
++    assert output.startswith(b"usage: cryosparc.tools")

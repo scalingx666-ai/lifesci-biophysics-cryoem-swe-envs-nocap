@@ -1,0 +1,181 @@
+diff --git a/torchmdnet/models/model.py b/torchmdnet/models/model.py
+index 1cc58460a..00654b0b1 100644
+--- a/torchmdnet/models/model.py
++++ b/torchmdnet/models/model.py
+@@ -114,6 +114,7 @@ def create_model(args, prior_model=None, mean=None, std=None):
+             static_shapes=args["static_shapes"],
+             q_dim=args.get("q_dim", 0),
+             output_charges=True if "Coul" in args["output_model"] else False,
++            repulsion=args.get("repulsion", False),
+             **shared_args,
+         )
+     else:
+@@ -590,6 +591,13 @@ def forward(
+         # apply the output network
+         x = self.output_model.pre_reduce(x, v, z, pos, batch, box=box)
+ 
++        # add extra per-atom energy terms computed inside the representation model on its own
++        # (main short-range) neighbour list, e.g. ZBL repulsion (see TensorNet2's repulsion arg)
++        if hasattr(self.representation_model, "extra_energy"):
++            extra_energy = self.representation_model.extra_energy
++            if extra_energy is not None:
++                x = x + extra_energy
++
+         # scale by data standard deviation
+         if self.std is not None:
+             x = x * self.std
+diff --git a/torchmdnet/models/tensornet2.py b/torchmdnet/models/tensornet2.py
+index 960570008..dca7248ac 100644
+--- a/torchmdnet/models/tensornet2.py
++++ b/torchmdnet/models/tensornet2.py
+@@ -221,6 +221,9 @@ class TensorNet2(nn.Module):
+             output is done by appending to the node features x that will be passed to the output 
+             model. If True the output model must be compatible with the output charges.
+             (default: :obj:`False`)
++        repulsion (bool, optional): Whether to add the ZBL short-range repulsion term
++            (see :py:class:`torchmdnet.models.utils.RepulsionZBL`) on top of the learned energy.
++            (default: :obj:`False`)
+     """
+ 
+     def __init__(
+@@ -241,12 +244,24 @@ def __init__(
+         dtype=torch.float32,
+         box_vecs=None,
+         output_charges=False,
++        repulsion=False,
+     ):
+         super(TensorNet2, self).__init__()
+ 
+         self.q_dim = q_dim
+         self.output_charges = output_charges
+ 
++        if not repulsion:
++            self.repulsion = None
++        else:
++            # aceff-omol/TensorNet2 checkpoints trained with repulsion=True include this
++            # short-range ZBL term as part of the total energy they were fit against -- see
++            # RepulsionZBL's docstring for where its fixed parameters come from.
++            from torchmdnet.models.utils import RepulsionZBL
++
++            self.repulsion = RepulsionZBL(max_z=max_z)
++        self.extra_energy: Optional[Tensor] = None
++
+         assert rbf_type in rbf_class_mapping, (
+             f'Unknown RBF type "{rbf_type}". '
+             f'Choose from {", ".join(rbf_class_mapping.keys())}.'
+@@ -400,6 +415,15 @@ def forward(
+         # I avoid dividing by zero by setting the weight of self edges and self loops to 1
+         edge_vec = edge_vec / edge_weight.masked_fill(mask, 1).unsqueeze(1)
+ 
++        # in-model short-range repulsion on the main neighbour list (reuses edge_index/edge_weight
++        # already computed above); consumed by TorchMD_Net.forward() via
++        # hasattr(representation_model, "extra_energy"). No-op (None) by default.
++        if self.repulsion is not None:
++            e_rep = self.repulsion(zp, edge_index, edge_weight)  # [zp.shape[0]]
++            self.extra_energy = e_rep[: batch.shape[0]].unsqueeze(-1)  # real atoms only, [nr, 1]
++        else:
++            self.extra_energy = None
++
+         graph_info = {"edge_index": edge_index}
+         graph_info.update(
+             {
+diff --git a/torchmdnet/models/utils.py b/torchmdnet/models/utils.py
+index b94a89535..37dda9d2b 100644
+--- a/torchmdnet/models/utils.py
++++ b/torchmdnet/models/utils.py
+@@ -9,6 +9,7 @@
+ import torch.nn.functional as F
+ from torchmdnet.extensions.ops import get_neighbor_pairs_kernel
+ import warnings
++from ase.data import covalent_radii
+ 
+ 
+ def visualize_basis(basis_type, num_rbf=50, cutoff_lower=0, cutoff_upper=5):
+@@ -701,6 +702,87 @@ def scatter(
+     return res
+ 
+ 
++class RepulsionZBL(nn.Module):
++    r"""Ziegler-Biersack-Littmark screened nuclear repulsion, computed on the model's own
++    short-range neighbour list.
++
++    .. math::
++        E_\mathrm{rep} = \tfrac12 \sum_{i \ne j} k_e \frac{Z_a Z_b}{r}\, \phi(r/a)\, f_c(r)
++
++        \phi(x) = 0.1818 e^{-3.2x} + 0.5099 e^{-0.9423x} + 0.2802 e^{-0.4029x} + 0.02817 e^{-0.2016x}
++
++        a = \frac{0.4543\, a_0}{Z_a^{0.3} + Z_b^{0.3}}
++
++    MODIFIED FROM https://github.com/orbital-materials/orb-models/blob/main/orb_models/forcefield/models/pair_repulsion.py
++
++    Apache License Version 2.0, January 2004 http://www.apache.org/licenses/
++
++    """
++
++    ANGSTROM_TO_BOHR = 1.8897261258369282
++    COULOMB_EV_ANGSTROM = 14.399645  # e^2 / (4 pi eps0), in eV*Angstrom
++    A_PREFACTOR = 0.4543
++    A_EXP = 0.300
++    ENVELOPE_P = 6
++
++    def __init__(self, max_z: int = 87):
++        super().__init__()
++        num_elem = min(max_z, len(covalent_radii))
++        z = torch.arange(num_elem, dtype=torch.get_default_dtype())
++        z[0] = 1  # avoid 0**A_EXP for the unused index-0 slot; never selected (atomic numbers >= 1)
++        cov_radius = torch.tensor(covalent_radii[:num_elem], dtype=torch.get_default_dtype())
++        # Persistent on purpose, even though every one of these is a fixed table derivable
++        # from the constants above. Checkpoints trained with repulsion=True fold this term into
++        # the total energy they were fit against, but older torchmd-net versions predate the
++        # `repulsion` hyperparameter and silently ignore it -- they would build a plain
++        # TensorNet2, load such a checkpoint without complaint, and return energies missing the
++        # ZBL term entirely (wrong by ~kcal/mol, with nothing in the output to say so). Keeping
++        # these tables in the state_dict makes that failure loud instead: the strict
++        # load_state_dict() in load_model() reports them as unexpected keys. Secondary benefit:
++        # the exact tables the model was trained with travel with the weights.
++        self.register_buffer("z_pow", z**self.A_EXP)
++        self.register_buffer("z_outer", torch.outer(z, z))
++        self.register_buffer(
++            "cutoff_ab", cov_radius.unsqueeze(0) + cov_radius.unsqueeze(1)
++        )
++        self.num_elem = int(num_elem)
++
++    def forward(self, z: Tensor, edge_index: Tensor, edge_weight: Tensor) -> Tensor:
++        # per-atom repulsion energy [num_z], reusing the model's own neighbour list
++        mask = edge_weight > 0  # drop self-loops (d=0) and padded edges
++        r = edge_weight.masked_fill(~mask, 1.0)  # Angstrom
++        za = z[edge_index[0]].clamp(max=self.num_elem - 1)
++        zb = z[edge_index[1]].clamp(max=self.num_elem - 1)
++
++        screening_length = self.A_PREFACTOR * (1.0 / self.ANGSTROM_TO_BOHR) / (
++            self.z_pow[za] + self.z_pow[zb]
++        )
++        x = r / screening_length
++        phi = (
++            0.1818 * torch.exp(-3.2 * x)
++            + 0.5099 * torch.exp(-0.9423 * x)
++            + 0.2802 * torch.exp(-0.4029 * x)
++            + 0.02817 * torch.exp(-0.2016 * x)
++        )
++
++        cutoff = self.cutoff_ab[za, zb].to(r.dtype)
++        p = float(self.ENVELOPE_P)
++        rr = (r / cutoff).clamp(max=1.0)
++        fc = (
++            1.0
++            - ((p + 1.0) * (p + 2.0) / 2.0) * rr.pow(p)
++            + p * (p + 2.0) * rr.pow(p + 1.0)
++            - (p * (p + 1.0) / 2.0) * rr.pow(p + 2.0)
++        ) * (r < cutoff)
++
++        z_ab = self.z_outer[za, zb].to(r.dtype)
++        e_ij = self.COULOMB_EV_ANGSTROM * (z_ab / r) * phi * fc
++        e_ij = e_ij * mask.to(e_ij.dtype)
++        e_atom = torch.zeros(z.shape[0], dtype=e_ij.dtype, device=e_ij.device)
++        e_atom = e_atom.index_add(0, edge_index[0], e_ij)
++        return 0.5 * e_atom  # half: each pair counted twice
++
++
+ rbf_class_mapping = {"gauss": GaussianSmearing, "expnorm": ExpNormalSmearing}
+ 
+ act_class_mapping = {

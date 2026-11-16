@@ -1,0 +1,466 @@
+diff --git a/openpathsampling/experimental/simstore/sql_backend.py b/openpathsampling/experimental/simstore/sql_backend.py
+index fe0800f61..41c663a6a 100644
+--- a/openpathsampling/experimental/simstore/sql_backend.py
++++ b/openpathsampling/experimental/simstore/sql_backend.py
+@@ -334,13 +334,13 @@ def register_storable_function(self, table_name, result_type):
+             the name for this table; typically the UUID of the storable
+             function
+         result_type : Str
+-            string name of the result type; must match one of the keys of
+-            ``sql_type``
++            string name of the result type
+         """
+         logger.info("Registering storable function: UUID: %s (%s)" %
+                     (table_name, result_type))
++        col_type = sql_type[backend_registration_type(result_type)]
+         columns = [sql.Column('uuid', sql.String, primary_key=True),
+-                   sql.Column('value', sql_type[result_type])]
++                   sql.Column('value', col_type)]
+         try:
+             table = sql.Table(table_name, self.metadata, *columns)
+         except sql.exc.InvalidRequestError:
+diff --git a/openpathsampling/experimental/simstore/storable_functions.py b/openpathsampling/experimental/simstore/storable_functions.py
+index feb5c858e..048ba72ea 100644
+--- a/openpathsampling/experimental/simstore/storable_functions.py
++++ b/openpathsampling/experimental/simstore/storable_functions.py
+@@ -140,7 +140,7 @@ class StorableFunctionResults(StorableNamedObject):
+     The function will be associated with a cache like this, and this is the
+     first place it will look for results (in order to avoid recalculating).
+     """
+-    _sanity_checks = True
++    _sanity_checks = False  # off by default; can't work with ndarray
+     def __init__(self, parent, parent_uuid):
+         # TODO: why does this require parent_uuid still?
+         super(StorableFunctionResults, self).__init__()
+@@ -223,13 +223,12 @@ class StorableFunction(StorableNamedObject):
+     Parameters
+     ----------
+     func : Callable
+-    result_type
+     store_store : Union[bool, None]
+         Whether to store the source for this function. Default behavior
+         (None) stores source for anything created in ``__main__`` that is
+         not a lambda expression.
+     """
+-    def __init__(self, func, result_type=None, func_config=None, store_source=None, **kwargs):
++    def __init__(self, func, func_config=None, store_source=None, **kwargs):
+         super(StorableFunction, self).__init__()
+         self.func = func
+         self.source = None
+@@ -248,7 +247,6 @@ def __init__(self, func, result_type=None, func_config=None, store_source=None,
+             except IOError:
+                 warnings.warn("Unable to get source for " + str(func))
+ 
+-        self.result_type = result_type
+         self.local_cache = None  # set correctly by self.mode setter
+         self._disk_cache = True
+         self._handler = None
+@@ -296,7 +294,6 @@ def to_dict(self):
+             'func': self.func,  # made into JSON by CallableCodec
+             'source': self.source,
+             'kwargs': self.kwargs,
+-            'result_type': self.result_type,
+         }
+ 
+     @classmethod
+@@ -445,17 +442,26 @@ def codec_settings(self, settings):
+             self._codec_settings = settings
+             self.callable_codec = CallableCodec(settings)
+ 
+-    def register_function(self, func, add_table=True):
++    def register_function(self, func, example_result=None):
+         func_uuid = get_uuid(func)
++
++        # add table to backend if needed
++        needs_table = not self.storage.backend.has_table(func_uuid)
++        add_table = needs_table and (example_result is not None)
++        if needs_table and not add_table:
++            logger.info("Result type unknown; unable to create table")
++        elif add_table:
++            identify = self.storage.type_identification.identify
++            result_type = identify(example_result)
++            self.storage.backend.register_storable_function(
++                table_name=func_uuid,
++                result_type=result_type
++            )
++
+         # register as a canonical function
+         if func_uuid not in self.canonical_functions:
+             logger.debug("Registering new function: %s" % func_uuid)
+             self.canonical_functions[func_uuid] = func
+-            if add_table:
+-                self.storage.backend.register_storable_function(
+-                    table_name=func_uuid,
+-                    result_type=func.result_type
+-                )
+ 
+         # register with all_functions
+         is_registered = any([func is registered
+@@ -464,8 +470,8 @@ def register_function(self, func, add_table=True):
+         if not is_registered:
+             self.all_functions[func_uuid].append(func)
+ 
+-        # set handler
+-        if not func.has_handler:
++        # set handler; only if the table exists
++        if not func.has_handler and (add_table or not needs_table):
+             func.set_handler(self)
+ 
+     def clear_non_canonical(self):
+diff --git a/openpathsampling/experimental/simstore/storage.py b/openpathsampling/experimental/simstore/storage.py
+index 9d2705e5e..9f9ffc828 100644
+--- a/openpathsampling/experimental/simstore/storage.py
++++ b/openpathsampling/experimental/simstore/storage.py
+@@ -29,6 +29,7 @@
+ from .serialization import ProxyObjectFactory
+ from .storable_functions import StorageFunctionHandler, StorableFunction
+ from .tags_table import TagsTable
++from .type_ident import STANDARD_TYPING
+ 
+ try:
+     basestring
+@@ -58,6 +59,7 @@ def __init__(self, backend, class_info, schema=None,
+         self._safemode = None
+         self.safemode = safemode
+         self._sf_handler = StorageFunctionHandler(storage=self)
++        self.type_identification = STANDARD_TYPING  # TODO: copy
+         # TODO: implement fallback
+         self.fallbacks = tools.none_to_default(fallbacks, [])
+ 
+@@ -286,12 +288,25 @@ def save_function_results(self, funcs=None):
+ 
+         funcs = tools.listify(funcs)
+         for func in funcs:
++            # TODO: XXX This is where we need to use type identification
++            # 1. check if the associated function is registered already
++            # 2. if not, extract type from the first function value
+             self._sf_handler.update_cache(func.local_cache)
+             result_dict = func.local_cache.result_dict
+-            self.backend.add_storable_function_results(
+-                table_name=get_uuid(func),
+-                result_dict=result_dict
+-            )
++            table_name = get_uuid(func)
++            if not self.backend.has_table(table_name):
++                if result_dict:
++                    example = next(iter(result_dict.values()))
++                else:
++                    example = None
++                self._sf_handler.register_function(func,
++                                                   example_result=example)
++
++            if result_dict:
++                self.backend.add_storable_function_results(
++                    table_name=table_name,
++                    result_dict=result_dict
++                )
+             self._reset_fixed_cache()
+ 
+     def load(self, input_uuids, allow_lazy=True, force=False):
+@@ -360,7 +375,7 @@ def load(self, input_uuids, allow_lazy=True, force=False):
+         # handle special case of storable functions
+         for result in new_results:
+             if isinstance(result, StorableFunction):
+-                self._sf_handler.register_function(result, add_table=False)
++                self._sf_handler.register_function(result)
+ 
+         return new_results
+ 
+diff --git a/openpathsampling/experimental/simstore/test_storable_function.py b/openpathsampling/experimental/simstore/test_storable_function.py
+index c5f074aa7..705e69ead 100644
+--- a/openpathsampling/experimental/simstore/test_storable_function.py
++++ b/openpathsampling/experimental/simstore/test_storable_function.py
+@@ -4,7 +4,8 @@
+ except ImportError:
+     import mock
+ 
+-import collections
++from collections import defaultdict
++import itertools
+ 
+ import numpy as np
+ 
+@@ -17,9 +18,12 @@
+ 
+ class MockBackend(object):
+     def __init__(self):
+-        self.storable_function_tables = {}
+-        self.called_register = collections.defaultdict(int)
+-        self.called_load = collections.defaultdict(int)
++        self.storable_function_tables = defaultdict(dict)
++        self.called_register = defaultdict(int)
++        self.called_load = defaultdict(int)
++
++    def has_table(self, table_name):
++        return table_name in self.storable_function_tables
+ 
+     def register_storable_function(self, table_name, result_type):
+         self.storable_function_tables[table_name] = {}
+@@ -140,8 +144,7 @@ def test_list_postprocess(self):
+ 
+     def test_storable_function_integration(self):
+         snap = make_1d_traj([5.0])[0]
+-        sf = StorableFunction(self.func, result_type='float',
+-                              func_config=self.config)
++        sf = StorableFunction(self.func, func_config=self.config)
+         assert sf(snap) == 5.0
+         np.testing.assert_array_equal(sf([snap]), np.array([5.0]))
+ 
+@@ -349,25 +352,35 @@ def test_codec_settings(self):
+         # TODO: is this actually used?
+         pytest.skip()
+ 
+-    @pytest.mark.parametrize("add_table", [True, False])
+-    def test_register_function(self, add_table):
++    @pytest.mark.parametrize('has_table, with_result',
++                             itertools.product([True, False],
++                                               [True, False]))
++    def test_register_function(self, has_table, with_result):
++        uuid = get_uuid(self.func)
++        if has_table:
++            self.storage.backend.storable_function_tables[uuid] = {}
++
++        example = 1.0 if with_result else None
++        unable_to_register = example is None and not has_table
++        add_table = not has_table and not unable_to_register
++
+         assert not self.func.has_handler
+         assert len(self.sf_handler.all_functions) == 0
+         assert self.sf_handler.functions == []
+-        self.sf_handler.register_function(self.func, add_table=add_table)
+-        uuid = get_uuid(self.func)
++        self.sf_handler.register_function(self.func, example)
+ 
+         sf_tables = self.backend.storable_function_tables
+-        if add_table:
++        if not unable_to_register:
+             assert uuid in sf_tables
+         else:
+             assert uuid not in sf_tables
+ 
+         assert self.func is self.sf_handler.canonical_functions[uuid]
+         assert self.sf_handler.all_functions[uuid] == [self.func]
+-        assert self.func.has_handler
+-        assert self.func._handler == self.sf_handler
+-        assert self.sf_handler.functions == [self.func]
++        if not unable_to_register:
++            assert self.func.has_handler
++            assert self.func._handler == self.sf_handler
++            assert self.sf_handler.functions == [self.func]
+ 
+         # make a copy of the func
+         assert get_uuid(self.f2) == get_uuid(self.func)
+@@ -376,7 +389,7 @@ def test_register_function(self, add_table):
+         # internal checks should ensure that you call add_table False here
+         expected_calls = {True: 1, False: 0}[add_table]
+         assert self.backend.called_register[uuid] == expected_calls
+-        self.sf_handler.register_function(self.f2, add_table)
++        self.sf_handler.register_function(self.f2, example)
+         assert self.sf_handler.canonical_functions[uuid] is not self.f2
+         assert self.sf_handler.canonical_functions[uuid] is self.func
+         assert self.sf_handler.all_functions[uuid] == [self.func, self.f2]
+diff --git a/openpathsampling/experimental/simstore/test_type_ident.py b/openpathsampling/experimental/simstore/test_type_ident.py
+new file mode 100644
+index 000000000..02b9a8815
+--- /dev/null
++++ b/openpathsampling/experimental/simstore/test_type_ident.py
+@@ -0,0 +1,43 @@
++import pytest
++from .type_ident import *
++
++from .test_utils import MockUUIDObject
++
++_TYPES = ['int', 'float', 'str', 'ndarray', 'bool', 'uuid']
++
++class TestStandardTyping(object):
++    # this tests everything in STANDARD_TYPING; it's a little more
++    # integration test than unit, but the individual tests ensure that each
++    # unit is tested
++    def setup(self):
++        self.objects = {
++            'int': ('int', 5),
++            'float': ('float', 2.3),
++            'str': ('str', "foo"),
++            'ndarray': ('ndarray.float64(2,3)',
++                        np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])),
++            'bool': ('bool', True),
++            'uuid': ('uuid', MockUUIDObject(name='int', normal_attr=5)),
++        }
++
++    @pytest.mark.parametrize('example', _TYPES)
++    def test_identify(self, example):
++        string, obj = self.objects[example]
++        assert STANDARD_TYPING.identify(obj) == string
++
++    @pytest.mark.parametrize('example', _TYPES)
++    def test_parsing(self, example):
++        string, _ = self.objects[example]
++        assert STANDARD_TYPING.parse(string) == example
++
++    def test_error_register_existing(self):
++        with pytest.raises(RuntimeError):
++            STANDARD_TYPING.register(int_type_id)
++
++    def test_error_identify(self):
++        with pytest.raises(TypeIdentificationError):
++            STANDARD_TYPING.identify(object())
++
++    def test_error_parse(self):
++        with pytest.raises(TypeStringError):
++            STANDARD_TYPING.parse('foo')
+diff --git a/openpathsampling/experimental/simstore/type_ident.py b/openpathsampling/experimental/simstore/type_ident.py
+new file mode 100644
+index 000000000..45dfa18d5
+--- /dev/null
++++ b/openpathsampling/experimental/simstore/type_ident.py
+@@ -0,0 +1,105 @@
++import re
++import numbers
++import numpy as np
++from .serialization_helpers import has_uuid
++
++class TypeStringError(RuntimeError):
++    pass
++
++class TypeIdentificationError(RuntimeError):
++    pass
++
++class TypingManager(object):
++    def __init__(self, type_ids):
++        self._type_ids = {}
++        for type_id in type_ids:
++            self.register(type_id)
++
++    def register(self, type_id, force=False):
++        if not force and type_id.name in self._type_ids:
++            raise RuntimeError("Type identifier for %s already exists. "
++                               "Use `force=True` to override."
++                               % type_id.name)
++        self._type_ids[type_id.name] = type_id
++
++    def _typing_func(self, inp, func_name):
++        for type_id in self._type_ids.values():
++            func = getattr(type_id, func_name)
++            result = func(inp)
++            if result is not None:
++                break
++        return result
++
++    def parse(self, string):
++        result = self._typing_func(string, 'parse')
++        if result is None:
++            raise TypeStringError("Unable to parse type string: ", string)
++        return result
++
++    def identify(self, obj):
++        result = self._typing_func(obj, 'identify')
++        if result is None:
++            raise TypeIdentificationError("Unable to identify backend type "
++                                          "for object of type "
++                                          + str(type(obj)))
++        return result
++
++
++class StandardTypeIdentifier(object):
++    """TypeIdentifier for most simple types.
++
++    Simple types are types where there is only one string identifier for the
++    type, and where that string can be determined using ``isinstance``.
++    """
++    # NOTE: Current implementation uses isinstance, which might be slow.
++    # Performance could be improved by using ClassIsSomething, if needed.
++    # However, expectation is for identify to be rarely used.
++    def __init__(self, name, cls):
++        self.name = name
++        self.cls = cls
++
++    def parse(self, string):
++        if string == self.name:
++            return self.name
++
++    def identify(self, obj):
++        if isinstance(obj, self.cls):
++            return self.name
++
++
++class NumpyTypeIdentifier(object):
++    ndarray_re = re.compile(
++        "ndarray\.(?P<dtype>[a-z0-9]+)(?P<shape>\([0-9\,\ ]+\))"
++    )
++    def __init__(self):
++        self.name = 'ndarray'
++
++    def parse(self, string):
++        m_ndarray = self.ndarray_re.match(string)
++        if m_ndarray:
++            return self.name
++
++    @staticmethod
++    def identify(obj):
++        if isinstance(obj, np.ndarray):
++            dtype = str(obj.dtype)
++            shape = "(" + ",".join(str(a) for a in obj.shape) + ")"
++            return "ndarray." + dtype + shape
++
++
++class UUIDTypeIdentifier(StandardTypeIdentifier):
++    def identify(self, obj):
++        if has_uuid(obj):
++            return self.name
++
++
++int_type_id = StandardTypeIdentifier('int', numbers.Integral)
++float_type_id = StandardTypeIdentifier('float', numbers.Real)
++str_type_id = StandardTypeIdentifier('str', str)
++bool_type_id = StandardTypeIdentifier('bool', bool)
++numpy_type_id = NumpyTypeIdentifier()
++uuid_type_id = UUIDTypeIdentifier('uuid', cls=None)
++
++
++STANDARD_TYPING = TypingManager([bool_type_id, int_type_id, float_type_id,
++                                 str_type_id, numpy_type_id, uuid_type_id])
+diff --git a/openpathsampling/experimental/storage/collective_variables.py b/openpathsampling/experimental/storage/collective_variables.py
+index a13a9dba4..39d778c1c 100644
+--- a/openpathsampling/experimental/storage/collective_variables.py
++++ b/openpathsampling/experimental/storage/collective_variables.py
+@@ -95,14 +95,13 @@ def __call__(self, values):
+         return paths.Trajectory(values).to_mdtraj(topology=top)
+ 
+ class MDTrajFunctionCV(CoordinateFunctionCV):
+-    def __init__(self, func, topology, result_type=None, func_config=None,
++    def __init__(self, func, topology, func_config=None,
+                  **kwargs):
+         if func_config is None:
+             func_config = StorableFunctionConfig([
+                 MDTrajProcessor(topology), wrap_numpy, scalarize_singletons,
+             ])
+-        super(MDTrajFunctionCV, self).__init__(func, result_type,
+-                                               func_config, **kwargs)
++        super(MDTrajFunctionCV, self).__init__(func, func_config, **kwargs)
+         self.topology = topology
+         self.mdtraj_topology = topology.mdtraj
+ 
+diff --git a/openpathsampling/experimental/storage/test_collective_variables.py b/openpathsampling/experimental/storage/test_collective_variables.py
+index 814c654e9..333367510 100644
+--- a/openpathsampling/experimental/storage/test_collective_variables.py
++++ b/openpathsampling/experimental/storage/test_collective_variables.py
+@@ -83,6 +83,7 @@ def setup(self):
+         mock_func.reset_mock()
+ 
+         backend = MockBackend()
++        backend.register_storable_function(get_uuid(self.func), 'float')
+         self.storage = mock.NonCallableMock(backend=backend)
+         self.storage._sf_handler = StorageFunctionHandler(self.storage)
+         self.storage._sf_handler.register_function(self.func)
+diff --git a/openpathsampling/high_level/interface_set.py b/openpathsampling/high_level/interface_set.py
+index 1b3a192b4..f0c27eebb 100644
+--- a/openpathsampling/high_level/interface_set.py
++++ b/openpathsampling/high_level/interface_set.py
+@@ -21,7 +21,6 @@ def _simstore_cv_max(cv):
+     from openpathsampling.experimental.simstore import StorableFunction
+     return StorableFunction(
+         func=_cv_max_func,
+-        result_type='float',
+         cv=cv
+     ).named("max " + cv.name)
+ 

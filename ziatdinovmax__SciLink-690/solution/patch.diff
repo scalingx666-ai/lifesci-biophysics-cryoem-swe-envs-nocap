@@ -1,0 +1,157 @@
+diff --git a/scilink/live/measurement_loop.py b/scilink/live/measurement_loop.py
+index 29819193..59c824af 100644
+--- a/scilink/live/measurement_loop.py
++++ b/scilink/live/measurement_loop.py
+@@ -57,6 +57,7 @@
+ FLAG_DEADLINE = "deadline_missed"         # slower than frame_deadline_s
+ FLAG_LLM_USED = "llm_used"                # the zero-LLM path was left (fallback codegen)
+ FLAG_OUT_OF_RANGE = "out_of_reference_range"  # a target left its plausible range
++FLAG_INTERRUPTED = "interrupted"          # stopped mid-frame by interrupt(): not a failure
+ 
+ #: Flags that say "the recipe has stopped describing the data".
+ _BREACH_FLAGS = (FLAG_FIT_FAILED, FLAG_GATE_POOR, FLAG_DRIFT)
+@@ -850,6 +851,9 @@ def step(self, data_path: str, params: Optional[Dict[str, Any]] = None) -> Dict[
+         flags: List[str] = []
+         result: Dict[str, Any] = {}
+         error = None
++        import threading as _threading
++        self._interrupt_requested = False
++        self._frame_thread = _threading.get_ident()
+         try:
+             agent = self._agent_factory(str(frame_dir))
+             self._use_warm_executor(agent)
+@@ -858,7 +862,19 @@ def step(self, data_path: str, params: Optional[Dict[str, Any]] = None) -> Dict[
+         except Exception as e:  # noqa: BLE001 - one frame must not kill the loop
+             error = f"{type(e).__name__}: {e}"
+             self.logger.exception(f"frame {idx} raised")
++        finally:
++            self._frame_thread = None
+         latency = time.perf_counter() - t0
++        if self._interrupt_requested:
++            # Stopped from outside while the frame ran: not evidence about the
++            # recipe, so it neither counts as a failure nor teaches the drift
++            # monitor, and nothing is escalated or recommended from it.
++            record = {"event": "frame", "step": idx, "data": str(data_path),
++                      "params": params or {}, "features": {}, "flags": [FLAG_INTERRUPTED],
++                      "latency_s": round(latency, 3), "recipe_id": self.recipe["id"],
++                      "frame_dir": str(frame_dir)}
++            self._append(record)
++            return record
+ 
+         features = (self.modality.features(result)
+                     if result.get("status") in self.modality.usable_status else {})
+@@ -1408,6 +1424,21 @@ def _sandbox_approved() -> bool:
+     def escalating(self) -> bool:
+         return self._escalation is not None
+ 
++    def interrupt(self) -> bool:
++        """End the frame that is being analysed now, from any thread: its
++        replay script (warm worker or cold subprocess) and everything that
++        script started. A stop that only sets a flag waits for the frame to
++        finish or time out; a person pressing Stop means now. The frame is
++        logged as ``interrupted``, not as a failed fit. Returns whether a
++        frame was running."""
++        tid = getattr(self, "_frame_thread", None)
++        if tid is None:
++            return False
++        self._interrupt_requested = True
++        from scilink.executors import kill_subprocesses_for_thread
++        kill_subprocesses_for_thread(tid)
++        return True
++
+     def pending_work(self) -> Optional[Dict[str, Any]]:
+         """The slow-clock work still running (an audit, a rebuild), or ``None``.
+         A host that reaches the end of its frames asks this before closing: an
+diff --git a/scilink/server/live_api.py b/scilink/server/live_api.py
+index d5f08279..484b0723 100644
+--- a/scilink/server/live_api.py
++++ b/scilink/server/live_api.py
+@@ -646,6 +646,8 @@ def decide(self, action: str, params: Optional[Dict[str, Any]] = None) -> Dict[s
+         self._decision = "stop" if action == "stop" else (dict(params) if params else "resume")
+         if action == "stop":
+             self._stop.set()
++            if self.loop is not None:
++                self.loop.interrupt()
+         self._decided.set()
+         return {"decision": action, "params": params or None}
+ 
+@@ -657,6 +659,10 @@ def _operator(self, current: Dict[str, Any], record: Dict[str, Any]):
+     # -------------------------------------------------------------- control
+     def stop(self) -> None:
+         self._stop.set()
++        # A replay already running would otherwise run to its end or its
++        # timeout before the loop sees the flag.
++        if self.loop is not None:
++            self.loop.interrupt()
+ 
+     def set_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+         """Parameters the operator wants from the next frame on — an accepted
+diff --git a/tests/test_loop_interrupt.py b/tests/test_loop_interrupt.py
+new file mode 100644
+index 00000000..e779f7f2
+--- /dev/null
++++ b/tests/test_loop_interrupt.py
+@@ -0,0 +1,63 @@
++"""A Stop ends the frame that is running, not only the ones after it.
++
++The Live tab's Stop set an event the loop checks between frames, so a replay
++already running went on to its end or its timeout (up to the executor's 600 s)
++before the run stopped. ``MeasurementLoop.interrupt()`` ends the running
++frame's script from any thread; the frame is logged as ``interrupted``, not
++as a failed fit, so it does not push the loop toward a rebuild.
++"""
++
++import threading
++import time
++from pathlib import Path
++
++import pytest
++
++from scilink import executors as ex
++from scilink.live import MeasurementLoop
++
++from test_measurement_loop import make_anchor
++
++
++class SlowReplayAgent:
++    """Runs its 'replay' as a real script through a ScriptExecutor (which the
++    loop swaps for its warm interpreter when warm_replay is on)."""
++
++    def __init__(self, output_dir):
++        self.output_dir = output_dir
++        self.executor = ex.ScriptExecutor(timeout=120)
++
++    def analyze(self, data, **kw):
++        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
++        r = self.executor.execute_script("import time\ntime.sleep(60)\n", working_dir=self.output_dir)
++        return {"status": "error" if r["status"] != "success" else "success",
++                "output_directory": self.output_dir}
++
++
++@pytest.mark.parametrize("warm", [True, False], ids=["warm", "cold"])
++def test_interrupt_ends_the_running_frame_quickly(tmp_path, warm):
++    loop = MeasurementLoop(str(tmp_path / "loop"), agent_factory=SlowReplayAgent, warm_replay=warm)
++    loop.setup(anchor=str(make_anchor(tmp_path)))
++    out = {}
++    t = threading.Thread(target=lambda: out.update(rec=loop.step(str(tmp_path / "frame.csv"))))
++    t.start()
++    deadline = time.time() + 30
++    while time.time() < deadline and not ex._active_subprocesses:
++        time.sleep(0.05)
++    assert ex._active_subprocesses, "the replay never started"
++    time.sleep(0.3)
++    t0 = time.time()
++    assert loop.interrupt() is True
++    t.join(timeout=20)
++    try:
++        assert not t.is_alive() and time.time() - t0 < 10
++        rec = out["rec"]
++        assert rec["flags"] == ["interrupted"]
++        assert loop._consecutive_breaches == 0            # not counted against the recipe
++    finally:
++        loop.close()
++
++
++def test_interrupt_with_no_frame_running_is_a_no_op(tmp_path):
++    loop = MeasurementLoop(str(tmp_path / "loop"), agent_factory=SlowReplayAgent, warm_replay=False)
++    assert loop.interrupt() is False

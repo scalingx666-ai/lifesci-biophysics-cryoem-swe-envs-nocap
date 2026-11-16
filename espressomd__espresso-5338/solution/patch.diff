@@ -1,0 +1,158 @@
+diff --git a/src/core/accumulators/ContactTimes.cpp b/src/core/accumulators/ContactTimes.cpp
+index 061d307fe3..324fe4bae9 100644
+--- a/src/core/accumulators/ContactTimes.cpp
++++ b/src/core/accumulators/ContactTimes.cpp
+@@ -30,13 +30,13 @@
+ 
+ namespace Accumulators {
+ void ContactTimes::update(boost::mpi::communicator const &comm) {
+-  if (comm.rank() != 0) {
+-    return;
+-  }
+   auto const &system = System::get_system();
+   auto time = system.get_sim_time();
+   auto dt = system.get_time_step();
+   auto dists = m_obs->operator()(comm);
++  if (comm.rank() != 0) {
++    return;
++  }
+ 
+   // Initialize the bookkeeping vectors
+   if (contacts.empty()) {
+diff --git a/src/core/observables/PairwiseDistances.hpp b/src/core/observables/PairwiseDistances.hpp
+index 7567d4a392..146305567f 100644
+--- a/src/core/observables/PairwiseDistances.hpp
++++ b/src/core/observables/PairwiseDistances.hpp
+@@ -26,10 +26,16 @@
+ #include "particle_node.hpp"
+ #include "system/System.hpp"
+ 
++#include <utils/Vector.hpp>
++
++#include <boost/mpi/collectives/gather.hpp>
++
+ #include <algorithm>
+ #include <cstddef>
+ #include <set>
+ #include <stdexcept>
++#include <unordered_map>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -44,24 +50,51 @@ class PairwiseDistances : public PidPairwiseDistancesObservable {
+       : PidPairwiseDistancesObservable(ids, target_ids),
+         m_pairs{get_unique_pairs(ids, target_ids)} {}
+ 
+-  /** @brief Evaluate the current contact times */
++  /** @brief Evaluate pairwise distances, gathering positions from all ranks. */
+   std::vector<double>
+   evaluate(boost::mpi::communicator const &comm, ParticleReferenceRange const &,
+            ParticleObservables::traits<Particle> const &) const override {
+ 
+-    if (comm.rank() != 0) {
+-      return {};
+-    }
+-    // Get instances of the system and cell structures
+     auto const &system = System::get_system();
+     auto const &box_geo = *system.box_geo;
+     auto &cell_structure = *system.cell_structure;
+ 
++    // Collect local (pid, position) pairs for all particles in m_pairs
++    std::unordered_set<int> visited_pids;
++    std::vector<std::pair<int, Utils::Vector3d>> local_pid_pos;
++    for (auto const &[pid1, pid2] : m_pairs) {
++      for (auto const pid : {pid1, pid2}) {
++        if (not visited_pids.contains(pid)) {
++          auto const *p = cell_structure.get_local_particle(pid);
++          if (p and not p->is_ghost()) {
++            local_pid_pos.emplace_back(pid, p->pos());
++          }
++          visited_pids.emplace(pid);
++        }
++      }
++    }
++
++    // Gather from all ranks to rank 0
++    std::vector<std::vector<std::pair<int, Utils::Vector3d>>> all_pid_pos;
++    boost::mpi::gather(comm, local_pid_pos, all_pid_pos, 0);
++
++    if (comm.rank() != 0) {
++      return {};
++    }
++
++    // Build position map on rank 0
++    std::unordered_map<int, Utils::Vector3d> pos_map;
++    for (auto const &rank_data : all_pid_pos) {
++      for (auto const &[pid, pos] : rank_data) {
++        pos_map.emplace(pid, pos);
++      }
++    }
++
+     std::vector<double> pairwise_distances;
++    pairwise_distances.reserve(m_pairs.size());
+     for (auto const &[pid1, pid2] : m_pairs) {
+-      auto const *p1 = cell_structure.get_local_particle(pid1);
+-      auto const *p2 = cell_structure.get_local_particle(pid2);
+-      auto const dist = box_geo.get_mi_vector(p1->pos(), p2->pos()).norm();
++      auto const dist =
++          box_geo.get_mi_vector(pos_map.at(pid1), pos_map.at(pid2)).norm();
+       pairwise_distances.emplace_back(dist);
+     }
+     return pairwise_distances;
+diff --git a/testsuite/python/contact_time.py b/testsuite/python/contact_time.py
+index d280580f86..a6873eba40 100644
+--- a/testsuite/python/contact_time.py
++++ b/testsuite/python/contact_time.py
+@@ -31,6 +31,15 @@
+ 
+ class ContactTimeTest(ut.TestCase):
+ 
++    system = espressomd.System(box_l=[20] * 3)
++    system.time_step = 0.01
++    system.cell_system.skin = 1.
++
++    def tearDown(self):
++        self.system.part.clear()
++        self.system.thermostat.turn_off()
++        self.system.integrator.set_vv()
++
+     @classmethod
+     def calculate_minimum_image_distance(cls, coords1, coords2, size_box):
+         """
+@@ -119,19 +128,31 @@ def calculate_contact_times(
+             distances.append(frame_dists)
+         return (np.array(contact_times), np.array(distances))
+ 
++    def test_pairwise_distance_across_ranks(self):
++        """
++        Place particles on two different MPI ranks well past the ghost layer.
++        The observable must collect data from all other ranks.
++        """
++        system = self.system
++        dist_larger_than_skin = 2. * system.cell_system.skin
++        system.part.add(id=0, pos=3 * [+dist_larger_than_skin])
++        system.part.add(id=1, pos=3 * [-dist_larger_than_skin])
++        pairwise_dist_obs = espressomd.observables.PairwiseDistances(
++            ids=[0, 1], target_ids=[0, 1])
++        obs_dist = pairwise_dist_obs.calculate()
++        ref_dist = dist_larger_than_skin * np.sqrt(12.)
++        self.assertAlmostEqual(obs_dist, ref_dist, delta=1e-7)
++
+     @utx.skipIfMissingFeatures(["LENNARD_JONES"])
+     def test_contact_time(self):
+         # System: LJ fluid
+         contact_threshold = 1.
+         seed = 23
+         N = 40
++        system = self.system
+ 
+         # Simulation parameters
+         N_steps = 1400
+-        box_l = 20
+-        system = espressomd.System(box_l=[box_l] * 3)
+-        system.time_step = 0.01
+-        system.cell_system.skin = 1
+         rng = np.random.default_rng(seed)
+         system.part.add(pos=rng.random((N, 3)) * np.copy(system.box_l))
+         ids = np.copy(system.part.all().id)

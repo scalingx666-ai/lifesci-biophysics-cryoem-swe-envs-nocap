@@ -1,0 +1,217 @@
+diff --git a/scilink/cli/shell/headless.py b/scilink/cli/shell/headless.py
+index 34d05f60..5127b5ee 100644
+--- a/scilink/cli/shell/headless.py
++++ b/scilink/cli/shell/headless.py
+@@ -78,7 +78,7 @@ def run(adapter, args, task: str, *, console: Console = None) -> int:
+             adapter.set_autonomy(agent, "autonomous")
+             hitl.set_default_channel(AutoAcceptChannel())
+             try:
+-                result = adapter.headless_run(agent, task)
++                result = adapter.headless_run(agent, task, context=adapter.headless_context(args))
+             finally:
+                 hitl.set_default_channel(None)
+     except bootstrap.BootstrapError as e:
+diff --git a/scilink/cli/shell/modes.py b/scilink/cli/shell/modes.py
+index 7472ae17..b85de9df 100644
+--- a/scilink/cli/shell/modes.py
++++ b/scilink/cli/shell/modes.py
+@@ -74,8 +74,16 @@ def extra_commands(self) -> List[Command]:
+     def initial_turns(self, args, agent) -> List[str]:
+         return []
+ 
+-    def headless_run(self, agent, task: str) -> Dict[str, Any]:
+-        result = agent.run_task(task)
++    def headless_context(self, args) -> Optional[Dict[str, Any]]:
++        """What the mode's flags name that a ``-p`` task must also be given.
++        The interactive shell feeds such inputs through ``initial_turns``;
++        headless runs one task and never reads those turns, so an input
++        returned here travels with the task as ``run_task`` context."""
++        return None
++
++    def headless_run(self, agent, task: str,
++                     context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
++        result = agent.run_task(task, context=context)
+         return result if isinstance(result, dict) else {"status": "success", "summary": str(result)}
+ 
+ 
+@@ -263,7 +271,7 @@ def extra_commands(self):
+     def initial_turns(self, args, agent):
+         return [args.initial_message] if getattr(args, "initial_message", None) else []
+ 
+-    def headless_run(self, agent, task):
++    def headless_run(self, agent, task, context=None):
+         reply = agent.chat(task)
+         ledger = getattr(agent, "_delegation_ledger", None) or []
+         files = [f for e in ledger for f in (e.get("files_produced") or [])]
+@@ -417,9 +425,23 @@ def initial_turns(self, args, agent):
+                          "analysis agent and explain your reasoning.")
+         return turns
+ 
+-    def headless_run(self, agent, task):
++    def headless_context(self, args):
++        """``--data`` / ``--metadata``: the interactive shell seeds its first
++        turn from them; a ``-p`` task gets them as context (they were
++        silently dropped, and the agent asked for the data file)."""
++        data, meta = getattr(args, "data_path", None), getattr(args, "metadata_path", None)
++        ctx: Dict[str, Any] = {}
++        if data:
++            ctx["data_path"] = str(Path(data).absolute())
++        if meta:
++            ctx["metadata_path"] = str(Path(meta).absolute())
++            ctx["metadata_format"] = ("JSON: load it" if Path(meta).suffix.lower() == ".json"
++                                      else "text description: convert it to metadata")
++        return ctx or None
++
++    def headless_run(self, agent, task, context=None):
+         from scilink.agents.exp_agents.analysis_orchestrator import AnalysisMode
+-        return agent.run_task(task, autonomy=AnalysisMode.AUTONOMOUS)
++        return agent.run_task(task, context=context, autonomy=AnalysisMode.AUTONOMOUS)
+ 
+ 
+ def _agents(shell, arg: str) -> None:
+@@ -595,9 +617,9 @@ def initial_turns(self, args, agent):
+         return ["Survey the workspace using list_workspace_files. Report what data files, "
+                 "papers, and other resources are available.", rec]
+ 
+-    def headless_run(self, agent, task):
++    def headless_run(self, agent, task, context=None):
+         from scilink.agents.planning_agents.planning_orchestrator import AutonomyLevel
+-        return agent.run_task(task, autonomy=AutonomyLevel.AUTONOMOUS)
++        return agent.run_task(task, context=context, autonomy=AutonomyLevel.AUTONOMOUS)
+ 
+ 
+ def _objective(shell, arg: str) -> None:
+@@ -678,9 +700,9 @@ def extra_commands(self):
+     def initial_turns(self, args, agent):
+         return [args.initial_request] if getattr(args, "initial_request", None) else []
+ 
+-    def headless_run(self, agent, task):
++    def headless_run(self, agent, task, context=None):
+         from scilink.agents.sim_agents.simulation_orchestrator import SimulationMode
+-        return agent.run_task(task, autonomy=SimulationMode.AUTONOMOUS)
++        return agent.run_task(task, context=context, autonomy=SimulationMode.AUTONOMOUS)
+ 
+ 
+ def _structures(shell, arg: str) -> None:
+diff --git a/tests/shell_fakes.py b/tests/shell_fakes.py
+index 8b426555..245d8968 100644
+--- a/tests/shell_fakes.py
++++ b/tests/shell_fakes.py
+@@ -119,7 +119,7 @@ def status_fields(self, agent):
+     def initial_turns(self, args, agent):
+         return [args.initial_message] if getattr(args, "initial_message", None) else []
+ 
+-    def headless_run(self, agent, task):
++    def headless_run(self, agent, task, context=None):
+         return agent.run_task(task)
+ 
+ 
+diff --git a/tests/test_headless_inputs.py b/tests/test_headless_inputs.py
+new file mode 100644
+index 00000000..0882c2d9
+--- /dev/null
++++ b/tests/test_headless_inputs.py
+@@ -0,0 +1,90 @@
++"""``scilink analyze -p TASK --data X --metadata Y`` hands X and Y to the task.
++
++The interactive shell seeds its first turn from --data / --metadata
++(``initial_turns``); headless runs one task through ``run_task`` and never
++read those turns, so both flags were silently dropped: live, the agent
++answered that no data path had been given and asked for one.
++"""
++
++import json
++from pathlib import Path
++
++from scilink.cli.shell import headless
++from scilink.cli.shell.modes import AnalyzeAdapter
++
++from shell_fakes import make_args
++
++
++class _Agent:
++    def __init__(self):
++        self.calls = []
++        self.mode = "co-pilot"
++
++    def run_task(self, task, context=None, autonomy=None):
++        self.calls.append({"task": task, "context": context, "autonomy": autonomy})
++        return {"status": "success", "summary": "ok", "key_findings": [], "files_produced": []}
++
++
++class _Adapter(AnalyzeAdapter):
++    """The real analyze adapter (flags, headless_context, headless_run) with
++    the orchestrator swapped for a recorder."""
++
++    def __init__(self):
++        self.agent = _Agent()
++
++    def build(self, args, creds, session_dir, *, restore, extras):
++        return self.agent
++
++    def get_autonomy(self, agent):
++        return agent.mode
++
++    def set_autonomy(self, agent, level):
++        agent.mode = level
++
++
++def _files(tmp_path):
++    data = tmp_path / "spectrum.txt"
++    data.write_text("1 2\n3 4\n")
++    meta = tmp_path / "spectrum.json"
++    meta.write_text(json.dumps({"technique": "Raman"}))
++    return data, meta
++
++
++def test_data_and_metadata_reach_the_headless_task(tmp_path, monkeypatch, capsys):
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setenv("SCILINK_HOME", str(tmp_path / "home"))
++    data, meta = _files(tmp_path)
++    adapter = _Adapter()
++    args = make_args(adapter, ["-p", "fit the peaks", "--data", str(data), "--metadata", str(meta),
++                               "--yes", "--api-key", "k", "--session-dir", str(tmp_path / "s")])
++    assert headless.run(adapter, args, args.print_task) == 0
++    call = adapter.agent.calls[0]
++    assert call["task"] == "fit the peaks"
++    assert call["context"]["data_path"] == str(data.absolute())
++    assert call["context"]["metadata_path"] == str(meta.absolute())
++    assert call["context"]["metadata_format"].startswith("JSON")
++
++
++def test_a_text_description_is_labelled_for_conversion(tmp_path):
++    desc = tmp_path / "notes.txt"
++    desc.write_text("Raman, 532 nm")
++    ctx = AnalyzeAdapter().headless_context(make_args(AnalyzeAdapter(), ["--metadata", str(desc)]))
++    assert ctx == {"metadata_path": str(desc.absolute()),
++                   "metadata_format": "text description: convert it to metadata"}
++
++
++def test_no_inputs_means_no_context(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setenv("SCILINK_HOME", str(tmp_path / "home"))
++    adapter = _Adapter()
++    args = make_args(adapter, ["-p", "t", "--yes", "--api-key", "k", "--session-dir", str(tmp_path / "s")])
++    headless.run(adapter, args, "t")
++    assert adapter.agent.calls[0]["context"] is None
++
++
++def test_every_mode_accepts_a_headless_context():
++    import inspect
++    from scilink.cli.shell.modes import ADAPTERS
++    for key, cls in ADAPTERS.items():
++        params = inspect.signature(cls.headless_run).parameters
++        assert "context" in params, key
+diff --git a/tests/test_shell_headless.py b/tests/test_shell_headless.py
+index 623b6b1e..bd43b708 100644
+--- a/tests/test_shell_headless.py
++++ b/tests/test_shell_headless.py
+@@ -44,7 +44,7 @@ def test_questions_are_auto_accepted(tmp_path, capsys, monkeypatch):
+     monkeypatch.chdir(tmp_path)
+ 
+     class AskingAdapter(FakeAdapter):
+-        def headless_run(self, agent, task):
++        def headless_run(self, agent, task, context=None):
+             agent.chat(task)   # asks through the chokepoint
+             return {"status": "success", "summary": "answered " + ",".join(agent.answers)}
+ 

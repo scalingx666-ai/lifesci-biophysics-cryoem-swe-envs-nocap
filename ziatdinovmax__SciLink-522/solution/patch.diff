@@ -1,0 +1,1597 @@
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator.py b/scilink/agents/exp_agents/analysis_orchestrator.py
+index 0d7d32a1b..a346aaf29 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator.py
+@@ -13,6 +13,7 @@
+ import json
+ import logging
+ import os
++import time
+ from pathlib import Path
+ from typing import List, Dict, Any, Optional
+ from datetime import datetime
+@@ -1613,7 +1614,7 @@ def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+             result["error"] = error_msg
+         return result
+ 
+-    def _auto_checkpoint(self):
++    def _auto_checkpoint(self, quiet: bool = False):
+         """Internal auto-checkpoint without LLM interaction."""
+         try:
+             checkpoint_data = {
+@@ -1634,11 +1635,38 @@ def _auto_checkpoint(self):
+             with open(self.checkpoint_path, 'w', encoding="utf-8") as f:
+                 json.dump(checkpoint_data, f, indent=2)
+ 
+-            print(f"    ✅ Auto-checkpoint saved")
+-            
++            if not quiet:
++                print(f"    ✅ Auto-checkpoint saved")
++
+         except Exception as e:
+             logging.warning(f"Auto-checkpoint failed: {e}")
+ 
++    # Wall-clock throttle for the per-tool-call checkpoint: a burst of cheap
++    # tool calls must not thrash the disk, while an expensive call (a whole
++    # run_analysis) always lands one because it outlasts the window.
++    TOOL_CHECKPOINT_MIN_INTERVAL_S = 15.0
++
++    def _checkpoint_after_tool(self) -> None:
++        """Persist history + state after a completed tool iteration.
++
++        The chat loop used to persist only at turn end, so a crash mid-turn
++        lost every completed tool call since the last turn boundary — and one
++        turn can contain a whole run_analysis. Mirrors the MCP server's
++        checkpoint-after-tool. Quiet and throttled; a mid-turn history ends
++        in a dangling tool_use pair at worst, which the loop's
++        repair_dangling_tool_calls heals on the next load.
++        """
++        now = time.monotonic()
++        if (now - getattr(self, "_last_tool_checkpoint_ts", 0.0)
++                < self.TOOL_CHECKPOINT_MIN_INTERVAL_S):
++            return
++        self._last_tool_checkpoint_ts = now
++        try:
++            self._save_history()
++            self._auto_checkpoint(quiet=True)
++        except Exception as e:  # noqa: BLE001 - persistence must not kill the turn
++            logging.warning(f"Per-tool checkpoint failed: {e}")
++
+     def _tool_message(self, tool_call_id: str, result: str) -> dict:
+         """Build the tool-result message. When the active provider renders
+         images in tool results (Claude/Bedrock, Gemini — not the OpenAI-
+@@ -1748,7 +1776,9 @@ def _handle_openai_chat(self, user_input: str) -> str:
+                 result = self.tools.execute_tool(func_name, **args)
+                 
+                 self.messages.append(self._tool_message(tool_call.id, result))
+-        
++
++            self._checkpoint_after_tool()
++
+         self._last_chat_hit_iter_cap = True
+         return "⚠️ Maximum tool iterations reached. Please simplify your request."
+ 
+@@ -1913,7 +1943,9 @@ def _handle_litellm_chat(self, user_input: str) -> str:
+                 result = self.tools.execute_tool(func_name, **args)
+                 
+                 self.messages.append(self._tool_message(tool_call.id, result))
+-        
++
++            self._checkpoint_after_tool()
++
+         self._last_chat_hit_iter_cap = True
+         return "⚠️ Maximum tool iterations reached. Please simplify your request."
+ 
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator_tools.py b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+index b3fc70c9b..e5335ea46 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator_tools.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+@@ -28,6 +28,29 @@
+ from pathlib import Path
+ from typing import Dict, Any, Callable, List, Optional
+ 
++
++# Bound on the metadata echoed back into a tool result. The FULL metadata is
++# always stored on the session (self._replace_metadata) and on disk — only
++# the conversational echo is bounded. Observed live: load_metadata pointed at
++# a large results JSON echoed 7.7MB into the history, overflowing the model's
++# context on every later call of the session.
++_METADATA_ECHO_MAX_CHARS = 20_000
++
++
++def _bounded_metadata_echo(metadata):
++    """The metadata object itself when small; a summary stub when huge."""
++    try:
++        s = json.dumps(metadata, default=str)
++    except Exception:  # noqa: BLE001 - echo must never break the tool
++        return metadata
++    if len(s) <= _METADATA_ECHO_MAX_CHARS:
++        return metadata
++    keys = (", ".join(list(metadata)[:40]) if isinstance(metadata, dict)
++            else type(metadata).__name__)
++    return {"_truncated_echo": (
++        f"metadata too large to echo in conversation ({len(s)} chars); it is "
++        f"stored IN FULL for the analysis. Top-level keys: {keys}")}
++
+ from .metadata_converter import (
+     generate_metadata_json_from_text,
+     METADATA_SCHEMA_DICT,
+@@ -1677,7 +1700,7 @@ def convert_metadata(
+ 
+                         result = {
+                             "status": "success",
+-                            "metadata": metadata,
++                            "metadata": _bounded_metadata_echo(metadata),
+                             "saved_to": str(output_path)
+                         }
+                         if cpi_warning:
+@@ -1721,7 +1744,7 @@ def convert_metadata(
+ 
+                         result = {
+                             "status": "success",
+-                            "metadata": metadata,
++                            "metadata": _bounded_metadata_echo(metadata),
+                             "saved_to": str(output_path)
+                         }
+                         if cpi_warning:
+@@ -1987,7 +2010,7 @@ def load_metadata(json_path: str) -> str:
+                         "status": "warning",
+                         "message": f"Metadata loaded but missing recommended fields: {missing}",
+                         "metadata_file": path.name,
+-                        "metadata": metadata,
++                        "metadata": _bounded_metadata_echo(metadata),
+                         "experiment_type": metadata.get("experiment_type"),
+                         "technique": metadata.get("experiment", {}).get("technique") if isinstance(metadata.get("experiment"), dict) else metadata.get("technique"),
+                         "material": metadata.get("sample", {}).get("material") if isinstance(metadata.get("sample"), dict) else metadata.get("material")
+@@ -1999,7 +2022,7 @@ def load_metadata(json_path: str) -> str:
+                 result = {
+                     "status": "success",
+                     "metadata_file": path.name,
+-                    "metadata": metadata,
++                    "metadata": _bounded_metadata_echo(metadata),
+                     "experiment_type": metadata.get("experiment_type"),
+                     "technique": metadata.get("experiment", {}).get("technique"),
+                     "material": metadata.get("sample", {}).get("material")
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index eb10f3704..313367793 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -684,12 +684,15 @@ def ask(self, req):
+         return self._qch.ask(req)
+ 
+ 
+-def _make_ephemeral_analysis_child(orch, base_dir: Path):
++def _make_ephemeral_analysis_child(orch, base_dir: Path, restore: bool = False):
+     """Build an isolated, one-shot analysis orchestrator for one branch.
+ 
+     NOT registered in ``orch._children`` — these are ephemeral fan-out workers,
+     not the persistent singleton, so they share no mutable state across threads
+-    and are never restored. Resting mode AUTONOMOUS; run_task pins it per call.
++    and are never restored by the meta's child-restore path. Resting mode
++    AUTONOMOUS; run_task pins it per call. ``restore=True`` (the resume path)
++    rebuilds the worker IN its original session dir with its own checkpoint,
++    so it comes back holding its per-tool-checkpointed partial progress.
+     """
+     from ..exp_agents.analysis_orchestrator import (
+         AnalysisOrchestratorAgent, AnalysisMode,
+@@ -703,7 +706,7 @@ def _make_ephemeral_analysis_child(orch, base_dir: Path):
+         embedding_model=orch.embedding_model,
+         embedding_api_key=orch.embedding_api_key,
+         futurehouse_api_key=orch.futurehouse_api_key,
+-        restore_checkpoint=False,
++        restore_checkpoint=restore,
+         analysis_mode=AnalysisMode.AUTONOMOUS,
+     )
+     child._agent_label = "Analysis branch"
+@@ -832,6 +835,49 @@ def _mesh_task(branch: dict, companions: List[dict]) -> str:
+     return task + "\n".join(block)
+ 
+ 
++def _cancel_overdue_branches(orch, pending, fut_entry, fut_stop, fut_label,
++                             budget: float) -> None:
++    """Cancel every pending branch that has outrun the wall-clock budget.
++
++    Shared by ``run_fanout`` and ``resume_fanout``: records the entry
++    degraded (excluded from fusion), fires the branch's stop event FIRST so
++    its thread aborts on its next print (releasing its memory-admission
++    slot), then kills any subprocess it is currently waiting on, and stops
++    waiting for its future. Mutates ``pending`` in place.
++    """
++    overdue = [f for f in pending
++               if fut_entry[f].get("_started_at") is not None
++               and fut_entry[f].get("status") == "running"
++               and (time.monotonic() - fut_entry[f]["_started_at"] > budget)]
++    for f in overdue:
++        e = fut_entry[f]
++        e["timed_out"] = True
++        print(f"  ⏱️  analysis branch '{fut_label[f]}' exceeded "
++              f"its wall-clock budget ({int(budget)}s) — "
++              "cancelling it (degraded, excluded from fusion).")
++        logger.warning(
++            f"fan-out branch {e['index']} ('{fut_label[f]}') "
++            f"cancelled after {int(budget)}s wall-clock budget")
++        fut_stop[f].set()
++        tid = e.get("_branch_tid")
++        if tid:
++            try:
++                from ...executors import kill_subprocesses_for_thread
++                kill_subprocesses_for_thread(tid)
++            except Exception:  # noqa: BLE001 - best-effort cleanup
++                pass
++        orch._close_delegation(e, {
++            "status": "error",
++            "error": (f"branch wall-clock budget exceeded "
++                      f"({int(budget)}s); branch abandoned"),
++            "summary": "", "key_findings": [],
++            "files_produced": [], "suggested_followups": [],
++            "warnings": [f"abandoned after {int(budget)}s "
++                         "wall-clock budget (#358)"],
++        })
++        pending.discard(f)
++
++
+ def _run_one_branch(orch, branch: dict, companions: List[dict],
+                     entry: dict, queue_channel=None,
+                     branch_autonomy=None, stop_event=None) -> None:
+@@ -879,9 +925,19 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+     try:
+         try:
+             from ..exp_agents.analysis_orchestrator import AnalysisMode
+-            child = _make_ephemeral_analysis_child(orch, base_dir)
++            # Positional call on the fresh path keeps the factory's widely
++            # monkeypatched two-arg signature working; only the resume path
++            # opts into restore.
++            child = (_make_ephemeral_analysis_child(orch, base_dir,
++                                                    restore=True)
++                     if branch.get("_resume")
++                     else _make_ephemeral_analysis_child(orch, base_dir))
++            # A resumed branch re-runs its RECORDED (already meshed) task
++            # verbatim — re-composing it would duplicate the mesh blocks.
++            task_text = (branch["task"] if branch.get("_premeshed")
++                         else _mesh_task(branch, companions))
+             result = child.run_task(
+-                _mesh_task(branch, companions),
++                task_text,
+                 context=branch.get("context"),
+                 autonomy=(branch_autonomy if branch_autonomy is not None
+                           else AnalysisMode.AUTONOMOUS),
+@@ -934,6 +990,108 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+     orch._close_delegation(entry, result)
+ 
+ 
++_RESUME_NOTE = (
++    "\n\nRESUME NOTE: this branch was interrupted mid-run and is being "
++    "resumed in its original session, which already holds its partial "
++    "progress. Continue from the recorded results — do not redo completed "
++    "steps.")
++
++
++def resume_fanout(orch) -> str:
++    """Re-run fan-out branches left unfinished by a dead or stopped session.
++
++    A coordinator death (or user stop) leaves a fan-out's provisional ledger
++    entries 'running' — swept to 'interrupted' at the next turn start. Each
++    such branch is re-created IN its original ``fanout/<NN>_<slug>/`` session
++    dir with ``restore_checkpoint=True``, so it comes back holding its
++    per-tool-checkpointed partial progress plus the interrupted-turn note,
++    and re-runs its RECORDED task verbatim (pre-meshed — never re-composed).
++    Completed branches keep their results and budget-degraded (timed_out)
++    branches keep their verdicts; only interrupted work is redone.
++    """
++    with orch._fanout_lock:
++        stale = [e for e in orch._delegation_ledger
++                 if e.get("fanout")
++                 and e.get("status") in ("running", "interrupted")
++                 and not e.get("timed_out")]
++        for e in stale:
++            # Reopen the provisional entry; keep the interruption on record.
++            e["resumed_from_interruption"] = True
++            e["status"] = "running"
++            e.pop("completed_at", None)
++    if not stale:
++        return json.dumps({
++            "status": "no_op",
++            "message": "No interrupted fan-out branches to resume."})
++
++    # Persist the reopened entries (and their audit stamps) NOW, so a crash
++    # DURING the resume leaves them recoverable again — resume must converge
++    # under repeated interruption, mirroring the launch-time persistence.
++    orch._auto_checkpoint(verbose=False)
++
++    print(f"  🔁 Resuming {len(stale)} interrupted fan-out branch(es) in "
++          "their original sessions...")
++    _ensure_stop_guard_installed()
++    budget = FANOUT_BRANCH_TIME_BUDGET_S
++    pool = ThreadPoolExecutor(max_workers=min(len(stale), FANOUT_MAX_WORKERS))
++    try:
++        fut_entry, fut_stop, fut_label = {}, {}, {}
++        for e in stale:
++            branch = {
++                "task": (e.get("task") or "") + _RESUME_NOTE,
++                "label": e.get("label"),
++                "data_path": e.get("data_path"),
++                "pattern": e.get("pattern"),
++                "metadata": e.get("metadata"),
++                "_premeshed": True,
++                "_resume": True,
++            }
++            stop_ev = _threading.Event()
++            fut = pool.submit(_run_one_branch, orch, branch, [], e,
++                              None, None, stop_ev)
++            fut_entry[fut] = e
++            fut_stop[fut] = stop_ev
++            fut_label[fut] = e.get("label") or f"branch {e['index']}"
++        pending = set(fut_entry)
++        since_tick = 0.0
++        while pending:
++            t0 = time.monotonic()
++            done, pending = wait(pending, timeout=_FANOUT_POLL_S)
++            since_tick += time.monotonic() - t0
++            for f in done:
++                f.result()
++                print(f"  ✅ resumed branch finished: {fut_label[f]} "
++                      f"(status: {fut_entry[f].get('status')})")
++                since_tick = 0.0
++            if budget > 0:
++                _cancel_overdue_branches(orch, pending, fut_entry, fut_stop,
++                                         fut_label, budget)
++            if pending and since_tick >= _FANOUT_HEARTBEAT_S:
++                since_tick = 0.0
++                print(f"  ⏳ {len(pending)} resumed branch(es) still "
++                      "running ...")
++    finally:
++        pool.shutdown(wait=False, cancel_futures=True)
++
++    results = [{"delegation_index": e["index"], "label": e.get("label"),
++                "status": e.get("status"),
++                "key_findings": (e.get("key_findings") or [])[:6],
++                "files_produced": (e.get("files_produced") or [])[:20]}
++               for e in stale]
++    ok = [r["delegation_index"] for r in results if r["status"] == "success"]
++    return json.dumps({
++        "status": "success" if ok else "error",
++        "branches_resumed": len(stale),
++        "results": results,
++        "message": ("Resumed branches finished. Combine them with the "
++                    "fan-out's already-completed branches and pass the "
++                    "successful delegation_index values to fuse_delegations."
++                    if ok else
++                    "No resumed branch succeeded — inspect the per-branch "
++                    "errors before retrying."),
++    }, default=str)
++
++
+ def run_fanout(orch, branches: List[dict],
+                branch_time_budget_s: Optional[float] = None,
+                figure_style: Optional[str] = None,
+@@ -1174,6 +1332,13 @@ def _companions_for(i):
+             entry["join_axis"] = verdict.get("join_axis")
+             entries.append(entry)
+ 
++    # Persist the provisional 'running' entries BEFORE any branch runs: a
++    # coordinator crash before the first branch completes would otherwise
++    # leave no on-disk trace of the fan-out (_close_delegation writes the
++    # first checkpoint), making the interrupted branches invisible to
++    # resume_fanout on restore.
++    orch._auto_checkpoint(verbose=False)
++
+     # --- harmonized pipeline replay (donor-first) ---
+     # The FIRST branch is the pipeline donor: it runs alone under the normal
+     # analysis path; its approved dynamic-analysis script(s) are then
+@@ -1264,6 +1429,13 @@ def _companions_for(i):
+                     "donor_status": entries[0].get("status")}
+                    if donor_partial else {}),
+             }
++        # Persist the follower entries' re-stamped replay tasks and
++        # harmonized_with stamps NOW: a coordinator crash during the replay
++        # phase must leave resumable followers that still carry the
++        # verbatim-replay instruction — otherwise a later resume_fanout
++        # would re-run them from the pre-harmonize task, silently
++        # unharmonized.
++        orch._auto_checkpoint(verbose=False)
+ 
+     # --- run concurrently; wiring per the mesh policy ---
+     print(f"  🔀 Launching {len(run_branches) - follower_start} parallel "
+@@ -1326,46 +1498,13 @@ def _companions_for(i):
+                 print(f"  ✅ analysis branch finished: {fut_label[f]}  "
+                       f"({n_total - len(pending)}/{n_total} done)")
+                 since_tick = 0.0  # a completion already shows the run is alive
+-            # Branch wall-clock budget (#358): abandon a branch that has run
++            # Branch wall-clock budget (#358): cancel a branch that has run
+             # past its deadline — record it degraded (the existing
+-            # degraded-branch machinery excludes it from fusion), kill its
+-            # registered subprocesses, and stop waiting for its thread.
++            # degraded-branch machinery excludes it from fusion), fire its
++            # stop event, kill its registered subprocesses, and stop waiting.
+             if budget > 0:
+-                overdue = [f for f in pending
+-                           if fut_entry[f].get("_started_at") is not None
+-                           and fut_entry[f].get("status") == "running"
+-                           and (time.monotonic() - fut_entry[f]["_started_at"]
+-                                > budget)]
+-                for f in overdue:
+-                    e = fut_entry[f]
+-                    e["timed_out"] = True
+-                    print(f"  ⏱️  analysis branch '{fut_label[f]}' exceeded "
+-                          f"its wall-clock budget ({int(budget)}s) — "
+-                          "cancelling it (degraded, excluded from fusion).")
+-                    logger.warning(
+-                        f"fan-out branch {e['index']} ('{fut_label[f]}') "
+-                        f"cancelled after {int(budget)}s wall-clock budget")
+-                    # Fire the branch's stop event FIRST so its thread aborts
+-                    # on its next print (releasing its memory-admission slot),
+-                    # then kill any subprocess it is currently waiting on.
+-                    fut_stop[f].set()
+-                    tid = e.get("_branch_tid")
+-                    if tid:
+-                        try:
+-                            from ...executors import kill_subprocesses_for_thread
+-                            kill_subprocesses_for_thread(tid)
+-                        except Exception:  # noqa: BLE001 - best-effort cleanup
+-                            pass
+-                    orch._close_delegation(e, {
+-                        "status": "error",
+-                        "error": (f"branch wall-clock budget exceeded "
+-                                  f"({int(budget)}s); branch abandoned"),
+-                        "summary": "", "key_findings": [],
+-                        "files_produced": [], "suggested_followups": [],
+-                        "warnings": [f"abandoned after {int(budget)}s "
+-                                     "wall-clock budget (#358)"],
+-                    })
+-                    pending.discard(f)
++                _cancel_overdue_branches(orch, pending, fut_entry, fut_stop,
++                                         fut_label, budget)
+             if pending and since_tick >= _FANOUT_HEARTBEAT_S:
+                 since_tick = 0.0
+                 elapsed = int(time.monotonic() - start)
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index ddb33f7d7..24223345a 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -17,6 +17,7 @@
+ import json
+ import logging
+ import os
++import time
+ import threading
+ from pathlib import Path
+ from typing import List, Dict, Any, Optional
+@@ -1281,6 +1282,12 @@ def _delegate(self, mode: str, task: str, context: Optional[dict] = None,
+                 "disagreement with the fused picture plainly — it is a "
+                 "valid, valuable outcome.")
+             entry["task"] = task
++        # Persist the provisional 'running' entry BEFORE the child runs
++        # (mirrors the fan-out launch checkpoint): a crash mid-delegation
++        # would otherwise leave no on-disk trace of it — the restored ledger
++        # would show the delegation as never having existed instead of
++        # interrupted.
++        self._auto_checkpoint(verbose=False)
+         try:
+             child = get_child()
+             result = child.run_task(
+@@ -1549,6 +1556,11 @@ def _run_fanout(self, branches: list,
+                           figure_style=figure_style,
+                           harmonize=harmonize)
+ 
++    def _resume_fanout(self) -> str:
++        """Re-run fan-out branches left unfinished by a dead/stopped session."""
++        from .fanout import resume_fanout
++        return resume_fanout(self)
++
+     def _fuse_delegations(self, indices: list, focus: Optional[str] = None) -> str:
+         """Reconcile finished complementary branch findings into one narrative."""
+         from .fanout import fuse_delegations
+@@ -1588,6 +1600,18 @@ def _restore_checkpoint(self):
+             print(f"       - Meta mode: {self.meta_mode.value}")
+             print(f"       - Delegations: {len(self._delegation_ledger)}")
+ 
++            # Surface interrupted fan-out branches so the user (and the LLM,
++            # which sees the resume_fanout tool) knows unfinished parallel
++            # work is recoverable rather than silently lost.
++            n_stale = sum(1 for e in self._delegation_ledger
++                          if e.get("fanout")
++                          and e.get("status") in ("running", "interrupted")
++                          and not e.get("timed_out"))
++            if n_stale:
++                print(f"       - ⚠️ {n_stale} fan-out branch(es) were "
++                      "interrupted mid-run — ask to resume the fan-out to "
++                      "finish them (resume_fanout).")
++
+         except Exception as e:
+             logging.warning(f"Failed to restore checkpoint: {e}")
+ 
+@@ -1619,6 +1643,33 @@ def _auto_checkpoint(self, verbose: bool = True):
+             logging.warning(f"Auto-checkpoint failed: {e}")
+             return False
+ 
++    # Wall-clock throttle for the per-tool-call checkpoint: a burst of cheap
++    # tool calls must not thrash the disk, while an expensive call (a whole
++    # delegation or fan-out) always lands one because it outlasts the window.
++    TOOL_CHECKPOINT_MIN_INTERVAL_S = 15.0
++
++    def _checkpoint_after_tool(self) -> None:
++        """Persist history + state after a completed tool iteration.
++
++        The chat loop used to persist only at turn end, so a crash mid-turn
++        lost every completed tool call since the last turn boundary — and one
++        meta turn can contain a whole delegation or fan-out. Mirrors the MCP
++        server's checkpoint-after-tool. Quiet and throttled; a mid-turn
++        history ends in a dangling tool_use pair at worst, which the loop's
++        repair_dangling_tool_calls heals on the next load. The checkpoint
++        write itself is atomic and lock-serialized (see _auto_checkpoint).
++        """
++        now = time.monotonic()
++        if (now - getattr(self, "_last_tool_checkpoint_ts", 0.0)
++                < self.TOOL_CHECKPOINT_MIN_INTERVAL_S):
++            return
++        self._last_tool_checkpoint_ts = now
++        try:
++            self._save_history()
++            self._auto_checkpoint(verbose=False)
++        except Exception as e:  # noqa: BLE001 - persistence must not kill the turn
++            logging.warning(f"Per-tool checkpoint failed: {e}")
++
+     def save_checkpoint(self) -> str:
+         """Save the meta checkpoint on demand and reset the auto-save timer.
+ 
+@@ -1877,6 +1928,8 @@ def _handle_openai_chat(self, user_input: str) -> str:
+ 
+                 self.messages.append(self._tool_message(tool_call.id, result))
+ 
++            self._checkpoint_after_tool()
++
+         self._last_chat_hit_iter_cap = True
+         return "⚠️ Maximum tool iterations reached. Please simplify your request."
+ 
+@@ -2043,5 +2096,7 @@ def _handle_litellm_chat(self, user_input: str) -> str:
+ 
+                 self.messages.append(self._tool_message(tool_call.id, result))
+ 
++            self._checkpoint_after_tool()
++
+         self._last_chat_hit_iter_cap = True
+         return "⚠️ Maximum tool iterations reached. Please simplify your request."
+diff --git a/scilink/agents/meta_agent/meta_orchestrator_tools.py b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+index 8e875de5b..7050771f7 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator_tools.py
++++ b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+@@ -781,6 +781,32 @@ def delegate_to_analyses(branches: list,
+             required=["branches"],
+         )
+ 
++        # -- resume_fanout (finish an interrupted parallel run) --------------
++        def resume_fanout() -> str:
++            print("  🔁 Resuming interrupted fan-out branches...")
++            return self.orch._resume_fanout()
++
++        self._register_tool(
++            func=resume_fanout,
++            name="resume_fanout",
++            description=(
++                "Resume the fan-out branches of a RESTORED session that were "
++                "left unfinished when the session died or was stopped "
++                "mid-fan-out (delegation ledger status 'interrupted' or "
++                "'running'). Each branch re-runs its recorded task inside "
++                "its ORIGINAL branch session, which still holds its partial "
++                "progress, so completed steps are not redone. Branches that "
++                "already completed — and branches degraded on the wall-clock "
++                "budget — are untouched. Use when the restore notice reports "
++                "interrupted fan-out branches or the user asks to resume/"
++                "finish an interrupted parallel analysis; afterwards fuse "
++                "the successful branches with `fuse_delegations` as usual. "
++                "No-op (with a message) when nothing is interrupted."
++            ),
++            parameters={},
++            required=[],
++        )
++
+         # -- fuse_delegations -----------------------------------------------
+         def fuse_delegations(delegation_indices: list, focus: str = None) -> str:
+             print("  " + _handoff(f"🧬 Fusing delegations {delegation_indices}..."))
+diff --git a/scilink/agents/planning_agents/planning_orchestrator.py b/scilink/agents/planning_agents/planning_orchestrator.py
+index 467a743fc..8dde103cf 100644
+--- a/scilink/agents/planning_agents/planning_orchestrator.py
++++ b/scilink/agents/planning_agents/planning_orchestrator.py
+@@ -1,6 +1,7 @@
+ import json
+ import logging
+ import os
++import time
+ import re
+ import pandas as pd
+ from pathlib import Path
+@@ -10,7 +11,8 @@
+ 
+ from ...auth import get_internal_proxy_key
+ from ...utils.prose_style import PROSE_STYLE_RULE
+-from ...utils.tool_media import (repair_dangling_tool_calls,
++from ...utils.tool_media import (clip_tool_result,
++                                 repair_dangling_tool_calls,
+                                  close_interrupted_turn)
+ from ...wrappers.openai_wrapper import OpenAIAsGenerativeModel
+ from ...wrappers.litellm_wrapper import LiteLLMGenerativeModel
+@@ -1614,7 +1616,7 @@ def _compress_large_tool_results(self):
+                 print(f"  📦 Compressed {compressed} large tool result(s) in history "
+                       f"({total_chars:,} → {new_total:,} chars)")
+ 
+-    def _auto_checkpoint(self):
++    def _auto_checkpoint(self, quiet: bool = False):
+         """Internal auto-checkpoint without LLM interaction."""
+         try:
+             checkpoint_data = {
+@@ -1646,12 +1648,39 @@ def _auto_checkpoint(self):
+             
+             with open(self.checkpoint_path, 'w', encoding="utf-8") as f:
+                 json.dump(checkpoint_data, f, indent=2)
+-            
+-            print(f"    ✅ Auto-checkpoint saved")
+-            
++
++            if not quiet:
++                print(f"    ✅ Auto-checkpoint saved")
++
+         except Exception as e:
+             logging.warning(f"Auto-checkpoint failed: {e}")
+ 
++    # Wall-clock throttle for the per-tool-call checkpoint: a burst of cheap
++    # tool calls must not thrash the disk, while an expensive call (a whole
++    # generate_plan) always lands one because it outlasts the window.
++    TOOL_CHECKPOINT_MIN_INTERVAL_S = 15.0
++
++    def _checkpoint_after_tool(self) -> None:
++        """Persist history + state after a completed tool iteration.
++
++        The chat loop used to persist only at turn end, so a crash mid-turn
++        lost every completed tool call since the last turn boundary — and one
++        turn can contain a whole plan generation. Mirrors the MCP server's
++        checkpoint-after-tool. Quiet and throttled; a mid-turn history ends
++        in a dangling tool_use pair at worst, which the loop's
++        repair_dangling_tool_calls heals on the next load.
++        """
++        now = time.monotonic()
++        if (now - getattr(self, "_last_tool_checkpoint_ts", 0.0)
++                < self.TOOL_CHECKPOINT_MIN_INTERVAL_S):
++            return
++        self._last_tool_checkpoint_ts = now
++        try:
++            self._save_history()
++            self._auto_checkpoint(quiet=True)
++        except Exception as e:  # noqa: BLE001 - persistence must not kill the turn
++            logging.warning(f"Per-tool checkpoint failed: {e}")
++
+     @staticmethod
+     def _parse_tool_args(tool_call, finish_reason=None):
+         """Parse a tool call's JSON arguments, failing loud on bad input.
+@@ -1781,9 +1810,11 @@ def _handle_openai_chat(self, user_input: str) -> str:
+                 self.messages.append({
+                     "role": "tool",
+                     "tool_call_id": tool_call.id,
+-                    "content": result
++                    "content": clip_tool_result(result)
+                 })
+ 
++            self._checkpoint_after_tool()
++
+         self._last_chat_hit_iter_cap = True
+         return "⚠️ Maximum tool iterations reached. Please simplify your request."
+ 
+@@ -1938,9 +1969,11 @@ def _handle_litellm_chat(self, user_input: str) -> str:
+                 self.messages.append({
+                     "role": "tool",
+                     "tool_call_id": tool_call.id,
+-                    "content": result
++                    "content": clip_tool_result(result)
+                 })
+ 
++            self._checkpoint_after_tool()
++
+         self._last_chat_hit_iter_cap = True
+         return "⚠️ Maximum tool iterations reached. Please simplify your request."
+ 
+diff --git a/scilink/agents/sim_agents/simulation_orchestrator.py b/scilink/agents/sim_agents/simulation_orchestrator.py
+index e9d8e894c..adacb993c 100644
+--- a/scilink/agents/sim_agents/simulation_orchestrator.py
++++ b/scilink/agents/sim_agents/simulation_orchestrator.py
+@@ -20,6 +20,7 @@
+ import json
+ import logging
+ import os
++import time
+ from pathlib import Path
+ from typing import List, Dict, Any, Optional
+ from datetime import datetime
+@@ -30,7 +31,8 @@
+     require_vendor_credentials,
+ )
+ from ...utils.prose_style import PROSE_STYLE_RULE
+-from ...utils.tool_media import (repair_dangling_tool_calls,
++from ...utils.tool_media import (clip_tool_result,
++                                 repair_dangling_tool_calls,
+                                  close_interrupted_turn)
+ from ...wrappers.openai_wrapper import OpenAIAsGenerativeModel
+ from ...wrappers.litellm_wrapper import LiteLLMGenerativeModel
+@@ -824,9 +826,14 @@ def _restore_checkpoint(self) -> None:
+         except Exception as e:
+             self.logger.warning(f"Failed to restore checkpoint: {e}")
+ 
+-    def _auto_checkpoint(self) -> None:
+-        """Save checkpoint periodically (every CHECKPOINT_INTERVAL messages)."""
+-        if self.message_count - self.last_checkpoint_message_count < self.CHECKPOINT_INTERVAL:
++    def _auto_checkpoint(self, force: bool = False, quiet: bool = False) -> None:
++        """Save checkpoint periodically (every CHECKPOINT_INTERVAL messages).
++
++        ``force`` bypasses the message-interval gate (used by the per-tool
++        checkpoint, which throttles by wall clock instead).
++        """
++        if (not force and self.message_count - self.last_checkpoint_message_count
++                < self.CHECKPOINT_INTERVAL):
+             return
+         try:
+             ck = {
+@@ -838,10 +845,37 @@ def _auto_checkpoint(self) -> None:
+             with open(self.checkpoint_path, "w", encoding="utf-8") as f:
+                 json.dump(ck, f, indent=2, default=str)
+             self.last_checkpoint_message_count = self.message_count
+-            print(f"    ✅ Auto-checkpoint saved")
++            if not quiet:
++                print(f"    ✅ Auto-checkpoint saved")
+         except Exception as e:
+             self.logger.warning(f"Auto-checkpoint failed: {e}")
+ 
++    # Wall-clock throttle for the per-tool-call checkpoint: a burst of cheap
++    # tool calls must not thrash the disk, while an expensive call (a whole
++    # DFT workflow) always lands one because it outlasts the window.
++    TOOL_CHECKPOINT_MIN_INTERVAL_S = 15.0
++
++    def _checkpoint_after_tool(self) -> None:
++        """Persist history + state after a completed tool iteration.
++
++        The chat loop used to persist only at turn end, so a crash mid-turn
++        lost every completed tool call since the last turn boundary — and one
++        turn can contain a whole structure-generation workflow. Mirrors the
++        MCP server's checkpoint-after-tool. Quiet and throttled; a mid-turn
++        history ends in a dangling tool_use pair at worst, which the loop's
++        repair_dangling_tool_calls heals on the next load.
++        """
++        now = time.monotonic()
++        if (now - getattr(self, "_last_tool_checkpoint_ts", 0.0)
++                < self.TOOL_CHECKPOINT_MIN_INTERVAL_S):
++            return
++        self._last_tool_checkpoint_ts = now
++        try:
++            self._save_history()
++            self._auto_checkpoint(force=True, quiet=True)
++        except Exception as e:  # noqa: BLE001 - persistence must not kill the turn
++            self.logger.warning(f"Per-tool checkpoint failed: {e}")
++
+     # ------------------------------------------------------------------
+     # Chat handlers — manual tool-call loops, mirrors analyze mode
+     # ------------------------------------------------------------------
+@@ -940,9 +974,11 @@ def _handle_openai_chat(self, user_input: str) -> str:
+                 self.messages.append({
+                     "role": "tool",
+                     "tool_call_id": tool_call.id,
+-                    "content": result,
++                    "content": clip_tool_result(result),
+                 })
+ 
++            self._checkpoint_after_tool()
++
+         self._last_chat_hit_iter_cap = True
+         return "⚠️ Maximum tool iterations reached. Please simplify your request."
+ 
+@@ -1043,9 +1079,11 @@ def _handle_litellm_chat(self, user_input: str) -> str:
+                 self.messages.append({
+                     "role": "tool",
+                     "tool_call_id": tool_call.id,
+-                    "content": result,
++                    "content": clip_tool_result(result),
+                 })
+ 
++            self._checkpoint_after_tool()
++
+         self._last_chat_hit_iter_cap = True
+         return "⚠️ Maximum tool iterations reached. Please simplify your request."
+ 
+diff --git a/scilink/utils/tool_media.py b/scilink/utils/tool_media.py
+index 12241d036..0afcde0cc 100644
+--- a/scilink/utils/tool_media.py
++++ b/scilink/utils/tool_media.py
+@@ -114,17 +114,48 @@ def _extract_images(result_str: str):
+     return images, json.dumps(data)
+ 
+ 
++# Bound on a single tool result's footprint in the message history. Far above
++# any legitimate result (large metadata echoes run ~60KB) and far below the
++# poison observed live: one tool result echoing a 7.7MB JSON put ~5.3M tokens
++# into EVERY subsequent LLM call of the session — and per-tool checkpointing
++# makes such a result durable, so it must be bounded before it enters the
++# history at all.
++TOOL_RESULT_MAX_CHARS = 200_000
++
++
++def clip_tool_result(result_str: str) -> str:
++    """Bound one tool result before it enters the message history.
++
++    Results at or under ``TOOL_RESULT_MAX_CHARS`` pass through byte-identical
++    (the overwhelmingly common case). An oversized result is truncated with a
++    marker telling the model how to recover (re-run narrower), instead of
++    poisoning every later call in the session — and, with per-tool
++    checkpointing, every restored session too.
++    """
++    if not isinstance(result_str, str) or len(result_str) <= TOOL_RESULT_MAX_CHARS:
++        return result_str
++    return (result_str[:TOOL_RESULT_MAX_CHARS]
++            + f"\n\n[... TOOL RESULT TRUNCATED: {len(result_str)} chars total, "
++              f"first {TOOL_RESULT_MAX_CHARS} kept. The full output was too "
++              "large to keep in conversation context; the tool's side effects "
++              "(saved files, stored state) are intact — re-run the tool with "
++              "a narrower request if specifics beyond this point are needed.]")
++
++
+ def build_tool_message(tool_call_id: str, result_str: str, *,
+                        allow_image: bool) -> dict[str, Any]:
+     """Build the ``tool`` message for the loop. Multimodal (text + image parts)
+     when ``allow_image`` and the result carries an image; otherwise the exact
+-    plain-string message the loop used before."""
++    plain-string message the loop used before. Either way the text part is
++    bounded by ``clip_tool_result`` (a no-op at normal sizes)."""
+     if not allow_image:
+-        return {"role": "tool", "tool_call_id": tool_call_id, "content": result_str}
++        return {"role": "tool", "tool_call_id": tool_call_id,
++                "content": clip_tool_result(result_str)}
+     images, text = _extract_images(result_str)
+     if not images:
+-        return {"role": "tool", "tool_call_id": tool_call_id, "content": result_str}
+-    content: list[dict] = [{"type": "text", "text": text}]
++        return {"role": "tool", "tool_call_id": tool_call_id,
++                "content": clip_tool_result(result_str)}
++    content: list[dict] = [{"type": "text", "text": clip_tool_result(text)}]
+     for mime, b64 in images:
+         content.append({"type": "image_url",
+                         "image_url": {"url": f"data:{mime};base64,{b64}"}})
+@@ -214,18 +245,34 @@ def sanitize_history_images(messages: list) -> list:
+ def close_interrupted_turn(messages: list) -> list:
+     """Restore user/assistant alternation after an interrupted turn.
+ 
+-    A mid-run Stop ends a turn on a tool result with no assistant reply.
++    A mid-run Stop (or a mid-turn crash, now that the chat loops checkpoint
++    per tool call) ends a turn on a tool result with no assistant reply.
+     The next user message would then directly follow a tool block — on
+     Bedrock's converse API both are user-role blocks, and litellm papers
+     over the pair with a noisy "Potential consecutive user/tool blocks.
+     Trying to merge." warning on every subsequent call in the session.
+     Closing the turn with a one-line assistant note keeps alternation
+-    intact instead. A normally completed turn (assistant last) — and
+-    anything else — passes through unchanged.
++    intact instead. The note names the last completed tool call(s) so the
++    model continues from the recorded results rather than restarting the
++    turn's work. A normally completed turn (assistant last) — and anything
++    else — passes through unchanged.
+     """
+     if messages and messages[-1].get("role") == "tool":
+-        messages.append({
+-            "role": "assistant",
+-            "content": "[Turn interrupted before a reply was produced.]",
+-        })
++        note = "[Turn interrupted before a reply was produced.]"
++        try:
++            last_names = None
++            for m in reversed(messages):
++                if m.get("role") == "assistant" and m.get("tool_calls"):
++                    last_names = [tc["function"]["name"]
++                                  for tc in m["tool_calls"]]
++                    break
++            if last_names:
++                note = (
++                    "[Turn interrupted before a reply was produced. The last "
++                    f"completed tool call was {', '.join(last_names)}; its "
++                    "result is recorded above. Continue from the recorded "
++                    "results — do not redo completed work unless asked.]")
++        except Exception:  # noqa: BLE001 - the generic note is always safe
++            pass
++        messages.append({"role": "assistant", "content": note})
+     return messages
+diff --git a/tests/test_per_tool_checkpoint.py b/tests/test_per_tool_checkpoint.py
+new file mode 100644
+index 000000000..f550e1189
+--- /dev/null
++++ b/tests/test_per_tool_checkpoint.py
+@@ -0,0 +1,189 @@
++"""Offline tests for per-tool-iteration checkpointing (Phase A).
++
++The chat loops persisted history + state only at turn end (or every N
++messages), so a crash mid-turn lost every completed tool call since the
++last turn boundary — one turn can contain a whole run_analysis, delegation
++or fan-out. Each orchestrator now calls ``_checkpoint_after_tool()`` after
++every completed tool iteration: quiet, wall-clock-throttled writes of
++chat_history.json + checkpoint.json, mirroring the MCP server's
++checkpoint-after-tool. A mid-turn history ends in a dangling tool_use at
++worst, which the existing repair machinery heals on the next load.
++
++  python -m pytest tests/test_per_tool_checkpoint.py -v
++"""
++import json
++import os
++from types import SimpleNamespace
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import pytest
++
++
++def _mk_response(tool_calls=None, content=None):
++    msg = SimpleNamespace(tool_calls=tool_calls, content=content)
++    return SimpleNamespace(choices=[SimpleNamespace(message=msg,
++                                                    finish_reason="stop")])
++
++
++def _mk_tool_call(call_id, name, args="{}"):
++    return SimpleNamespace(id=call_id,
++                           function=SimpleNamespace(name=name,
++                                                    arguments=args))
++
++
++class _Boom(BaseException):
++    """Simulates the process dying mid-turn: bypasses every except Exception
++    (chat()'s catch-all included), so no turn-end save can run."""
++
++
++def _scripted_completion(script):
++    """Yield canned responses; raise _Boom when the script says so."""
++    it = iter(script)
++
++    def fake(*a, **k):
++        step = next(it)
++        if step == "boom":
++            raise _Boom()
++        return step
++    return fake
++
++
++# ------------------------------------------------------------ analysis, meta
++
++
++def _make_analysis(tmp_path):
++    from scilink.agents.exp_agents.analysis_orchestrator import (
++        AnalysisOrchestratorAgent)
++    return AnalysisOrchestratorAgent(api_key="sk-dummy",
++                                     base_dir=str(tmp_path / "an"))
++
++
++def _make_meta(tmp_path):
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent)
++    return MetaOrchestratorAgent(api_key="sk-dummy",
++                                 base_dir=str(tmp_path / "meta"))
++
++
++@pytest.mark.parametrize("which", ["analysis", "meta"])
++def test_mid_turn_crash_preserves_completed_tool_calls(which, tmp_path,
++                                                       monkeypatch):
++    orch = (_make_analysis if which == "analysis" else _make_meta)(tmp_path)
++    orch.TOOL_CHECKPOINT_MIN_INTERVAL_S = 0.0
++    orch.use_openai = False
++    monkeypatch.setattr(orch.tools, "execute_tool",
++                        lambda name, **kw: f"TOOL-OK::{name}")
++
++    import scilink.wrappers.litellm_wrapper as lw
++    monkeypatch.setattr(lw, "litellm_completion", _scripted_completion([
++        _mk_response(tool_calls=[_mk_tool_call("c1", "some_tool")]),
++        "boom",   # the process dies before the turn can complete
++    ]))
++
++    with pytest.raises(_Boom):
++        orch.chat("do something")
++
++    # The completed tool call survived on disk despite the mid-turn death.
++    hist = json.loads(orch.history_path.read_text(encoding="utf-8"))
++    roles = [m.get("role") for m in hist]
++    assert "tool" in roles, f"{which}: no tool result persisted mid-turn"
++    tool_msgs = [m for m in hist if m.get("role") == "tool"]
++    assert any("TOOL-OK::some_tool" in str(m.get("content"))
++               for m in tool_msgs)
++    assert orch.checkpoint_path.exists()
++
++    # A new session on the same dir picks the mid-turn history up and can
++    # run a clean turn (the loop's repair heals the dangling tool_use).
++    orch2 = (_make_analysis if which == "analysis" else _make_meta)(tmp_path)
++    assert any(m.get("role") == "tool" for m in orch2.messages)
++    monkeypatch.setattr(lw, "litellm_completion", _scripted_completion([
++        _mk_response(content="recovered fine"),
++    ]))
++    monkeypatch.setattr(orch2.tools, "execute_tool",
++                        lambda name, **kw: "unused")
++    reply = orch2.chat("continue where you left off")
++    assert "recovered fine" in reply
++
++
++# --------------------------------------------------- helper contract, all 4
++
++
++def _make(mode, tmp_path):
++    if mode == "analysis":
++        return _make_analysis(tmp_path)
++    if mode == "meta":
++        return _make_meta(tmp_path)
++    if mode == "planning":
++        from scilink.agents.planning_agents.planning_orchestrator import (
++            PlanningOrchestratorAgent)
++        return PlanningOrchestratorAgent(api_key="sk-dummy",
++                                         data_dir=str(tmp_path),
++                                         base_dir=str(tmp_path / "pl"))
++    from scilink.agents.sim_agents.simulation_orchestrator import (
++        SimulationOrchestratorAgent)
++    return SimulationOrchestratorAgent(api_key="sk-dummy",
++                                       base_dir=str(tmp_path / "si"))
++
++
++@pytest.mark.parametrize("mode", ["analysis", "planning", "simulate", "meta"])
++def test_checkpoint_after_tool_writes_both_files(mode, tmp_path):
++    orch = _make(mode, tmp_path)
++    orch.TOOL_CHECKPOINT_MIN_INTERVAL_S = 0.0
++    orch.messages.append({"role": "user", "content": "hello"})
++    if orch.history_path.exists():
++        orch.history_path.unlink()
++    if orch.checkpoint_path.exists():
++        orch.checkpoint_path.unlink()
++
++    orch._checkpoint_after_tool()
++
++    assert orch.history_path.exists(), f"{mode}: history not written"
++    assert orch.checkpoint_path.exists(), f"{mode}: checkpoint not written"
++    hist = json.loads(orch.history_path.read_text(encoding="utf-8"))
++    assert any(m.get("content") == "hello" for m in hist)
++
++
++@pytest.mark.parametrize("mode", ["analysis", "planning", "simulate", "meta"])
++def test_checkpoint_after_tool_is_wall_clock_throttled(mode, tmp_path):
++    orch = _make(mode, tmp_path)
++    orch.TOOL_CHECKPOINT_MIN_INTERVAL_S = 3600.0
++
++    orch._checkpoint_after_tool()          # first call: writes
++    assert orch.history_path.exists()
++    orch.history_path.unlink()
++    orch._checkpoint_after_tool()          # inside the window: skipped
++    assert not orch.history_path.exists(), f"{mode}: throttle did not hold"
++
++    orch._last_tool_checkpoint_ts = 0.0    # window elapsed
++    orch._checkpoint_after_tool()
++    assert orch.history_path.exists()
++
++
++@pytest.mark.parametrize("mode", ["analysis", "planning", "simulate", "meta"])
++def test_checkpoint_after_tool_is_quiet(mode, tmp_path, capsys):
++    orch = _make(mode, tmp_path)
++    orch.TOOL_CHECKPOINT_MIN_INTERVAL_S = 0.0
++    capsys.readouterr()
++    orch._checkpoint_after_tool()
++    out = capsys.readouterr().out
++    assert "Auto-checkpoint saved" not in out, (
++        f"{mode}: per-tool cadence must not spam the console")
++
++
++def test_sim_interval_gate_still_holds_without_force(tmp_path):
++    """The simulate orchestrator's N-message auto-checkpoint cadence is
++    unchanged: a plain _auto_checkpoint() inside the interval still skips."""
++    orch = _make("simulate", tmp_path)
++    if orch.checkpoint_path.exists():
++        orch.checkpoint_path.unlink()
++    orch.message_count = orch.last_checkpoint_message_count  # inside interval
++    orch._auto_checkpoint()
++    assert not orch.checkpoint_path.exists()
++    orch._auto_checkpoint(force=True, quiet=True)
++    assert orch.checkpoint_path.exists()
++
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_resume_fanout.py b/tests/test_resume_fanout.py
+new file mode 100644
+index 000000000..dbe5bfcae
+--- /dev/null
++++ b/tests/test_resume_fanout.py
+@@ -0,0 +1,293 @@
++"""Offline tests for fan-out branch resume (Phase C).
++
++A coordinator death (or user stop) leaves a fan-out's provisional ledger
++entries 'running' — swept to 'interrupted' at the next turn start.
++``resume_fanout`` re-creates each such branch IN its original
++``fanout/<NN>_<slug>/`` session dir with ``restore_checkpoint=True`` (so it
++holds its per-tool-checkpointed partial progress) and re-runs its RECORDED
++task verbatim; completed branches and budget-degraded branches are
++untouched.
++
++  python -m pytest tests/test_resume_fanout.py -v
++"""
++import json
++import os
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import pytest
++
++import scilink.agents.meta_agent.fanout as fo
++from scilink.agents.meta_agent.meta_orchestrator import MetaOrchestratorAgent
++
++
++def _entry(index, label, status, task, **kw):
++    e = {"index": index, "label": label, "status": status, "task": task,
++         "mode": "analysis", "fanout": True, "parallel_group": "fanout_1",
++         "key_findings": [], "files_produced": [], "summary": ""}
++    e.update(kw)
++    return e
++
++
++@pytest.fixture()
++def meta(tmp_path):
++    return MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path))
++
++
++def _capture_factory(calls):
++    def fake_child(orch, base_dir, restore=False):
++        class C:
++            def run_task(self, task, context=None, autonomy=None):
++                calls.append({"base_dir": str(base_dir), "restore": restore,
++                              "task": task})
++                return {"status": "success", "summary": "resumed ok",
++                        "key_findings": ["resumed finding"],
++                        "files_produced": []}
++        return C()
++    return fake_child
++
++
++def test_resume_reruns_interrupted_branches_in_place(meta, monkeypatch):
++    recorded_task = ("Analyze X\n\nNOTE — this is ONE branch of a JOINT "
++                     "multi-dataset analysis: ...\n\nPRIMARY dataset for "
++                     "THIS analysis: /data/a.npy — pass it VERBATIM ...")
++    done = _entry(1, "done branch", "success", "Analyze done",
++                  key_findings=["orig finding"], completed_at="t")
++    i2 = _entry(2, "vib series", "interrupted", recorded_task)
++    i3 = _entry(3, "xrd series", "running", "Analyze Y (recorded)")
++    meta._delegation_ledger = [done, i2, i3]
++
++    calls = []
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _capture_factory(calls))
++    out = json.loads(meta._resume_fanout())
++
++    assert out["status"] == "success"
++    assert out["branches_resumed"] == 2
++    assert {r["delegation_index"] for r in out["results"]} == {2, 3}
++
++    # Both branches re-ran with restore=True IN their original dirs.
++    assert len(calls) == 2
++    assert all(c["restore"] is True for c in calls)
++    dirs = {os.path.basename(c["base_dir"]) for c in calls}
++    assert dirs == {"02_vib_series", "03_xrd_series"}
++
++    # The RECORDED task is used verbatim (not re-meshed: the mesh block
++    # appears exactly once) plus the resume note.
++    t2 = next(c["task"] for c in calls if "02_" in c["base_dir"])
++    assert t2.startswith(recorded_task)
++    assert t2.count("PRIMARY dataset for THIS analysis") == 1
++    assert "RESUME NOTE" in t2
++
++    # Ledger updated in place; the completed branch untouched.
++    assert i2["status"] == "success" and i2["key_findings"] == ["resumed finding"]
++    assert i2["resumed_from_interruption"] is True
++    assert i3["status"] == "success"
++    assert done["key_findings"] == ["orig finding"]
++
++
++def test_resume_is_a_noop_without_interrupted_branches(meta, monkeypatch):
++    meta._delegation_ledger = [
++        _entry(1, "a", "success", "t", completed_at="t"),
++        _entry(2, "b", "error", "t", timed_out=True, completed_at="t"),
++    ]
++    calls = []
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _capture_factory(calls))
++    out = json.loads(meta._resume_fanout())
++    assert out["status"] == "no_op"
++    assert not calls
++
++
++def test_budget_degraded_branches_are_not_resumed(meta, monkeypatch):
++    """A timed_out verdict is final (#358) — resume must not reopen it."""
++    meta._delegation_ledger = [
++        _entry(1, "stuck", "interrupted", "t", timed_out=True),
++        _entry(2, "lost", "interrupted", "recorded task"),
++    ]
++    calls = []
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        _capture_factory(calls))
++    out = json.loads(meta._resume_fanout())
++    assert out["branches_resumed"] == 1
++    assert len(calls) == 1 and "02_lost" in calls[0]["base_dir"]
++    assert meta._delegation_ledger[0]["status"] == "interrupted"
++
++
++def test_failed_resume_keeps_honest_error_status(meta, monkeypatch):
++    meta._delegation_ledger = [_entry(1, "bad", "interrupted", "t")]
++
++    def failing_child(orch, base_dir, restore=False):
++        class C:
++            def run_task(self, task, context=None, autonomy=None):
++                return {"status": "error", "error": "still broken",
++                        "summary": "", "key_findings": [],
++                        "files_produced": []}
++        return C()
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", failing_child)
++    out = json.loads(meta._resume_fanout())
++    assert out["status"] == "error"
++    assert meta._delegation_ledger[0]["status"] == "error"
++
++
++def test_restore_notice_reports_interrupted_fanout(tmp_path, capsys):
++    m1 = MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path))
++    m1._delegation_ledger = [
++        _entry(1, "ok", "success", "t", completed_at="t"),
++        _entry(2, "lost", "running", "t"),
++    ]
++    m1.save_checkpoint()
++
++    capsys.readouterr()
++    m2 = MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path),
++                               restore_checkpoint=True)
++    out = capsys.readouterr().out
++    assert "interrupted mid-run" in out and "resume_fanout" in out
++    assert len(m2._delegation_ledger) == 2
++
++
++def test_resume_tool_is_registered(meta):
++    schemas = json.dumps(meta.tools.openai_schemas)
++    assert "resume_fanout" in schemas
++
++
++def test_provisional_entries_persisted_before_branches_run(tmp_path,
++                                                          monkeypatch):
++    """A crash BEFORE the first branch completes must still leave the
++    'running' entries on disk — otherwise the fan-out is invisible to
++    resume_fanout on restore. Asserted from inside a running branch: the
++    meta checkpoint must already hold this branch's running entry."""
++    import numpy as np
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent, MetaMode)
++    import scilink.agents.exp_agents.analysis_orchestrator  # noqa: F401
++
++    paths = [str(tmp_path / f"{n}.npy") for n in "AB"]
++    for p in paths:
++        np.save(p, np.zeros((4, 4)))
++    ag = MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path),
++                               meta_mode=MetaMode.AUTONOMOUS)
++
++    seen = []
++
++    def fake_child(orch, base_dir):
++        class C:
++            def run_task(self, task, context=None, autonomy=None):
++                led = json.loads(
++                    ag.checkpoint_path.read_text()).get("delegation_ledger", [])
++                seen.append([e.get("status") for e in led
++                             if e.get("fanout")])
++                return {"status": "success", "summary": "ok",
++                        "key_findings": ["f"], "files_produced": []}
++        return C()
++
++    def fake_llm(orch, prompt, extra_parts=None):
++        return {"verdict": "complementary", "confidence": 0.9,
++                "rationale": "r", "join_axis": "T",
++                "join_type": "shared_parameter_axis",
++                "fanout_set": list(paths), "redundant_clusters": [],
++                "unrelated": [], "excluded_notes": ""}
++
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", fake_child)
++    monkeypatch.setattr(fo, "_llm_json", fake_llm)
++    json.loads(ag._run_fanout(
++        [{"data_path": p, "task": f"Analyze {p}",
++          "label": os.path.basename(p)} for p in paths]))
++
++    assert seen, "no branch observed the checkpoint"
++    # Every branch found the full fan-out already on disk when it started.
++    assert all(len(statuses) == 2 for statuses in seen), seen
++
++
++def test_harmonize_stamps_persisted_before_followers_run(tmp_path,
++                                                         monkeypatch):
++    """A crash DURING the harmonized replay phase must leave followers whose
++    on-disk entries still carry the verbatim-replay task + harmonized_with
++    stamp — otherwise resume_fanout would re-run them from the
++    pre-harmonize task, silently unharmonized. Asserted from inside a
++    running follower."""
++    import numpy as np
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent, MetaMode)
++    import scilink.agents.exp_agents.analysis_orchestrator  # noqa: F401
++
++    paths = [str(tmp_path / f"{n}.npy") for n in "AB"]
++    for p in paths:
++        np.save(p, np.zeros((4, 4)))
++    ag = MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path),
++                               meta_mode=MetaMode.AUTONOMOUS)
++
++    seen_followers = []
++    n_run = {"n": 0}
++
++    def fake_child(orch, base_dir):
++        class C:
++            def run_task(self, task, context=None, autonomy=None):
++                n_run["n"] += 1
++                if n_run["n"] == 1:      # the donor: write approved records
++                    rdir = os.path.join(str(base_dir), "results", "an_fake")
++                    os.makedirs(rdir, exist_ok=True)
++                    with open(os.path.join(
++                            rdir, "dynamic_analysis_records.json"), "w") as fh:
++                        json.dump([{"target": "t", "task_success": True,
++                                    "required_outputs": [],
++                                    "script": "print(1)"}], fh)
++                else:                    # a follower: check the disk state
++                    led = json.loads(ag.checkpoint_path.read_text()).get(
++                        "delegation_ledger", [])
++                    mine = [e for e in led if e.get("fanout")
++                            and e.get("status") == "running"]
++                    seen_followers.append(
++                        all("reuse_locked_script=true" in (e.get("task") or "")
++                            and e.get("harmonized_with") for e in mine))
++                return {"status": "success", "summary": "ok",
++                        "key_findings": ["f"], "files_produced": []}
++        return C()
++
++    def fake_llm(orch, prompt, extra_parts=None):
++        return {"verdict": "complementary", "confidence": 0.9,
++                "rationale": "r", "join_axis": "T",
++                "join_type": "shared_parameter_axis",
++                "fanout_set": list(paths), "redundant_clusters": [],
++                "unrelated": [], "excluded_notes": ""}
++
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child", fake_child)
++    monkeypatch.setattr(fo, "_llm_json", fake_llm)
++    json.loads(ag._run_fanout(
++        [{"data_path": p, "task": f"Analyze {p}",
++          "label": os.path.basename(p)} for p in paths], harmonize=True))
++
++    assert seen_followers and all(seen_followers), (
++        "follower ran while its on-disk entry lacked the replay task/stamp")
++
++
++def test_single_delegation_provisional_entry_persisted(tmp_path, monkeypatch):
++    """A crash mid-delegation must leave the provisional 'running' entry on
++    disk (mirrors the fan-out launch checkpoint) so the restored ledger
++    shows the delegation as interrupted, not as never having existed.
++    Asserted from inside the running child."""
++    meta = MetaOrchestratorAgent(api_key="sk-dummy", base_dir=str(tmp_path))
++    seen = []
++
++    class FakeChild:
++        def run_task(self, task, context=None, autonomy=None):
++            led = json.loads(meta.checkpoint_path.read_text()).get(
++                "delegation_ledger", [])
++            seen.append([(e.get("mode"), e.get("status")) for e in led])
++            return {"status": "success", "summary": "ok",
++                    "key_findings": ["f"], "files_produced": []}
++
++    monkeypatch.setattr(meta, "_get_analysis_child", lambda: FakeChild())
++    meta._delegate("analysis", "analyze the thing", label="one-off")
++
++    assert seen and seen[0] == [("analysis", "running")], (
++        "child ran while its provisional entry was not yet on disk")
++    # After completion the persisted entry is finalized as usual.
++    led = json.loads(meta.checkpoint_path.read_text())["delegation_ledger"]
++    assert led[0]["status"] == "success"
++
++
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_stop_turn_alternation.py b/tests/test_stop_turn_alternation.py
+index 6b377c4ea..cd665bf98 100644
+--- a/tests/test_stop_turn_alternation.py
++++ b/tests/test_stop_turn_alternation.py
+@@ -45,6 +45,46 @@ def test_healthy_histories_untouched(tail):
+     assert close_interrupted_turn(list(tail)) == tail
+ 
+ 
++def test_note_names_the_last_completed_tool_call():
++    """Phase B of the resume plan: the closure note tells the model WHERE the
++    turn stopped, so a restored session continues from the recorded results
++    instead of restarting the turn's work."""
++    msgs = [{"role": "user", "content": "go"},
++            {"role": "assistant", "content": None,
++             "tool_calls": [{"id": "c9", "type": "function",
++                             "function": {"name": "run_analysis",
++                                          "arguments": "{}"}}]},
++            {"role": "tool", "tool_call_id": "c9", "content": "big result"}]
++    out = close_interrupted_turn(list(msgs))
++    note = out[-1]["content"]
++    assert "run_analysis" in note
++    assert "do not redo completed work" in note
++
++
++def test_note_names_all_calls_of_the_last_batch():
++    msgs = [{"role": "user", "content": "go"},
++            {"role": "assistant", "content": None,
++             "tool_calls": [
++                 {"id": "a", "type": "function",
++                  "function": {"name": "load_metadata", "arguments": "{}"}},
++                 {"id": "b", "type": "function",
++                  "function": {"name": "run_analysis", "arguments": "{}"}}]},
++            {"role": "tool", "tool_call_id": "a", "content": "r1"},
++            {"role": "tool", "tool_call_id": "b", "content": "r2"}]
++    note = close_interrupted_turn(list(msgs))[-1]["content"]
++    assert "load_metadata" in note and "run_analysis" in note
++
++
++def test_malformed_tool_calls_fall_back_to_generic_note():
++    msgs = [{"role": "user", "content": "go"},
++            {"role": "assistant", "content": None,
++             "tool_calls": [{"bad": "shape"}]},
++            {"role": "tool", "tool_call_id": "c1", "content": "r"}]
++    out = close_interrupted_turn(list(msgs))
++    assert out[-1]["role"] == "assistant"
++    assert "interrupted" in out[-1]["content"]
++
++
+ ORCHESTRATORS = [
+     Path("scilink/agents/exp_agents/analysis_orchestrator.py"),
+     Path("scilink/agents/planning_agents/planning_orchestrator.py"),
+diff --git a/tests/test_tool_result_clip.py b/tests/test_tool_result_clip.py
+new file mode 100644
+index 000000000..a2900113b
+--- /dev/null
++++ b/tests/test_tool_result_clip.py
+@@ -0,0 +1,152 @@
++"""Tests for the oversized-tool-result guards.
++
++Found live: a resumed fan-out branch pointed ``load_metadata`` at a large
++results JSON; the tool echoed all 7.7MB into its tool result, putting ~5.3M
++tokens into every later LLM call of the session — and per-tool
++checkpointing makes such a result durable across restores. Two layers now
++bound it: ``clip_tool_result`` at the message-build chokepoints (all four
++orchestrators), and ``load_metadata``'s conversational echo capped at the
++source (the full metadata is still stored for the analysis).
++
++  python -m pytest tests/test_tool_result_clip.py -v
++"""
++import json
++import os
++from pathlib import Path
++from types import SimpleNamespace
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import pytest
++
++from scilink.utils.tool_media import (TOOL_RESULT_MAX_CHARS, build_tool_message,
++                                      clip_tool_result)
++
++
++def test_normal_results_pass_through_byte_identical():
++    s = "x" * (TOOL_RESULT_MAX_CHARS)
++    assert clip_tool_result(s) is s
++    msg = build_tool_message("c1", '{"status": "success"}', allow_image=False)
++    assert msg["content"] == '{"status": "success"}'
++
++
++def test_oversized_result_is_clipped_with_recovery_marker():
++    s = "y" * (TOOL_RESULT_MAX_CHARS + 500)
++    out = clip_tool_result(s)
++    assert len(out) < len(s)
++    assert "TOOL RESULT TRUNCATED" in out
++    assert str(len(s)) in out
++
++
++def test_build_tool_message_clips_both_paths():
++    big = json.dumps({"status": "ok", "payload": "z" * (TOOL_RESULT_MAX_CHARS + 100)})
++    plain = build_tool_message("c1", big, allow_image=False)
++    assert "TOOL RESULT TRUNCATED" in plain["content"]
++
++    with_img = json.dumps({"status": "ok",
++                           "payload": "z" * (TOOL_RESULT_MAX_CHARS + 100),
++                           "image_base64": "aGVsbG8="})
++    multi = build_tool_message("c1", with_img, allow_image=True)
++    # The image survives as its own part; the text part is clipped.
++    assert any(p.get("type") == "image_url" for p in multi["content"])
++    text = next(p["text"] for p in multi["content"] if p.get("type") == "text")
++    assert "TOOL RESULT TRUNCATED" in text
++
++
++@pytest.mark.parametrize("mode", ["analysis", "planning", "simulate", "meta"])
++def test_giant_tool_result_never_reaches_history_unclipped(mode, tmp_path,
++                                                           monkeypatch):
++    """End-to-end through each orchestrator's litellm loop: a runaway tool
++    result is bounded both in the live messages and in the per-tool
++    checkpointed history."""
++    if mode == "analysis":
++        from scilink.agents.exp_agents.analysis_orchestrator import (
++            AnalysisOrchestratorAgent)
++        orch = AnalysisOrchestratorAgent(api_key="sk-dummy",
++                                         base_dir=str(tmp_path / "an"))
++    elif mode == "planning":
++        from scilink.agents.planning_agents.planning_orchestrator import (
++            PlanningOrchestratorAgent)
++        orch = PlanningOrchestratorAgent(api_key="sk-dummy",
++                                         data_dir=str(tmp_path),
++                                         base_dir=str(tmp_path / "pl"))
++    elif mode == "simulate":
++        from scilink.agents.sim_agents.simulation_orchestrator import (
++            SimulationOrchestratorAgent)
++        orch = SimulationOrchestratorAgent(api_key="sk-dummy",
++                                           base_dir=str(tmp_path / "si"))
++    else:
++        from scilink.agents.meta_agent.meta_orchestrator import (
++            MetaOrchestratorAgent)
++        orch = MetaOrchestratorAgent(api_key="sk-dummy",
++                                     base_dir=str(tmp_path / "meta"))
++    orch.TOOL_CHECKPOINT_MIN_INTERVAL_S = 0.0
++    orch.use_openai = False
++    monkeypatch.setattr(orch.tools, "execute_tool",
++                        lambda name, **kw: "G" * (TOOL_RESULT_MAX_CHARS + 999))
++
++    tc = SimpleNamespace(id="c1", function=SimpleNamespace(
++        name="some_tool", arguments="{}"))
++    responses = iter([
++        SimpleNamespace(choices=[SimpleNamespace(
++            message=SimpleNamespace(tool_calls=[tc], content=None),
++            finish_reason="tool_calls")]),
++        SimpleNamespace(choices=[SimpleNamespace(
++            message=SimpleNamespace(tool_calls=None, content="done"),
++            finish_reason="stop")]),
++    ])
++    import scilink.wrappers.litellm_wrapper as lw
++    monkeypatch.setattr(lw, "litellm_completion",
++                        lambda *a, **k: next(responses))
++
++    orch.chat("go")
++
++    tool_msgs = [m for m in orch.messages if m.get("role") == "tool"]
++    assert tool_msgs
++    assert all(len(json.dumps(m)) < TOOL_RESULT_MAX_CHARS + 2000
++               for m in tool_msgs), f"{mode}: giant result reached history"
++    hist = json.loads(Path(orch.history_path).read_text(encoding="utf-8"))
++    assert all(len(json.dumps(m)) < TOOL_RESULT_MAX_CHARS + 2000
++               for m in hist), f"{mode}: giant result persisted to disk"
++
++
++def test_load_metadata_echo_is_bounded_but_storage_is_full(tmp_path):
++    from scilink.agents.exp_agents.analysis_orchestrator import (
++        AnalysisOrchestratorAgent)
++    orch = AnalysisOrchestratorAgent(api_key="sk-dummy",
++                                     base_dir=str(tmp_path / "an"))
++    big = {"experiment_type": "Diffraction",
++           "experiment": {"technique": "XRD"},
++           "sample": {"material": "test"},
++           "bootstrap_samples": list(range(30000))}
++    p = tmp_path / "big_metadata.json"
++    p.write_text(json.dumps(big))
++
++    result = json.loads(orch.tools.execute_tool("load_metadata",
++                                                json_path=str(p)))
++    assert result["status"] in ("success", "warning")
++    assert "_truncated_echo" in result["metadata"], (
++        "giant metadata echoed verbatim into the tool result")
++    assert len(json.dumps(result)) < 25_000
++    # The analysis-side storage keeps the FULL object.
++    assert orch.current_metadata == big
++
++
++def test_load_metadata_small_echo_unchanged(tmp_path):
++    from scilink.agents.exp_agents.analysis_orchestrator import (
++        AnalysisOrchestratorAgent)
++    orch = AnalysisOrchestratorAgent(api_key="sk-dummy",
++                                     base_dir=str(tmp_path / "an"))
++    small = {"experiment_type": "Diffraction",
++             "experiment": {"technique": "XRD"},
++             "sample": {"material": "test"}}
++    p = tmp_path / "small_metadata.json"
++    p.write_text(json.dumps(small))
++    result = json.loads(orch.tools.execute_tool("load_metadata",
++                                                json_path=str(p)))
++    assert result["metadata"] == small
++
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(pytest.main([__file__, "-v"]))

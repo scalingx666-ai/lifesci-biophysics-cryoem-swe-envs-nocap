@@ -1,0 +1,553 @@
+diff --git a/scilink/agents/exp_agents/controllers/base_controllers.py b/scilink/agents/exp_agents/controllers/base_controllers.py
+index 7c2f2f1a..cc039ad1 100644
+--- a/scilink/agents/exp_agents/controllers/base_controllers.py
++++ b/scilink/agents/exp_agents/controllers/base_controllers.py
+@@ -152,6 +152,13 @@ def side(label, model, score, flag):
+                         f"has a lower {metric}", [compare])
+ 
+ 
++def _required_outputs_text(target: dict) -> str:
++    req = target.get("required_outputs")
++    if isinstance(req, str):
++        return req.strip()
++    return ", ".join(str(k) for k in req) if isinstance(req, list) else ""
++
++
+ def refinement_plan_subject(state: dict) -> dict:
+     """What the hyperspectral targets gate shows, as subject blocks
+     (scilink.hitl): the sections ``IterativeFeedbackController`` prints,
+@@ -174,6 +181,10 @@ def refinement_plan_subject(state: dict) -> dict:
+         f"{plan_label} = **{decision.get('refinement_needed', False)}**\n\n"
+         f"Reasoning: {decision.get('reasoning') or 'N/A'}")))
+     if targets:
++        # The maps a target must deliver are a promise the run is held to,
++        # so the person approving the plan sees them (a column only when
++        # some target names any).
++        required = [_required_outputs_text(t) for t in targets]
+         rows = []
+         for i, t in enumerate(targets, 1):
+             # custom_code targets carry value=None by schema design — the
+@@ -181,8 +192,13 @@ def refinement_plan_subject(state: dict) -> dict:
+             value = t.get("value")
+             rows.append([i, t.get("type", "N/A"), "" if value is None else str(value),
+                          t.get("description", "No description provided.")])
++        columns = ["#", "Type", "Value", "Description"]
++        if any(required):
++            columns.append("Required outputs")
++            for row, req in zip(rows, required):
++                row.append(req)
+         blocks.append(subject_block("table", label=f"🎯 Targeted actions ({len(targets)})",
+-                                    columns=["#", "Type", "Value", "Description"], rows=rows))
++                                    columns=columns, rows=rows))
+     else:
+         blocks.append(subject_block("text", label="🎯 Targeted actions (0)",
+                                     markdown="No specific targets were generated."))
+@@ -522,6 +538,8 @@ def execute(self, state: dict) -> dict:
+             print(f"\n{header}")
+             for line in textwrap.wrap(t_desc, width=70):
+                 print(f"      {line}")
++            if _required_outputs_text(t):
++                print(f"      Required outputs: {_required_outputs_text(t)}")
+ 
+         print("-" * 80)
+         
+diff --git a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+index daf3fafa..54b03e68 100644
+--- a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
++++ b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+@@ -536,6 +536,30 @@ def _render_data_facts(data, axis, axis_units: str, max_peaks: int = 4) -> str:
+     return _data_facts(data, axis, axis_units, max_peaks).get("text", "")
+ 
+ 
++def _as_float_maps(maps):
++    """The script's maps as float arrays, so every downstream check and plot
++    sees one dtype. A boolean or integer map (a detection mask, a count) is a
++    legitimate output; left as is, one such map crashed the dashboard's
++    percentile scaling and failed the whole attempt with every other map in
++    it (#809). Float arrays are returned as the same objects, untouched; a
++    list becomes an array; a value that is not numeric stays as returned, for
++    the existing checks to judge."""
++    if not isinstance(maps, dict):
++        return maps
++    out = {}
++    for name, arr in maps.items():
++        a = arr if isinstance(arr, np.ndarray) else np.asarray(arr)
++        if a.dtype.kind in "biu":
++            a = a.astype(float)
++        elif a.dtype.kind == "O":
++            try:
++                a = a.astype(float)
++            except (TypeError, ValueError):
++                a = arr
++        out[name] = a
++    return out
++
++
+ def _declares_unmeasured(result_dict: dict, required_outputs) -> bool:
+     """A ``not_measurable`` declaration stands when every REQUIRED output is
+     absent or entirely NaN — diagnostic maps beside it (a mask, an SNR map)
+@@ -2565,11 +2589,94 @@ def execute(self, state: dict) -> dict:
+         return state
+ 
+ 
++_REQUIRED_OUTPUTS_RULES_START = "**Required outputs (objective-aware QC enforcement):**"
++_REQUIRED_OUTPUTS_RULES_END = "**Example 1"
++_OUTPUT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
++
++
++def _required_outputs_rules() -> str:
++    """The planner's own required-outputs rules, quoted from the refinement
++    instructions so the declaration step and the planner cannot drift."""
++    text = SPECTROSCOPY_REFINEMENT_INSTRUCTIONS
++    start = text.find(_REQUIRED_OUTPUTS_RULES_START)
++    end = text.find(_REQUIRED_OUTPUTS_RULES_END, start + 1) if start >= 0 else -1
++    return text[start:end].strip() if start >= 0 and end > start else ""
++
++
++def _required_outputs_prompt(objective: str, target: dict) -> str:
++    return (
++        "A plan's measurement target names no `required_outputs`. The pipeline "
++        "guarantees only the outputs listed there: with none, an attempt that "
++        "returns just diagnostic maps (a mask, a validity or noise map) is "
++        "accepted as the task's result.\n\n"
++        f"Analysis objective: {objective}\n\n"
++        f"Target description: {target.get('description') or ''}\n\n"
++        f"{_required_outputs_rules()}\n\n"
++        "Declare the target's required outputs under these rules, as map keys "
++        "(letters, digits and underscores). An empty list is the right answer "
++        "where the rules say to leave it empty.\n"
++        'Output a JSON object: {"required_outputs": [...], "reason": "..."}'
++    )
++
++
+ class SelectRefinementTargetController:
+     """
+     [🧠 LLM Step]
+     Asks the LLM if a refinement (zoom-in) is needed and where.
+     """
++
++    def _declare_required_outputs(self, target: dict, state: dict) -> None:
++        """A measurement target with no required outputs leaves the gate
++        nothing to hold an attempt to (#810). When the run has an objective,
++        ask once for the declaration the planner skipped, under the planner's
++        own rules; the answer may be an empty list. Fails open: any problem
++        keeps the plan as it was.
++
++        The planner's value is normalised first, whatever happens next: a bare
++        string is one key (read as a list it became one key per letter), and
++        any other non-list is no declaration."""
++        current = target.get("required_outputs")
++        if isinstance(current, str):
++            current = [current.strip()] if current.strip() else []
++            target["required_outputs"] = current
++        elif "required_outputs" in target and not isinstance(current, list):
++            current = []
++            target["required_outputs"] = current
++        objective = state.get("analysis_objective")
++        if current or not objective:
++            return
++        try:
++            response = self.model.generate_content(
++                contents=[_required_outputs_prompt(objective, target)],
++                generation_config=None,
++                safety_settings=self.safety_settings,
++            )
++            result_json, error_dict = self._parse_llm_response(response)
++            if error_dict or not isinstance(result_json, dict):
++                raise ValueError(error_dict or "no JSON object")
++            answer = result_json.get("required_outputs")
++            if not isinstance(answer, list):
++                raise ValueError("required_outputs is not a list")
++            usable = [k.strip() for k in answer
++                      if isinstance(k, str) and _OUTPUT_KEY_RE.match(k.strip())]
++            dropped = [k for k in answer
++                       if not (isinstance(k, str) and _OUTPUT_KEY_RE.match(k.strip()))]
++            if answer and not usable:
++                # An answer that named outputs but none usable is no
++                # declaration, never a deliberate empty one.
++                raise ValueError(f"no usable map key in {answer!r}")
++            keys = list(dict.fromkeys(usable))
++        except Exception as e:  # noqa: BLE001 - the declaration is an addition, never a blocker
++            self.logger.warning(f"Required-outputs declaration skipped: {e}")
++            return
++        if dropped:
++            self.logger.warning("Required-outputs declaration: dropped entries that are "
++                                f"not map keys: {dropped!r}")
++        target["required_outputs"] = keys
++        self.logger.info(
++            f"🎯 Required outputs declared for the target: {keys or '[] (none required)'}"
++            f" — {str(result_json.get('reason') or '').strip()[:200]}")
++
+     def __init__(self, model, logger, generation_config, safety_settings, parse_fn: Callable):
+         self.model = model
+         self.logger = logger
+@@ -2786,6 +2893,7 @@ def execute(self, state: dict) -> dict:
+                 # Winner-Takes-All: If code is needed, focus ONLY on that.
+                 # We pick the first custom target and ignore standard zooms for this turn.
+                 top_target = custom_code_targets[0]
++                self._declare_required_outputs(top_target, state)
+                 label = "Analysis Plan" if skip_mode else "Priority Target Selected"
+                 self.logger.info(f"🎯 {label} (Custom Code): {top_target.get('description')}")
+                 final_targets = [top_target]
+@@ -4327,6 +4435,8 @@ def _attempt(_timeout_s: int):
+                     ctx.timeout_used_s = _timeout_used
+                     if not isinstance(result_dict, dict):
+                         raise ValueError("Function return must be a dict.")
++                    if "maps" in result_dict:
++                        result_dict["maps"] = _as_float_maps(result_dict["maps"])
+                     # A not_measurable declaration that CONTRADICTS the
+                     # deterministic data facts (a >= 5-sigma feature in the
+                     # field mean) is a wrong gate, not a finding: repaired in
+@@ -4495,10 +4605,30 @@ def _attempt(_timeout_s: int):
+                 # axis_spec so non-spatial leading axes get axis-
+                 # name-driven labels ("Voltage-Time Map" / "Sample
+                 # Count") instead of "Spatial Map" / "Pixel Count".
+-                dashboard_bytes = tools.create_feature_dashboard(
+-                    result_map, feature_name, current_unit,
+-                    axis_spec=resolve_axis_spec(state.get("system_info")),
+-                )
++                # A map whose figure cannot be drawn fails ITS review, not the
++                # attempt: the other maps keep their reviews (#809).
++                try:
++                    dashboard_bytes = tools.create_feature_dashboard(
++                        result_map, feature_name, current_unit,
++                        axis_spec=resolve_axis_spec(state.get("system_info")),
++                    )
++                except Exception as _dash_exc:  # noqa: BLE001
++                    self.logger.warning(
++                        f"    Skipping {feature_name}: its figure could not be drawn "
++                        f"({type(_dash_exc).__name__}: {_dash_exc}).")
++                    # The map is numeric, frame-shaped and not all-NaN by
++                    # now, so the cause is rarely the script's: name the
++                    # error, and point at the script only for infinities.
++                    try:
++                        _has_inf = bool(np.isinf(result_map).any())
++                    except Exception:  # noqa: BLE001
++                        _has_inf = False
++                    qc_failures.append(
++                        f"{feature_name}: its figure could not be drawn, so the map was "
++                        f"not reviewed ({type(_dash_exc).__name__}: {_dash_exc})."
++                        + (" The map holds infinite values; return NaN where a pixel has "
++                           "no valid estimate." if _has_inf else ""))
++                    continue
+ 
+                 if dashboard_bytes:
+                     _prev_passed = ctx.passed_reviews.get(feature_name)
+diff --git a/tests/test_hs_map_dtype_and_required_outputs.py b/tests/test_hs_map_dtype_and_required_outputs.py
+new file mode 100644
+index 00000000..8fd9d290
+--- /dev/null
++++ b/tests/test_hs_map_dtype_and_required_outputs.py
+@@ -0,0 +1,312 @@
++"""Two gaps that let a hyperspectral run end without the quantities asked for.
++
++#809: a boolean (or integer) map from the generated script crashed the
++dashboard's percentile scaling, and the exception failed the WHOLE attempt,
++discarding every other map in it. Maps are now float before any check or
++plot, and a map whose figure cannot be drawn fails its own review only.
++
++#810: a measurement target planned with an empty ``required_outputs`` gave
++the gate nothing to hold an attempt to, so an attempt returning only
++diagnostic maps was committed as the task's result. When the run has an
++objective, the planner is asked once to declare them; a target that already
++declares them, or a run with no objective, is untouched.
++
++Through the real controllers (``RunDynamicAnalysisController``,
++``SelectRefinementTargetController``) with scripted models.
++"""
++import json
++import logging
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++os.environ["UNSAFE_EXECUTION_OK"] = "true"
++sys.path.insert(0, str(Path(__file__).parent))
++
++from qc_golden.harness import Rule, ScriptedModel  # noqa: E402
++from scilink.agents.exp_agents.controllers import hyperspectral_controllers as hc  # noqa: E402
++from scilink.agents.exp_agents.controllers.hyperspectral_controllers import (  # noqa: E402
++    RunDynamicAnalysisController,
++    SelectRefinementTargetController,
++    _as_float_maps,
++    _required_outputs_rules,
++)
++from scilink.agents.exp_agents.instruct import SPECTROSCOPY_VISUAL_QC_INSTRUCTIONS  # noqa: E402
++
++_QC_MARKER = SPECTROSCOPY_VISUAL_QC_INSTRUCTIONS.split("{")[0].strip()[:60]
++
++
++def _parse(resp):
++    return json.loads(resp.text), None
++
++
++# ── #809: map dtype ──────────────────────────────────────────────────────
++
++def test_float_maps_pass_through_as_the_same_objects():
++    a = np.random.default_rng(0).random((3, 4))
++    out = _as_float_maps({"V": a})
++    assert out["V"] is a                       # the working path is untouched
++
++
++@pytest.mark.parametrize("value, expected", [
++    (np.array([[True, False]]), np.array([[1.0, 0.0]])),
++    (np.array([[1, 2]], dtype=np.int64), np.array([[1.0, 2.0]])),
++    (np.array([[1, 2]], dtype=np.uint8), np.array([[1.0, 2.0]])),
++    ([[0.5, 1.5]], np.array([[0.5, 1.5]])),
++    (np.array([[1, 2]], dtype=object), np.array([[1.0, 2.0]])),
++])
++def test_non_float_numeric_maps_become_float(value, expected):
++    out = _as_float_maps({"M": value})["M"]
++    assert out.dtype.kind == "f"
++    np.testing.assert_array_equal(out, expected)
++
++
++def test_a_non_numeric_map_is_left_for_the_existing_checks():
++    weird = np.array([["a", "b"]], dtype=object)
++    assert _as_float_maps({"W": weird})["W"] is weird
++
++
++def _cube():
++    rng = np.random.default_rng(0)
++    return rng.random((6, 5, 12)), np.linspace(0.0, 11.0, 12)
++
++
++def _run_dynamic(tmp_path, code, required=None, description="map the mean intensity per pixel",
++                 retries=0):
++    rules = [
++        Rule("qc", _QC_MARKER, [{"valid": True}], repeat_last=True),
++        Rule("codegen", "analyze_feature", [{"code": code}], repeat_last=True),
++    ]
++    model = ScriptedModel(rules)
++    ctrl = RunDynamicAnalysisController(model=model, logger=logging.getLogger("t809"),
++                                        generation_config=None, safety_settings=None,
++                                        parse_fn=_parse, executor_timeout=60)
++    ctrl._review_required_output = lambda *a, **k: (True, "")
++    ctrl._check_result_visually = lambda *a, **k: (True, "")
++    cube, E = _cube()
++    target = {"type": "custom_code", "description": description}
++    if required is not None:
++        target["required_outputs"] = required
++    state = ctrl.execute({
++        "refinement_decision": {"refinement_needed": True, "requires_custom_code": True,
++                                "targets": [target]},
++        "hspy_data": cube, "original_hspy_data": cube, "energy_axis": E, "system_info": {},
++        "settings": {"output_dir": str(tmp_path)}, "iteration_title": "T",
++        "analysis_images": [], "error_dict": None, "max_verification_iterations": retries})
++    return state, model
++
++
++MASK_AND_VALUE = """\
++def analyze_feature(data, energy_axis):
++    import numpy as np
++    d = np.asarray(data)
++    v = d.mean(axis=2)
++    return {"maps": {"Value": v, "Detection_Mask": v > np.median(v)},
++            "units": "a.u.", "description": "mean and a detection mask"}
++"""
++
++
++def test_a_boolean_mask_beside_a_required_map_commits_both(tmp_path):
++    state, model = _run_dynamic(tmp_path, MASK_AND_VALUE, required=["Value"])
++    rec = state["dynamic_analysis_records"][0]
++    assert rec["task_success"] is True
++    names = {m["name"] for m in state["custom_analysis_metadata_list"]}
++    assert {"Value", "Detection_Mask"} <= names
++    assert sum(c["rule"] == "codegen" for c in model.calls) == 1   # no retry spent
++
++
++def test_a_figure_that_cannot_be_drawn_fails_only_its_map(tmp_path, monkeypatch):
++    real = hc.tools.create_feature_dashboard
++
++    def flaky(result_map, feature_name, *a, **k):
++        if feature_name == "Detection_Mask":
++            raise RuntimeError("renderer exploded")
++        return real(result_map, feature_name, *a, **k)
++
++    monkeypatch.setattr(hc.tools, "create_feature_dashboard", flaky)
++    state, _ = _run_dynamic(tmp_path, MASK_AND_VALUE, required=["Value"])
++    assert state["dynamic_analysis_records"][0]["task_success"] is True
++    names = {m["name"] for m in state["custom_analysis_metadata_list"]}
++    assert "Value" in names and "Detection_Mask" not in names
++
++
++def _flaky_once(monkeypatch, name):
++    real = hc.tools.create_feature_dashboard
++    seen = {"n": 0}
++
++    def flaky(result_map, feature_name, *a, **k):
++        if feature_name == name and seen["n"] == 0:
++            seen["n"] += 1
++            raise RuntimeError("renderer exploded")
++        return real(result_map, feature_name, *a, **k)
++
++    monkeypatch.setattr(hc.tools, "create_feature_dashboard", flaky)
++
++
++def _retry_prompt(model):
++    prompts = [c["prompt"] for c in model.calls if c["rule"] == "codegen"]
++    assert len(prompts) >= 2, "expected a retry"
++    return prompts[1]
++
++
++def test_a_figure_failure_is_not_blamed_on_the_script(tmp_path, monkeypatch):
++    """The map reaching the figure is numeric and frame-shaped: the retry is
++    told the error, not to change the map's type."""
++    _flaky_once(monkeypatch, "Value")
++    state, model = _run_dynamic(tmp_path, MASK_AND_VALUE, required=["Value"], retries=2)
++    retry = _retry_prompt(model)
++    assert "its figure could not be drawn" in retry and "renderer exploded" in retry
++    assert "numeric (H, W)" not in retry and "infinite values" not in retry
++    assert state["dynamic_analysis_records"][0]["task_success"] is True
++
++
++def test_infinities_are_pointed_out_when_the_figure_fails(tmp_path, monkeypatch):
++    _flaky_once(monkeypatch, "Value")
++    code = MASK_AND_VALUE.replace("v = d.mean(axis=2)", "v = d.mean(axis=2); v[0, 0] = np.inf")
++    _, model = _run_dynamic(tmp_path, code, required=["Value"], retries=2)
++    assert "infinite values" in _retry_prompt(model)
++
++
++def test_a_float_only_attempt_is_unchanged(tmp_path):
++    """Request parity for the common case: float maps, one codegen call, committed."""
++    code = MASK_AND_VALUE.replace("v > np.median(v)", "v * 2.0")
++    state, model = _run_dynamic(tmp_path, code, required=["Value"])
++    assert state["dynamic_analysis_records"][0]["task_success"] is True
++    assert sum(c["rule"] == "codegen" for c in model.calls) == 1
++
++
++# ── #810: required outputs ───────────────────────────────────────────────
++
++_DECL_MARKER = "names no `required_outputs`"
++
++
++def _plan(required):
++    t = {"type": "custom_code", "value": None, "description": "Per-pixel fit of the main band: center and area maps."}
++    if required is not None:
++        t["required_outputs"] = required
++    return {"refinement_needed": True, "reasoning": "fit needed", "targets": [t]}
++
++
++def _run_planner(tmp_path, plan, declaration=None, objective="Map where the material is and how its band position varies."):
++    rules = []
++    if declaration is not None:
++        rules.append(Rule("declare", _DECL_MARKER, [declaration], repeat_last=True))
++    rules.append(Rule("plan", "refinement", [plan], repeat_last=True))
++    model = ScriptedModel(rules)
++    ctrl = SelectRefinementTargetController(model=model, logger=logging.getLogger("t810"),
++                                            generation_config=None, safety_settings=None,
++                                            parse_fn=_parse)
++    cube, E = _cube()
++    state = {"hspy_data": cube, "original_hspy_data": cube, "energy_axis": E, "system_info": {},
++             "settings": {"output_dir": str(tmp_path)}, "iteration_title": "T",
++             "analysis_images": [], "error_dict": None}
++    if objective:
++        state["analysis_objective"] = objective
++    state = ctrl.execute(state)
++    return state, model
++
++
++def test_an_empty_declaration_is_asked_for_once_and_applied(tmp_path):
++    state, model = _run_planner(tmp_path, _plan([]),
++                                {"required_outputs": ["Band_Center", "Band_Area"], "reason": "named"})
++    target = state["refinement_decision"]["targets"][0]
++    assert target["required_outputs"] == ["Band_Center", "Band_Area"]
++    assert [c["rule"] for c in model.calls] == ["plan", "declare"]
++    decl = model.calls[1]["prompt"]
++    assert "Map where the material is" in decl and "Per-pixel fit of the main band" in decl
++    assert _required_outputs_rules() in decl          # the planner's own rules, verbatim
++
++
++def test_a_missing_field_counts_as_empty(tmp_path):
++    state, _ = _run_planner(tmp_path, _plan(None), {"required_outputs": ["Band_Center"], "reason": "r"})
++    assert state["refinement_decision"]["targets"][0]["required_outputs"] == ["Band_Center"]
++
++
++def test_a_declared_target_gets_no_extra_call(tmp_path):
++    state, model = _run_planner(tmp_path, _plan(["Peak_Center"]),
++                                {"required_outputs": ["SHOULD_NOT_APPEAR"], "reason": "r"})
++    assert state["refinement_decision"]["targets"][0]["required_outputs"] == ["Peak_Center"]
++    assert [c["rule"] for c in model.calls] == ["plan"]
++
++
++def test_no_objective_no_extra_call(tmp_path):
++    state, model = _run_planner(tmp_path, _plan([]), {"required_outputs": ["X"], "reason": "r"}, objective=None)
++    assert state["refinement_decision"]["targets"][0]["required_outputs"] == []
++    assert [c["rule"] for c in model.calls] == ["plan"]
++
++
++def test_an_exploratory_answer_keeps_the_list_empty(tmp_path):
++    state, _ = _run_planner(tmp_path, _plan([]), {"required_outputs": [], "reason": "exploratory"})
++    assert state["refinement_decision"]["targets"][0]["required_outputs"] == []
++
++
++def test_a_deliberate_empty_answer_is_logged_as_none_required(tmp_path, caplog):
++    with caplog.at_level("INFO"):
++        _run_planner(tmp_path, _plan([]), {"required_outputs": [], "reason": "rules say empty"})
++    assert "[] (none required)" in caplog.text
++
++
++@pytest.mark.parametrize("planned, expected", [("Band_Center", ["Band_Center"]),
++                                               ("  Band_Center ", ["Band_Center"])])
++def test_a_planner_string_is_one_key_not_letters(tmp_path, planned, expected):
++    state, model = _run_planner(tmp_path, _plan(planned), {"required_outputs": ["X"], "reason": "r"})
++    assert state["refinement_decision"]["targets"][0]["required_outputs"] == expected
++    assert [c["rule"] for c in model.calls] == ["plan"]          # a declaration, not asked again
++
++
++@pytest.mark.parametrize("planned", [{"a": 1}, 3, ""])
++def test_a_planner_non_list_is_no_declaration(tmp_path, planned):
++    state, model = _run_planner(tmp_path, _plan(planned), {"required_outputs": ["Band_Center"], "reason": "r"})
++    assert state["refinement_decision"]["targets"][0]["required_outputs"] == ["Band_Center"]
++    assert [c["rule"] for c in model.calls] == ["plan", "declare"]
++
++
++def test_a_planner_non_list_is_normalised_even_without_an_objective(tmp_path):
++    state, model = _run_planner(tmp_path, _plan("Band_Center"), None, objective=None)
++    assert state["refinement_decision"]["targets"][0]["required_outputs"] == ["Band_Center"]
++
++
++def test_invalid_keys_are_dropped_and_duplicates_collapsed(tmp_path):
++    state, _ = _run_planner(tmp_path, _plan([]),
++                            {"required_outputs": ["Band_Center", "Band_Center", "bad key!", 3, " Band_Area "]})
++    assert state["refinement_decision"]["targets"][0]["required_outputs"] == ["Band_Center", "Band_Area"]
++
++
++@pytest.mark.parametrize("reply", [
++    "not json",                                        # sent as is, not wrapped in JSON
++    {"required_outputs": "Band_Center"},               # not a list
++    {"reason": "no field"},
++    {"required_outputs": ["Peak Position (eV)", 7]},   # names outputs, none usable
++])
++def test_a_bad_declaration_keeps_the_plan_as_it_was(tmp_path, caplog, reply):
++    """Started from a plan with NO key, so "kept" and "declared empty" differ."""
++    with caplog.at_level("INFO"):
++        state, model = _run_planner(tmp_path, _plan(None), reply)
++    target = state["refinement_decision"]["targets"][0]
++    assert "required_outputs" not in target
++    assert [c["rule"] for c in model.calls] == ["plan", "declare"]
++    assert "Required-outputs declaration skipped" in caplog.text
++    assert "declared for the target" not in caplog.text
++    assert state["refinement_decision"]["requires_custom_code"] is True
++
++
++def test_the_plan_gate_shows_the_required_outputs(tmp_path):
++    from scilink.agents.exp_agents.controllers.base_controllers import refinement_plan_subject
++    state, _ = _run_planner(tmp_path, _plan([]),
++                            {"required_outputs": ["Band_Center", "Band_Area"], "reason": "named"})
++    table = [b for b in refinement_plan_subject(state)["blocks"] if b.get("columns")][0]
++    assert table["columns"][-1] == "Required outputs"
++    assert table["rows"][0][-1] == "Band_Center, Band_Area"
++
++
++def test_the_rules_markers_still_exist_in_the_planner_prompt():
++    """The declaration quotes the planner's rules; if the prompt's headings
++    move, this must fail rather than send an empty rules block."""
++    rules = _required_outputs_rules()
++    assert rules.startswith("**Required outputs") and len(rules) > 500
++    # the section runs from its heading to its last rule, and no further
++    assert rules.rstrip().endswith("let the honest-null / resolution-ladder machinery "
++                                   "handle the per-pixel question.")

@@ -1,0 +1,37 @@
+# Issue
+
+**Title:** Telemetry tab: tool sequence, worker agents, analysis reports
+
+## Description
+
+## Summary
+
+The **Telemetry** tab in a meta session now shows what the agents actually did, not only which delegations ran. Under the delegation detail you get every tool call each layer made in order (the meta, the analysis specialist, the planning specialist) with a click to see the exact arguments and result, each worker agent's action history (curve fitting, Bayesian optimization, scalarizer, and so on) down to the input, result and rationale of a single action, and every analysis's scientific claims and reasoning. It updates while a turn runs, so you can watch a delegation unfold.
+
+This is the web port of the Streamlit telemetry tab, including its dependency graph (drawn as plain SVG, no graphviz needed: root, status-colored delegation boxes with their sub-agents, grey dispatch edges, blue context edges; click a box to expand its row) and the per-layer download of the full chat history.
+
+## Technical description
+
+The `GET /sessions/{id}/telemetry` endpoint (`collect_session_telemetry`) was already wired. One server fix: `delegation_view` read the fan-out marker as a dict, but `run_fanout` stamps `fanout=True` + `parallel_group="fanout_<n>"`, so `fanout_group` was always null; it now reads `parallel_group` (test added), which the graph keys on. Reader fix in `telemetry.py`: an image-bearing tool result is a multimodal message whose content is a list of parts, which `_maybe_json` left as a list, so `_action_status` called every such result ok; the text part is now parsed (new `tests/test_meta_telemetry_reader.py` covers an exception-wrapped error, a bad-argument error, a multimodal error and a pending call). Everything else is frontend.
+
+- `webui/src/components/TelemetryDetails.tsx` (new), rendered below `DelegationsPanel` in the Telemetry tab body (both inside a new `.telemetry-scroll` container so the tab scrolls as one page).
+  - **Tool sequence**: per layer in `tool_sequence` (meta / analysis / planning, in that order, empty layers hidden). Table columns `# | tool | input | output | status`; input/output are the type signature (`{task: str, label: str}`, `list[21]`), a TypeScript port of the Streamlit `_type_summary`. Clicking a row expands the actual `args` and `result` as JSON, capped at 4000 characters; a `pending` call shows "(no result yet)". A failed call (`status: error`) shows its error message inline in red in the output cell (`error` / `message` / `detail` / `reason` keys, the shapes tools and the executor produce), in the worker action list too. The "full history" link opens the layer's `chat_history.json` in the Files tab (the absolute `source` path is made session-relative from `meta.session_dir`).
+  - **Worker agents**: one row per `agents` entry (specialist, name, status, action count, outcomes, first/last timestamp); expands to `actions_by_type` chips and the action table (time, action, status, rationale); an action expands to input / result / feedback JSON.
+  - **Analysis reports**: a `<details>` per `analysis_reports` entry with the claims (claim + impact), the capped `detailed_analysis`, and a chip that opens the `analysis_results.json` in Files.
+  - Refresh policy: fetched when the tab is active, re-fetched whenever the `delegations` view object changes (a ledger SSE event), and polled every 3 s while `status === "running"` because `_tool_sequence` reads the agents' live `messages` and therefore moves mid-turn. Nothing is fetched while the tab is hidden.
+- `DelegationGraph.tsx` (new), rendered above the ledger in `DelegationsPanel`: nodes layered by context depth (a delegation sits below everything in its `context_from`), centered per layer; edges that skip a layer are bowed sideways by one step per skipped layer (right for context, left for dispatch) so they do not cross the boxes between; the canvas widens by the deepest bow. A layer wider than six wraps into rows; the branches of one fan-out (same `fanout_group`) collapse into one stacked node with outcome counts and a single context edge in/out; every edge is routed around the boxes it does not connect: straight when clear, else a sweep inside the box-free band between rows into the nearest vertical lane (a column gap of any row, the strip beside a row, or the canvas edge) that clears every box; sources in a wrapped layer go to its last row so their edges never cross a sibling row. Layout and routing are a pure module, `webui/src/delegationGraph.ts`, and `npm run check:graph` (`webui/scripts/graph_check.ts`, Node type-stripping, no test framework added) runs sixteen ledger scenarios through it asserting: drawn context edges == the ledger's `context_from` relations (branches → group node), one dispatch edge per node, endpoints on the right boxes, no edge through a third box, downward flow, no overlapping boxes. Edge paths carry `data-from`/`data-to` and node groups `data-node`; the same audit was run in Chrome against the rendered SVG (browser geometry, ledger from `/delegations`) on four resumed sessions, all clean; dispatch edges below the first row are faint; `ctx` labels sit on the routed curve over a halo and are dropped past three sources. Clicking a node sets the panel's open row (a fan-out node opens its first failed branch). Root label carries the meta autonomy (`session.autonomy`).
+- Each tool-sequence layer has a `⬇ download` link (`api.fileUrl` with the `download` attribute, cookie-authenticated like the zip links) next to "full history".
+- `api.ts`: `TelemetrySnapshot`, `ToolCall`, `WorkerAgent`, `WorkerAction`, `AnalysisReport` types and `api.telemetry`.
+- `app.css`: `.tel-*` table, status pill and JSON block styles using the existing theme tokens (`--code-bg`, `--code-border`, `--text-dim`); the delegation panel loses its own scroll to the shared container.
+
+### Verification
+
+`tsc -b` and `npm run build` clean. Checked in Chrome on a resumed meta session (one delegation, Curve Fitting worker): meta layer with 2 calls and analysis layer with 3, row expansion showing the `select_agent` arguments and result, the worker row expanding to its `curve_fit` action and that action's input/result, the report expanding to its claim and reasoning. No console errors. The graph was checked on the same session with three synthetic ledger entries added to the checkpoint (planning ← #1, running analysis ← #1,#2, failed simulation) to exercise layering, bowed edges and every status color; the download URL returns the JSON. Scaling checked on a 45-entry synthetic ledger (a 30-branch fan-out feeding a fusion and a plan, a four-step chain across three specialists, seven standalone analyses): the fan-out is one node and the whole graph fits the panel. The existing server test already covers the endpoint on a bare agent.
+
+### Docs
+
+`react_web_ui.md`: Telemetry tab bullet rewritten, not-yet-ported list updated. `react_ui_roadmap.md`: item 6 marks Telemetry and Skills browse/upload done; persistent-memory UI is next.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `40ec709a3758`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

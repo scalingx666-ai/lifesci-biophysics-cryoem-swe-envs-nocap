@@ -1,0 +1,512 @@
+diff --git a/Yank/__init__.py b/Yank/__init__.py
+index 388e0203..bdef77e0 100644
+--- a/Yank/__init__.py
++++ b/Yank/__init__.py
+@@ -14,6 +14,7 @@
+ from . import restraints
+ from . import pipeline
+ from . import experiment
++from . import fire
+ from .yank import Topography, AlchemicalPhase
+ 
+ __version__ = version.version
+diff --git a/Yank/experiment.py b/Yank/experiment.py
+index e0510f84..81f0b6da 100644
+--- a/Yank/experiment.py
++++ b/Yank/experiment.py
+@@ -230,7 +230,7 @@ class AlchemicalPhaseFactory(object):
+         'anisotropic_dispersion_cutoff': 'auto',
+         'minimize': True,
+         'minimize_tolerance': 1.0 * unit.kilojoules_per_mole/unit.nanometers,
+-        'minimize_max_iterations': 0,
++        'minimize_max_iterations': 1000,
+         'randomize_ligand': False,
+         'randomize_ligand_sigma_multiplier': 2.0,
+         'randomize_ligand_close_cutoff': 1.5 * unit.angstrom,
+diff --git a/Yank/fire.py b/Yank/fire.py
+new file mode 100644
+index 00000000..e62f9226
+--- /dev/null
++++ b/Yank/fire.py
+@@ -0,0 +1,183 @@
++from simtk import openmm, unit
++import numpy as np
++from openmmtools.constants import kB
++
++# ==============================================================================
++# FIRE minimizer
++#
++# TODO: Move this to openmmtools once it is sufficiently stable
++# ==============================================================================
++
++class FIREMinimizationIntegrator(openmm.CustomIntegrator):
++    """Fast Internal Relaxation Engine (FIRE) minimization.
++
++    Notes
++    -----
++    This integrator is taken verbatim from Peter Eastman's example appearing in the CustomIntegrator header file documentation.
++
++    References
++    ----------
++    Erik Bitzek, Pekka Koskinen, Franz Gaehler, Michael Moseler, and Peter Gumbsch.
++    Structural Relaxation Made Simple. PRL 97:170201, 2006.
++    http://dx.doi.org/10.1103/PhysRevLett.97.170201
++
++    Examples
++    --------
++
++    >>> from openmmtools import testsystems
++    >>> t = testsystems.AlanineDipeptideVacuum()
++    >>> system, positions = t.system, t.positions
++
++    Create a FIRE integrator with default parameters and minimize for 100 steps
++
++    >>> integrator = FIREMinimizationIntegrator()
++    >>> context = openmm.Context(system, integrator)
++    >>> context.setPositions(positions)
++    >>> integrator.step(100)
++
++    """
++
++    def __init__(self, timestep=1.0 * unit.femtoseconds, tolerance=None, alpha=0.1, dt_max=10.0 * unit.femtoseconds, f_inc=1.1, f_dec=0.5, f_alpha=0.99, N_min=5):
++        """Construct a Fast Internal Relaxation Engine (FIRE) minimization integrator.
++        Parameters
++        ----------
++        timestep : unit.Quantity compatible with femtoseconds, optional, default = 1*femtoseconds
++            The integration timestep.
++        tolerance : unit.Quantity compatible with kilojoules_per_mole/nanometer, optional, default = None
++            Minimization will be terminated when RMS force reaches this tolerance.
++        alpha : float, optional default = 0.1
++            Velocity relaxation parameter, alpha \in (0,1).
++        dt_max : unit.Quantity compatible with femtoseconds, optional, default = 10*femtoseconds
++            Maximum allowed timestep.
++        f_inc : float, optional, default = 1.1
++            Timestep increment multiplicative factor.
++        f_dec : float, optional, default = 0.5
++            Timestep decrement multiplicative factor.
++        f_alpha : float, optional, default = 0.99
++            alpha multiplicative relaxation parameter
++        N_min : int, optional, default = 5
++            Limit on number of timesteps P is negative before decrementing timestep.
++        Notes
++        -----
++        Velocities should be set to zero before using this integrator.
++        """
++
++        # Check input ranges.
++        if not ((alpha > 0.0) and (alpha < 1.0)):
++            raise Exception("alpha must be in the interval (0,1); specified alpha = %f" % alpha)
++
++        if tolerance is None:
++            tolerance = 0 * unit.kilojoules_per_mole / unit.nanometers
++
++        super(FIREMinimizationIntegrator, self).__init__(timestep)
++
++        # Use high-precision constraints
++        self.setConstraintTolerance(1.0e-8)
++
++        self.addGlobalVariable("alpha", alpha)  # alpha
++        self.addGlobalVariable("P", 0)  # P
++        self.addGlobalVariable("N_neg", 0.0)
++        self.addGlobalVariable("fmag", 0)  # |f|
++        self.addGlobalVariable("fmax", 0)  # max|f_i|
++        self.addGlobalVariable("ndof", 0)  # number of degrees of freedom
++        self.addGlobalVariable("ftol", tolerance.value_in_unit_system(unit.md_unit_system))  # convergence tolerance
++        self.addGlobalVariable("vmag", 0)  # |v|
++        self.addGlobalVariable("converged", 0) # 1 if convergence threshold reached, 0 otherwise
++        self.addPerDofVariable("x0", 0)
++        self.addPerDofVariable("v0", 0)
++        self.addPerDofVariable("x1", 0)
++        self.addGlobalVariable("E0", 0) # old energy associated with x0
++        self.addGlobalVariable("dE", 0)
++        self.addGlobalVariable("restart", 0)
++        self.addGlobalVariable("delta_t", timestep.value_in_unit_system(unit.md_unit_system))
++
++        # Assess convergence
++        # TODO: Can we more closely match the OpenMM criterion here?
++        self.beginIfBlock('converged < 1')
++
++        # Compute fmag = |f|
++        #self.addComputeGlobal('fmag', '0.0')
++        self.addComputeSum('fmag', 'f*f')
++        self.addComputeGlobal('fmag', 'sqrt(fmag)')
++
++        # Compute ndof
++        self.addComputeSum('ndof', '1')
++
++        self.addComputeSum('converged', 'step(ftol - fmag/ndof)')
++        self.endBlock()
++
++        # Enclose everything in a block that checks if we have already converged.
++        self.beginIfBlock('converged < 1')
++
++        # Store old positions and energy
++        self.addComputePerDof('x0', 'x')
++        self.addComputePerDof('v0', 'v')
++        self.addComputeGlobal('E0', 'energy')
++
++        # MD: Take a velocity Verlet step.
++        self.addComputePerDof("v", "v+0.5*delta_t*f/m")
++        self.addComputePerDof("x", "x+delta_t*v")
++        self.addComputePerDof("x1", "x")
++        self.addConstrainPositions()
++        self.addComputePerDof("v", "v+0.5*delta_t*f/m+(x-x1)/delta_t")
++        self.addConstrainVelocities()
++
++        self.addComputeGlobal('dE', 'energy - E0')
++
++        # Compute fmag = |f|
++        #self.addComputeGlobal('fmag', '0.0')
++        self.addComputeSum('fmag', 'f*f')
++        self.addComputeGlobal('fmag', 'sqrt(fmag)')
++        # Compute vmag = |v|
++        #self.addComputeGlobal('vmag', '0.0')
++        self.addComputeSum('vmag', 'v*v')
++        self.addComputeGlobal('vmag', 'sqrt(vmag)')
++
++        # F1: Compute P = F.v
++        self.addComputeSum('P', 'f*v')
++
++        # F2: set v = (1-alpha) v + alpha \hat{F}.|v|
++        # Update velocities.
++        # TODO: This must be corrected to be atomwise redirection of v magnitude along f
++        self.addComputePerDof('v', '(1-alpha)*v + alpha*(f/fmag)*vmag')
++
++        # Back up if the energy went up, protecing against NaNs
++        self.addComputeGlobal('restart', '1')
++        self.beginIfBlock('dE < 0')
++        self.addComputeGlobal('restart', '0')
++        self.endBlock()
++        self.beginIfBlock('restart > 0')
++        self.addComputePerDof('v', 'v0')
++        self.addComputePerDof('x', 'x0')
++        self.addComputeGlobal('P', '-1')
++        self.endBlock()
++
++        # If dt goes to zero, signal we've converged!
++        dt_min = 1.0e-5 * timestep
++        self.beginIfBlock('delta_t <= %f' % dt_min.value_in_unit_system(unit.md_unit_system))
++        self.addComputeGlobal('converged', '1')
++        self.endBlock()
++
++        # F3: If P > 0 and the number of steps since P was negative > N_min,
++        # Increase timestep dt = min(dt*f_inc, dt_max) and decrease alpha = alpha*f_alpha
++        self.beginIfBlock('P > 0')
++        # Update count of number of steps since P was negative.
++        self.addComputeGlobal('N_neg', 'N_neg + 1')
++        # If we have enough steps since P was negative, scale up timestep.
++        self.beginIfBlock('N_neg > %d' % N_min)
++        self.addComputeGlobal('delta_t', 'min(delta_t*%f, %f)' % (f_inc, dt_max.value_in_unit_system(unit.md_unit_system))) # TODO: Automatically convert dt_max to md units
++        self.addComputeGlobal('alpha', 'alpha * %f' % f_alpha)
++        self.endBlock()
++        self.endBlock()
++
++        # F4: If P < 0, decrease the timestep dt = dt*f_dec, freeze the system v=0,
++        # and set alpha = alpha_start
++        self.beginIfBlock('P < 0')
++        self.addComputeGlobal('N_neg', '0.0')
++        self.addComputeGlobal('delta_t', 'delta_t*%f' % f_dec)
++        self.addComputePerDof('v', '0.0')
++        self.addComputeGlobal('alpha', '%f' % alpha)
++        self.endBlock()
++
++        # Close block that checks for convergence.
++        self.endBlock()
+diff --git a/Yank/mpi.py b/Yank/mpi.py
+index 843abdb9..a24f5f5a 100644
+--- a/Yank/mpi.py
++++ b/Yank/mpi.py
+@@ -100,7 +100,10 @@ def get_mpicomm():
+     # http://docs.roguewave.com/threadspotter/2012.1/linux/manual_html/apas03.html
+     variables = ['PMI_RANK', 'OMPI_COMM_WORLD_RANK', 'OMPI_MCA_ns_nds_vpid',
+                  'PMI_ID', 'SLURM_PROCID', 'LAMRANK', 'MPI_RANKID',
+-                 'MP_CHILD', 'MP_RANK', 'MPIRUN_RANK']
++                 'MP_CHILD', 'MP_RANK', 'MPIRUN_RANK',
++                 'ALPS_APP_PE', # Cray aprun
++                ]
++
+     use_mpi = False
+     for var in variables:
+         if var in os.environ:
+@@ -145,6 +148,15 @@ def handle_signal(signal, frame):
+     # Report initialization
+     logger.debug("MPI initialized on node {}/{}".format(mpicomm.rank+1, mpicomm.size))
+ 
++    # Cray machines are usually old and sick; prevent them from causing trouble with CUDA caches
++    # by explicitly using different CUDA cache paths for each process
++    if 'ALPS_APP_PE' in variables:
++        cuda_cache_path = os.path.abspath(os.path.join('nvcc-cache', str(mpicomm.rank)))
++        if not os.path.exists(cuda_cache_path):
++            os.makedirs(cuda_cache_path)
++        os.environ['CUDA_CACHE_PATH'] = cuda_cache_path
++        print('Cray detected; node {}/{} using CUDA cache path {}'.format(mpicomm.rank+1, mpicomm.size, cuda_cache_path))
++
+     return mpicomm
+ 
+ get_mpicomm._is_initialized = False  # Static variable
+diff --git a/Yank/multistate/multistatesampler.py b/Yank/multistate/multistatesampler.py
+index e079d392..e03960ea 100644
+--- a/Yank/multistate/multistatesampler.py
++++ b/Yank/multistate/multistatesampler.py
+@@ -47,6 +47,8 @@
+ from .. import mpi
+ from pymbar.utils import ParameterError
+ 
++from yank.fire import FIREMinimizationIntegrator
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -677,7 +679,7 @@ def equilibrate(self, n_iterations, mcmc_moves=None):
+         """
+         # Check that simulation has been created.
+         if self.n_replicas == 0:
+-            raise RuntimeError('Cannot minimize replicas. The simulation must be created first.')
++            raise RuntimeError('Cannot equilibrate replicas. The simulation must be created first.')
+ 
+         # If no MCMCMove is specified, use the ones for production.
+         if mcmc_moves is None:
+@@ -1219,14 +1221,19 @@ def _get_replica_move_statistics(self, replica_id):
+         return move_statistics
+ 
+     def _minimize_replica(self, replica_id, tolerance, max_iterations):
+-        """Minimize the specified replica."""
++        """Minimize the specified replica.
++        """
++
+         # Retrieve thermodynamic and sampler states.
+         thermodynamic_state_id = self._replica_thermodynamic_states[replica_id]
+         thermodynamic_state = self._thermodynamic_states[thermodynamic_state_id]
+         sampler_state = self._sampler_states[replica_id]
+ 
+-        # Retrieve a context. Any Integrator works.
+-        context, integrator = mmtools.cache.global_context_cache.get_context(thermodynamic_state)
++        # Use the FIRE minimizer
++        integrator = FIREMinimizationIntegrator(tolerance=tolerance)
++
++        # Create context
++        context = thermodynamic_state.create_context(integrator)
+ 
+         # Set initial positions and box vectors.
+         sampler_state.apply_to_context(context)
+@@ -1237,16 +1244,33 @@ def _minimize_replica(self, replica_id, tolerance, max_iterations):
+             replica_id + 1, self.n_replicas, initial_energy))
+ 
+         # Minimize energy.
+-        openmm.LocalEnergyMinimizer.minimize(context, tolerance, max_iterations)
++        try:
++            if max_iterations == 0:
++                logger.debug('Using FIRE: tolerance {} minimizing to convergence'.format(tolerance))
++                while integrator.getGlobalVariableByName('converged') < 1:
++                    integrator.step(50)
++            else:
++                logger.debug('Using FIRE: tolerance {} max_iterations {}'.format(tolerance, fire_iterations))
++                integrator.step(max_iterations)
++        except Exception as e:
++            if str(e) == 'Particle coordinate is nan':
++                logger.debug('NaN encountered in FIRE minimizer; falling back to L-BFGS after resetting positions')
++                sampler_state.apply_to_context(context)
++                openmm.LocalEnergyMinimizer.minimize(context, tolerance, max_iterations)
++            else:
++                raise e
+ 
+         # Get the minimized positions.
+         sampler_state.update_from_context(context)
+-
++        
+         # Compute the final energy of the system for logging.
+         final_energy = thermodynamic_state.reduced_potential(sampler_state)
+         logger.debug('Replica {}/{}: final energy {:8.3f}kT'.format(
+             replica_id + 1, self.n_replicas, final_energy))
+ 
++        # Clean up the integrator
++        del context
++
+         # Return minimized positions.
+         return sampler_state.positions
+ 
+diff --git a/Yank/tests/test_sampling.py b/Yank/tests/test_sampling.py
+index c2fc2179..6a6a6e21 100644
+--- a/Yank/tests/test_sampling.py
++++ b/Yank/tests/test_sampling.py
+@@ -1248,7 +1248,7 @@ def test_minimize(self):
+             new_sampler_states = sampler._sampler_states
+             new_diffs = [np.average(new_sampler_states[i].positions - new_sampler_states[i + 1].positions)
+                          for i in range(n_replicas - 1)]
+-            assert np.allclose(original_diffs, new_diffs)
++            assert np.allclose(original_diffs, new_diffs, atol=0.1)
+ 
+             # Each replica keeps only the info for the replicas it is
+             # responsible for to minimize network traffic.
+@@ -1256,9 +1256,11 @@ def test_minimize(self):
+ 
+             # The energies have been minimized.
+             sampler._compute_energies()
+-            for i in node_replica_ids:
+-                j = sampler._replica_thermodynamic_states[i]
+-                assert sampler._energy_thermodynamic_states[i, j] < original_energies[i]
++            for replica_index in node_replica_ids:
++                state_index = sampler._replica_thermodynamic_states[replica_index]
++                old_energy = original_energies[replica_index]
++                new_energy = sampler._energy_thermodynamic_states[replica_index, state_index]
++                assert new_energy <= old_energy, "Energies did not decrease: Replica {} was originally {}, now {}".format(replica_index, old_energy, new_energy)
+ 
+             # The storage has been updated.
+             reporter.close()
+diff --git a/Yank/tests/test_yank.py b/Yank/tests/test_yank.py
+index 6fd6def3..c295843b 100644
+--- a/Yank/tests/test_yank.py
++++ b/Yank/tests/test_yank.py
+@@ -530,7 +530,7 @@ def test_minimize(self):
+             sampler_states = alchemical_phase._sampler.sampler_states
+             new_diffs = [np.average(sampler_states[i].positions - sampler_states[i+1].positions)
+                          for i in range(len(sampler_states) - 1)]
+-            assert np.allclose(original_diffs, new_diffs)
++            assert np.allclose(original_diffs, new_diffs, rtol=0.1), "original_diffs {} are not close to new_diffs {}".format(original_diffs, new_diffs)
+ 
+     def test_randomize_ligand(self):
+         """Test method AlchemicalPhase.randomize_ligand."""
+diff --git a/Yank/yank.py b/Yank/yank.py
+index 2474b542..fd558c6d 100644
+--- a/Yank/yank.py
++++ b/Yank/yank.py
+@@ -33,6 +33,7 @@
+ 
+ from . import pipeline, mpi, multistate
+ from .restraints import RestraintState, RestraintParameterError, V0
++from .fire import FIREMinimizationIntegrator
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -604,7 +605,6 @@ def _get_region_set(self, region_set_string):
+         parsed_output = mmtools.utils.math_eval(region_set_string, variables=variables)
+         return parsed_output
+ 
+-
+ # ==============================================================================
+ # Class that define a single thermodynamic leg (phase) of the calculation
+ # ==============================================================================
+@@ -1099,8 +1099,8 @@ def minimize(self, tolerance=1.0*unit.kilojoules_per_mole/unit.nanometers,
+             Minimization tolerance (units of energy/mole/length, default is
+             ``1.0 * unit.kilojoules_per_mole / unit.nanometers``).
+         max_iterations : int, optional
+-            Maximum number of iterations for minimization. If 0, minimization
+-            continues until converged.
++            Maximum number of iterations for minimization.
++            If 0, minimization continues until converged.
+ 
+         """
+         metadata = self._sampler.metadata
+@@ -1398,11 +1398,15 @@ def _find_similar_sampler_states(sampler_states):
+     @staticmethod
+     def _minimize_sampler_state(sampler_state_id, sampler_states, thermodynamic_state,
+                                 tolerance, max_iterations):
+-        """Minimize the specified sampler state at the given thermodynamic state."""
++        """Minimize the specified sampler state at the given thermodynamic state.
++        """
+         sampler_state = sampler_states[sampler_state_id]
+ 
+-        # Retrieve a context. Any Integrator works.
+-        context, integrator = mmtools.cache.global_context_cache.get_context(thermodynamic_state)
++        # Use the FIRE minimizer
++        integrator = FIREMinimizationIntegrator(tolerance=tolerance)
++
++        # Create context
++        context = thermodynamic_state.create_context(integrator)
+ 
+         # Set initial positions and box vectors.
+         sampler_state.apply_to_context(context)
+@@ -1413,16 +1417,33 @@ def _minimize_sampler_state(sampler_state_id, sampler_states, thermodynamic_stat
+             sampler_state_id + 1, len(sampler_states), initial_energy))
+ 
+         # Minimize energy.
+-        openmm.LocalEnergyMinimizer.minimize(context, tolerance, max_iterations)
++        try:
++            if max_iterations == 0:
++                logger.debug('Using FIRE: tolerance {} minimizing to convergence'.format(tolerance))
++                while integrator.getGlobalVariableByName('converged') < 1:
++                    integrator.step(50)
++            else:
++                logger.debug('Using FIRE: tolerance {} max_iterations {}'.format(tolerance, fire_iterations))
++                integrator.step(max_iterations)
++        except Exception as e:
++            if str(e) == 'Particle coordinate is nan':
++                logger.debug('NaN encountered in FIRE minimizer; falling back to L-BFGS after resetting positions')
++                sampler_state.apply_to_context(context)
++                openmm.LocalEnergyMinimizer.minimize(context, tolerance, max_iterations)
++            else:
++                raise e
+ 
+         # Get the minimized positions.
+         sampler_state.update_from_context(context)
+ 
+         # Compute the final energy of the system for logging.
+-        final_energy = thermodynamic_state.reduced_potential(sampler_state)
++        final_energy = thermodynamic_state.reduced_potential(context)
+         logger.debug('Sampler state {}/{}: final energy {:8.3f}kT'.format(
+             sampler_state_id + 1, len(sampler_states), final_energy))
+ 
++        # Clean up the integrator
++        del context
++
+         # Return minimized positions.
+         return sampler_state.positions
+ 
+diff --git a/docs/references.bib b/docs/references.bib
+index ab77c2cf..64c2f4b8 100644
+--- a/docs/references.bib
++++ b/docs/references.bib
+@@ -1,3 +1,24 @@
++@article{LBFGS,
++  title={On the limited memory BFGS method for large scale optimization},
++  author={Liu, Dong C and Nocedal, Jorge},
++  journal={Mathematical programming},
++  volume={45},
++  number={1-3},
++  pages={503--528},
++  year={1989},
++  publisher={Springer}
++}
++
++@article{FIREMinimizer,
++  title={Structural relaxation made simple},
++  author={Bitzek, Erik and Koskinen, Pekka and G{\"a}hler, Franz and Moseler, Michael and Gumbsch, Peter},
++  journal={Physical review letters},
++  volume={97},
++  number={17},
++  pages={170201},
++  year={2006},
++  publisher={APS}
++}
+ @article{LeimkuhlerMatthews2016,
+   title={Efficient molecular dynamics using geodesic integration and solvent--solute splitting},
+   author={Leimkuhler, Benedict and Matthews, Charles},
+diff --git a/docs/yamlpages/options.rst b/docs/yamlpages/options.rst
+index dd053f2a..12a1dd26 100644
+--- a/docs/yamlpages/options.rst
++++ b/docs/yamlpages/options.rst
+@@ -436,10 +436,12 @@ Valid options (0): <Integer>
+ .. code-block:: yaml
+ 
+    options:
+-     minimize: yes
++     minimize: True
+ 
+-Minimize the input configuration before starting simulation. Highly recommended if a pre-minimized structure is provided,
+-or if explicit solvent generation is left to YANK.
++Minimize the input configuration before starting simulation.
++This is highly recommended if a pre-minimized structure is provided, or if explicit solvent generation is left to YANK.
++The FIRE minimizer :cite:`FIREMinimizer`, a fast minimizer that can run entirely on the GPU, is used first.
++If this fails, an L-BFGS minimizer :cite:`LBFGS` (as `implemented in OpenMM <http://docs.openmm.org/latest/userguide/application.html#energy-minimization>`_) is used.
+ 
+ Valid Options: [yes]/no
+ 
+@@ -455,7 +457,7 @@ Valid Options: [yes]/no
+ .. code-block:: yaml
+ 
+    options:
+-     minimize_max_iterations: 0
++     minimize_max_iterations: 1000
+ 
+ Set the maximum number of iterations the
+ :ref:`energy minimization process <yaml_options_minimize>` attempts to converge to :ref:`given tolerance energy <yaml_options_minimize_tolerance>`. 0 steps indicate unlimited.

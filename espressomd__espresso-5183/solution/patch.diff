@@ -1,0 +1,405 @@
+diff --git a/src/python/espressomd/particle_data.py b/src/python/espressomd/particle_data.py
+index 72751814c74..13f4b90c57b 100644
+--- a/src/python/espressomd/particle_data.py
++++ b/src/python/espressomd/particle_data.py
+@@ -920,22 +920,6 @@ def __init__(self, *args, **kwargs):
+         self._get_particle = functools.lru_cache(
+             maxsize=self._particle_cache_size)(self._get_particle_impl)
+ 
+-    @property
+-    def pos_folded(self):
+-        """
+-        Particle position (folded into central image).
+-
+-        """
+-        pos_array = np.zeros((len(self.id_selection), 3))
+-        for i in range(len(self.id_selection)):
+-            pos_array[i, :] = self._get_particle(
+-                self.id_selection[i]).pos_folded
+-        return pos_array
+-
+-    @pos_folded.setter
+-    def pos_folded(self, value):
+-        raise RuntimeError("Parameter 'pos_folded' is read-only.")
+-
+     def add_exclusion(self, _partner):
+         assert_features(["EXCLUSIONS"])
+         for p_id in self.id_selection:
+@@ -1462,26 +1446,18 @@ def get_attribute(particle_slice, attribute):
+         if N == 0:
+             return np.empty(0, dtype=type(None))
+ 
+-        # get first slice member to determine its type
+-        p_id = particle_slice.id_selection[0]
+-        is_trivially_serializable = attribute in ParticleSlice._particle_attributes_trivially_serializable
+-        target = getattr(particle_slice._get_particle(p_id), attribute)
+-        if isinstance(target, array_locked):  # vectorial quantity
+-            target_type = target.dtype
+-        else:  # scalar quantity
+-            target_type = type(target)
+-
+         if attribute in ["exclusions", "bonds", "vs_relative", "swimming"]:
+             values = []
+             for part in particle_slice._id_gen():
+                 values.append(getattr(part, attribute))
+         else:
+-            values = np.empty((N,) + np.shape(target), dtype=target_type)
+-            for i, part in enumerate(particle_slice._id_gen()):
+-                if is_trivially_serializable:
+-                    values[i] = part.get_parameter(attribute)
+-                else:
+-                    values[i] = getattr(part, attribute)
++            values = particle_slice.call_method(
++                "get_param_parallel", name=attribute)
++            if attribute == "propagation":
++                values = np.array([Propagation(value)
++                                  for value in values], dtype=object)
++            else:
++                values = np.stack(values)
+ 
+         return values
+ 
+diff --git a/src/script_interface/Variant.hpp b/src/script_interface/Variant.hpp
+index 4e747acf9e4..3095484a590 100644
+--- a/src/script_interface/Variant.hpp
++++ b/src/script_interface/Variant.hpp
+@@ -85,6 +85,9 @@ struct recursive_variant : recursive_variant_add_containers<Ts...> {
+   using BaseClass = recursive_variant_add_containers<Ts...>;
+   using BaseClass::BaseClass;
+ 
++  /** @brief Is a given type part of this variant's type list. */
++  template <class T> using has_type = std::disjunction<std::is_same<T, Ts>...>;
++
+ private:
+   friend class boost::serialization::access;
+ 
+diff --git a/src/script_interface/particle_data/ParticleHandle.cpp b/src/script_interface/particle_data/ParticleHandle.cpp
+index 183d32c5aa1..461a375e58b 100644
+--- a/src/script_interface/particle_data/ParticleHandle.cpp
++++ b/src/script_interface/particle_data/ParticleHandle.cpp
+@@ -58,6 +58,7 @@
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ #include <tuple>
+ #include <type_traits>
+ #include <vector>
+@@ -807,7 +808,7 @@ void ParticleHandle::do_construct(VariantMap const &params) {
+     context()->parallel_try_catch([&]() {
+       /* clang-format off */
+       // set particle properties (filter out read-only and deferred properties)
+-      std::set<std::string> const skip = {
++      std::set<std::string_view> const skip = {
+           "pos_folded", "pos", "id", "exclusions", "node", "image_box", "bonds",
+           "lees_edwards_flag", "__cpt_sentinel",
+       };
+diff --git a/src/script_interface/particle_data/ParticleSlice.cpp b/src/script_interface/particle_data/ParticleSlice.cpp
+index 5c5a2f976f7..fb56b398892 100644
+--- a/src/script_interface/particle_data/ParticleSlice.cpp
++++ b/src/script_interface/particle_data/ParticleSlice.cpp
+@@ -21,9 +21,9 @@
+ #include "ParticleHandle.hpp"
+ 
+ #include "core/bonds.hpp"
++#include "core/nonbonded_interactions/nonbonded_interaction_data.hpp"
+ #include "core/particle_node.hpp"
+ #include "core/system/System.hpp"
+-#include "nonbonded_interactions/nonbonded_interaction_data.hpp"
+ 
+ #include "script_interface/Context.hpp"
+ #include "script_interface/Exception.hpp"
+@@ -31,12 +31,16 @@
+ #include "script_interface/get_value.hpp"
+ 
+ #include <utils/Vector.hpp>
++#include <utils/mpi/gather_buffer.hpp>
+ 
+ #include <algorithm>
++#include <functional>
+ #include <iterator>
+ #include <memory>
+ #include <stdexcept>
+ #include <string>
++#include <utility>
++#include <variant>
+ #include <vector>
+ 
+ namespace ScriptInterface {
+@@ -245,6 +249,55 @@ Variant ParticleSlice::do_call_method(std::string const &name,
+     }
+     return {};
+   }
++  if (name == "get_param_parallel") {
++    auto const param_name = get_value<std::string>(params, "name");
++
++    // handle special optimized properties
++    if (param_name == "type") {
++      auto const getter{[](Particle const &p) { return p.type(); }};
++      return get_particles_properties<int>(m_id_selection, getter, context(),
++                                           *get_cell_structure());
++    }
++    if (param_name == "q") {
++      auto const getter{[](Particle const &p) { return p.q(); }};
++      return get_particles_properties<double>(m_id_selection, getter, context(),
++                                              *get_cell_structure());
++    }
++    if (param_name == "pos") {
++      auto const &box_geo = *get_system()->box_geo;
++      auto const getter = [&box_geo](Particle const &p) {
++        return box_geo.unfolded_position(p.pos(), p.image_box());
++      };
++      return get_particles_properties<Utils::Vector3d>(
++          m_id_selection, getter, context(), *get_cell_structure());
++    }
++    if (param_name == "pos_folded") {
++      auto const &box_geo = *get_system()->box_geo;
++      auto const getter = [&box_geo](Particle const &p) {
++        return box_geo.folded_position(p.pos());
++      };
++      return get_particles_properties<Utils::Vector3d>(
++          m_id_selection, getter, context(), *get_cell_structure());
++    }
++
++    // handle all other particle properties using expensive MPI reductions
++    if (!context()->is_head_node()) {
++      return {};
++    }
++    std::vector<Variant> result;
++    result.reserve(m_id_selection.size());
++    auto so = std::dynamic_pointer_cast<ParticleModifier>(
++        context()->make_shared("Particles::ParticleModifier",
++                               {{"id", -1},
++                                {"__cell_structure", m_cell_structure.lock()},
++                                {"__bonded_ias", m_bonded_ias.lock()}}));
++    for (int pid : m_id_selection) {
++      so->set_pid(pid);
++      result.emplace_back(so->get_parameter(param_name));
++    }
++    return result;
++  }
++
+   if (not context()->is_head_node()) {
+     return {};
+   }
+diff --git a/src/script_interface/particle_data/ParticleSlice.hpp b/src/script_interface/particle_data/ParticleSlice.hpp
+index cb8dad90b39..4616da79251 100644
+--- a/src/script_interface/particle_data/ParticleSlice.hpp
++++ b/src/script_interface/particle_data/ParticleSlice.hpp
+@@ -22,6 +22,7 @@
+ #include "ParticleHandle.hpp"
+ 
+ #include "script_interface/ScriptInterface.hpp"
++#include "script_interface/Variant.hpp"
+ #include "script_interface/auto_parameters/AutoParameters.hpp"
+ #include "script_interface/cell_system/CellSystem.hpp"
+ #include "script_interface/get_value.hpp"
+@@ -29,8 +30,16 @@
+ 
+ #include "core/system/System.hpp"
+ 
++#include <utils/mpi/gather_buffer.hpp>
++
++#include <algorithm>
++#include <cassert>
++#include <functional>
+ #include <memory>
++#include <ranges>
+ #include <string>
++#include <string_view>
++#include <utility>
+ #include <vector>
+ 
+ namespace ScriptInterface {
+@@ -61,6 +70,47 @@ struct SetParticleParametersVisitor {
+   }
+ };
+ 
++template <typename T>
++inline auto
++get_particles_properties(std::vector<int> const &pids,
++                         std::function<T(Particle const &)> const &getter,
++                         Context *context,
++                         CellStructure const &cell_structure) {
++
++  using value_type =
++      std::conditional_t<Variant::has_type<std::vector<T>>::value, T, Variant>;
++  std::vector<value_type> result;
++
++  auto const n_ranks = static_cast<std::size_t>(context->get_comm().size());
++  auto const size_hint = pids.size() / n_ranks;
++  std::vector<std::pair<int, T>> parameters;
++  parameters.reserve(size_hint);
++  for (auto const &pid : pids) {
++    auto const p = cell_structure.get_local_particle(pid);
++    if (p and not p->is_ghost()) {
++      parameters.emplace_back(pid, getter(*p));
++    }
++  }
++
++  // collect values from all nodes
++  Utils::Mpi::gather_buffer(parameters, context->get_comm(), 0);
++  if (!context->is_head_node()) {
++    return result;
++  }
++
++  // sort values by particle id to retain original order
++  auto const projector = [](auto const &pair) { return pair.first; };
++  std::ranges::sort(parameters, std::less<int>{}, projector);
++  assert(std::ranges::equal(pids, parameters | std::views::keys) &&
++         "Missing or duplicate particle ids");
++
++  result.reserve(pids.size());
++  for (auto const &value : parameters | std::views::values) {
++    result.emplace_back(std::move(value));
++  }
++  return result;
++}
++
+ class ParticleSlice : public AutoParameters<ParticleSlice> {
+   std::vector<int> m_id_selection;
+   int m_chunk_size;
+@@ -69,7 +119,7 @@ class ParticleSlice : public AutoParameters<ParticleSlice> {
+   std::weak_ptr<::System::System> m_system;
+   /** @brief Data structure to store names of parameters with special setters.
+    */
+-  std::set<std::string> m_special_parameters{
++  std::set<std::string_view> const m_special_parameters{
+       "pos",        "type", "bonds",
+ #ifdef ESPRESSO_ELECTROSTATICS
+       "q",
+diff --git a/src/script_interface/tests/CMakeLists.txt b/src/script_interface/tests/CMakeLists.txt
+index 35c0c5711d0..69897c2a925 100644
+--- a/src/script_interface/tests/CMakeLists.txt
++++ b/src/script_interface/tests/CMakeLists.txt
+@@ -58,4 +58,7 @@ espresso_unit_test(
+   espresso::script_interface Boost::mpi MPI::MPI_CXX NUM_PROC 2)
+ espresso_unit_test(
+   SRC ParticleSlice_test.cpp DEPENDS espresso::core espresso::script_interface
+-  espresso::instrumentation Boost::mpi MPI::MPI_CXX NUM_PROC 1)
++  Boost::mpi MPI::MPI_CXX NUM_PROC 1)
++espresso_unit_test(
++  SRC get_particles_properties_test.cpp DEPENDS espresso::core
++  espresso::script_interface Boost::mpi MPI::MPI_CXX NUM_PROC 2)
+diff --git a/src/script_interface/tests/get_particles_properties_test.cpp b/src/script_interface/tests/get_particles_properties_test.cpp
+new file mode 100644
+index 00000000000..1c124f5e724
+--- /dev/null
++++ b/src/script_interface/tests/get_particles_properties_test.cpp
+@@ -0,0 +1,91 @@
++/*
++ * Copyright (C) 2025 The ESPResSo project
++ *
++ * This file is part of ESPResSo.
++ *
++ * ESPResSo is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * ESPResSo is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#define BOOST_TEST_MODULE "particle property parallel getters"
++#define BOOST_TEST_DYN_LINK
++
++#include <boost/test/unit_test.hpp>
++
++#include "script_interface/Context.hpp"
++#include "script_interface/LocalContext.hpp"
++#include "script_interface/Variant.hpp"
++#include "script_interface/particle_data/ParticleSlice.hpp"
++
++#include "core/Particle.hpp"
++#include "core/cell_system/CellStructure.hpp"
++#include "core/unit_tests/EspressoCoreGlobalConfig.hpp"
++#include "core/unit_tests/ParticleFactory.hpp"
++
++#include <utils/Factory.hpp>
++#include <utils/Vector.hpp>
++
++#include <boost/mpi/graph_communicator.hpp>
++#include <boost/test/tools/old/interface.hpp>
++
++#include <algorithm>
++#include <functional>
++#include <memory>
++#include <vector>
++
++using namespace ScriptInterface;
++
++namespace espresso {
++// ESPResSo system instance
++static std::shared_ptr<::System::System> system;
++} // namespace espresso
++
++struct GlobalConfig : public EspressoCoreGlobalConfig {
++  GlobalConfig() {
++    espresso::system = ::System::System::create();
++    espresso::system->set_cell_structure_topology(CellStructureType::REGULAR);
++    ::System::set_system(espresso::system);
++  }
++  ~GlobalConfig() {
++    espresso::system.reset();
++    ::System::reset_system();
++  }
++};
++
++BOOST_TEST_GLOBAL_CONFIGURATION(GlobalConfig);
++
++BOOST_FIXTURE_TEST_CASE(test_get_particles_properties, ParticleFactory) {
++  // particle ids and types
++  std::vector<int> pids{0, 1, 2, 3, 4};
++  std::vector<int> expected_types{1, 0, 3, 2, 2};
++
++  Utils::Factory<ObjectHandle> f;
++  boost::mpi::communicator comm;
++  auto ctx = std::make_shared<LocalContext>(f, comm);
++
++  auto const get_type = [](Particle const &p) { return p.type(); };
++
++  // Create particle core objects
++  create_particle(Utils::Vector3d{0., 0., 0.}, 1, 0);
++  create_particle(Utils::Vector3d{0., 0., 0.}, 0, 1);
++  create_particle(Utils::Vector3d{0., 0., 0.}, 2, 3);
++  create_particle(Utils::Vector3d{0., 0., 0.}, 4, 2);
++  create_particle(Utils::Vector3d{0., 0., 0.}, 3, 2);
++
++  auto const result = Particles::get_particles_properties<int>(
++      pids, get_type, ctx.get(), *espresso::system->cell_structure);
++
++  if (comm.rank() == 0) {
++    BOOST_CHECK(std::ranges::equal(result, expected_types));
++  }
++}
+diff --git a/testsuite/python/particle_slice.py b/testsuite/python/particle_slice.py
+index b87eb8fb3e3..64a7890b1a6 100644
+--- a/testsuite/python/particle_slice.py
++++ b/testsuite/python/particle_slice.py
+@@ -90,8 +90,19 @@ def test_pos_str(self):
+         self.assertEqual(repr(self.p0p1.pos),
+                          repr(np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]])))
+ 
++    def test_pos(self):
++        box_l = self.system.box_l
++        self.p0.pos = [-1, 2, box_l[2] + 3]
++        self.p1.pos = [0, 0, 1]
++        np.testing.assert_equal(
++            np.copy(self.p0p1.image_box), [[-1, 0, 1], [0, 0, 0]])
++        np.testing.assert_allclose(
++            np.copy(self.p0p1.pos), [[-1, 2, box_l[2] + 3], [0, 0, 1]])
++        np.testing.assert_allclose(
++            np.copy(self.p0p1.pos_folded), [[box_l[0] - 1, 2, 3], [0, 0, 1]])
++
+     @utx.skipIfMissingFeatures(["ELECTROSTATICS"])
+-    def test_scalar(self):
++    def test_charges(self):
+         self.p0.q = 1.3
+         self.assertEqual(self.p0.q, 1.3)
+         self.p0p1.q = 2.0

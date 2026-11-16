@@ -1,0 +1,1509 @@
+diff --git a/src/colvarcomp_coordnums.cpp b/src/colvarcomp_coordnums.cpp
+index 6e70d586e..6b7dfe976 100644
+--- a/src/colvarcomp_coordnums.cpp
++++ b/src/colvarcomp_coordnums.cpp
+@@ -26,14 +26,9 @@ class colvar::coordnum::coordnum_gpu_impl_t {
+     d_pairlist(nullptr), d_coordnum(nullptr),
+     d_com_grad_tmp{nullptr, nullptr},
+     d_com_grad_out{nullptr, nullptr},
+-    d_tbcount(nullptr), pairlist_transposed(false),
+-    numTiles(0), tileListsSize(0),
+-    d_tileLists(nullptr), d_tileListsStart(nullptr),
+-    d_tileListsLen(nullptr),
+-    d_tilePairList_32(nullptr),
+-    d_tilePairListSelf_32(nullptr),
+-    d_tilePairList_64(nullptr),
+-    d_tilePairListSelf_64(nullptr),
++    d_tbcount(nullptr),
++    coordNumPairList(cpu_coordnum_in->cvmodule),
++    selfCoordNumTileList(cpu_coordnum_in->cvmodule),
+     h_coordnum(nullptr) {}
+   ~coordnum_gpu_impl_t() {
+     colvarproxy* p = cvmodule->proxy;
+@@ -45,13 +40,6 @@ class colvar::coordnum::coordnum_gpu_impl_t {
+     p->deallocate_device(&d_com_grad_tmp[1]);
+     p->deallocate_device(&d_com_grad_out[0]);
+     p->deallocate_device(&d_com_grad_out[1]);
+-    p->deallocate_device(&d_tileLists);
+-    p->deallocate_device(&d_tileListsStart);
+-    p->deallocate_device(&d_tileListsLen);
+-    p->deallocate_device(&d_tilePairList_32);
+-    p->deallocate_device(&d_tilePairListSelf_32);
+-    p->deallocate_device(&d_tilePairList_64);
+-    p->deallocate_device(&d_tilePairListSelf_64);
+   }
+   int init() {
+     int error_code = COLVARS_OK;
+@@ -59,8 +47,11 @@ class colvar::coordnum::coordnum_gpu_impl_t {
+     error_code |= p->reallocate_device(&d_coordnum, 1);
+     error_code |= p->reallocate_device(&d_tbcount, 1);
+     error_code |= p->reallocate_host(&h_coordnum, 1);
++    const std::string function_type = cvc->function_type();
+     if (cvc->b_enable_pairlist) {
+-      if (cvc->function_type() != "selfCoordNum") {
++      if ((function_type != "selfCoordNum") &&
++          ((function_type != "coordNum") || cvc->b_group1_center_only ||
++           cvc->b_group2_center_only)) {
+         error_code |= p->reallocate_device(&d_pairlist, cvc->num_pairs);
+         error_code |= p->clear_device_array(d_pairlist, cvc->num_pairs);
+       }
+@@ -68,7 +59,7 @@ class colvar::coordnum::coordnum_gpu_impl_t {
+     error_code |= p->clear_device_array(d_coordnum, 1);
+     error_code |= p->clear_device_array(d_tbcount, 1);
+     h_coordnum[0] = 0;
+-    if (cvc->function_type() != "selfCoordNum") {
++    if (function_type != "selfCoordNum") {
+       if (cvc->b_group1_center_only || cvc->b_group2_center_only) {
+         error_code |= p->reallocate_device(&d_com_grad_tmp[0], 1);
+         error_code |= p->reallocate_device(&d_com_grad_tmp[1], 1);
+@@ -79,12 +70,22 @@ class colvar::coordnum::coordnum_gpu_impl_t {
+         error_code |= p->clear_device_array(d_com_grad_out[0], 1);
+         error_code |= p->clear_device_array(d_com_grad_out[1], 1);
+       }
+-      pairlist_transposed = cvc->group1->size() > cvc->group2->size();
+     }
+     return error_code;
+   }
+   int calc_value_two_groups(int flags) {
+     int error_code = COLVARS_OK;
++    if (cvc->b_enable_pairlist) {
++      if (!coordNumPairList.initialized) {
++        colvarproxy* p = cvmodule->proxy;
++        const unsigned int gpu_warp_size = p->gpu_warp_size();
++        error_code |= coordNumPairList.preparePairList(
++          cvc->group1->size(), cvc->group2->size(), gpu_warp_size, cvc->get_stream());
++        if (error_code != COLVARS_OK) {
++          return error_code;
++        }
++      }
++    }
+     // NOTE: We pass boundary_conditions as a function argument from CPU, so this is not necessary
+     // for the time being, but it may be useful if the boundary_conditions is GPU-resident.
+     // error_code |= checkGPUError(cudaStreamWaitEvent(
+@@ -102,7 +103,9 @@ class colvar::coordnum::coordnum_gpu_impl_t {
+       cvc->inv_r0_vec, cvc->inv_r0sq_vec, cvc->boundary_conditions,
+       cvc->group1->get_gpu_atom_group()->get_gpu_buffers().d_atoms_grad,
+       cvc->group2->get_gpu_atom_group()->get_gpu_buffers().d_atoms_grad,
+-      cvc->tolerance, cvc->tolerance_l2_max, d_pairlist, d_tbcount,
++      cvc->tolerance, cvc->tolerance_l2_max,
++      coordNumPairList.d_tilePairList_32,
++      coordNumPairList.d_tilePairList_64, d_tbcount,
+       d_coordnum, h_coordnum, flags, cvc->get_stream(), cvmodule);
+     error_code |= checkGPUError(cudaEventRecord(
+       cvc->get_event(cvc::event_type::calc_value), cvc->get_stream()));
+@@ -188,118 +191,13 @@ class colvar::coordnum::coordnum_gpu_impl_t {
+     }
+     return error_code;
+   }
+-  // NOTE: Maybe it is better to build tile lists on GPU if we
+-  // want to exclude non-interacting tiles periodically like NAMD.
+-  int buildTileLists(const unsigned int tileSize, cudaStream_t stream) {
+-    int error_code = COLVARS_OK;
+-    colvarproxy* p = cvmodule->proxy;
+-    const unsigned int numAtoms = cvc->group1->size();
+-    numTiles = (numAtoms + tileSize - 1) / tileSize;
+-    const unsigned int numTileInteractions = numTiles * (numTiles - 1) / 2;
+-    const unsigned int maxNumInteractionsPerTile =
+-      (numTileInteractions + numTiles - 1) / numTiles;
+-    tileListsSize = numTiles * maxNumInteractionsPerTile;
+-    tileListsLen.assign(numTiles, 0);
+-    tileListsStart.assign(numTiles, 0);
+-    tileLists.assign(tileListsSize, 0);
+-    /**
+-      for (unsigned int i = 0; i < numTiles; ++i) {
+-        tileListsStart[i] = i * maxNumInteractionsPerTile;
+-        const unsigned int jStart = i + 1;
+-        const unsigned int jEnd = std::min(numTiles, jStart + maxNumInteractionsPerTile);
+-        for (unsigned int j = jStart; j < jEnd; ++j) {
+-          const unsigned int offset = tileListsLen[i]++;
+-          const unsigned int pos = i * maxNumInteractionsPerTile;
+-          tileLists[pos+offset] = j;
+-        }
+-        for (unsigned int j = jEnd; j < numTiles; ++j) {
+-          const unsigned int offset = tileListsLen[j]++;
+-          const unsigned int pos = j * maxNumInteractionsPerTile;
+-          tileLists[pos+offset] = i;
+-        }
+-      }
+-      * @note The following loop is a more refined version of the loop above
+-    */
+-    for (unsigned int i = 0; i < numTiles; ++i) {
+-      const unsigned int jStart = i + 1;
+-      const unsigned int jEnd = std::min(numTiles, jStart + maxNumInteractionsPerTile);
+-      const unsigned int posStart = i * maxNumInteractionsPerTile;
+-      tileListsLen[i] += jEnd - jStart;
+-      tileListsStart[i] = posStart;
+-      for (unsigned int j = jStart; j < jEnd; ++j) {
+-        const unsigned int offset = j - jStart;
+-        tileLists[posStart+offset] = j;
+-      }
+-      if (i > maxNumInteractionsPerTile) {
+-        tileListsLen[i] += i - maxNumInteractionsPerTile;
+-        for (unsigned int k = 0; k < i - maxNumInteractionsPerTile; ++k) {
+-          const unsigned int offset = jEnd - jStart + k;
+-          tileLists[posStart+offset] = k;
+-        }
+-      }
+-    }
+-#if 0
+-    if constexpr (cvm::debug()) {
+-      for (unsigned int i = 0; i < numTiles; ++i) {
+-        const unsigned int pos = tileListsStart[i];
+-        const unsigned int len = tileListsLen[i];
+-        const auto begin = tileLists.begin() + pos;
+-        const auto end = begin + len;
+-        std::string s = "Tilelist[" + cvm::to_str(int(i)) + "], start = " +
+-                        cvm::to_str(int(pos)) + " size = " + cvm::to_str(int(len)) +
+-                        ", data = [";
+-        for (auto it = begin; it != end; ++it) {
+-          const unsigned int tile = *it;
+-          s += " " + cvm::to_str((int)tile);
+-        }
+-        s += "]\n";
+-        cvmodule->log(s);
+-      }
+-    }
+-#endif
+-    error_code |= p->deallocate_device_async(&d_tileLists, stream);
+-    error_code |= p->deallocate_device_async(&d_tileListsStart, stream);
+-    error_code |= p->deallocate_device_async(&d_tileListsLen, stream);
+-    error_code |= p->allocate_device_async(&d_tileLists, tileListsSize, stream);
+-    error_code |= p->allocate_device_async(&d_tileListsStart, numTiles, stream);
+-    error_code |= p->allocate_device_async(&d_tileListsLen, numTiles, stream);
+-    error_code |= p->copy_HtoD_async(tileLists.data(), d_tileLists, tileListsSize, stream);
+-    error_code |= p->copy_HtoD_async(tileListsStart.data(), d_tileListsStart, numTiles, stream);
+-    error_code |= p->copy_HtoD_async(tileListsLen.data(), d_tileListsLen, numTiles, stream);
+-    // Allocate tilePairLists
+-    if (cvc->b_enable_pairlist) {
+-      switch (tileSize) {
+-        case 32: {
+-          error_code |= p->deallocate_device_async(&d_tilePairListSelf_32, stream);
+-          error_code |= p->deallocate_device_async(&d_tilePairList_32, stream);
+-          error_code |= p->allocate_device_async(&d_tilePairListSelf_32, numTiles, stream);
+-          error_code |= p->allocate_device_async(&d_tilePairList_32, tileListsSize, stream);
+-          error_code |= p->clear_device_array_async(d_tilePairListSelf_32, numTiles, stream);
+-          error_code |= p->clear_device_array_async(d_tilePairList_32, tileListsSize, stream);
+-          break;
+-        }
+-        case 64: {
+-          error_code |= p->deallocate_device_async(&d_tilePairListSelf_64, stream);
+-          error_code |= p->deallocate_device_async(&d_tilePairList_64, stream);
+-          error_code |= p->allocate_device_async(&d_tilePairListSelf_64, numTiles, stream);
+-          error_code |= p->allocate_device_async(&d_tilePairList_64, tileListsSize, stream);
+-          error_code |= p->clear_device_array_async(d_tilePairListSelf_64, numTiles, stream);
+-          error_code |= p->clear_device_array_async(d_tilePairList_64, tileListsSize, stream);
+-          break;
+-        }
+-        default: {
+-          error_code |= cvmodule->error("Unsupported tileSize (" + cvm::to_str((int)tileSize) + ") in buildTileLists.\n");
+-        }
+-      }
+-    }
+-    return error_code;
+-  }
+   int calc_value_self_group(int flags) {
+     int error_code = COLVARS_OK;
+-    if (d_tileListsStart == nullptr) {
++    if (selfCoordNumTileList.d_tileListsStart == nullptr) {
+       colvarproxy* p = cvmodule->proxy;
+       const unsigned int gpu_warp_size = p->gpu_warp_size();
+-      error_code |= buildTileLists(gpu_warp_size, cvc->get_stream());
++      error_code |= selfCoordNumTileList.buildTileLists(
++        cvc->group1->size(), cvc->b_enable_pairlist, gpu_warp_size, cvc->get_stream());
+     }
+     error_code |= checkGPUError(cudaStreamWaitEvent(
+       cvc->get_stream(), cvmodule->proxy->get_event(colvarproxy_gpu::event_type::update_lattice)));
+@@ -311,10 +209,10 @@ class colvar::coordnum::coordnum_gpu_impl_t {
+       cvc->group1->size(), cvc->en, cvc->ed, cvc->inv_r0_vec, cvc->inv_r0sq_vec,
+       cvc->boundary_conditions,
+       cvc->group1->get_gpu_atom_group()->get_gpu_buffers().d_atoms_grad,
+-      d_tileLists, d_tileListsStart, d_tileListsLen,
++      selfCoordNumTileList.d_tileLists, selfCoordNumTileList.d_tileListsStart, selfCoordNumTileList.d_tileListsLen,
+       cvc->tolerance, cvc->tolerance_l2_max, d_pairlist,
+-      d_tilePairListSelf_32, d_tilePairList_32,
+-      d_tilePairListSelf_64, d_tilePairList_64,
++      selfCoordNumTileList.d_tilePairListSelf_32, selfCoordNumTileList.d_tilePairList_32,
++      selfCoordNumTileList.d_tilePairListSelf_64, selfCoordNumTileList.d_tilePairList_64,
+       d_tbcount, d_coordnum, h_coordnum, flags, cvc->get_stream(), cvmodule);
+     error_code |= checkGPUError(cudaEventRecord(
+       cvc->get_event(cvc::event_type::calc_value), cvc->get_stream()));
+@@ -332,26 +230,156 @@ class colvar::coordnum::coordnum_gpu_impl_t {
+   cvm::rvector* d_com_grad_tmp[2];
+   cvm::rvector* d_com_grad_out[2];
+   unsigned int* d_tbcount;
+-  // pairlist_transposed is for debugging (if you want to see if the GPU pairlist matches the CPU result you need to check this flag).
+-  bool pairlist_transposed;
+-  /**
+-   * @name Tile lists for self coordnum
+-   */
+-  ///@[
+-  using tl_vec_t = std::vector<unsigned int, colvars_gpu::CudaHostAllocator<unsigned int>>;
+-  tl_vec_t tileListsLen;
+-  tl_vec_t tileListsStart;
+-  tl_vec_t tileLists;
+-  unsigned int numTiles;
+-  unsigned int tileListsSize;
+-  unsigned int* d_tileLists;
+-  unsigned int* d_tileListsStart;
+-  unsigned int* d_tileListsLen;
+-  colvars_gpu::TilePairMask<32>* d_tilePairList_32;
+-  colvars_gpu::TilePairMask<32>* d_tilePairListSelf_32;
+-  colvars_gpu::TilePairMask<64>* d_tilePairList_64;
+-  colvars_gpu::TilePairMask<64>* d_tilePairListSelf_64;
+-  ///@]
++  struct coordNumPairListT {
++    /**
++     * @name Tile-based pairlist for two-group coordnum
++     */
++    ///@[
++    colvars_gpu::TilePairMask<32>* d_tilePairList_32 = nullptr;
++    colvars_gpu::TilePairMask<64>* d_tilePairList_64 = nullptr;
++    ///@]
++    bool initialized = false;
++    colvarmodule* cvmodule;
++    coordNumPairListT(colvarmodule* cvmodule_in): cvmodule(cvmodule_in) {}
++    ~coordNumPairListT() {
++      colvarproxy* p = cvmodule->proxy;
++      p->deallocate_device(&d_tilePairList_32);
++      p->deallocate_device(&d_tilePairList_64);
++    }
++    int preparePairList(const unsigned int numAtoms1,
++                        const unsigned int numAtoms2,
++                        const unsigned int tileSize,
++                        cudaStream_t stream) {
++      int error_code = COLVARS_OK;
++      const unsigned int numAtomsInLargeGroup = numAtoms1 < numAtoms2 ? numAtoms2 : numAtoms1;
++      const unsigned int numAtomsInSmallGroup = numAtoms1 < numAtoms2 ? numAtoms1 : numAtoms2;
++      const unsigned int numTilesInGroup1 = (numAtomsInLargeGroup + tileSize - 1) / tileSize;
++      const unsigned int numTilesInGroup2 = (numAtomsInSmallGroup + tileSize - 1) / tileSize;
++      const size_t tileListsSize = (size_t)numTilesInGroup1 * (size_t)numTilesInGroup2;
++      colvarproxy* p = cvmodule->proxy;
++      switch (tileSize) {
++        case 32: {
++          error_code |= p->deallocate_device_async(&d_tilePairList_32, stream);
++          error_code |= p->allocate_device_async(&d_tilePairList_32, tileListsSize, stream);
++          error_code |= p->clear_device_array_async(d_tilePairList_32, tileListsSize, stream);
++          break;
++        }
++        case 64: {
++          error_code |= p->deallocate_device_async(&d_tilePairList_64, stream);
++          error_code |= p->allocate_device_async(&d_tilePairList_64, tileListsSize, stream);
++          error_code |= p->clear_device_array_async(d_tilePairList_64, tileListsSize, stream);
++          break;
++        }
++        default: {
++          error_code |= cvmodule->error("Unsupported tileSize (" + cvm::to_str((int)tileSize) + ") in preparePairList.\n");
++        }
++      };
++      initialized = true;
++      return error_code;
++    }
++  } coordNumPairList;
++  struct selfCoordNumTileListT {
++    /**
++    * @name Tile lists for self coordnum
++    */
++    ///@[
++    using tl_vec_t = std::vector<unsigned int, colvars_gpu::CudaHostAllocator<unsigned int>>;
++    tl_vec_t tileListsLen;
++    tl_vec_t tileListsStart;
++    tl_vec_t tileLists;
++    unsigned int numTiles = 0;
++    unsigned int tileListsSize = 0;
++    unsigned int* d_tileLists = nullptr;
++    unsigned int* d_tileListsStart  = nullptr;
++    unsigned int* d_tileListsLen  = nullptr;
++    colvars_gpu::TilePairMask<32>* d_tilePairList_32 = nullptr;
++    colvars_gpu::TilePairMask<32>* d_tilePairListSelf_32 = nullptr;
++    colvars_gpu::TilePairMask<64>* d_tilePairList_64 = nullptr;
++    colvars_gpu::TilePairMask<64>* d_tilePairListSelf_64 = nullptr;
++    ///@]
++    colvarmodule* cvmodule;
++    selfCoordNumTileListT(colvarmodule* cvmodule_in): cvmodule(cvmodule_in) {}
++    ~selfCoordNumTileListT() {
++      colvarproxy* p = cvmodule->proxy;
++      p->deallocate_device(&d_tileLists);
++      p->deallocate_device(&d_tileListsStart);
++      p->deallocate_device(&d_tileListsLen);
++      p->deallocate_device(&d_tilePairList_32);
++      p->deallocate_device(&d_tilePairListSelf_32);
++      p->deallocate_device(&d_tilePairList_64);
++      p->deallocate_device(&d_tilePairListSelf_64);
++    }
++    int buildTileLists(const unsigned int numAtoms,
++                       const bool b_enable_pairlist,
++                       const unsigned int tileSize,
++                       cudaStream_t stream) {
++      int error_code = COLVARS_OK;
++      colvarproxy* p = cvmodule->proxy;
++      // const unsigned int numAtoms = cvc->group1->size();
++      numTiles = (numAtoms + tileSize - 1) / tileSize;
++      const unsigned int numTileInteractions = numTiles * (numTiles - 1) / 2;
++      const unsigned int maxNumInteractionsPerTile =
++        (numTileInteractions + numTiles - 1) / numTiles;
++      tileListsSize = numTiles * maxNumInteractionsPerTile;
++      tileListsLen.assign(numTiles, 0);
++      tileListsStart.assign(numTiles, 0);
++      tileLists.assign(tileListsSize, 0);
++      for (unsigned int i = 0; i < numTiles; ++i) {
++        const unsigned int jStart = i + 1;
++        const unsigned int jEnd = std::min(numTiles, jStart + maxNumInteractionsPerTile);
++        const unsigned int posStart = i * maxNumInteractionsPerTile;
++        tileListsLen[i] += jEnd - jStart;
++        tileListsStart[i] = posStart;
++        for (unsigned int j = jStart; j < jEnd; ++j) {
++          const unsigned int offset = j - jStart;
++          tileLists[posStart+offset] = j;
++        }
++        if (i > maxNumInteractionsPerTile) {
++          tileListsLen[i] += i - maxNumInteractionsPerTile;
++          for (unsigned int k = 0; k < i - maxNumInteractionsPerTile; ++k) {
++            const unsigned int offset = jEnd - jStart + k;
++            tileLists[posStart+offset] = k;
++          }
++        }
++      }
++      error_code |= p->deallocate_device_async(&d_tileLists, stream);
++      error_code |= p->deallocate_device_async(&d_tileListsStart, stream);
++      error_code |= p->deallocate_device_async(&d_tileListsLen, stream);
++      error_code |= p->allocate_device_async(&d_tileLists, tileListsSize, stream);
++      error_code |= p->allocate_device_async(&d_tileListsStart, numTiles, stream);
++      error_code |= p->allocate_device_async(&d_tileListsLen, numTiles, stream);
++      error_code |= p->copy_HtoD_async(tileLists.data(), d_tileLists, tileListsSize, stream);
++      error_code |= p->copy_HtoD_async(tileListsStart.data(), d_tileListsStart, numTiles, stream);
++      error_code |= p->copy_HtoD_async(tileListsLen.data(), d_tileListsLen, numTiles, stream);
++      // Allocate tilePairLists
++      if (b_enable_pairlist) {
++        switch (tileSize) {
++          case 32: {
++            error_code |= p->deallocate_device_async(&d_tilePairListSelf_32, stream);
++            error_code |= p->deallocate_device_async(&d_tilePairList_32, stream);
++            error_code |= p->allocate_device_async(&d_tilePairListSelf_32, numTiles, stream);
++            error_code |= p->allocate_device_async(&d_tilePairList_32, tileListsSize, stream);
++            error_code |= p->clear_device_array_async(d_tilePairListSelf_32, numTiles, stream);
++            error_code |= p->clear_device_array_async(d_tilePairList_32, tileListsSize, stream);
++            break;
++          }
++          case 64: {
++            error_code |= p->deallocate_device_async(&d_tilePairListSelf_64, stream);
++            error_code |= p->deallocate_device_async(&d_tilePairList_64, stream);
++            error_code |= p->allocate_device_async(&d_tilePairListSelf_64, numTiles, stream);
++            error_code |= p->allocate_device_async(&d_tilePairList_64, tileListsSize, stream);
++            error_code |= p->clear_device_array_async(d_tilePairListSelf_64, numTiles, stream);
++            error_code |= p->clear_device_array_async(d_tilePairList_64, tileListsSize, stream);
++            break;
++          }
++          default: {
++            error_code |= cvmodule->error("Unsupported tileSize (" + cvm::to_str((int)tileSize) + ") in buildTileLists.\n");
++          }
++        }
++      }
++      return error_code;
++    }
++  } selfCoordNumTileList;
+ public:
+   cvm::real* h_coordnum;
+ };
+diff --git a/src/cuda/colvarcomp_coordnums_kernel.cu b/src/cuda/colvarcomp_coordnums_kernel.cu
+index a71a48687..58a91c55a 100644
+--- a/src/cuda/colvarcomp_coordnums_kernel.cu
++++ b/src/cuda/colvarcomp_coordnums_kernel.cu
+@@ -36,7 +36,7 @@ __global__ void computeCoordinationNumberTwoGroupsCUDAKernel1(
+   cvm::real* __restrict gz2,
+   const cvm::real pairlist_tol,
+   const cvm::real pairlist_tol_l2_max,
+-  bool* __restrict pairlist,
++  TilePairMask<tileSize>* __restrict tlPairList,
+   unsigned int* __restrict tbcount,
+   cvm::real* __restrict coordnum_tmp,
+   cvm::real* __restrict coordnum_out) {
+@@ -56,8 +56,8 @@ __global__ void computeCoordinationNumberTwoGroupsCUDAKernel1(
+   constexpr unsigned int numTilesPerBlock = blockSize / tileSize;
+   // Shared memory buffers for atoms in group2
+   __shared__ double3 shJGrad[numTilesPerBlock][tileSize];
+-  using pairmask_t = std::conditional_t<(tileSize <= 32), uint32_t, uint64_t>;
+-  pairmask_t pairmask;
++  using PairMaskT = typename TilePairMask<tileSize>::PairMaskT;
++  PairMaskT pairMask;
+   __shared__ bool isLastBlockDone;
+   // Total coordnum
+   cvm::real ei = 0;
+@@ -78,38 +78,34 @@ __global__ void computeCoordinationNumberTwoGroupsCUDAKernel1(
+     const cvm::real z1 = mask_i ? pos1z[tid] : 0;
+     double3 iGrad{0, 0, 0};
+     // Load atom j from group2
+-    // TODO: In the future, we may build neighbor list of tiles.
+-    //       We can sort the atoms in group1 and group2 spatially,
+-    //       and then build a neighbor list of interacting tiles
+-    //       by comparing the distances between tile bounding boxes
+-    //       with a cutoff. However, currently it is unclear to me
+-      //       whether Colvars developers would accept the idea of
+-    //       allowing re-sorting atoms dynamically in atom groups.
+     for (unsigned int jTileIndex = 0; jTileIndex < numTilesInGroup2; ++jTileIndex) {
++      if constexpr (use_pairlist && rebuild_pairlist) {
++        pairMask = PairMaskT(0);
++      }
++      if constexpr (use_pairlist && !rebuild_pairlist) {
++        const unsigned int l = iTile * numTilesInGroup2 + jTileIndex;
++        pairMask = tlPairList[l].pairMask[threadIndexInTile];
++        // Skip the entire tile if there is no interaction
++#if defined (COLVARS_HIP)
++        // For ROCm 6.x, there is no __any_sync, so I have to use this workaround.
++        const bool tileHasNoInteraction = !(__any(pairMask != PairMaskT(0)));
++        COLVARS_SYNC_WARP;
++        if (tileHasNoInteraction) continue;
++#else
++        // For other platforms, I assume that they have cooperative groups properly supported.
++        if (!tilePartition.any(pairMask != PairMaskT(0))) continue;
++#endif
++      }
+       const unsigned int jid_global = jTileIndex * tileSize + threadIndexInTile;
+       const bool mask_j = jid_global < numAtoms2;
+       const cvm::real jx2 = mask_j ? pos2x[jid_global] : 0;
+       const cvm::real jy2 = mask_j ? pos2y[jid_global] : 0;
+       const cvm::real jz2 = mask_j ? pos2z[jid_global] : 0;
+-      if constexpr (use_pairlist) {
+-        pairmask = pairmask_t(0);
+-      }
+       if constexpr (gradients) {
+         shJGrad[tileIndexInBlock][threadIndexInTile].x = 0;
+         shJGrad[tileIndexInBlock][threadIndexInTile].y = 0;
+         shJGrad[tileIndexInBlock][threadIndexInTile].z = 0;
+       }
+-      if constexpr (use_pairlist && !(rebuild_pairlist)) {
+-        // TODO: Optimize the d_pairlist by using a bit array
+-        #pragma unroll
+-        for (unsigned int t = 0; t < tileSize; ++t) {
+-          const unsigned int jid = jTileIndex * tileSize + t;
+-          const bool mask_jid = jid < numAtoms2;
+-          const size_t pairlistID = (size_t)tid + (size_t)jid * (size_t)numAtoms1;
+-          const bool b = (mask_i && mask_jid) ? pairlist[pairlistID] : false;
+-          pairmask |= (pairmask_t)b << t;
+-        }
+-      }
+       tilePartition.sync();
+       #pragma unroll 4
+       for (unsigned int t = 0; t < tileSize; ++t) {
+@@ -118,11 +114,16 @@ __global__ void computeCoordinationNumberTwoGroupsCUDAKernel1(
+         const cvm::real x2 = tilePartition.shfl(jx2, jid);
+         const cvm::real y2 = tilePartition.shfl(jy2, jid);
+         const cvm::real z2 = tilePartition.shfl(jz2, jid);
++        bool pairlist_elem = true;
+         // NOTE: Using shfl_xor to sum the j-atom gradients
+         // may be slower.
+         if (mask_i && mask_jid) {
+-          if constexpr (!(use_pairlist)) {
+-            ei += colvar::coordnum::compute_pair_coordnum<flags>(
++          if constexpr (use_pairlist && !rebuild_pairlist) {
++            pairlist_elem = (pairMask >> jid) & PairMaskT(1);
++          }
++          cvm::real partial = 0;
++          if (pairlist_elem) {
++            partial = colvar::coordnum::compute_pair_coordnum<flags>(
+               inv_r0_vec, inv_r0sq_vec, en, ed,
+               x1, y1, z1, x2, y2, z2,
+               iGrad.x, iGrad.y, iGrad.z,
+@@ -130,45 +131,18 @@ __global__ void computeCoordinationNumberTwoGroupsCUDAKernel1(
+               shJGrad[tileIndexInBlock][jid].y,
+               shJGrad[tileIndexInBlock][jid].z,
+               pairlist_tol, pairlist_tol_l2_max, bc);
+-          } else {
+-            if constexpr (!(rebuild_pairlist)) {
+-              bool within = (pairmask >> jid) & pairmask_t(1);
+-              if (within) {
+-                ei += colvar::coordnum::compute_pair_coordnum<flags>(
+-                  inv_r0_vec, inv_r0sq_vec, en, ed,
+-                  x1, y1, z1, x2, y2, z2,
+-                  iGrad.x, iGrad.y, iGrad.z,
+-                  shJGrad[tileIndexInBlock][jid].x,
+-                  shJGrad[tileIndexInBlock][jid].y,
+-                  shJGrad[tileIndexInBlock][jid].z,
+-                  pairlist_tol, pairlist_tol_l2_max, bc);
+-              }
+-            } else {
+-              const auto f = colvar::coordnum::compute_pair_coordnum<flags>(
+-                  inv_r0_vec, inv_r0sq_vec, en, ed,
+-                  x1, y1, z1, x2, y2, z2,
+-                  iGrad.x, iGrad.y, iGrad.z,
+-                  shJGrad[tileIndexInBlock][jid].x,
+-                  shJGrad[tileIndexInBlock][jid].y,
+-                  shJGrad[tileIndexInBlock][jid].z,
+-                  pairlist_tol, pairlist_tol_l2_max, bc);
+-              pairmask = (pairmask & ~(pairmask_t(1) << jid)) | ((pairmask_t)(f > 0.0) << jid);
+-              ei += f;
+-            }
++          }
++          ei += partial;
++          if constexpr (use_pairlist && rebuild_pairlist) {
++            pairlist_elem = partial > 0.0 ? true : false;
++            pairMask = (pairMask & ~(PairMaskT(1) << jid)) | ((PairMaskT)(pairlist_elem) << jid);
+           }
+         }
+         tilePartition.sync();
+       }
+       if constexpr (use_pairlist && rebuild_pairlist) {
+-        #pragma unroll
+-        for (unsigned int t = 0; t < tileSize; ++t) {
+-          const unsigned int jid = jTileIndex * tileSize + t;
+-          const bool mask_jid = jid < numAtoms2;
+-          if (mask_i && mask_jid) {
+-            const size_t pairlistID = (size_t)tid + (size_t)jid * (size_t)numAtoms1;
+-            pairlist[pairlistID] = ((pairmask >> t) & pairmask_t(1)) != 0;
+-          }
+-        }
++        const unsigned int l = iTile * numTilesInGroup2 + jTileIndex;
++        tlPairList[l].pairMask[threadIndexInTile] = pairMask;
+       }
+       if constexpr (gradients) {
+         if (mask_j) {
+@@ -220,7 +194,8 @@ int calc_value_coordnum_two_groups(
+   cvm::real* group1_grad, cvm::real* group2_grad,
+   cvm::real pairlist_tol,
+   cvm::real pairlist_tol_l2_max,
+-  bool* d_pairlist,
++  TilePairMask<32>* d_tlPairList_32,
++  TilePairMask<64>* d_tlPairList_64,
+   unsigned int* d_tbcount,
+   cvm::real* d_coordnum_tmp,
+   cvm::real* h_coordnum_out,
+@@ -234,7 +209,8 @@ int calc_value_coordnum_two_groups(
+       en, ed, inv_r0_vec, inv_r0sq_vec, bc,
+       group2_grad, group1_grad,
+       pairlist_tol, pairlist_tol_l2_max,
+-      d_pairlist, d_tbcount, d_coordnum_tmp,
++      d_tlPairList_32, d_tlPairList_64,
++      d_tbcount, d_coordnum_tmp,
+       h_coordnum_out, flags, stream, cvmodule
+     );
+   }
+@@ -250,6 +226,21 @@ int calc_value_coordnum_two_groups(
+   cvm::real* grad2x = group2_grad;
+   cvm::real* grad2y = grad2x + numAtoms2;
+   cvm::real* grad2z = grad2y + numAtoms2;
++  const int gpu_warp_size = cvmodule->proxy->gpu_warp_size();
++  void* d_tlPairList = nullptr;
++  switch (gpu_warp_size) {
++    case 32: {
++      d_tlPairList = (void*)d_tlPairList_32;
++      break;
++    }
++    case 64: {
++      d_tlPairList = (void*)d_tlPairList_64;
++      break;
++    }
++    default: {
++      return cvmodule->error("Unsupported warp size: " + cvm::to_str(gpu_warp_size) + "\n");
++    }
++  }
+   void* args[] = {
+     &pos1x, &pos1y, &pos1z,
+     &pos2x, &pos2y, &pos2z,
+@@ -260,25 +251,24 @@ int calc_value_coordnum_two_groups(
+     &grad1x, &grad1y, &grad1z,
+     &grad2x, &grad2y, &grad2z,
+     &pairlist_tol, &pairlist_tol_l2_max,
+-    &d_pairlist, &d_tbcount,
++    &d_tlPairList, &d_tbcount,
+     &d_coordnum_tmp, &h_coordnum_out
+   };
+-  const int warpSize = cvmodule->proxy->gpu_warp_size();
+   const unsigned int numBlocks = (numAtoms1 + default_block_size - 1) / default_block_size;
+   void* kernel = nullptr;
+ #if defined (COLVARS_CUDA)
+-#define CASE(N) case N: { switch (warpSize) { \
++#define CASE(N) case N: { switch (gpu_warp_size) { \
+     case 32: {kernel = (void*)computeCoordinationNumberTwoGroupsCUDAKernel1< \
+       0, 0, default_block_size, 32, N>; break;} \
+-    default: return cvmodule->error("Unimplemented warp size: " + cvm::to_str(warpSize));} \
++    default: return cvmodule->error("Unimplemented warp size: " + cvm::to_str(gpu_warp_size));} \
+   } break
+ #elif defined (COLVARS_HIP)
+-#define CASE(N) case N: { switch (warpSize) { \
++#define CASE(N) case N: { switch (gpu_warp_size) { \
+     case 32: {kernel = (void*)computeCoordinationNumberTwoGroupsCUDAKernel1< \
+       0, 0, default_block_size, 32, N>; break;} \
+     case 64: {kernel = (void*)computeCoordinationNumberTwoGroupsCUDAKernel1< \
+       0, 0, default_block_size, 64, N>; break;} \
+-    default: return cvmodule->error("Unimplemented warp size: " + cvm::to_str(warpSize));} \
++    default: return cvmodule->error("Unimplemented warp size: " + cvm::to_str(gpu_warp_size));} \
+   } break
+ #endif
+   switch (flags) {
+@@ -660,13 +650,6 @@ int calc_value_coordnum_com_to_com(
+   return error_code;
+ }
+ 
+-__inline__ __device__ size_t computeGlobalPairlistIDSelfGroup(
+-  size_t iid_global, size_t jid_global, size_t numAtoms) {
+-  const size_t iid = min(iid_global, jid_global);
+-  const size_t jid = max(iid_global, jid_global);
+-  return iid * (2 * numAtoms - 1 - iid) / 2 + (jid - iid - 1);
+-}
+-
+ template <int N, int M, int blockSize, int tileSize, int flags>
+ __global__ void computeCoordinationNumberSelfGroupCUDAKernel1(
+   const cvm::real* __restrict pos1x,
+@@ -738,9 +721,7 @@ __global__ void computeCoordinationNumberSelfGroupCUDAKernel1(
+       // NAMD/OpenMM style swizzling
+       const unsigned int jid = (t + threadIndexInTile) & (tileSize - 1);
+       const bool mask_t = tilePartition.shfl(mask_i, jid);
+-      // size_t pairlistID;
+       bool pairlist_elem = true;
+-      // unsigned int jid_global;
+       const cvm::real x2 = tilePartition.shfl(x1, jid);
+       const cvm::real y2 = tilePartition.shfl(y1, jid);
+       const cvm::real z2 = tilePartition.shfl(z1, jid);
+@@ -762,8 +743,6 @@ __global__ void computeCoordinationNumberSelfGroupCUDAKernel1(
+         }
+         if constexpr (use_pairlist && rebuild_pairlist) {
+           pairlist_elem = partial > 0.0 ? true : false;
+-        }
+-        if constexpr (use_pairlist && rebuild_pairlist) {
+           pairMaskSelf = (pairMaskSelf & ~(PairMaskT(1) << jid)) | ((PairMaskT)(pairlist_elem) << jid);
+         }
+       }
+@@ -772,7 +751,6 @@ __global__ void computeCoordinationNumberSelfGroupCUDAKernel1(
+     // Last loop: t == block_size / 2
+     {
+       const unsigned int jid = (half_tile_size + threadIndexInTile) & (tileSize - 1);
+-      // size_t pairlistID;
+       bool pairlist_elem = true;
+       const bool mask_t = tilePartition.shfl(mask_i, jid);
+       const cvm::real x2 = tilePartition.shfl(x1, jid);
+@@ -798,8 +776,6 @@ __global__ void computeCoordinationNumberSelfGroupCUDAKernel1(
+           coordnum_tb += partial;
+           if constexpr (use_pairlist && rebuild_pairlist) {
+             pairlist_elem = partial > 0.0 ? true : false;
+-          }
+-          if constexpr (use_pairlist && rebuild_pairlist) {
+             pairMaskSelf = (pairMaskSelf & ~(PairMaskT(1) << jid)) | ((PairMaskT)(pairlist_elem) << jid);
+           }
+         }
+@@ -823,6 +799,9 @@ __global__ void computeCoordinationNumberSelfGroupCUDAKernel1(
+     const unsigned int jTileEnd = jTileStart + numJTiles;
+     for (unsigned int l = jTileStart; l < jTileEnd; ++l) {
+       PairMaskT pairMask;
++      if constexpr (use_pairlist && rebuild_pairlist) {
++        pairMask = PairMaskT(0);
++      }
+       if constexpr (use_pairlist && !rebuild_pairlist) {
+         pairMask = tlPairList[l].pairMask[threadIndexInTile];
+         // Skip the entire tile if there is no interaction
+@@ -852,7 +831,6 @@ __global__ void computeCoordinationNumberSelfGroupCUDAKernel1(
+       for (unsigned int t = 0; t < tileSize; ++t) {
+         const unsigned int jid = t ^ threadIndexInTile;
+         const bool mask_t = tilePartition.shfl(mask_j, jid);
+-        // size_t pairlistID;
+         bool pairlist_elem = true;
+         const cvm::real x2 = tilePartition.shfl(jx2, jid);
+         const cvm::real y2 = tilePartition.shfl(jy2, jid);
+@@ -875,8 +853,8 @@ __global__ void computeCoordinationNumberSelfGroupCUDAKernel1(
+           coordnum_tb += partial;
+           if constexpr (use_pairlist && rebuild_pairlist) {
+             pairlist_elem = partial > 0.0 ? true : false;
+-          }
+-          if constexpr (use_pairlist && rebuild_pairlist) {
++            // pairMask & ~(PairMaskT(1) << jid): clear the bit at jid
++            // Set jid bit to 1 if pairlist_elem is true, and keep 0 otherwise.
+             pairMask = (pairMask & ~(PairMaskT(1) << jid)) | ((PairMaskT)(pairlist_elem) << jid);
+           }
+         }
+@@ -925,97 +903,6 @@ __global__ void computeCoordinationNumberSelfGroupCUDAKernel1(
+   }
+ }
+ 
+-// For debug only
+-#if 0
+-template <int blockSize, int tileSize>
+-__global__ void pairlistToHostKernel(
+-  const unsigned int numAtoms1,
+-  const unsigned int* __restrict tilesList,
+-  const unsigned int* __restrict tilesListStart,
+-  const unsigned int* __restrict tilesListSizes,
+-  TilePairMask<tileSize>* __restrict tlPairListSelf,
+-  TilePairMask<tileSize>* __restrict tlPairList,
+-  bool* __restrict pairlist) {
+-  constexpr unsigned int numTilesPerBlock = blockSize / tileSize;
+-  constexpr const unsigned int half_tile_size = tileSize / 2;
+-  const unsigned int numTilesInGroup1 = (numAtoms1 + tileSize - 1) / tileSize;
+-  namespace cg = cooperative_groups;
+-  const cg::thread_block thb = cg::this_thread_block();
+-  const auto tilePartition = cg::tiled_partition<tileSize>(thb);
+-  extern __shared__ unsigned int globalJIDs_buffer[];
+-  unsigned int (&globalJIDs)[numTilesPerBlock][tileSize] =
+-    *reinterpret_cast<unsigned int (*)[numTilesPerBlock][tileSize]>(globalJIDs_buffer);
+-  // Which tile is the current thread working on?
+-  const unsigned int tileIndexInBlock = tilePartition.meta_group_rank();
+-  // The thread id in a tile
+-  const unsigned int threadIndexInTile = tilePartition.thread_rank();
+-  for (unsigned int iTile = blockIdx.x * numTilesPerBlock + tileIndexInBlock;
+-       iTile < numTilesInGroup1; iTile += numTilesPerBlock * gridDim.x) {
+-    const unsigned int tid = iTile * tileSize + threadIndexInTile;
+-    const bool mask_i = tid < numAtoms1;
+-    using PairMaskT = TilePairMask<tileSize>::PairMaskT;
+-    PairMaskT pairMaskSelf;
+-    globalJIDs[tileIndexInBlock][threadIndexInTile] = tid;
+-    pairMaskSelf = tlPairListSelf[iTile].pairMask[threadIndexInTile];
+-    tilePartition.sync();
+-    // Self tiles
+-    #pragma unroll
+-    for (unsigned int t = 1; t < half_tile_size; ++t) {
+-      // NAMD/OpenMM style swizzling
+-      const unsigned int jid = (t + threadIndexInTile) & (tileSize - 1);
+-      const bool mask_t = tilePartition.shfl(mask_i, jid);
+-      if (mask_i && mask_t) {
+-        unsigned int jid_global = globalJIDs[tileIndexInBlock][jid];
+-        size_t pairlistID = computeGlobalPairlistIDSelfGroup(tid, jid_global, numAtoms1);
+-        const bool pairlist_elem = (pairMaskSelf >> jid) & PairMaskT(1);
+-        pairlist[pairlistID] = pairlist_elem;
+-      }
+-    }
+-    // Last loop: t == block_size / 2
+-    {
+-      // NAMD/OpenMM style swizzling
+-      const unsigned int jid = (half_tile_size + threadIndexInTile) & (tileSize - 1);
+-      const bool mask_t = tilePartition.shfl(mask_i, jid);
+-      if (jid > threadIndexInTile) {
+-        if (mask_i && mask_t) {
+-          const unsigned int jid_global = globalJIDs[tileIndexInBlock][jid];
+-          size_t pairlistID = computeGlobalPairlistIDSelfGroup(tid, jid_global, numAtoms1);
+-          const bool pairlist_elem = (pairMaskSelf >> jid) & PairMaskT(1);
+-          pairlist[pairlistID] = pairlist_elem;
+-        }
+-      }
+-    }
+-    tilePartition.sync();
+-    // Iterate over other tiles
+-    const unsigned int jTileStart = tilesListStart[iTile];
+-    const unsigned int numJTiles = tilesListSizes[iTile];
+-    const unsigned int jTileEnd = jTileStart + numJTiles;
+-    for (unsigned int l = jTileStart; l < jTileEnd; ++l) {
+-      const unsigned int jTileIndex = tilesList[l];
+-      const auto& tilePairMask = tlPairList[l];
+-      PairMaskT pairmask = tilePairMask.pairMask[threadIndexInTile];
+-      const unsigned int jid_global = jTileIndex * tileSize + threadIndexInTile;
+-      const bool mask_j = jid_global < numAtoms1;
+-      globalJIDs[tileIndexInBlock][threadIndexInTile] = jid_global;
+-      tilePartition.sync();
+-      #pragma unroll
+-      for (unsigned int t = 0; t < tileSize; ++t) {
+-        const unsigned int jid = t ^ threadIndexInTile;
+-        const bool mask_t = tilePartition.shfl(mask_j, jid);
+-        // unsigned int pairlistID;
+-        if (mask_i && mask_t) {
+-          const unsigned int pairlistID = computeGlobalPairlistIDSelfGroup(
+-            tid, globalJIDs[tileIndexInBlock][jid], numAtoms1);
+-          const bool pairlist_elem = (pairmask >> jid) & PairMaskT(1);
+-          pairlist[pairlistID] = pairlist_elem;
+-        }
+-      }
+-      tilePartition.sync();
+-    }
+-  }
+-}
+-#endif
+-
+ int calc_value_coordnum_self_group(
+   const cvm::real* group_pos,
+   unsigned int numAtoms,
+diff --git a/src/cuda/colvarcomp_coordnums_kernel.h b/src/cuda/colvarcomp_coordnums_kernel.h
+index b049f5de5..e7e1655a7 100644
+--- a/src/cuda/colvarcomp_coordnums_kernel.h
++++ b/src/cuda/colvarcomp_coordnums_kernel.h
+@@ -24,7 +24,8 @@ int calc_value_coordnum_two_groups(
+   cvm::real* group1_grad, cvm::real* group2_grad,
+   cvm::real pairlist_tol,
+   cvm::real pairlist_tol_l2_max,
+-  bool* d_pairlist,
++  TilePairMask<32>* d_tlPairList_32,
++  TilePairMask<64>* d_tlPairList_64,
+   unsigned int* d_tbcount,
+   cvm::real* d_coordnum_tmp,
+   cvm::real* h_coordnum_out,
+diff --git a/tests/build_tests.sh b/tests/build_tests.sh
+index 6ed34fbaf..9b4c577bb 100755
+--- a/tests/build_tests.sh
++++ b/tests/build_tests.sh
+@@ -228,7 +228,7 @@ m4 -Daxis -DdistanceZ=distanceXY < distancez.in.m4 > distancexy-axis.in
+ for colvar in \
+     "angle" \
+     "dihedral" \
+-    "coordnum" "coordnum-group2centeronly" "coordnum-pairlist" \
++    "coordnum" "coordnum-group2centeronly" "coordnum-pairlist" "coordnum-pairlist-large" \
+     "coordnum-aniso" "coordnum-aniso-pairlist" \
+     "groupcoord" "groupcoord-aniso" \
+     "dipoleangle" "dipolemagnitude" \
+diff --git a/tests/coordnum-pairlist-large.in b/tests/coordnum-pairlist-large.in
+new file mode 100644
+index 000000000..16df4ff6c
+--- /dev/null
++++ b/tests/coordnum-pairlist-large.in
+@@ -0,0 +1,20 @@
++colvar {
++
++    name one
++
++    outputAppliedForce on
++
++    width 0.5
++
++    coordNum {
++        debugGradients on
++        group1 {
++            indexGroup group11
++        }
++        group2 {
++            indexGroup group12
++        }
++        tolerance 0.001
++        pairListFrequency 2
++    }
++} 
+diff --git a/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out.colvars.state b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out.colvars.state
+new file mode 100644
+index 000000000..6f18ec16a
+--- /dev/null
++++ b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out.colvars.state
+@@ -0,0 +1,19 @@
++configuration {
++  step            5
++  dt 1.000000e+00
++  version 2026-07-27
++  units real
++}
++
++colvar {
++  name one
++  x       174.91126439122
++}
++
++restraint {
++  configuration {
++    step 5
++    name harmonic1
++  }
++}
++
+diff --git a/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out.colvars.traj b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out.colvars.traj
+new file mode 100644
+index 000000000..606629793
+--- /dev/null
++++ b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out.colvars.traj
+@@ -0,0 +1,6 @@
++# step         one                   fa_one                
++           0    1.68545978481357e+02 -6.73783913925429e-01 
++           1    1.91738678606567e+02 -7.66554714426267e-01 
++           2    1.83773756025594e+02 -7.34695024102375e-01 
++           3    1.85936273814312e+02 -7.43345095257247e-01 
++           4    1.74911264391223e+02 -6.99245057564891e-01 
+diff --git a/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_0.dat b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_0.dat
+new file mode 100644
+index 000000000..1307d1612
+--- /dev/null
++++ b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_0.dat
+@@ -0,0 +1,104 @@
++  6.330796706130e-02  -2.330829418190e-02  -5.459275397514e-02 
++  8.091307325063e-02  -2.914520249487e-02  -8.147653637645e-02 
++  2.922360321365e-02  -1.184085908360e-02  -2.467133520668e-02 
++  8.188533584205e-02  -1.525586831298e-02  -5.955891284590e-02 
++  4.925457306686e-02  -1.096366700903e-02  -3.067708257733e-02 
++  5.154679248423e-02  -2.768475936346e-03  -4.185111930874e-02 
++  4.982426514789e-02   2.700440643444e-03  -3.595316082745e-02 
++  2.404074762424e-02  -2.651872160152e-03  -2.044001171287e-02 
++  6.984878226780e-02  -5.968008794299e-04  -6.539521794921e-02 
++  2.887909040733e-01  -3.550473662411e-02  -1.952601224544e-01 
++  5.535959327286e-01  -6.858129361098e-02  -4.764581379934e-01 
++  3.345620957577e-01  -2.330608131799e-02  -1.550043816374e-01 
++  1.581052934032e-01  -1.176035832063e-02  -6.201512763346e-02 
++  9.039587919962e-01  -5.086073789305e-02  -3.164241093320e-01 
++  1.131706458191e+00  -2.799166171776e-01  -4.032180611666e-01 
++  5.211164023405e-01  -4.900029837714e-03  -8.133740188241e-02 
++  7.565045781614e-01   2.449216110963e-02  -2.007390260397e-02 
++  3.168394037378e-01  -4.689891566245e-02  -4.080753665874e-02 
++  2.586281050243e-01   2.352806971139e-02  -4.437781312746e-02 
++  1.590109027197e+00   2.206754387131e-01  -6.684859413320e-01 
++  2.434780261645e+00   9.729884175447e-02  -9.982044604016e-01 
++  1.036085939434e+00   3.375581633754e-01  -4.054346624729e-01 
++  4.622963906601e-01   1.489128887576e-01  -1.646643142414e-01 
++  1.379399171249e+00   6.092835418934e-01  -5.012673717372e-01 
++  1.806772940825e+00   9.260608334074e-01  -2.913456861199e-01 
++  4.546877709580e-01   2.254472049544e-01  -1.600636572406e-01 
++  2.648784878705e-01   1.230841354991e-01  -1.322337707817e-01 
++  4.397972510904e-01   2.635913177773e-01  -1.338278551536e-01 
++  2.524850058899e-01   1.248528466048e-01  -6.266404575431e-02 
++  2.044559178145e+00   8.997873170549e-01  -1.227696265745e+00 
++  2.213726501187e+00   1.648292348416e+00  -1.243035585042e+00 
++  1.494820891210e+00   4.615975033182e-01  -1.313441775993e+00 
++  8.658056995556e-01   2.486611474232e-01  -7.276582184617e-01 
++  1.640095464518e+00   4.661432143396e-01  -1.920345786962e+00 
++  1.488606580358e+00   7.752446005065e-01  -1.937004787950e+00 
++  6.431645376671e-01   1.337495256286e-01  -7.896774482087e-01 
++  3.264092389080e-01   1.076724158337e-01  -4.026509092800e-01 
++  4.588715933181e-01   3.856285550083e-02  -5.558368018394e-01 
++  7.982450963915e-01   1.460479810413e-01  -9.743566178143e-01 
++  2.623594509343e+00   1.839364541552e-01  -2.900148080586e+00 
++  2.504485841288e+00   6.093866334538e-01  -3.245469750492e+00 
++  2.185455916980e+00  -5.096162178237e-01  -2.263986704827e+00 
++  1.451644228017e+00  -2.291561893396e-01  -1.569600075024e+00 
++  2.150921735252e+00  -1.426518840870e+00  -2.179230565664e+00 
++  1.718567967007e+00  -1.547954984387e+00  -2.146977524734e+00 
++  1.262549394917e+00  -1.028007701561e+00  -1.315364825724e+00 
++  8.039502670739e-01  -5.916018854794e-01  -9.231378665572e-01 
++  1.496148727086e+00  -9.867917070202e-01  -1.180091794461e+00 
++  9.846877068736e-01  -1.267032870541e+00  -1.079930564717e+00 
++  2.915555189695e+00  -2.126330193024e+00  -2.034632859395e+00 
++ -1.988466341026e+00  -8.712863361921e-01   1.168536802481e+00 
++ -2.103176200374e+00  -9.966497996767e-01   2.599829396457e+00 
++ -2.255812169925e+00  -1.156477667275e+00   3.161682699292e+00 
++ -1.442313254648e+00  -2.822471814404e-01   2.369205729479e+00 
++ -1.063062419191e+00  -3.050963652180e-01   1.681282530555e+00 
++ -9.757349505232e-01  -2.078241728820e-01   2.178606763110e+00 
++ -1.337715970951e+00  -1.503217453209e-01   2.881643478874e+00 
++ -4.758259269142e-01  -7.602154743918e-02   1.078788294731e+00 
++ -8.565837535814e-01  -4.430856818570e-01   2.216811338320e+00 
++ -1.332781082343e+00   4.841891040599e-02   1.709826915275e+00 
++ -7.092286075982e-01   6.012378416417e-02   8.809961330125e-01 
++ -1.973324732049e+00   4.190685636170e-01   1.923917126510e+00 
++ -2.635248687726e+00   7.081943794199e-01   2.373589139150e+00 
++ -1.369105761930e+00   4.727751273258e-01   1.093075498505e+00 
++ -6.990381816630e-01   2.459386645889e-01   6.737262008796e-01 
++ -1.606652345066e+00   9.261176049983e-01   1.241167847393e+00 
++ -2.164271633972e+00   1.301125130357e+00   1.115634565804e+00 
++ -9.964835414350e-01   6.833669314797e-01   6.733290699293e-01 
++ -1.708088611574e+00   1.049583318167e+00   1.695107065420e+00 
++ -1.159833054967e+00   3.425628968404e-01   5.692522766257e-01 
++ -5.329300244494e-01   1.743010412654e-01   2.395552217216e-01 
++ -1.689081424575e+00   3.262975464732e-01   5.013652953179e-01 
++ -2.519096976302e+00   4.095589533312e-01   7.560250799475e-01 
++ -1.105613914732e+00   9.019713167671e-02   1.175197762296e-01 
++ -5.999100423885e-01   8.117073491448e-02   4.173628966726e-02 
++ -1.521618920264e+00  -1.644484392304e-02  -2.038747576200e-01 
++ -7.825993655314e-01  -7.596299766817e-02  -1.603957642159e-01 
++ -1.620077936438e+00   8.952506648484e-02  -3.542103835770e-01 
++ -2.167055089607e+00  -2.397081702640e-01  -2.663339112346e-01 
++ -6.288381503322e-01  -2.407632798608e-02   1.343877701322e-01 
++ -2.191202671423e-01  -1.498778163232e-02   3.791745067781e-02 
++ -8.539359188188e-01  -7.848277547863e-02   3.387515837740e-01 
++ -1.365076137903e+00  -1.130502990809e-01   7.199578833566e-01 
++ -3.605524662502e-01  -7.248074252976e-02   1.792283662906e-01 
++ -2.365739396968e-01  -6.761505464372e-02   8.839103033825e-02 
++ -4.644839318560e-01  -1.644654641813e-01   3.476804471311e-01 
++ -7.599045840650e-01  -3.565741733403e-01   4.810608635828e-01 
++ -5.983313008543e-01  -1.564081663324e-01   5.948523148549e-01 
++ -2.046608342184e-01  -9.612847700160e-02   1.756968602659e-01 
++ -1.285816393415e-01  -1.435341528287e-02   7.731950208778e-02 
++ -5.269202243097e-02  -7.593839748793e-03   2.832580465495e-02 
++ -3.508004195714e-02   6.008853739340e-03   2.565167555126e-02 
++ -2.167779800098e-02   5.643480075624e-03   1.721292441105e-02 
++ -3.459342391657e-02   5.505826505686e-03   1.896318048906e-02 
++ -2.361279283935e-02   5.233135960806e-03   1.168163613026e-02 
++ -5.476833923424e-02   5.285727157816e-03   2.648094666798e-02 
++ -1.349410052200e-01   1.222680397041e-03   1.005510892754e-01 
++ -2.711025227554e-01   1.198676391014e-02   2.315075406848e-01 
++ -5.128238165430e-02   2.910906298098e-03   4.316513662286e-02 
++ -2.627119674982e-02  -7.761348505034e-05   2.187957496331e-02 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
+diff --git a/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_1.dat b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_1.dat
+new file mode 100644
+index 000000000..6b97e11e4
+--- /dev/null
++++ b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_1.dat
+@@ -0,0 +1,104 @@
++  4.193483850644e-02  -3.525729994896e-04  -2.102271074768e-02 
++  2.309338212036e-02  -5.562099882178e-04  -1.057136369949e-02 
++  3.229456567441e-02   2.102099728748e-03  -1.818067804978e-02 
++  4.699097162258e-02  -5.732881809349e-03  -2.859199902430e-02 
++  4.072175902311e-02  -4.287281227636e-03  -2.894621892419e-02 
++  1.957210390043e-02  -4.207499249509e-03  -1.129101470626e-02 
++  1.864938941301e-02  -5.979196269968e-03  -1.213608875749e-02 
++  8.949940126746e-03  -1.457101261013e-03  -5.447384656438e-03 
++  1.894785834655e-02  -4.220295811892e-03  -9.146128599021e-03 
++  1.406851650511e-01  -2.290008508087e-02  -9.022975325674e-02 
++  2.461327447874e-01  -3.496300104312e-02  -1.916302909506e-01 
++  2.048664668171e-01  -4.448205938598e-02  -1.033620355438e-01 
++  1.095967019082e-01  -2.611688296126e-02  -4.627195540929e-02 
++  5.717339247732e-01  -2.002660280526e-01  -2.857501518250e-01 
++  4.341482565604e-01  -2.232509695741e-01  -2.789387632109e-01 
++  4.662560036291e-01  -2.117143496435e-01  -1.273393489066e-01 
++  7.760717256968e-01  -4.861976740425e-01  -1.562354963275e-01 
++  1.802501920154e-01  -9.997345156892e-02  -4.915498210380e-02 
++  4.110429771826e-01  -1.238345846751e-01  -7.595765672445e-02 
++  1.450937642137e+00  -3.479271204813e-01  -7.698608610109e-01 
++  1.980012243571e+00  -9.098478980808e-01  -1.206335461107e+00 
++  1.382927737628e+00   2.104583310952e-02  -6.041870558935e-01 
++  6.050568287361e-01   2.241618396365e-02  -2.481890043654e-01 
++  2.316774223684e+00   4.005247552951e-01  -7.834037178457e-01 
++  2.659617758920e+00   3.902592672008e-01  -3.573991651999e-01 
++  1.149047123010e+00   3.448263546762e-01  -2.742094341219e-01 
++  7.405370174756e-01   2.011238815132e-01  -2.303635878532e-01 
++  1.322467229635e+00   5.609325516167e-01  -1.004074155864e-01 
++  5.522904792771e-01   1.508687055145e-01  -1.076361595220e-01 
++  3.056777523789e+00   4.040036969722e-01  -1.478888777041e+00 
++  3.376180516767e+00   1.095342194619e+00  -1.224082568348e+00 
++  2.227845097510e+00   7.349012506835e-04  -1.667513222971e+00 
++  1.207576146959e+00  -1.086654716453e-02  -9.248081028037e-01 
++  2.341982462292e+00  -4.540211663610e-02  -2.292703073072e+00 
++  2.451573574763e+00   5.790793815206e-01  -2.291646317722e+00 
++  9.482298315241e-01  -9.415272558821e-02  -1.044989265423e+00 
++  4.985695306203e-01  -5.385466121235e-04  -5.106498913652e-01 
++  6.321384809338e-01  -1.276677056192e-01  -7.021609666389e-01 
++  9.431817694260e-01  -3.231380556758e-02  -1.206191839529e+00 
++  3.014993625383e+00  -7.189373136873e-01  -3.260786860418e+00 
++  2.518236778674e+00  -4.192353999002e-01  -3.880872830904e+00 
++  2.698846426690e+00  -1.589433897237e+00  -2.565905210699e+00 
++  2.346109513136e+00  -1.238795658767e+00  -2.102460405654e+00 
++  2.347592254788e+00  -2.611918661182e+00  -2.303603674393e+00 
++  1.968867874481e+00  -2.609618043969e+00  -2.782878951770e+00 
++  1.260413062164e+00  -1.735863463479e+00  -1.440238957025e+00 
++  9.389787227358e-01  -1.037202066593e+00  -1.229083674427e+00 
++  1.223219611775e+00  -1.686488073791e+00  -1.215905004476e+00 
++  8.878704517377e-01  -1.888690642376e+00  -1.261643583732e+00 
++  2.670015779579e+00  -3.405297650810e+00  -1.468309886868e+00 
++ -2.341676232678e+00  -3.612040078814e-01   1.525746723424e+00 
++ -2.458383290722e+00  -8.547617370569e-01   2.973886496267e+00 
++ -2.373429016913e+00  -1.226293132579e+00   3.239878083734e+00 
++ -1.877409577917e+00   3.899990922354e-02   3.045612081269e+00 
++ -1.139078303920e+00  -1.019412937413e-01   2.119972777113e+00 
++ -1.402671177952e+00   2.348634611756e-02   3.180531044119e+00 
++ -1.668582708634e+00   6.577931777081e-01   3.465819292368e+00 
++ -7.532146084768e-01  -1.350440061989e-02   1.750430129044e+00 
++ -1.251952648303e+00  -4.197061551143e-01   3.687271207677e+00 
++ -1.756632069322e+00   6.102434981298e-01   2.196154781046e+00 
++ -9.447775759968e-01   3.948387749562e-01   1.077983514084e+00 
++ -2.297304492605e+00   1.434834415968e+00   2.391313922014e+00 
++ -2.543657597472e+00   1.939516920921e+00   2.824621205915e+00 
++ -1.742550205992e+00   1.291298500083e+00   1.271306289633e+00 
++ -9.445996548317e-01   7.151028889838e-01   7.593762659859e-01 
++ -1.844946678927e+00   1.944905012527e+00   9.389998290350e-01 
++ -2.421165352839e+00   2.388715332013e+00   7.113187036954e-01 
++ -1.260474936019e+00   1.381730538942e+00   4.657498377164e-01 
++ -1.617975923766e+00   2.156588135789e+00   1.082966788795e+00 
++ -1.478711419590e+00   8.805981751481e-01   7.027011122899e-01 
++ -5.722451882448e-01   3.343565821101e-01   2.688177518355e-01 
++ -2.205352799928e+00   1.035189442410e+00   4.874089863382e-01 
++ -2.944731647097e+00   1.072101414578e+00   3.688984328496e-01 
++ -1.501730117103e+00   4.981363295659e-01   1.275113070572e-01 
++ -8.639539691997e-01   3.422661436470e-01   3.769845720337e-02 
++ -2.009211612170e+00   3.528998389525e-01  -3.332840693211e-01 
++ -1.194439142738e+00   9.837203030915e-02  -2.841305261228e-01 
++ -2.131422268030e+00   5.227426010383e-01  -6.633743508246e-01 
++ -2.567420598000e+00   1.369637470891e-01  -2.602419569694e-01 
++ -8.192231290982e-01   1.929137459269e-01   1.877193520751e-01 
++ -2.754482099684e-01   5.715439556003e-02   5.000335612285e-02 
++ -1.037611090616e+00   1.563680597139e-01   4.164505883976e-01 
++ -1.603040673050e+00   2.174716570008e-01   8.854052813868e-01 
++ -3.951563917207e-01   2.393926264814e-02   1.950150851676e-01 
++ -2.385523755488e-01   5.583953570915e-04   8.716917123329e-02 
++ -4.952408770305e-01  -6.485206986412e-02   3.373350907845e-01 
++ -9.474990551605e-01  -2.163125959826e-01   5.717778043891e-01 
++ -4.693668769235e-01  -3.837301593593e-02   4.521024766567e-01 
++ -2.127784739007e-01  -4.937954874442e-02   1.416946795112e-01 
++ -1.421348220744e-01   2.186251620217e-02   8.547151838269e-02 
++ -5.437994981890e-02   4.990276795114e-03   3.381605845851e-02 
++ -2.852959514162e-02   1.137587313257e-02   1.763126774278e-02 
++ -1.272176680602e-02   5.763663234742e-03   8.387765142866e-03 
++ -3.461257814434e-02   1.306857919097e-02   1.575653018815e-02 
++ -1.809804044222e-02   7.394851521730e-03   7.478157981556e-03 
++ -6.422511903876e-02   2.111480492562e-02   2.631482987616e-02 
++ -1.533380320451e-01   4.770277200213e-02   1.063565254795e-01 
++ -3.046501858356e-01   1.177621567615e-01   2.238492072237e-01 
++ -5.685602290292e-02   2.099303649575e-02   4.373619724782e-02 
++ -3.764220630287e-02   1.164381004612e-02   3.310388849048e-02 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
+diff --git a/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_2.dat b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_2.dat
+new file mode 100644
+index 000000000..db2a3dbfc
+--- /dev/null
++++ b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_2.dat
+@@ -0,0 +1,104 @@
++  3.601574215919e-02  -1.153066846504e-03  -2.044190712572e-02 
++  1.645943476355e-02  -5.607639058012e-04  -9.478790513207e-03 
++  5.016120527128e-02   2.510965602038e-03  -2.809793439506e-02 
++  3.890486309358e-02  -4.901004988047e-03  -2.793406960802e-02 
++  3.023790857433e-02  -2.808838701855e-03  -2.436072185391e-02 
++  1.653683731591e-02  -3.941281509397e-03  -1.222732038772e-02 
++  1.444012669070e-02  -4.658497334362e-03  -1.223336446213e-02 
++  7.614813801947e-03  -1.473727760529e-03  -5.634482702000e-03 
++  1.802586737616e-02  -5.407568605881e-03  -1.181832118831e-02 
++  1.063318056296e-01  -2.025350662873e-02  -8.331541800254e-02 
++  1.559815622882e-01  -2.978381728838e-02  -1.471778276458e-01 
++  1.505854165499e-01  -4.131757952615e-02  -1.023229405129e-01 
++  9.930974256410e-02  -2.594503541184e-02  -5.604248970174e-02 
++  3.756765899380e-01  -1.575011626494e-01  -2.716486896168e-01 
++  2.713674630099e-01  -1.502162424379e-01  -2.464517953070e-01 
++  2.281280263219e-01  -1.355064448738e-01  -1.238151392636e-01 
++  3.189040734709e-01  -2.614164681632e-01  -1.744231396501e-01 
++  8.963520979180e-02  -5.646434240668e-02  -5.190285272765e-02 
++  2.201949885545e-01  -1.036597741445e-01  -8.615528666470e-02 
++  1.189138534366e+00  -3.882933940722e-01  -8.310704548299e-01 
++  1.626637313347e+00  -9.551183814273e-01  -1.235930110233e+00 
++  1.178841677087e+00  -7.508066093880e-02  -7.176482540773e-01 
++  5.138353857548e-01  -1.588373875771e-02  -2.964610634541e-01 
++  1.958033792155e+00   2.008435058644e-01  -9.817222657902e-01 
++  2.428140965616e+00   2.768110384630e-01  -7.058639243528e-01 
++  9.563698408419e-01   2.107344749205e-01  -3.909564660078e-01 
++  4.453452534313e-01   7.389728572373e-02  -2.211776081265e-01 
++  1.286275812632e+00   3.757243129454e-01  -4.522187429983e-01 
++  6.645203732619e-01   1.976594556489e-01  -1.727564570961e-01 
++  2.716520941563e+00   1.015015589107e-01  -1.819497778387e+00 
++  3.197130611737e+00   5.670266936520e-01  -1.592228039160e+00 
++  1.968633480031e+00  -2.098071170007e-01  -1.942882660444e+00 
++  1.055090026959e+00  -1.345696950578e-01  -1.084318958181e+00 
++  2.141649012045e+00  -2.592659443896e-01  -2.694166081590e+00 
++  2.266493184067e+00   5.559685127049e-01  -2.695919974857e+00 
++  9.882878591280e-01  -1.476852578172e-01  -1.391898374802e+00 
++  7.480236950003e-01  -3.223016959172e-03  -1.004277818355e+00 
++  5.407680968492e-01  -1.297386185854e-01  -7.231487147965e-01 
++  8.756378281573e-01  -3.948677726619e-02  -1.444340787820e+00 
++  2.471409887392e+00  -1.140381167048e+00  -3.311685406993e+00 
++  1.756394818818e+00  -1.096091646011e+00  -3.805737227818e+00 
++  2.139724181820e+00  -1.717648608402e+00  -2.481245641541e+00 
++  1.660674657487e+00  -1.167085578083e+00  -1.953187829526e+00 
++  1.772160889220e+00  -2.599880361836e+00  -2.025342475918e+00 
++  1.364947130690e+00  -2.590624607978e+00  -2.028986792389e+00 
++  9.500431124586e-01  -1.723196704425e+00  -1.234164251342e+00 
++  6.186523667956e-01  -1.053640111724e+00  -9.276116211619e-01 
++  1.145085942774e+00  -1.735740263393e+00  -1.168071371617e+00 
++  6.355615875629e-01  -1.960025422094e+00  -9.542272278955e-01 
++  2.300498306448e+00  -3.532777277980e+00  -1.634994945505e+00 
++ -2.226896197736e+00  -1.710741802967e-01   1.524081083976e+00 
++ -2.006834670696e+00  -3.562309705410e-01   3.148356554447e+00 
++ -1.622795570915e+00  -6.500462007138e-01   3.576854065284e+00 
++ -1.361457122041e+00   4.236208209941e-01   2.942983261676e+00 
++ -8.115109788850e-01   1.884360707774e-01   2.044284963190e+00 
++ -8.271784438479e-01   3.393042456630e-01   2.971986547720e+00 
++ -9.736833458939e-01   7.827608693113e-01   3.370008591167e+00 
++ -4.402370962999e-01   1.560866331001e-01   1.608021540188e+00 
++ -4.773935685091e-01  -8.241682513319e-02   3.319520578258e+00 
++ -1.294859526722e+00   7.104046178631e-01   2.046064897911e+00 
++ -6.347866852550e-01   3.931187418891e-01   9.262835016290e-01 
++ -1.832303766557e+00   1.459780958686e+00   2.392230437546e+00 
++ -2.125396969328e+00   2.012870459124e+00   2.713174049430e+00 
++ -1.459615404926e+00   1.271082869594e+00   1.328988842002e+00 
++ -7.661692363145e-01   6.729318025320e-01   7.842918903892e-01 
++ -1.551369534428e+00   1.898615007206e+00   1.170259218162e+00 
++ -2.038477455622e+00   2.295281502420e+00   9.419448923461e-01 
++ -9.185123190427e-01   1.223373640654e+00   6.069043170069e-01 
++ -1.610186197173e+00   2.239399886209e+00   1.566461651182e+00 
++ -1.254898818262e+00   8.310742398360e-01   7.307330311960e-01 
++ -4.715096444302e-01   3.136801050507e-01   2.591492255185e-01 
++ -2.003315003238e+00   9.549151398649e-01   6.625155770713e-01 
++ -2.785277275823e+00   1.150392047261e+00   6.937526602108e-01 
++ -1.349586238372e+00   4.470170979549e-01   2.308202450750e-01 
++ -6.824404608337e-01   2.482474477291e-01   8.327546667389e-02 
++ -1.906310991604e+00   3.219721611594e-01  -1.606322263854e-01 
++ -1.122139507788e+00   8.521735615701e-02  -1.469744118940e-01 
++ -2.244780706947e+00   3.898040622439e-01  -4.890548129005e-01 
++ -2.337334532199e+00   1.473124137563e-01  -3.354637480269e-02 
++ -6.859916006836e-01   1.863968609208e-01   2.126509810179e-01 
++ -2.403742021734e-01   5.884192802372e-02   6.775924337836e-02 
++ -8.907280949707e-01   2.123761672978e-01   4.421000719180e-01 
++ -1.482303410135e+00   3.152826970521e-01   9.199655142246e-01 
++ -3.434623706814e-01   6.421540975314e-02   2.166732892808e-01 
++ -1.921934240002e-01   1.760000737084e-02   1.003161639912e-01 
++ -4.258304444370e-01   2.626687891873e-02   3.890742298086e-01 
++ -6.980948021423e-01  -6.247844100146e-02   5.748219204141e-01 
++ -5.402357022593e-01   1.093554475381e-01   6.434645250806e-01 
++ -1.774700077970e-01   2.672917509050e-03   1.906010893466e-01 
++ -1.327680796840e-01   4.175750201029e-02   1.021591788588e-01 
++ -5.010505153711e-02   1.353812042503e-02   3.821298663529e-02 
++ -4.227930363027e-02   2.629064445191e-02   3.243245118331e-02 
++ -2.521591077714e-02   1.857385144770e-02   2.022220148465e-02 
++ -4.301682370376e-02   2.258424505949e-02   2.519922980856e-02 
++ -2.701220649151e-02   1.508774260461e-02   1.403315280957e-02 
++ -5.867048686346e-02   2.541654253200e-02   3.196962308408e-02 
++ -1.623764324057e-01   7.909908018368e-02   1.480884754270e-01 
++ -3.501100762312e-01   1.946605583381e-01   3.372863126135e-01 
++ -6.503900466962e-02   3.760009957573e-02   6.360464071472e-02 
++ -3.450353769580e-02   1.746538963030e-02   3.584727404080e-02 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
+diff --git a/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_3.dat b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_3.dat
+new file mode 100644
+index 000000000..7de32f4ed
+--- /dev/null
++++ b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_3.dat
+@@ -0,0 +1,104 @@
++  5.684647079985e-02  -3.470784813843e-03  -2.540348647191e-02 
++  2.656887295030e-02  -1.787566991471e-03  -1.101569341389e-02 
++  5.817572187463e-02   2.008050087724e-03  -2.751941018942e-02 
++  5.962801250887e-02  -1.046960531953e-02  -3.597754957984e-02 
++  4.329143236334e-02  -5.399116560062e-03  -3.033668905209e-02 
++  2.464997161076e-02  -7.281099084840e-03  -1.409995009998e-02 
++  1.827555737138e-02  -7.426204840505e-03  -1.237771868113e-02 
++  1.150567838846e-02  -2.741315208680e-03  -6.397781076530e-03 
++  3.156611274832e-02  -1.076488914044e-02  -1.450648379219e-02 
++  1.758521108487e-01  -4.334543065459e-02  -1.220419784661e-01 
++  2.308033126944e-01  -4.670577903025e-02  -2.035672155473e-01 
++  2.924326585587e-01  -1.077850538985e-01  -1.712134501255e-01 
++  1.575512217996e-01  -6.429492126626e-02  -7.447127577601e-02 
++  7.286138380466e-01  -4.138486653800e-01  -4.582077992310e-01 
++  5.110757653292e-01  -3.964682571442e-01  -4.286612703636e-01 
++  6.380135543628e-01  -4.697904688919e-01  -2.318115513820e-01 
++  8.365952925702e-01  -8.782820549571e-01  -2.715953288756e-01 
++  2.309492765875e-01  -1.901510338501e-01  -8.214542804459e-02 
++  7.757518442482e-01  -4.397567528536e-01  -1.538864605562e-01 
++  1.669687388932e+00  -7.147439724087e-01  -1.031974573913e+00 
++  1.772270038619e+00  -1.178455411237e+00  -1.155468923720e+00 
++  1.755256778735e+00  -1.518178683987e-01  -9.253333210262e-01 
++  1.016037447720e+00  -6.337161258574e-02  -5.058718528625e-01 
++  2.347676577884e+00   3.209663727098e-01  -1.041752146690e+00 
++  2.709712279777e+00   3.579387276125e-01  -4.445163325929e-01 
++  1.183557250566e+00   3.160394945863e-01  -4.890470822245e-01 
++  6.878262158730e-01   1.386595850754e-01  -3.925227625783e-01 
++  1.220559472289e+00   4.310507136095e-01  -3.645477830665e-01 
++  8.099936349572e-01   2.152517690747e-01  -2.345688032415e-01 
++  2.573104471766e+00   1.324514720744e-01  -1.960559473435e+00 
++  2.953458233731e+00   5.247959797884e-01  -2.011087201819e+00 
++  1.599126863689e+00  -1.274254120535e-01  -1.875402713665e+00 
++  1.012179346023e+00  -9.129613329424e-02  -1.121519951268e+00 
++  1.236322011772e+00  -2.249061185094e-01  -2.055237047318e+00 
++  1.266788955187e+00  -1.700347101828e-02  -2.051725678056e+00 
++  3.930645371566e-01  -9.465494264196e-02  -7.149195085309e-01 
++  2.413375275887e-01  -2.616520658537e-02  -3.779933150106e-01 
++  3.225071252839e-01  -1.316839572854e-01  -5.759666465591e-01 
++  2.983734516875e-01  -8.781316158768e-02  -6.130273436712e-01 
++  1.771028865167e+00  -8.516382398413e-01  -3.261529936444e+00 
++  1.566257975816e+00  -4.552438631443e-01  -3.932074031491e+00 
++  1.576941526995e+00  -1.578040656556e+00  -2.845077692791e+00 
++  1.250232128846e+00  -1.297273405430e+00  -2.299365217544e+00 
++  1.283944288388e+00  -2.558624312698e+00  -2.754635373305e+00 
++  7.197504055184e-01  -2.221091892468e+00  -3.212401349322e+00 
++  5.529350254834e-01  -1.998164438457e+00  -1.643058361850e+00 
++  4.145725547740e-01  -1.153820022739e+00  -1.233250915481e+00 
++  4.949421246229e-01  -2.017334733811e+00  -1.465264677952e+00 
++  3.500353982818e-01  -2.198086988376e+00  -1.333368083316e+00 
++  1.774820725362e+00  -3.363248202176e+00  -2.009140674760e+00 
++ -1.722406085617e+00  -4.899930669818e-02   1.768809143164e+00 
++ -2.203335915204e+00  -8.679786810973e-02   3.020142660489e+00 
++ -2.217456451303e+00   4.037949278599e-02   3.058313617913e+00 
++ -1.527748634091e+00   3.231613029845e-01   3.193110980392e+00 
++ -9.581814353301e-01   5.634408371107e-02   2.401727237030e+00 
++ -1.332425802046e+00   1.937576816645e-01   3.529479045120e+00 
++ -1.338833145823e+00   8.666252119467e-01   3.597702121883e+00 
++ -8.527240304271e-01   8.960395142430e-02   2.455137067590e+00 
++ -1.411024702849e+00  -3.773719865042e-01   3.955294116806e+00 
++ -1.176779297585e+00   7.531501630398e-01   2.089088798038e+00 
++ -5.144492900325e-01   3.771276284515e-01   1.001790485737e+00 
++ -1.607477665048e+00   1.581600471874e+00   2.306756284806e+00 
++ -2.013044775694e+00   2.155090268946e+00   2.728453955459e+00 
++ -1.046151971964e+00   1.191334940898e+00   1.128228272743e+00 
++ -5.886161794913e-01   6.303022845574e-01   6.843788100027e-01 
++ -1.104860686162e+00   1.599014024589e+00   9.116708244102e-01 
++ -1.378182534258e+00   1.983787617167e+00   6.644583596199e-01 
++ -5.272918573358e-01   7.881061175285e-01   3.895072974980e-01 
++ -1.393026345256e+00   2.200856740643e+00   1.253171311325e+00 
++ -8.235301210079e-01   8.210146647324e-01   6.760691851361e-01 
++ -3.104971837138e-01   2.939761237897e-01   2.391943907156e-01 
++ -1.449743140345e+00   1.163368344138e+00   7.952209952813e-01 
++ -2.049698216827e+00   1.493941106798e+00   9.653745473079e-01 
++ -1.112124544225e+00   6.370216931967e-01   3.672801431848e-01 
++ -6.058487054752e-01   3.720717190330e-01   1.278190769355e-01 
++ -1.833351899376e+00   6.852197154932e-01   1.281043643476e-01 
++ -1.233483145290e+00   3.649344287316e-01  -7.277686799647e-02 
++ -2.178683525567e+00   1.039050589598e+00  -1.002431585464e-01 
++ -2.126249412422e+00   5.516495676651e-01   3.732927439455e-01 
++ -5.518823649523e-01   2.536052411615e-01   2.786806790082e-01 
++ -1.966313716807e-01   8.247107249757e-02   8.876110699626e-02 
++ -6.946067747110e-01   2.796213328122e-01   5.294481500231e-01 
++ -1.011169583740e+00   4.528208296174e-01   9.996272701089e-01 
++ -2.547057902543e-01   6.531206594734e-02   2.215173450166e-01 
++ -1.486984066235e-01   2.984421056024e-02   1.055277199064e-01 
++ -3.686688425089e-01   1.034106925742e-02   3.966449287763e-01 
++ -6.349132881739e-01  -2.554274826915e-02   5.379026684019e-01 
++ -4.991631615209e-01   3.808437320588e-02   7.295532988292e-01 
++ -1.581847562555e-01  -1.494577980331e-02   1.835003290950e-01 
++ -9.437841918481e-02   3.584893484264e-02   9.942509234973e-02 
++ -3.928182475002e-02   1.158204619491e-02   4.537819233100e-02 
++ -2.170221993488e-02   1.669208093829e-02   2.241628254509e-02 
++ -1.078154478235e-02   9.602643771744e-03   1.245375758737e-02 
++ -2.644692430734e-02   2.009327705621e-02   2.158160714574e-02 
++ -1.449098066978e-02   1.184660108231e-02   1.094063541647e-02 
++ -4.331672655806e-02   2.912697130662e-02   3.265792602429e-02 
++ -9.405502248236e-02   5.625421785657e-02   1.021827073065e-01 
++ -1.746871150555e-01   1.241282379630e-01   1.800693983797e-01 
++ -3.769216831195e-02   2.500423307436e-02   4.664403689697e-02 
++ -1.976334793087e-02   1.139917342063e-02   2.597635374735e-02 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
+diff --git a/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_4.dat b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_4.dat
+new file mode 100644
+index 000000000..b8486a28f
+--- /dev/null
++++ b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/AutoDiff/test_out_forces_4.dat
+@@ -0,0 +1,104 @@
++  3.170766081255e-02  -7.043938725787e-03  -8.692379487801e-03 
++  1.723331074490e-02  -4.054309877227e-03  -3.659590843527e-03 
++  2.703316906410e-02  -3.717559631346e-03  -8.408635329362e-03 
++  3.200948010022e-02  -1.104050627797e-02  -1.281610470363e-02 
++  1.979499266072e-02  -6.228308538759e-03  -9.667777965558e-03 
++  1.554286220496e-02  -7.044439295214e-03  -5.365629941969e-03 
++  1.219453054032e-02  -6.816209368988e-03  -5.239598140307e-03 
++  7.171987402865e-03  -2.735827401168e-03  -2.536381245325e-03 
++  1.805978904629e-02  -8.532789923934e-03  -4.361148914446e-03 
++  9.251686929648e-02  -3.531743872296e-02  -4.288683348144e-02 
++  8.769147205684e-02  -3.576514128129e-02  -5.529263540404e-02 
++  2.115520126949e-01  -9.039522288244e-02  -7.524737585983e-02 
++  1.638917082184e-01  -6.763682439839e-02  -3.896479887548e-02 
++  6.010635987690e-01  -3.435604440920e-01  -2.531358977209e-01 
++  4.563335515848e-01  -3.333200688646e-01  -2.757295997904e-01 
++  5.330009815297e-01  -4.312095745364e-01  -1.173596563119e-01 
++  6.697313498336e-01  -7.485323359170e-01  -1.504918263707e-01 
++  2.025574302688e-01  -1.749490699584e-01  -4.563733583150e-02 
++  6.739538000843e-01  -4.462783079200e-01  -4.621332467623e-02 
++  1.465228732032e+00  -5.919741038005e-01  -7.212972503601e-01 
++  1.826224903686e+00  -1.106893401718e+00  -9.577538952621e-01 
++  1.321360233367e+00  -1.606903100794e-01  -5.906716489737e-01 
++  6.022727584199e-01  -6.661956153093e-02  -2.705610915671e-01 
++  2.038232632777e+00   1.220938600839e-01  -7.615705937127e-01 
++  2.465366093094e+00   2.027619379625e-01  -3.394066690123e-01 
++  1.003192745257e+00   1.550116902930e-01  -3.398777310301e-01 
++  5.810942526519e-01   6.742535981918e-02  -2.683994219479e-01 
++  1.300234984153e+00   3.123166264359e-01  -2.691189724378e-01 
++  5.298046330217e-01   8.117324035998e-02  -1.344327362462e-01 
++  2.596404905939e+00  -8.726295483730e-02  -1.645766656138e+00 
++  3.107527922011e+00   2.828888875738e-01  -1.677283601251e+00 
++  1.675398221935e+00  -2.391605863625e-01  -1.619973257536e+00 
++  9.940061446006e-01  -1.300840871203e-01  -9.270866508481e-01 
++  1.554752504870e+00  -3.661050723627e-01  -2.121703339121e+00 
++  1.797514799095e+00  -7.371423219785e-02  -2.458490627871e+00 
++  5.138754166335e-01  -1.333825783257e-01  -8.058339887146e-01 
++  3.112466043325e-01  -4.381129477691e-02  -4.220474274212e-01 
++  3.677555481297e-01  -1.505922678364e-01  -6.130981881694e-01 
++  4.337352678323e-01  -1.197442245602e-01  -7.650112407084e-01 
++  1.962117233838e+00  -1.122714506213e+00  -2.967174464952e+00 
++  1.790456226249e+00  -1.086549120434e+00  -3.734804908708e+00 
++  1.557586328187e+00  -1.471132948650e+00  -2.297364779085e+00 
++  1.271341063540e+00  -1.052332530626e+00  -1.728676231246e+00 
++  1.332551971963e+00  -2.314951726742e+00  -2.281286174502e+00 
++  9.829702918282e-01  -2.200952768081e+00  -2.490762351333e+00 
++  6.989310408682e-01  -1.624761062801e+00  -1.321318609745e+00 
++  4.109093386932e-01  -1.051256719829e+00  -1.031551951353e+00 
++  7.846725403491e-01  -1.469651844049e+00  -1.049641426428e+00 
++  4.853323031388e-01  -1.874012766867e+00  -1.141475316880e+00 
++  1.933666288865e+00  -3.121088450264e+00  -2.097617240370e+00 
++ -2.117800785012e+00   1.404696706947e-01   1.400050469974e+00 
++ -2.408904935921e+00   2.393284410418e-02   2.665847312371e+00 
++ -2.395481994995e+00  -2.457872633277e-01   2.552075856495e+00 
++ -1.656550076974e+00   5.227873489252e-01   2.839874303202e+00 
++ -1.059801003396e+00   2.614441391866e-01   1.999126794669e+00 
++ -1.314083742070e+00   4.702574914880e-01   2.940415028752e+00 
++ -1.355178294944e+00   9.881176376344e-01   3.194144541062e+00 
++ -7.386962390043e-01   2.711839108286e-01   1.631808751594e+00 
++ -1.306722624123e+00   1.578693388360e-01   3.279315183048e+00 
++ -1.356887467868e+00   8.260986060443e-01   1.920514513897e+00 
++ -7.103481371289e-01   4.674997831849e-01   9.755628612943e-01 
++ -1.670741554337e+00   1.551977023292e+00   2.002345273503e+00 
++ -2.128048669197e+00   2.089209882272e+00   2.285116482949e+00 
++ -1.001006916243e+00   1.064727784422e+00   9.499517110445e-01 
++ -5.500499628983e-01   5.644113219387e-01   5.795957293366e-01 
++ -1.065103842786e+00   1.550598656779e+00   7.863966114350e-01 
++ -1.402701638625e+00   2.004234285868e+00   5.979467854635e-01 
++ -5.609224366725e-01   9.044641583030e-01   3.378185516282e-01 
++ -1.210153841806e+00   1.941696485047e+00   1.031215229323e+00 
++ -7.342177948198e-01   6.766911517379e-01   5.122428889910e-01 
++ -2.688729572175e-01   2.397626147981e-01   1.752670547870e-01 
++ -1.347980048284e+00   1.040147739001e+00   5.845122359341e-01 
++ -2.100228170148e+00   1.481455364717e+00   8.005206532266e-01 
++ -8.696140179959e-01   5.128258896901e-01   2.341884331724e-01 
++ -4.284165879698e-01   2.721723354146e-01   8.917005925365e-02 
++ -1.314646521393e+00   5.697720059849e-01  -1.681427317041e-03 
++ -7.146360386130e-01   2.393626505310e-01  -2.835559741697e-02 
++ -1.300441307190e+00   6.603934630150e-01  -1.974048986300e-01 
++ -1.934254316782e+00   6.515140143601e-01   4.340281640780e-02 
++ -5.083271937158e-01   2.313554723609e-01   2.077900167466e-01 
++ -1.812135596612e-01   7.404146322531e-02   6.881648801556e-02 
++ -7.944141533983e-01   2.762746422728e-01   4.632922107714e-01 
++ -1.237761683286e+00   4.368579536972e-01   9.217301280049e-01 
++ -3.940002876858e-01   7.173073575280e-02   2.601187271650e-01 
++ -2.578745341748e-01   2.788822164560e-02   1.256113781877e-01 
++ -5.960208461965e-01  -8.293038154420e-03   4.955277286966e-01 
++ -9.784888785025e-01  -1.063303603992e-01   6.516036007692e-01 
++ -6.144574670381e-01   2.600137133085e-02   7.351642305112e-01 
++ -2.720013581821e-01  -3.489029458444e-02   2.366537311935e-01 
++ -1.333310220816e-01   3.297366629328e-02   1.102486726726e-01 
++ -5.525941491600e-02   9.030375989102e-03   4.371677764147e-02 
++ -1.933017788106e-02   1.034954252797e-02   1.742694939123e-02 
++ -8.244029762253e-03   5.005267639159e-03   8.102602481067e-03 
++ -2.270162664194e-02   1.202462714912e-02   1.589205701442e-02 
++ -1.187942020741e-02   6.358107319842e-03   7.630852352431e-03 
++ -4.610513180842e-02   2.280551461157e-02   2.860622337141e-02 
++ -1.191073972995e-01   5.188152075738e-02   1.182118191466e-01 
++ -2.300327393882e-01   1.271013910646e-01   2.448968714201e-01 
++ -4.100427648117e-02   1.934764811964e-02   4.337972597015e-02 
++ -2.475736554738e-02   9.141671761546e-03   2.735997285087e-02 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
++  0.000000000000e+00   0.000000000000e+00   0.000000000000e+00 
+diff --git a/tests/input_files/coordnum-pairlist-large_harmonic-fixed/test.in b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/test.in
+new file mode 100644
+index 000000000..3b9e19014
+--- /dev/null
++++ b/tests/input_files/coordnum-pairlist-large_harmonic-fixed/test.in
+@@ -0,0 +1,30 @@
++colvarsTrajFrequency 1
++colvarsRestartFrequency 10
++indexFile index.ndx
++
++colvar {
++
++    name one
++
++    outputAppliedForce on
++
++    width 0.5
++
++    coordNum {
++        debugGradients on
++        group1 {
++            indexGroup group11
++        }
++        group2 {
++            indexGroup group12
++        }
++        tolerance 0.001
++        pairListFrequency 2
++    }
++} 
++
++harmonic {
++    colvars        one
++    centers        0.1
++    forceConstant  0.001
++}
+diff --git a/tests/input_files/index.ndx b/tests/input_files/index.ndx
+index f844f37c4..f44e058e2 100644
+--- a/tests/input_files/index.ndx
++++ b/tests/input_files/index.ndx
+@@ -128,3 +128,20 @@
+         11        21        31        41        51        61        71        81
+         91        93
+ 
++[ group11 ]
++         1         3         5         7         9        11        13        15
++        17        19        21        23        25        27        29        31
++        33        35        37        39        41        43        45        47
++        49        51        53        55        57        59        61        63
++        65        67        69        71        73        75        77        79
++        81        83        85        87        89        91        93        95
++        97        99
++
++[ group12 ]
++                   2         4         6         8        10        12        14
++        16        18        20        22        24        26        28        30
++        32        34        36        38        40        42        44        46
++        48        50        52        54        56        58        60        62
++        64        66        68        70        72        74        76        78
++        80        82        84        86        88        90        92        94
++        96        98       100

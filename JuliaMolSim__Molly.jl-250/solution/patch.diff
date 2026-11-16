@@ -1,0 +1,2228 @@
+diff --git a/docs/src/documentation.md b/docs/src/documentation.md
+index ffc5721b2..1df3e377e 100644
+--- a/docs/src/documentation.md
++++ b/docs/src/documentation.md
+@@ -1538,8 +1538,11 @@ The oscillatory behavior is due to the harmonic bond interactions.
+ 
+ ## Constraints
+ 
+-Molly implements SHAKE and its extension, RATTLE, to perform constrained molecular dynamics (see [`SHAKE_RATTLE`](@ref)).
++Molly implements SHAKE/RATTLE (see [`SHAKE_RATTLE`](@ref)) and LINCS (see [`LINCS`](@ref)) to perform constrained molecular dynamics.
+ These methods are useful for maintaining bond lengths and angles during a simulation, often allowing the use of longer time steps and therefore more efficient use of computing resources.
++
++### SHAKE/RATTLE
++
+ The constraints satisfied by SHAKE are solely on the atomic coordinates:
+ ```math
+ \begin{aligned}
+@@ -1555,6 +1558,17 @@ whereas RATTLE also constrains the velocities:
+ Here $\vec{r}_{ij}$ is the vector between atoms i and j in a constraint, $d_{ij}$ is the bond length to be maintained and $\vec{v}_{ij}$ is the difference in the velocity vectors for atoms i and j.
+ SHAKE was originally derived for the Verlet integration scheme ([Ryckaert et al. 1977](https://doi.org/10.1016/0021-9991(77)90098-5)) with RATTLE extending SHAKE to work for velocity Verlet where the velocities are also integrated ([Andersen 1983](https://doi.org/10.1016/0021-9991(83)90014-1)).
+ 
++### LINCS
++
++LINCS (LINear Constraint Solver) is a non-iterative constraint algorithm that uses matrix expansion to approximate the inverse of the constraint coupling matrix ([Hess et al. 1997](https://doi.org/10.1002/(SICI)1096-987X(199709)18:12<1463::AID-JCC4>3.0.CO;2-H)).
++It is typically faster than SHAKE/RATTLE for large systems.
++The implementation in Molly includes explicit velocity constraints.
++The key parameters controlling accuracy are `nrec`, the order of the matrix expansion for coupling matrix inversion (default 4), and `niter`, the number of outer correction iterations for rotational lengthening (default 1).
++Higher values of either improve accuracy at the cost of performance.
++
++!!! note
++    LINCS requires that angle constraints are isolated: none of their atoms may participate in distance constraints or in other angle constraints. This is because internally angle constraints are treated as a triangle of distance constraints, so interactions with other constraints may violate the constrained angle.
++
+ Currently, constraints are supported by the following simulators:
+ - [`SteepestDescentMinimizer`](@ref)
+ - [`VelocityVerlet`](@ref)
+@@ -1584,6 +1598,20 @@ shake = SHAKE_RATTLE(
+ # SHAKE_RATTLE with 0 2-atom clusters, 1 3-atom clusters, 0 4-atom clusters and 1 angle clusters
+ ```
+ `constraints=(shake,)` can then be given when setting up a [`System`](@ref).
++
++Alternatively, using LINCS:
++```julia
++masses = [1.0u"g/mol", 1.0u"g/mol", 1.0u"g/mol", 1.0u"g/mol", 1.0u"g/mol", 1.0u"g/mol"]
++
++lincs = LINCS(
++    masses=masses,
++    dist_constraints=dist_constraints,
++    angle_constraints=angle_constraints,
++)
++# LINCS with 2 distance and 1 angle constraints (nrec=4, niter=1) (implicitly 5 distance constraints)
++```
++`constraints=(lincs,)` can then be given when setting up a [`System`](@ref).
++
+ See [this example](@ref "Constrained dynamics") for more.
+ 
+ This diagram demonstrates the four allowed constraint types:
+@@ -1594,13 +1622,14 @@ This diagram demonstrates the four allowed constraint types:
+ - 3 atoms around 1 central atom, 3 [`DistanceConstraint`](@ref)s (e.g. an ammonia molecule).
+ 
+ !!! note
+-    You can't constrain a linear chain of four atoms or an angle of 180°. Constraints beyond the four valid classes can't be used. For example, you can't constrain all the hydrogen bonds and the double bond in ethylene simultaneously. This would create a cluster of 5 constraints which is not supported.
++    For SHAKE/RATTLE, you can't constrain a linear chain of four atoms or an angle of 180°. Constraints beyond the four valid classes can't be used. For example, you can't constrain all the hydrogen bonds and the double bond in ethylene simultaneously. This would create a cluster of 5 constraints which is not supported. LINCS does not have these cluster size limitations but does require that angle constraints are isolated (no shared atoms with distance constraints or other angle constraints).
+ 
+ These constraints provide enough flexibility to constrain all hydrogen atoms in organic molecules as well as water molecules.
+ 
+-All velocity constraints and diatomic distance constraints are solved analytically while larger constraints are linearized and solved iteratively via matrix inverse.
++For SHAKE/RATTLE, all velocity constraints and diatomic distance constraints are solved analytically while larger constraints are linearized and solved iteratively via matrix inverse.
+ The direct matrix inverse does not scale well beyond clusters with 3 constraints and is not implemented.
+ Other methods can be used to solve larger constraint clusters, these are not yet supported by Molly.
++LINCS uses a matrix expansion approach that scales better with system size and does not have the same cluster size limitations.
+ 
+ ## Virtual sites
+ 
+diff --git a/src/Molly.jl b/src/Molly.jl
+index 8334bc341..e9d5b9085 100644
+--- a/src/Molly.jl
++++ b/src/Molly.jl
+@@ -67,6 +67,7 @@ include("interactions/muller_brown.jl")
+ include("interactions/dpd.jl")
+ include("constraints/constraints.jl")
+ include("constraints/shake.jl")
++include("constraints/lincs.jl")
+ include("simulators.jl")
+ include("coupling.jl")
+ include("neighbors.jl")
+diff --git a/src/constraints/constraints.jl b/src/constraints/constraints.jl
+index 18effcc78..2e8a850cd 100644
+--- a/src/constraints/constraints.jl
++++ b/src/constraints/constraints.jl
+@@ -397,30 +397,6 @@ Check whether the coordinates of a system satisfy the position constraints.
+ """
+ check_position_constraints(sys) = all(ca -> check_position_constraints(sys, ca), sys.constraints)
+ 
+-function check_position_constraints(sys::System{<:Any, <:Any, FT}, ca) where FT
+-    err_unit = unit(eltype(eltype(sys.coords)))
+-    if err_unit != unit(ca.dist_tolerance)
+-        throw(ArgumentError("distance tolerance units in SHAKE ($(unit(ca.dist_tolerance))) " *
+-                            "are inconsistent with system coordinate units ($err_unit)"))
+-    end
+-
+-    cluster_maxes = FT[]
+-    backend = get_backend(sys.coords)
+-    err_kernel = max_dist_error(backend, 128)
+-
+-    for cluster_type in cluster_keys(ca)
+-        clusters = getproperty(ca, cluster_type)
+-        if length(clusters) > 0
+-            max_storage = allocate(backend, FT, length(clusters))
+-            err_kernel(clusters, sys.coords, sys.boundary, max_storage; ndrange=length(clusters))
+-            push!(cluster_maxes, reduce(max, Array(max_storage)))
+-        end
+-    end
+-
+-    KernelAbstractions.synchronize(backend)
+-    return maximum(cluster_maxes) < ustrip(ca.dist_tolerance)
+-end
+-
+ """
+     check_velocity_constraints(sys)
+     check_velocity_constraints(sys, constraints)
+@@ -429,31 +405,6 @@ Check whether the velocities of a system satisfy the velocity constraints.
+ """
+ check_velocity_constraints(sys) = all(ca -> check_velocity_constraints(sys, ca), sys.constraints)
+ 
+-function check_velocity_constraints(sys::System{<:Any, <:Any, FT}, ca) where FT
+-    err_unit = unit(eltype(eltype(sys.velocities))) * unit(eltype(eltype(sys.coords)))
+-    if err_unit != unit(ca.vel_tolerance)
+-        throw(ArgumentError("velocity tolerance units in RATTLE ($(unit(ca.vel_tolerance))) " *
+-                    "are inconsistent with system velocity and coordinate units ($err_unit)"))
+-    end
+-
+-    cluster_maxes = FT[]
+-    backend = get_backend(sys.coords)
+-    err_kernel = max_vel_error(backend, 128)
+-
+-    for cluster_type in cluster_keys(ca)
+-        clusters = getproperty(ca, cluster_type)
+-        if length(clusters) > 0
+-            max_storage = allocate(backend, FT, length(clusters))
+-            err_kernel(clusters, sys.coords, sys.velocities, sys.boundary, max_storage;
+-                       ndrange=length(clusters))
+-            push!(cluster_maxes, reduce(max, Array(max_storage)))
+-        end
+-    end
+-
+-    KernelAbstractions.synchronize(backend)
+-    return maximum(cluster_maxes) < ustrip(ca.vel_tolerance)
+-end
+-
+ """
+     check_constraints(sys)
+     check_constraints(sys, constraints)
+diff --git a/src/constraints/lincs.jl b/src/constraints/lincs.jl
+new file mode 100644
+index 000000000..9204f8789
+--- /dev/null
++++ b/src/constraints/lincs.jl
+@@ -0,0 +1,1016 @@
++export LINCS
++
++# Internal types for LINCS algorithm
++
++struct LincsCouplingMatrix{R, N, C}
++    range::R       # length K+1, row pointers (CSR format)
++    neighbors::N   # coupled constraint indices
++    coef::C        # mass-weighted coupling coefficients
++end
++
++struct LincsCouplingDense{CI, CC, NC}
++    coupled_indices::CI   # Int[max_coupled, K_padded]
++    coupled_coef::CC      # T[max_coupled, K_padded]
++    n_coupled::NC         # Int[K_padded]
++    max_coupled::Int
++end
++
++struct LincsData{A1, A2, L, IM, SD, CM}
++    atom1::A1
++    atom2::A2
++    lengths::L
++    invmass::IM
++    sdiag::SD
++    coupling::CM
++    nrec::Int
++    niter::Int
++end
++
++struct LincsWorkspace{BV, R, S, TM, BL}
++    B::BV
++    rhs::R
++    sol::S
++    tmp::TM
++    blcc::BL
++end
++
++"""
++    LINCS(masses, dist_tolerance=1e-8u"nm", vel_tolerance=1e-8u"nm^2 * ps^-1";
++          dist_constraints=nothing, angle_constraints=nothing, nrec=4, niter=1,
++          iter_vel_correction=false, gpu_block_size=128)
++
++Constrain bond distances during a simulation using the LINCS (LINear Constraint Solver)
++algorithm.
++
++LINCS is a non-iterative constraint algorithm that uses matrix expansion to approximate
++the inverse of the constraint coupling matrix. It is typically faster than
++[`SHAKE_RATTLE`](@ref) for large systems but is approximate for ring topologies.
++
++Velocity constraints are applied implicitly through position constraint correction.
++See [Hess et al. 1997](https://doi.org/10.1002/(SICI)1096-987X(199709)18:12<1463::AID-JCC4>3.0.CO;2-H)
++for the original LINCS paper.
++
++# Arguments
++- `masses`: vector of atom masses.
++- `dist_tolerance=1e-8u"nm"`: the tolerance for checking position constraints, should
++    have the same units as the coordinates.
++- `vel_tolerance=1e-8u"nm^2 * ps^-1"`: the tolerance for checking velocity constraints,
++    should have the same units as the velocities times the coordinates.
++- `dist_constraints`: a vector of [`DistanceConstraint`](@ref) objects.
++- `angle_constraints`: a vector of [`AngleConstraint`](@ref) objects. Each angle constraint
++    is converted into 3 distance constraints internally. LINCS requires that angle
++    constraints are isolated: none of their atoms may participate in distance constraints
++    or in other angle constraints.
++- `nrec=4`: order of the matrix expansion for coupling matrix inversion. Higher values
++    improve accuracy for coupled constraints at the cost of performance.
++- `niter=1`: number of outer correction iterations for rotational lengthening. Higher
++    values improve accuracy for strongly perturbed bonds.
++- `iter_vel_correction=false`: whether to use iterative velocity constraint solving.
++    When `false` (the default), velocity correction uses the simple one-step approach
++    `v += Δx/dt` as in GROMACS (for the Verlet simulator only, otherwise velocities are
++    not constrained). When `true`, a full iterative velocity constraint projection
++    is performed.
++- `gpu_block_size=128`: the number of threads per block to use for GPU calculations.
++"""
++struct LINCS{CL, LD, LW, DC, AC, E, F, DB, CI}
++    clusters::CL
++    lincs_data::LD
++    workspace::LW
++    dist_constraints::DC
++    angle_constraints::AC
++    dist_tolerance::E
++    vel_tolerance::F
++    iter_vel_correction::Bool
++    gpu_block_size::Int
++    delta_buf::DB         # 3 × n_atoms matrix for atomic scatter (or nothing on CPU)
++    constrained_atoms::CI # sorted unique atom indices in constraints (or nothing on CPU)
++end
++
++function validate_angle_constraints(dist_constraints, angle_constraints)
++    dist_atoms = Set{Int}()
++    for dc in dist_constraints
++        push!(dist_atoms, dc.i, dc.j)
++    end
++
++    for (idx, ac) in enumerate(angle_constraints)
++        ac_atoms = (ac.i, ac.j, ac.k)
++        for a in ac_atoms
++            if a in dist_atoms
++                throw(ArgumentError(
++                    "angle constraint $idx (atoms $(ac.i)/$(ac.j)/$(ac.k)) shares " *
++                    "atom $a with a distance constraint; LINCS requires angle " *
++                    "constraints to be isolated"))
++            end
++        end
++
++        for (idx2, ac2) in enumerate(angle_constraints)
++            idx2 == idx && continue
++            ac2_atoms = (ac2.i, ac2.j, ac2.k)
++            for a in ac_atoms
++                if a in ac2_atoms
++                    throw(ArgumentError(
++                        "angle constraint $idx (atoms $(ac.i)/$(ac.j)/$(ac.k)) shares " *
++                        "atom $a with angle constraint $idx2 (atoms $(ac2.i)/$(ac2.j)/$(ac2.k)); " *
++                        "LINCS requires angle constraints to be isolated"))
++                end
++            end
++        end
++    end
++end
++
++function LINCS(;masses,
++               dist_tolerance=1e-8u"nm",
++               vel_tolerance=1e-8u"nm^2 * ps^-1",
++               dist_constraints=nothing,
++               angle_constraints=nothing,
++               nrec::Integer=4,
++               niter::Integer=1,
++               iter_vel_correction::Bool=false,
++               gpu_block_size::Integer=128)
++    ustrip(dist_tolerance) > 0 || throw(ArgumentError("dist_tolerance must be greater than zero"))
++    ustrip(vel_tolerance)  > 0 || throw(ArgumentError("vel_tolerance must be greater than zero"))
++
++    dc_present = !isnothing(dist_constraints) && length(dist_constraints) > 0
++    ac_present = !isnothing(angle_constraints) && length(angle_constraints) > 0
++
++    if !dc_present && !ac_present
++        throw(ArgumentError("at least one of dist_constraints or angle_constraints must " *
++                            "be provided and non-empty for LINCS"))
++    end
++
++    all_dist_constraints = dc_present ? collect(dist_constraints) : DistanceConstraint[]
++
++    if ac_present
++        validate_angle_constraints(all_dist_constraints, angle_constraints)
++        for ac in angle_constraints
++            append!(all_dist_constraints, to_distance_constraints(ac))
++        end
++    end
++
++    if isa(all_dist_constraints, AbstractGPUArray)
++        throw(ArgumentError("constraints should be passed to LINCS on CPU"))
++    end
++
++    clusters = StructArray([Cluster12Data(Int32(dc.i), Int32(dc.j), dc.dist)
++                            for dc in all_dist_constraints])
++
++    lincs_data = build_lincs_data(all_dist_constraints, masses; nrec=Int(nrec), niter=Int(niter))
++    workspace = create_lincs_workspace(lincs_data)
++
++    stored_angle_constraints = ac_present ? collect(angle_constraints) : nothing
++
++    return LINCS(clusters, lincs_data, workspace, all_dist_constraints,
++                 stored_angle_constraints, dist_tolerance, vel_tolerance,
++                 iter_vel_correction, Int(gpu_block_size), nothing, nothing)
++end
++
++function Base.show(io::IO, lincs::LINCS)
++    n_ac = isnothing(lincs.angle_constraints) ? 0 : length(lincs.angle_constraints)
++    n_dc = length(lincs.dist_constraints) - 3 * n_ac # avoid counting angle constraints as distance constraints
++    print(io, "LINCS with ", n_dc, " distance and ", n_ac, " angle constraints (nrec=",
++          lincs.lincs_data.nrec, ", niter=", lincs.lincs_data.niter,
++          ", iter_vel_correction=", lincs.iter_vel_correction, ")")
++end
++
++function constrained_atom_inds(lincs::LINCS)
++    atom_inds = Int[]
++    for dc in lincs.dist_constraints
++        push!(atom_inds, dc.i, dc.j)
++    end
++    return atom_inds
++end
++
++cluster_keys(::LINCS) = (:clusters,)
++
++# --- Setup functions ---
++
++function build_lincs_coupling_matrix(atom1, atom2, invmass, sdiag, ::Type{T}) where T
++    K = length(atom1)
++
++    atom_to_constraints = Dict{Int, Vector{Int}}()
++    for (ci, (a1, a2)) in enumerate(zip(atom1, atom2))
++        for a in (a1, a2)
++            push!(get!(Vector{Int}, atom_to_constraints, a), ci)
++        end
++    end
++
++    neighbor_lists = [Int[] for _ in 1:K]
++    coef_lists = [T[] for _ in 1:K]
++
++    for (ci, (a1_i, a2_i)) in enumerate(zip(atom1, atom2))
++        for a in (a1_i, a2_i)
++            for cj in atom_to_constraints[a]
++                cj == ci && continue
++
++                a1_j = atom1[cj]
++
++                # Sign convention (GROMACS):
++                # -1 if both constraints use center in same position (both atom1 or both atom2)
++                # +1 if center is atom1 of one and atom2 of the other
++                same_side_i = (a == a1_i)
++                same_side_j = (a == a1_j)
++                sign = (same_side_i == same_side_j) ? T(-1) : T(1)
++
++                coef = sign * invmass[a] * sdiag[ci] * sdiag[cj]
++                push!(neighbor_lists[ci], cj)
++                push!(coef_lists[ci], coef)
++            end
++        end
++    end
++
++    # Deduplicate: a pair sharing two atoms would appear twice
++    for ci in 1:K
++        seen = Dict{Int, Int}()
++        dedup_neighbors = Int[]
++        dedup_coefs = T[]
++        for (idx, cj) in enumerate(neighbor_lists[ci])
++            if haskey(seen, cj)
++                dedup_coefs[seen[cj]] += coef_lists[ci][idx]
++            else
++                seen[cj] = length(dedup_neighbors) + 1
++                push!(dedup_neighbors, cj)
++                push!(dedup_coefs, coef_lists[ci][idx])
++            end
++        end
++        neighbor_lists[ci] = dedup_neighbors
++        coef_lists[ci] = dedup_coefs
++    end
++
++    # Pack into CSR format
++    range = Vector{Int}(undef, K + 1)
++    range[1] = 1
++    for ci in 1:K
++        range[ci + 1] = range[ci] + length(neighbor_lists[ci])
++    end
++    ncc = range[K + 1] - 1
++    neighbors = Vector{Int}(undef, max(ncc, 0))
++    coef = Vector{T}(undef, max(ncc, 0))
++    for ci in 1:K
++        idx_start = range[ci]
++        for (j, cj) in enumerate(neighbor_lists[ci])
++            neighbors[idx_start + j - 1] = cj
++            coef[idx_start + j - 1] = coef_lists[ci][j]
++        end
++    end
++
++    return LincsCouplingMatrix(range, neighbors, coef)
++end
++
++function build_lincs_data(dist_constraints::AbstractVector{<:DistanceConstraint},
++                          masses::AbstractVector;
++                          nrec::Int=4, niter::Int=1)
++    T = typeof(float(ustrip(masses[1])))
++    K = length(dist_constraints)
++
++    atom1 = [dc.i for dc in dist_constraints]
++    atom2 = [dc.j for dc in dist_constraints]
++    lengths = T[ustrip(dc.dist) for dc in dist_constraints]
++
++    raw_masses = T[ustrip(m) for m in masses]
++    invmass = inv.(raw_masses)
++
++    sdiag = Vector{T}(undef, K)
++    for i in 1:K
++        sdiag[i] = inv(sqrt(invmass[atom1[i]] + invmass[atom2[i]]))
++    end
++
++    coupling = build_lincs_coupling_matrix(atom1, atom2, invmass, sdiag, T)
++    return LincsData(atom1, atom2, lengths, invmass, sdiag, coupling, nrec, niter)
++end
++
++function create_lincs_workspace(data::LincsData)
++    T = eltype(data.lengths)
++    K = length(data.atom1)
++    ncc = length(data.coupling.neighbors)
++    B = Vector{SVector{3, T}}(undef, K)
++    rhs = zeros(T, K)
++    sol = zeros(T, K)
++    tmp = zeros(T, K)
++    blcc = zeros(T, ncc)
++    return LincsWorkspace(B, rhs, sol, tmp, blcc)
++end
++
++# --- GPU grouping and dense coupling layout ---
++
++function group_constraints_for_gpu(atom1, atom2, block_size)
++    K = length(atom1)
++    K == 0 && return Int[]
++
++    # Build constraint adjacency via shared atoms
++    atom_to_constraints = Dict{Int, Vector{Int}}()
++    for (ci, (a1, a2)) in enumerate(zip(atom1, atom2))
++        for a in (a1, a2)
++            push!(get!(Vector{Int}, atom_to_constraints, a), ci)
++        end
++    end
++
++    # BFS to find connected components
++    visited = falses(K)
++    components = Vector{Vector{Int}}()
++    for ci in 1:K
++        visited[ci] && continue
++        comp = Int[]
++        queue = [ci]
++        visited[ci] = true
++        while !isempty(queue)
++            c = popfirst!(queue)
++            push!(comp, c)
++            for a in (atom1[c], atom2[c])
++                for cj in get(atom_to_constraints, a, Int[])
++                    if !visited[cj]
++                        visited[cj] = true
++                        push!(queue, cj)
++                    end
++                end
++            end
++        end
++        push!(components, comp)
++    end
++
++    for comp in components
++        if length(comp) > block_size
++            error(
++                "LINCS: connected component of $(length(comp)) coupled constraints exceeds " *
++                "gpu_block_size=$block_size. Increase gpu_block_size in the LINCS constructor " *
++                "to at least $(length(comp)), or use CPU constraints for this system.",
++            )
++        end
++    end
++
++    sort!(components, by=length, rev=true)
++
++    # Pack components into blocks, padding with 0 (dummy)
++    perm = Int[]
++    pos_in_block = 0
++    for comp in components
++        nc = length(comp)
++        if nc > block_size - pos_in_block && pos_in_block > 0
++            append!(perm, zeros(Int, block_size - pos_in_block))
++            pos_in_block = 0
++        end
++        append!(perm, comp)
++        pos_in_block = (pos_in_block + nc) % block_size
++    end
++    if pos_in_block > 0
++        append!(perm, zeros(Int, block_size - pos_in_block))
++    end
++
++    return perm
++end
++
++function build_dense_coupling(perm, coupling_csr::LincsCouplingMatrix, ::Type{T}) where T
++    K_padded = length(perm)
++
++    # Build inverse permutation (original constraint index → new position)
++    inv_perm = Dict{Int, Int}()
++    for (new_i, old_c) in enumerate(perm)
++        if old_c != 0
++            inv_perm[old_c] = new_i
++        end
++    end
++
++    max_coupled = 0
++    for old_c in perm
++        old_c == 0 && continue
++        nc = coupling_csr.range[old_c + 1] - coupling_csr.range[old_c]
++        max_coupled = max(max_coupled, nc)
++    end
++    max_coupled = max(max_coupled, 1)
++
++    # Build dense arrays (column-major: [max_coupled, K_padded])
++    coupled_indices = ones(Int, max_coupled, K_padded)
++    coupled_coef_arr = zeros(T, max_coupled, K_padded)
++    n_coupled_arr = zeros(Int, K_padded)
++
++    for (new_i, old_c) in enumerate(perm)
++        old_c == 0 && continue
++        start = coupling_csr.range[old_c]
++        stop = coupling_csr.range[old_c + 1] - 1
++        nc = stop - start + 1
++        n_coupled_arr[new_i] = nc
++        for (j, n) in enumerate(start:stop)
++            coupled_indices[j, new_i] = inv_perm[coupling_csr.neighbors[n]]
++            coupled_coef_arr[j, new_i] = coupling_csr.coef[n]
++        end
++    end
++
++    return LincsCouplingDense(coupled_indices, coupled_coef_arr, n_coupled_arr, max_coupled)
++end
++
++# --- Core algorithm ---
++
++@inline function lincs_bond_vector(coords, a1, a2, boundary)
++    return ustrip.(vector(coords[a2], coords[a1], boundary))
++end
++
++# --- GPU kernels ---
++# These fused kernels rely on @synchronize (workgroup barrier) between matrix expansion
++# iterations. Correctness requires that all coupled constraints within a connected
++# component reside in the same workgroup. This is ensured by group_constraints_for_gpu,
++# which packs connected components into blocks, and by passing gpu_block_size as the
++# workgroup size to the KernelAbstractions kernel constructor.
++
++@kernel inbounds=true function lincs_fused_position_kernel!(
++        delta_buf,
++        B, rhs, sol, tmp,
++        @Const(coords), @Const(old_coords),
++        @Const(atom1), @Const(atom2), @Const(lengths), @Const(invmass), @Const(sdiag),
++        @Const(coupled_indices), @Const(coupled_coef), @Const(n_coupled_arr),
++        max_coupled, nrec, boundary)
++    i = @index(Global, Linear)
++    @uniform T = eltype(lengths)
++
++    a1, a2 = atom1[i], atom2[i]
++
++    diff_old = lincs_bond_vector(old_coords, a1, a2, boundary)
++    inv_len = inv(sqrt(dot(diff_old, diff_old)))
++    B_i = diff_old * inv_len
++    B[i] = B_i
++
++    diff_new = lincs_bond_vector(coords, a1, a2, boundary)
++    proj = dot(B_i, diff_new)
++    val = sdiag[i] * (proj - lengths[i])
++    rhs[i] = val
++    sol[i] = val
++
++    @synchronize
++
++    nc = n_coupled_arr[i]
++    for rec in 1:nrec
++        mvb = zero(T)
++        for j in 1:max_coupled
++            if j <= nc
++                cj = coupled_indices[j, i]
++                blcc_val = coupled_coef[j, i] * dot(B_i, B[cj])
++                src_val = isodd(rec) ? rhs[cj] : tmp[cj]
++                mvb += blcc_val * src_val
++            end
++        end
++        if isodd(rec)
++            tmp[i] = mvb
++        else
++            rhs[i] = mvb
++        end
++        sol[i] += mvb
++        @synchronize
++    end
++
++    factor = sdiag[i] * sol[i]
++    delta = B_i * factor
++    for dim in 1:3
++        d = delta[dim]
++        Atomix.@atomic delta_buf[dim, a1] -= invmass[a1] * d
++        Atomix.@atomic delta_buf[dim, a2] += invmass[a2] * d
++    end
++end
++
++@kernel inbounds=true function lincs_fused_correction_kernel!(
++        delta_buf,
++        @Const(B), rhs, sol, tmp,
++        @Const(coords),
++        @Const(atom1), @Const(atom2), @Const(lengths), @Const(invmass), @Const(sdiag),
++        @Const(coupled_indices), @Const(coupled_coef), @Const(n_coupled_arr),
++        max_coupled, nrec, boundary)
++    i = @index(Global, Linear)
++    @uniform T = eltype(lengths)
++
++    a1, a2 = atom1[i], atom2[i]
++
++    # Correction RHS (rotational lengthening) + recompute B from current coords
++    diff = lincs_bond_vector(coords, a1, a2, boundary)
++    dlen2 = 2 * lengths[i]^2 - dot(diff, diff)
++    p = sqrt(max(dlen2, zero(T)))
++    val = sdiag[i] * (lengths[i] - p)
++    rhs[i] = val
++    sol[i] = val
++
++    B_i = B[i]
++
++    @synchronize
++
++    nc = n_coupled_arr[i]
++    for rec in 1:nrec
++        mvb = zero(T)
++        for j in 1:max_coupled
++            if j <= nc
++                cj = coupled_indices[j, i]
++                blcc_val = coupled_coef[j, i] * dot(B_i, B[cj])
++                src_val = isodd(rec) ? rhs[cj] : tmp[cj]
++                mvb += blcc_val * src_val
++            end
++        end
++        if isodd(rec)
++            tmp[i] = mvb
++        else
++            rhs[i] = mvb
++        end
++        sol[i] += mvb
++        @synchronize
++    end
++
++    factor = sdiag[i] * sol[i]
++    delta = B_i * factor
++    for dim in 1:3
++        d = delta[dim]
++        Atomix.@atomic delta_buf[dim, a1] -= invmass[a1] * d
++        Atomix.@atomic delta_buf[dim, a2] += invmass[a2] * d
++    end
++end
++
++@kernel inbounds=true function lincs_fused_velocity_kernel!(
++        delta_buf,
++        B, rhs, sol, tmp,
++        @Const(coords), @Const(velocities),
++        @Const(atom1), @Const(atom2), @Const(invmass), @Const(sdiag),
++        @Const(coupled_indices), @Const(coupled_coef), @Const(n_coupled_arr),
++        max_coupled, nrec, boundary)
++    i = @index(Global, Linear)
++    @uniform T = eltype(sdiag)
++
++    a1, a2 = atom1[i], atom2[i]
++
++    diff = lincs_bond_vector(coords, a1, a2, boundary)
++    inv_len = inv(sqrt(dot(diff, diff)))
++    B_i = diff * inv_len
++    B[i] = B_i
++    dv = ustrip.(velocities[a2] - velocities[a1])
++    val = -sdiag[i] * dot(B_i, dv)
++    rhs[i] = val
++    sol[i] = val
++
++    @synchronize
++
++    nc = n_coupled_arr[i]
++    for rec in 1:nrec
++        mvb = zero(T)
++        for j in 1:max_coupled
++            if j <= nc
++                cj = coupled_indices[j, i]
++                blcc_val = coupled_coef[j, i] * dot(B_i, B[cj])
++                src_val = isodd(rec) ? rhs[cj] : tmp[cj]
++                mvb += blcc_val * src_val
++            end
++        end
++        if isodd(rec)
++            tmp[i] = mvb
++        else
++            rhs[i] = mvb
++        end
++        sol[i] += mvb
++        @synchronize
++    end
++
++    factor = sdiag[i] * sol[i]
++    delta = B_i * factor
++    for dim in 1:3
++        d = delta[dim]
++        Atomix.@atomic delta_buf[dim, a1] -= invmass[a1] * d
++        Atomix.@atomic delta_buf[dim, a2] += invmass[a2] * d
++    end
++end
++
++@kernel inbounds=true function lincs_fused_velocity_correction_kernel!(
++        delta_buf,
++        @Const(B), rhs, sol, tmp,
++        @Const(velocities),
++        @Const(atom1), @Const(atom2), @Const(invmass), @Const(sdiag),
++        @Const(coupled_indices), @Const(coupled_coef), @Const(n_coupled_arr),
++        max_coupled, nrec)
++    i = @index(Global, Linear)
++    @uniform T = eltype(sdiag)
++
++    a1, a2 = atom1[i], atom2[i]
++
++    B_i = B[i]
++    dv = ustrip.(velocities[a2] - velocities[a1])
++    val = -sdiag[i] * dot(B_i, dv)
++    rhs[i] = val
++    sol[i] = val
++
++    @synchronize
++
++    nc = n_coupled_arr[i]
++    for rec in 1:nrec
++        mvb = zero(T)
++        for j in 1:max_coupled
++            if j <= nc
++                cj = coupled_indices[j, i]
++                blcc_val = coupled_coef[j, i] * dot(B_i, B[cj])
++                src_val = isodd(rec) ? rhs[cj] : tmp[cj]
++                mvb += blcc_val * src_val
++            end
++        end
++        if isodd(rec)
++            tmp[i] = mvb
++        else
++            rhs[i] = mvb
++        end
++        sol[i] += mvb
++        @synchronize
++    end
++
++    factor = sdiag[i] * sol[i]
++    delta = B_i * factor
++    for dim in 1:3
++        d = delta[dim]
++        Atomix.@atomic delta_buf[dim, a1] -= invmass[a1] * d
++        Atomix.@atomic delta_buf[dim, a2] += invmass[a2] * d
++    end
++end
++
++@kernel inbounds=true function lincs_apply_deltas_kernel!(
++        coords, delta_buf,
++        @Const(constrained_atoms), unit_scale)
++    idx = @index(Global, Linear)
++    if idx <= length(constrained_atoms)
++        a = constrained_atoms[idx]
++        coords[a] += SVector(delta_buf[1, a], delta_buf[2, a], delta_buf[3, a]) .* unit_scale
++        delta_buf[1, a] = zero(eltype(delta_buf))
++        delta_buf[2, a] = zero(eltype(delta_buf))
++        delta_buf[3, a] = zero(eltype(delta_buf))
++    end
++end
++
++# --- CPU solve path ---
++
++function lincs_solve!(coords, data::LincsData, ws::LincsWorkspace, unit_scale)
++    T = eltype(data.lengths)
++    coupling = data.coupling
++    rhs = ws.rhs
++    tmp = ws.tmp
++
++    # Matrix expansion: nrec iterations
++    for rec in 1:data.nrec
++        @inbounds for i in eachindex(data.atom1)
++            mvb = zero(T)
++            for n in coupling.range[i]:(coupling.range[i+1] - 1)
++                mvb += ws.blcc[n] * rhs[coupling.neighbors[n]]
++            end
++            tmp[i] = mvb
++            ws.sol[i] += mvb
++        end
++        # Ping-pong: swap local bindings so next iteration reads from what was just written.
++        # ws.rhs/ws.tmp fields still point to original arrays; callers reassign ws.rhs before reuse.
++        rhs, tmp = tmp, rhs
++    end
++
++    # Position update
++    @inbounds for i in eachindex(data.atom1)
++        a1, a2 = data.atom1[i], data.atom2[i]
++        factor = data.sdiag[i] * ws.sol[i]
++        delta = ws.B[i] * factor
++        coords[a1] -= (data.invmass[a1] * delta) .* unit_scale
++        coords[a2] += (data.invmass[a2] * delta) .* unit_scale
++    end
++end
++
++function lincs_apply!(coords, old_coords, data::LincsData, ws::LincsWorkspace,
++                      boundary)
++    T = eltype(data.lengths)
++    K = length(data.atom1)
++    coupling = data.coupling
++
++    unit_scale = oneunit(eltype(eltype(coords)))
++
++    # Compute unit bond vectors and initial RHS
++    @inbounds for i in 1:K
++        diff_old = lincs_bond_vector(old_coords, data.atom1[i], data.atom2[i], boundary)
++        inv_len = inv(sqrt(dot(diff_old, diff_old)))
++        B_i = diff_old * inv_len
++        ws.B[i] = B_i
++
++        diff_new = lincs_bond_vector(coords, data.atom1[i], data.atom2[i], boundary)
++        proj = dot(B_i, diff_new)
++        ws.rhs[i] = data.sdiag[i] * (proj - data.lengths[i])
++    end
++
++    # Compute runtime coupling coefficients: blcc = coef * dot(B[i], B[neighbor])
++    @inbounds for i in 1:K
++        for n in coupling.range[i]:(coupling.range[i+1] - 1)
++            j = coupling.neighbors[n]
++            ws.blcc[n] = coupling.coef[n] * dot(ws.B[i], ws.B[j])
++        end
++    end
++
++    copyto!(ws.sol, ws.rhs)
++    lincs_solve!(coords, data, ws, unit_scale)
++
++    # Outer correction iterations (rotational lengthening)
++    for _ in 1:data.niter
++        @inbounds for i in 1:K
++            diff = lincs_bond_vector(coords, data.atom1[i], data.atom2[i], boundary)
++            dlen2 = 2 * data.lengths[i]^2 - dot(diff, diff)
++            if dlen2 < zero(T)
++                @warn "LINCS correction: bond $(data.atom1[i])-$(data.atom2[i]) stretched " *
++                      "beyond sqrt(2) * target length, constraint may be unreliable" maxlog=1
++            end
++            p = sqrt(max(dlen2, zero(T)))
++            ws.rhs[i] = data.sdiag[i] * (data.lengths[i] - p)
++        end
++        copyto!(ws.sol, ws.rhs)
++        lincs_solve!(coords, data, ws, unit_scale)
++    end
++
++    return coords
++end
++
++function lincs_vel_apply!(velocities, coords, data::LincsData, ws::LincsWorkspace, boundary)
++    K = length(data.atom1)
++    coupling = data.coupling
++    unit_vel_scale = oneunit(eltype(eltype(velocities)))
++
++    # Bond vectors from current (constrained) coords + velocity RHS
++    @inbounds for i in 1:K
++        a1, a2 = data.atom1[i], data.atom2[i]
++        diff = lincs_bond_vector(coords, a1, a2, boundary)
++        inv_len = inv(sqrt(dot(diff, diff)))
++        ws.B[i] = diff * inv_len
++        dv = ustrip.(velocities[a2] - velocities[a1])
++        ws.rhs[i] = -data.sdiag[i] * dot(ws.B[i], dv)
++    end
++
++    # Recompute coupling coefficients using current B vectors
++    @inbounds for i in 1:K
++        for n in coupling.range[i]:(coupling.range[i+1] - 1)
++            ws.blcc[n] = coupling.coef[n] * dot(ws.B[i], ws.B[coupling.neighbors[n]])
++        end
++    end
++
++    copyto!(ws.sol, ws.rhs)
++    lincs_solve!(velocities, data, ws, unit_vel_scale)
++
++    # Iterative correction: re-evaluate velocity residual and solve again
++    for _ in 1:data.niter
++        @inbounds for i in 1:K
++            a1, a2 = data.atom1[i], data.atom2[i]
++            dv = ustrip.(velocities[a2] - velocities[a1])
++            ws.rhs[i] = -data.sdiag[i] * dot(ws.B[i], dv)
++        end
++        copyto!(ws.sol, ws.rhs)
++        lincs_solve!(velocities, data, ws, unit_vel_scale)
++    end
++end
++
++# --- GPU solve path ---
++
++function lincs_apply_gpu!(coords, old_coords, data, ws, boundary,
++                          delta_buf, constrained_atoms, block_size)
++    K_padded = length(data.atom1)
++    backend = get_backend(coords)
++    unit_scale = oneunit(eltype(eltype(coords)))
++    n_ca = length(constrained_atoms)
++    coupling = data.coupling
++
++    # Fused solve: bond vectors + blcc + SpMV iterations + scatter
++    fused_kern! = lincs_fused_position_kernel!(backend, block_size)
++    fused_kern!(delta_buf, ws.B, ws.rhs, ws.sol, ws.tmp,
++                coords, old_coords,
++                data.atom1, data.atom2, data.lengths, data.invmass, data.sdiag,
++                coupling.coupled_indices, coupling.coupled_coef, coupling.n_coupled,
++                coupling.max_coupled, data.nrec, boundary;
++                ndrange=K_padded)
++
++    apply_kern! = lincs_apply_deltas_kernel!(backend, block_size)
++    apply_kern!(coords, delta_buf, constrained_atoms, unit_scale;
++                ndrange=n_ca)
++
++    # Correction iterations (rotational lengthening)
++    for _ in 1:data.niter
++        corr_kern! = lincs_fused_correction_kernel!(backend, block_size)
++        corr_kern!(delta_buf, ws.B, ws.rhs, ws.sol, ws.tmp,
++                   coords,
++                   data.atom1, data.atom2, data.lengths, data.invmass, data.sdiag,
++                   coupling.coupled_indices, coupling.coupled_coef, coupling.n_coupled,
++                   coupling.max_coupled, data.nrec, boundary;
++                   ndrange=K_padded)
++        apply_kern!(coords, delta_buf, constrained_atoms, unit_scale;
++                    ndrange=n_ca)
++    end
++
++    KernelAbstractions.synchronize(backend)
++    return coords
++end
++
++function lincs_vel_apply_gpu!(velocities, coords, data, ws, boundary,
++                               delta_buf, constrained_atoms, block_size)
++    K_padded = length(data.atom1)
++    backend = get_backend(velocities)
++    unit_vel_scale = oneunit(eltype(eltype(velocities)))
++    n_ca = length(constrained_atoms)
++    coupling = data.coupling
++
++    fused_kern! = lincs_fused_velocity_kernel!(backend, block_size)
++    fused_kern!(delta_buf, ws.B, ws.rhs, ws.sol, ws.tmp,
++                coords, velocities,
++                data.atom1, data.atom2, data.invmass, data.sdiag,
++                coupling.coupled_indices, coupling.coupled_coef, coupling.n_coupled,
++                coupling.max_coupled, data.nrec, boundary;
++                ndrange=K_padded)
++
++    apply_kern! = lincs_apply_deltas_kernel!(backend, block_size)
++    apply_kern!(velocities, delta_buf, constrained_atoms, unit_vel_scale;
++                ndrange=n_ca)
++
++    # Iterative correction: re-evaluate velocity residual and solve again
++    for _ in 1:data.niter
++        corr_kern! = lincs_fused_velocity_correction_kernel!(backend, block_size)
++        corr_kern!(delta_buf, ws.B, ws.rhs, ws.sol, ws.tmp,
++                   velocities,
++                   data.atom1, data.atom2, data.invmass, data.sdiag,
++                   coupling.coupled_indices, coupling.coupled_coef, coupling.n_coupled,
++                   coupling.max_coupled, data.nrec;
++                   ndrange=K_padded)
++        apply_kern!(velocities, delta_buf, constrained_atoms, unit_vel_scale;
++                    ndrange=n_ca)
++    end
++
++    KernelAbstractions.synchronize(backend)
++    return velocities
++end
++
++# --- Molly interface ---
++
++function apply_position_constraints!(sys::System, ca::LINCS, r_pre_unconstrained_update;
++                                     kwargs...)
++    if !isnothing(ca.delta_buf)
++        lincs_apply_gpu!(sys.coords, r_pre_unconstrained_update,
++                         ca.lincs_data, ca.workspace, sys.boundary,
++                         ca.delta_buf, ca.constrained_atoms, ca.gpu_block_size)
++    else
++        lincs_apply!(sys.coords, r_pre_unconstrained_update,
++                     ca.lincs_data, ca.workspace, sys.boundary)
++    end
++    return sys
++end
++
++function apply_velocity_constraints!(sys::System, ca::LINCS; kwargs...)
++    ca.iter_vel_correction || return sys
++    if !isnothing(ca.delta_buf)
++        lincs_vel_apply_gpu!(sys.velocities, sys.coords,
++                             ca.lincs_data, ca.workspace, sys.boundary,
++                             ca.delta_buf, ca.constrained_atoms, ca.gpu_block_size)
++    else
++        lincs_vel_apply!(sys.velocities, sys.coords,
++                         ca.lincs_data, ca.workspace, sys.boundary)
++    end
++    return sys
++end
++
++function check_position_constraints(sys::System{<:Any, <:Any, FT}, ca::LINCS) where FT
++    err_unit = unit(eltype(eltype(sys.coords)))
++    if err_unit != unit(ca.dist_tolerance)
++        throw(ArgumentError("distance tolerance units in LINCS ($(unit(ca.dist_tolerance))) " *
++                            "are inconsistent with system coordinate units ($err_unit)"))
++    end
++
++    max_err = typemin(FT)
++    for dc in ca.dist_constraints
++        dr = vector(sys.coords[dc.i], sys.coords[dc.j], sys.boundary)
++        err = ustrip(abs(norm(dr) - dc.dist))
++        max_err = max(err, max_err)
++    end
++    return max_err < ustrip(ca.dist_tolerance)
++end
++
++function check_position_constraints(sys::System{<:Any, <:AbstractGPUArray, FT}, ca::LINCS) where FT
++    err_unit = unit(eltype(eltype(sys.coords)))
++    if err_unit != unit(ca.dist_tolerance)
++        throw(ArgumentError("distance tolerance units in LINCS ($(unit(ca.dist_tolerance))) " *
++                            "are inconsistent with system coordinate units ($err_unit)"))
++    end
++
++    # Use CPU dist_constraints to avoid issues with padded GPU arrays
++    unit_len = oneunit(eltype(eltype(sys.coords)))
++    coords_cpu = Array(sys.coords)
++    max_err = typemin(FT)
++    for dc in ca.dist_constraints
++        dr = vector(coords_cpu[dc.i], coords_cpu[dc.j], sys.boundary)
++        err = ustrip(abs(norm(dr) - dc.dist))
++        max_err = max(err, max_err)
++    end
++    return max_err < ustrip(ca.dist_tolerance)
++end
++
++function check_velocity_constraints(sys::System{<:Any, <:Any, FT}, ca::LINCS) where FT
++    err_unit = unit(eltype(eltype(sys.velocities))) * unit(eltype(eltype(sys.coords)))
++    if err_unit != unit(ca.vel_tolerance)
++        throw(ArgumentError("velocity tolerance units in LINCS ($(unit(ca.vel_tolerance))) " *
++                            "are inconsistent with system velocity and coordinate units ($err_unit)"))
++    end
++
++    max_err = typemin(FT)
++    for dc in ca.dist_constraints
++        dr = vector(sys.coords[dc.i], sys.coords[dc.j], sys.boundary)
++        v_diff = sys.velocities[dc.j] .- sys.velocities[dc.i]
++        err = ustrip(abs(dot(dr, v_diff)))
++        max_err = max(err, max_err)
++    end
++    return max_err < ustrip(ca.vel_tolerance)
++end
++
++function check_velocity_constraints(sys::System{<:Any, <:AbstractGPUArray, FT}, ca::LINCS) where FT
++    err_unit = unit(eltype(eltype(sys.velocities))) * unit(eltype(eltype(sys.coords)))
++    if err_unit != unit(ca.vel_tolerance)
++        throw(ArgumentError("velocity tolerance units in LINCS ($(unit(ca.vel_tolerance))) " *
++                            "are inconsistent with system velocity and coordinate units ($err_unit)"))
++    end
++
++    # Use CPU dist_constraints to avoid issues with padded GPU arrays
++    coords_cpu = Array(sys.coords)
++    vels_cpu = Array(sys.velocities)
++    max_err = typemin(FT)
++    for dc in ca.dist_constraints
++        dr = vector(coords_cpu[dc.i], coords_cpu[dc.j], sys.boundary)
++        v_diff = vels_cpu[dc.j] .- vels_cpu[dc.i]
++        err = ustrip(abs(dot(dr, v_diff)))
++        max_err = max(err, max_err)
++    end
++    return max_err < ustrip(ca.vel_tolerance)
++end
++
++# --- GPU data transfer ---
++
++function move_lincs_to_gpu(data::LincsData, ws, arr_type, n_atoms, block_size)
++    T = eltype(data.lengths)
++    K = length(data.atom1)
++
++    # Group coupled constraints into thread blocks for cache-friendly atomics
++    perm = group_constraints_for_gpu(data.atom1, data.atom2, block_size)
++    K_padded = length(perm)
++
++    # Reorder + pad constraint arrays according to grouping
++    atom1_padded = Vector{Int}(undef, K_padded)
++    atom2_padded = Vector{Int}(undef, K_padded)
++    lengths_padded = Vector{T}(undef, K_padded)
++    sdiag_padded = Vector{T}(undef, K_padded)
++
++    for (new_i, old_c) in enumerate(perm)
++        if old_c != 0
++            atom1_padded[new_i] = data.atom1[old_c]
++            atom2_padded[new_i] = data.atom2[old_c]
++            lengths_padded[new_i] = data.lengths[old_c]
++            sdiag_padded[new_i] = data.sdiag[old_c]
++        else
++            # Dummy: valid atom indices, zero sdiag ensures no effect
++            atom1_padded[new_i] = 1
++            atom2_padded[new_i] = min(2, n_atoms)
++            lengths_padded[new_i] = zero(T)
++            sdiag_padded[new_i] = zero(T)
++        end
++    end
++
++    # Build dense coupling layout
++    dense_coupling = build_dense_coupling(perm, data.coupling, T)
++
++    # Transfer to GPU
++    atom1_gpu = arr_type(atom1_padded)
++    atom2_gpu = arr_type(atom2_padded)
++    lengths_gpu = arr_type(lengths_padded)
++    invmass_gpu = arr_type(data.invmass)
++    sdiag_gpu = arr_type(sdiag_padded)
++
++    coupled_indices_gpu = arr_type(dense_coupling.coupled_indices)
++    coupled_coef_gpu = arr_type(dense_coupling.coupled_coef)
++    n_coupled_gpu = arr_type(dense_coupling.n_coupled)
++    coupling_gpu = LincsCouplingDense(coupled_indices_gpu, coupled_coef_gpu,
++                                      n_coupled_gpu, dense_coupling.max_coupled)
++
++    data_gpu = LincsData(atom1_gpu, atom2_gpu, lengths_gpu, invmass_gpu,
++                         sdiag_gpu, coupling_gpu, data.nrec, data.niter)
++
++    # Workspace sized for padded constraint count
++    backend = get_backend(atom1_gpu)
++    B_gpu = KernelAbstractions.zeros(backend, SVector{3, T}, K_padded)
++    rhs_gpu = KernelAbstractions.zeros(backend, T, K_padded)
++    sol_gpu = KernelAbstractions.zeros(backend, T, K_padded)
++    tmp_gpu = KernelAbstractions.zeros(backend, T, K_padded)
++    blcc_gpu = KernelAbstractions.zeros(backend, T, 1)  # unused in fused kernels
++    ws_gpu = LincsWorkspace(B_gpu, rhs_gpu, sol_gpu, tmp_gpu, blcc_gpu)
++
++    delta_buf = KernelAbstractions.zeros(backend, T, 3, n_atoms)
++
++    return data_gpu, ws_gpu, delta_buf
++end
++
++function setup_constraints!(lincs::LINCS, neighbor_finder, arr_type)
++    if !(neighbor_finder isa NoNeighborFinder)
++        disable_constrained_interactions!(neighbor_finder, lincs.clusters)
++    end
++
++    if arr_type <: AbstractGPUArray
++        n_atoms = length(lincs.lincs_data.invmass)
++        data_gpu, ws_gpu, delta_buf = move_lincs_to_gpu(
++            lincs.lincs_data, lincs.workspace, arr_type, n_atoms, lincs.gpu_block_size)
++
++        ca_indices = sort!(unique!(vcat(lincs.lincs_data.atom1, lincs.lincs_data.atom2)))
++        ca_gpu = arr_type(ca_indices)
++
++        clusters_gpu = replace_storage(arr_type, lincs.clusters)
++
++        lincs = LINCS(clusters_gpu, data_gpu, ws_gpu, lincs.dist_constraints,
++                      lincs.angle_constraints, lincs.dist_tolerance, lincs.vel_tolerance,
++                      lincs.iter_vel_correction, lincs.gpu_block_size, delta_buf, ca_gpu)
++    end
++
++    return lincs
++end
+diff --git a/src/constraints/shake.jl b/src/constraints/shake.jl
+index 33392b366..d61f320a6 100644
+--- a/src/constraints/shake.jl
++++ b/src/constraints/shake.jl
+@@ -899,3 +899,52 @@ function apply_velocity_constraints!(sys::System, ca::SHAKE_RATTLE; kwargs...)
+ 
+     KernelAbstractions.synchronize(backend)
+ end
++
++function check_position_constraints(sys::System{<:Any, <:Any, FT}, ca::SHAKE_RATTLE) where FT
++    err_unit = unit(eltype(eltype(sys.coords)))
++    if err_unit != unit(ca.dist_tolerance)
++        throw(ArgumentError("distance tolerance units in SHAKE ($(unit(ca.dist_tolerance))) " *
++                            "are inconsistent with system coordinate units ($err_unit)"))
++    end
++
++    cluster_maxes = FT[]
++    backend = get_backend(sys.coords)
++    err_kernel = max_dist_error(backend, 128)
++
++    for cluster_type in cluster_keys(ca)
++        clusters = getproperty(ca, cluster_type)
++        if length(clusters) > 0
++            max_storage = allocate(backend, FT, length(clusters))
++            err_kernel(clusters, sys.coords, sys.boundary, max_storage; ndrange=length(clusters))
++            push!(cluster_maxes, reduce(max, Array(max_storage)))
++        end
++    end
++
++    KernelAbstractions.synchronize(backend)
++    return maximum(cluster_maxes) < ustrip(ca.dist_tolerance)
++end
++
++function check_velocity_constraints(sys::System{<:Any, <:Any, FT}, ca::SHAKE_RATTLE) where FT
++    err_unit = unit(eltype(eltype(sys.velocities))) * unit(eltype(eltype(sys.coords)))
++    if err_unit != unit(ca.vel_tolerance)
++        throw(ArgumentError("velocity tolerance units in RATTLE ($(unit(ca.vel_tolerance))) " *
++                    "are inconsistent with system velocity and coordinate units ($err_unit)"))
++    end
++
++    cluster_maxes = FT[]
++    backend = get_backend(sys.coords)
++    err_kernel = max_vel_error(backend, 128)
++
++    for cluster_type in cluster_keys(ca)
++        clusters = getproperty(ca, cluster_type)
++        if length(clusters) > 0
++            max_storage = allocate(backend, FT, length(clusters))
++            err_kernel(clusters, sys.coords, sys.velocities, sys.boundary, max_storage;
++                       ndrange=length(clusters))
++            push!(cluster_maxes, reduce(max, Array(max_storage)))
++        end
++    end
++
++    KernelAbstractions.synchronize(backend)
++    return maximum(cluster_maxes) < ustrip(ca.vel_tolerance)
++end
+\ No newline at end of file
+diff --git a/src/setup.jl b/src/setup.jl
+index 9b6f8d531..7c2d67337 100644
+--- a/src/setup.jl
++++ b/src/setup.jl
+@@ -435,6 +435,8 @@ Gromacs file reading should be considered experimental.
+ - `strictness=:warn`: determines behavior when encountering possible problems,
+     options are `:warn` to emit warnings, `:nowarn` to suppress warnings or
+     `:error` to error.
++- `constraint_algorithm`: Constraint algorithm to use for enforcing the
++    constraints. Can be [`LINCS`](@ref) or [`SHAKE_RATTLE`](@ref), defaults to LINCS.
+ """
+ function System(coord_file::AbstractString,
+                 force_field::MolecularForceField;
+@@ -462,7 +464,8 @@ function System(coord_file::AbstractString,
+                 disulfide_bonds=true,
+                 grad_safe::Bool=false,
+                 strictness=default_strictness(),
+-                force_separate_lj14=false) where {AT <: AbstractArray}
++                force_separate_lj14=false,
++                constraint_algorithm=LINCS) where {AT <: AbstractArray}
+     check_strictness(strictness)
+     if dist_buffer < zero(dist_buffer)
+         throw(ArgumentError("dist_buffer ($dist_buffer) should not be less than zero"))
+@@ -941,7 +944,7 @@ function System(coord_file::AbstractString,
+                   nonbonded_method, ewald_error_tol, approximate_pme, neighbor_finder_type,
+                   implicit_solvent, kappa, grad_safe, dist_neighbors, weight_14_lj,
+                   weight_14_coulomb, disp_corr, hydrogen_mass, strictness,
+-                  launch_config, autotune_launch)
++                  launch_config, autotune_launch, constraint_algorithm)
+ end
+ 
+ function element_from_mass(atom_mass, element_names, element_masses)
+@@ -978,7 +981,8 @@ function System(T::Type,
+                 data=nothing,
+                 implicit_solvent=:none,
+                 kappa=0.0u"nm^-1",
+-                grad_safe::Bool=false) where AT <: AbstractArray
++                grad_safe::Bool=false,
++                constraint_algorithm=LINCS) where AT <: AbstractArray
+     if dist_buffer < zero(dist_buffer)
+         throw(ArgumentError("dist_buffer ($dist_buffer) should not be less than zero"))
+     end
+@@ -1274,7 +1278,7 @@ function System(T::Type,
+                   nonbonded_method, ewald_error_tol, approximate_pme, neighbor_finder_type,
+                   implicit_solvent, kappa, grad_safe, dist_neighbors, weight_14_lj,
+                   weight_14_coulomb, dispersion_correction, hydrogen_mass, strictness,
+-                  launch_config, autotune_launch)
++                  launch_config, autotune_launch, constraint_algorithm)
+ end
+ 
+ function System(coord_file::AbstractString, top_file::AbstractString; kwargs...)
+@@ -1298,8 +1302,31 @@ function find_bond_r0(bonds_all, i, j)
+     error("atoms $i and $j are in an angle constraint but the bond cannot be found")
+ end
+ 
++function build_constraint_algorithm(T, dist_constraints, angle_constraints, atoms_data,
++                                    units, strictness, masses, ::Type{SHAKE_RATTLE})
++    return SHAKE_RATTLE(
++        length(atoms_data),
++        add_units(T(1e-6), u"nm", units),
++        add_units(T(1e-6), u"nm^2 * ps^-1", units);
++        dist_constraints=[dist_constraints...],
++        angle_constraints=[angle_constraints...],
++        strictness=strictness,
++    )
++end
++
++function build_constraint_algorithm(T, dist_constraints, angle_constraints, atoms_data,
++                                    units, strictness, masses, ::Type{LINCS})
++    return LINCS(
++        masses=masses,
++        dist_tolerance=add_units(T(1e-6), u"nm", units),
++        vel_tolerance=add_units(T(1e-6), u"nm^2 * ps^-1", units),
++        dist_constraints=[dist_constraints...],
++        angle_constraints=[angle_constraints...],
++    )
++end
++
+ function exchange_constraints(T, bonds_all, angles_all, atoms_data, constraints_type,
+-                              rigid_water, units, strictness)
++                              rigid_water, units, strictness, masses, constraint_algorithm)
+     if (constraints_type == :none && !rigid_water) || iszero(length(bonds_all.is))
+         return (), bonds_all, angles_all
+     end
+@@ -1344,15 +1371,9 @@ function exchange_constraints(T, bonds_all, angles_all, atoms_data, constraints_
+     end
+ 
+     if length(dist_constraints) > 0 || length(angle_constraints) > 0
+-        shake = SHAKE_RATTLE(
+-            length(atoms_data),
+-            add_units(T(1e-6), u"nm", units),
+-            add_units(T(1e-6), u"nm^2 * ps^-1", units);
+-            dist_constraints=[dist_constraints...],
+-            angle_constraints=[angle_constraints...],
+-            strictness=strictness,
+-        )
+-        constraints = (shake,)
++        algo = build_constraint_algorithm(T, dist_constraints, angle_constraints, atoms_data,
++                                          units, strictness, masses, constraint_algorithm)
++        constraints = (algo,)
+     else
+         constraints = ()
+     end
+@@ -1417,7 +1438,7 @@ function System(T, AT, atoms, coords, boundary_used, velocities, atoms_data, vir
+                 rigid_water, nonbonded_method, ewald_error_tol, approximate_pme,
+                 neighbor_finder_type, implicit_solvent, kappa, grad_safe, dist_neighbors,
+                 weight_14_lj, weight_14_coulomb, dispersion_correction, hydrogen_mass, strictness,
+-                launch_config, autotune_launch)
++                launch_config, autotune_launch, constraint_algorithm)
+     coords_dev = to_device(coords, AT)
+     using_neighbors = (neighbor_finder_type != NoNeighborFinder)
+ 
+@@ -1509,8 +1530,10 @@ function System(T, AT, atoms, coords, boundary_used, velocities, atoms_data, vir
+         topology = nothing
+     end
+ 
++    masses = mass.(from_device(atoms))
+     constraints, bonds, angles = exchange_constraints(T, bonds_all, angles_all, atoms_data,
+-                                            constraints_type, rigid_water, units, strictness)
++                                            constraints_type, rigid_water, units, strictness,
++                                            masses, constraint_algorithm)
+ 
+     # Only add present interactions and ensure that array types are concrete
+     specific_inter_array = []
+diff --git a/test/constraints.jl b/test/constraints.jl
+index 891f5e00a..040778ebb 100644
+--- a/test/constraints.jl
++++ b/test/constraints.jl
+@@ -17,9 +17,12 @@
+     bond_length = 0.74u"Å"
+     constraints = [DistanceConstraint(j, j + 1, bond_length) for j in 1:2:n_atoms]
+     atoms = [Atom(index=j, mass=atom_mass, σ=2.8279u"Å", ϵ=0.074u"kcal* mol^-1") for j in 1:n_atoms]
+-    cons = SHAKE_RATTLE(n_atoms, 1e-8u"Å", 1e-8u"Å^2 * ps^-1"; dist_constraints=constraints)
++    cons_shake = SHAKE_RATTLE(n_atoms, 1e-8u"Å", 1e-8u"Å^2 * ps^-1"; dist_constraints=constraints)
++    cons_lincs = LINCS(masses=repeat([atom_mass], n_atoms), dist_tolerance=1e-8u"Å",
++                       vel_tolerance=1e-8u"Å^2 * ps^-1", dist_constraints=constraints,
++                       iter_vel_correction=true)
+ 
+-    @test length(cons.clusters12) == (n_atoms ÷ 2)
++    @test length(cons_shake.clusters12) == (n_atoms ÷ 2)
+ 
+     boundary = CubicBoundary(200.0u"Å")
+     lj = LennardJones(cutoff=ShiftedPotentialCutoff(r_cut), use_neighbors=true)
+@@ -27,29 +30,32 @@
+         eligible=trues(n_atoms, n_atoms),
+         dist_cutoff=1.5*r_cut,
+     )
++    constraints = [cons_shake, cons_lincs]
+ 
+     for simulator in simulators
+-        coords = [SVector(coords_matrix[j, 1]u"Å", coords_matrix[j, 2]u"Å", coords_matrix[j, 3]u"Å")
+-                  for j in 1:n_atoms]
+-        velocities = [1000 * SVector(vel_matrix[j, :]u"Å/ps"...) for j in 1:n_atoms]
++        for cons in constraints
++            coords = [SVector(coords_matrix[j, 1]u"Å", coords_matrix[j, 2]u"Å", coords_matrix[j, 3]u"Å")
++                    for j in 1:n_atoms]
++            velocities = [1000 * SVector(vel_matrix[j, :]u"Å/ps"...) for j in 1:n_atoms]
+ 
+-        sys = System(
+-            atoms=atoms,
+-            coords=coords,
+-            boundary=boundary,
+-            velocities=velocities,
+-            pairwise_inters=(lj,),
+-            neighbor_finder=neighbor_finder,
+-            constraints=(cons,),
+-            force_units=u"kcal * mol^-1 * Å^-1",
+-            energy_units=u"kcal * mol^-1",
+-        )
++            sys = System(
++                atoms=atoms,
++                coords=coords,
++                boundary=boundary,
++                velocities=velocities,
++                pairwise_inters=(lj,),
++                neighbor_finder=neighbor_finder,
++                constraints=(cons,),
++                force_units=u"kcal * mol^-1 * Å^-1",
++                energy_units=u"kcal * mol^-1",
++            )
+ 
+-        simulate!(sys, simulator, 10_000)
++            simulate!(sys, simulator, 10_000)
+ 
+-        @test check_position_constraints(sys, cons)
+-        if simulator isa VelocityVerlet
+-            @test check_velocity_constraints(sys, cons)
++            @test check_position_constraints(sys, cons)
++            if simulator isa VelocityVerlet
++                @test check_velocity_constraints(sys, cons)
++            end
+         end
+     end
+ end
+@@ -316,41 +322,769 @@ end
+     minimizer = SteepestDescentMinimizer()
+     simulator = VelocityVerlet(dt=T(0.001)u"ps")
+ 
++    constraint_algorithms = [SHAKE_RATTLE, LINCS]
++
+     for AT in array_list
+-        for rigid_water in (false, true)
+-            sys = System(
+-                pdb_fp,
+-                ff;
+-                boundary=boundary,
+-                array_type=AT,
+-                constraints=:hbonds,
+-                rigid_water=rigid_water, # No water present
++        for constraint_algorithm in constraint_algorithms
++            for rigid_water in (false, true)
++                sys = System(
++                    pdb_fp,
++                    ff;
++                    boundary=boundary,
++                    array_type=AT,
++                    constraints=:hbonds,
++                    rigid_water=rigid_water, # No water present
++                    constraint_algorithm=constraint_algorithm,    
++                )
++                if constraint_algorithm === LINCS
++                    # increase tolerances from default
++                    lincs = LINCS(
++                        masses=Array(masses(sys)),
++                        dist_constraints=sys.constraints[1].dist_constraints,
++                        angle_constraints=sys.constraints[1].angle_constraints,
++                        dist_tolerance=sys.constraints[1].dist_tolerance,
++                        vel_tolerance=sys.constraints[1].vel_tolerance,
++                        nrec=6,
++                        niter=6,
++                        iter_vel_correction=true,
++                    )
++                    sys.constraints = (Molly.setup_constraints!(lincs, sys.neighbor_finder, AT),)
++                end
++
++                simulate!(sys, minimizer)
++                random_velocities!(sys, temp)
++
++                simulate!(sys, simulator, 20)
++                simulate!(sys, simulator, 1000)
++
++                @test check_position_constraints(sys)
++                @test check_velocity_constraints(sys)
++                @test check_constraints(sys)
++
++                coords_copy = copy(sys.coords)
++                coords_bump     = randn(SVector{3, T}, length(sys))u"nm"         ./ 100
++                velocities_bump = randn(SVector{3, T}, length(sys))u"nm * ps^-1" ./ 100
++                sys.coords     .+= to_device(coords_bump, AT)
++                sys.velocities .+= to_device(velocities_bump, AT)
++                @test !check_position_constraints(sys)
++                @test !check_velocity_constraints(sys)
++                @test !check_constraints(sys)
++
++                apply_position_constraints!(sys, coords_copy)
++                apply_velocity_constraints!(sys)
++                @test check_position_constraints(sys)
++                @test check_velocity_constraints(sys)
++                @test check_constraints(sys)
++            end
++        end
++    end
++end
++
++# --- LINCS test helpers ---
++
++function make_lincs_diatomic(; mass1=12.0, mass2=12.0, bond_length=0.15,
++                               v1=SVector(0.0, 0.0, 0.0), v2=SVector(0.0, 0.0, 0.0),
++                               nrec=4, niter=1)
++    dc = [DistanceConstraint(1, 2, bond_length)]
++    masses = [mass1, mass2]
++    x = [SVector(0.0, 0.0, 0.0), SVector(bond_length, 0.0, 0.0)]
++    v = [v1, v2]
++    data = Molly.build_lincs_data(dc, masses; nrec, niter)
++    ws = Molly.create_lincs_workspace(data)
++    return x, v, data, ws
++end
++
++function make_lincs_triatomic(; masses_val=[12.0, 12.0, 12.0], bond_length=0.15,
++                                x=nothing, v=nothing, nrec=4, niter=1)
++    if x === nothing
++        x = [SVector(0.0, 0.0, 0.0), SVector(0.15, 0.0, 0.0), SVector(0.30, 0.0, 0.0)]
++    end
++    if v === nothing
++        v = [SVector(0.0, 0.0, 0.0) for _ in 1:3]
++    end
++    dc = [DistanceConstraint(1, 2, bond_length), DistanceConstraint(2, 3, bond_length)]
++    data = Molly.build_lincs_data(dc, masses_val; nrec, niter)
++    ws = Molly.create_lincs_workspace(data)
++    return x, v, data, ws
++end
++
++function make_lincs_methane(; center_mass=12.0, outer_mass=1.008, bond_length=0.109,
++                              nrec=4, niter=1)
++    x = [
++        SVector(0.0, 0.0, 0.0),
++        SVector( 0.0629,  0.0629,  0.0629),
++        SVector(-0.0629, -0.0629,  0.0629),
++        SVector(-0.0629,  0.0629, -0.0629),
++        SVector( 0.0629, -0.0629, -0.0629),
++    ]
++    v = [SVector(0.0, 0.0, 0.0) for _ in 1:5]
++    masses_val = [center_mass, outer_mass, outer_mass, outer_mass, outer_mass]
++    dc = [
++        DistanceConstraint(1, 2, bond_length),
++        DistanceConstraint(1, 3, bond_length),
++        DistanceConstraint(1, 4, bond_length),
++        DistanceConstraint(1, 5, bond_length),
++    ]
++    data = Molly.build_lincs_data(dc, masses_val; nrec, niter)
++    ws = Molly.create_lincs_workspace(data)
++    return x, v, data, ws
++end
++
++function make_lincs_triangle(; masses_val=[12.0, 12.0, 12.0], bond_length=0.15,
++                               x=nothing, v=nothing, nrec=4, niter=2)
++    if x === nothing
++        x = [
++            SVector(0.0, 0.0, 0.0),
++            SVector(bond_length, 0.0, 0.0),
++            SVector(bond_length / 2, bond_length * sqrt(3) / 2, 0.0),
++        ]
++    end
++    if v === nothing
++        v = [SVector(0.0, 0.0, 0.0) for _ in 1:3]
++    end
++    dc = [
++        DistanceConstraint(1, 2, bond_length),
++        DistanceConstraint(2, 3, bond_length),
++        DistanceConstraint(3, 1, bond_length),
++    ]
++    data = Molly.build_lincs_data(dc, masses_val; nrec, niter)
++    ws = Molly.create_lincs_workspace(data)
++    return x, v, data, ws
++end
++
++function make_lincs_square(; masses_val=[12.0, 12.0, 12.0, 12.0], bond_length=0.15,
++                             x=nothing, v=nothing, nrec=4, niter=2)
++    if x === nothing
++        x = [
++            SVector(0.0, 0.0, 0.0),
++            SVector(bond_length, 0.0, 0.0),
++            SVector(bond_length, bond_length, 0.0),
++            SVector(0.0, bond_length, 0.0),
++        ]
++    end
++    if v === nothing
++        v = [SVector(0.0, 0.0, 0.0) for _ in 1:4]
++    end
++    dc = [
++        DistanceConstraint(1, 2, bond_length),
++        DistanceConstraint(2, 3, bond_length),
++        DistanceConstraint(3, 4, bond_length),
++        DistanceConstraint(4, 1, bond_length),
++    ]
++    data = Molly.build_lincs_data(dc, masses_val; nrec, niter)
++    ws = Molly.create_lincs_workspace(data)
++    return x, v, data, ws
++end
++
++function lincs_check_constraints(xp, data; atol=1e-10)
++    for i in eachindex(data.atom1)
++        d = norm(xp[data.atom1[i]] - xp[data.atom2[i]])
++        if !isapprox(d, data.lengths[i]; atol)
++            return false
++        end
++    end
++    return true
++end
++
++function lincs_center_of_mass(x, masses_val)
++    total = sum(masses_val)
++    return sum(masses_val[i] * x[i] for i in eachindex(x)) / total
++end
++
++function make_lincs_chain(natoms; bond_length=0.15, mass=12.0)
++    x = [SVector(i * bond_length, 0.0, 0.0) for i in 0:natoms-1]
++    v = [SVector(0.01 * randn(), 0.01 * randn(), 0.01 * randn()) for _ in 1:natoms]
++    dc = [DistanceConstraint(i, i + 1, bond_length) for i in 1:natoms-1]
++    masses_val = fill(mass, natoms)
++    return x, v, dc, masses_val
++end
++
++function make_lincs_branched(nbackbone; nbranch=3, backbone_length=0.153, branch_length=0.109,
++                             backbone_mass=12.0, branch_mass=1.008)
++    natoms = nbackbone + nbackbone * nbranch
++    x = Vector{SVector{3,Float64}}(undef, natoms)
++    masses_val = Vector{Float64}(undef, natoms)
++    dc = DistanceConstraint{Float64, Int}[]
++
++    for i in 1:nbackbone
++        x[i] = SVector((i - 1) * backbone_length, 0.0, 0.0)
++        masses_val[i] = backbone_mass
++        if i > 1
++            push!(dc, DistanceConstraint(i - 1, i, backbone_length))
++        end
++    end
++
++    atom_idx = nbackbone
++    for i in 1:nbackbone
++        for j in 1:nbranch
++            atom_idx += 1
++            angle = 2π * j / nbranch
++            x[atom_idx] = x[i] + SVector(0.0, branch_length * cos(angle), branch_length * sin(angle))
++            masses_val[atom_idx] = branch_mass
++            push!(dc, DistanceConstraint(i, atom_idx, branch_length))
++        end
++    end
++
++    v = [SVector(0.01 * randn(), 0.01 * randn(), 0.01 * randn()) for _ in 1:natoms]
++    return x, v, dc, masses_val
++end
++
++# --- LINCS tests ---
++
++@testset "LINCS setup" begin
++    # single constraint - empty coupling
++    @testset begin
++        dc = [DistanceConstraint(1, 2, 0.15)]
++        masses_val = [12.0, 12.0]
++        data = Molly.build_lincs_data(dc, masses_val)
++
++        @test length(data.coupling.neighbors) == 0
++        @test data.coupling.range == [1, 1]
++        @test data.sdiag[1] ≈ 1.0 / sqrt(1/12.0 + 1/12.0)
++    end
++
++    # chain A-B-C - one coupling pair
++    @testset begin
++        dc = [DistanceConstraint(1, 2, 0.15), DistanceConstraint(2, 3, 0.15)]
++        masses_val = [12.0, 12.0, 12.0]
++        data = Molly.build_lincs_data(dc, masses_val)
++
++        @test data.coupling.range == [1, 2, 3]
++        @test data.coupling.neighbors == [2, 1]
++
++        invmass2 = 1.0 / 12.0
++        s1 = data.sdiag[1]
++        s2 = data.sdiag[2]
++        expected_coef = 1.0 * invmass2 * s1 * s2
++        @test data.coupling.coef[1] ≈ expected_coef
++        @test data.coupling.coef[2] ≈ expected_coef
++    end
++
++    # star topology (methane-like)
++    @testset begin
++        dc = [
++            DistanceConstraint(1, 2, 0.109),
++            DistanceConstraint(1, 3, 0.109),
++            DistanceConstraint(1, 4, 0.109),
++            DistanceConstraint(1, 5, 0.109),
++        ]
++        masses_val = [12.0, 1.008, 1.008, 1.008, 1.008]
++        data = Molly.build_lincs_data(dc, masses_val)
++
++        for i in 1:4
++            n_neighbors = data.coupling.range[i+1] - data.coupling.range[i]
++            @test n_neighbors == 3
++        end
++
++        for n in 1:length(data.coupling.coef)
++            @test data.coupling.coef[n] < 0
++        end
++    end
++
++    # sdiag values
++    @testset begin
++        dc = [DistanceConstraint(1, 2, 0.15)]
++        masses_val = [1.0, 4.0]
++        data = Molly.build_lincs_data(dc, masses_val)
++        @test data.sdiag[1] ≈ 1.0 / sqrt(1.0 + 0.25)
++    end
++
++    # nrec and niter defaults
++    @testset begin
++        dc = [DistanceConstraint(1, 2, 0.15)]
++        masses_val = [12.0, 12.0]
++        data = Molly.build_lincs_data(dc, masses_val)
++        @test data.nrec == 4
++        @test data.niter == 1
++
++        data2 = Molly.build_lincs_data(dc, masses_val; nrec=6, niter=2)
++        @test data2.nrec == 6
++        @test data2.niter == 2
++    end
++
++    # workspace allocation
++    @testset begin
++        dc = [DistanceConstraint(1, 2, 0.15)]
++        masses_val = [12.0, 12.0]
++        data = Molly.build_lincs_data(dc, masses_val)
++        ws = Molly.create_lincs_workspace(data)
++
++        @test length(ws.B) == 1
++        @test length(ws.rhs) == 1
++        @test length(ws.sol) == 1
++        @test length(ws.tmp) == 1
++    end
++end
++
++@testset "LINCS solver" begin
++    # nrec=0 - sol equals rhs, direct position update
++    @testset begin
++        x, v, _, _ = make_lincs_diatomic(; v1=SVector(0.1, 0.0, 0.0), v2=SVector(-0.1, 0.0, 0.0))
++        dc = [DistanceConstraint(1, 2, 0.15)]
++        masses_val = [12.0, 12.0]
++        data = Molly.build_lincs_data(dc, masses_val; nrec=0, niter=0)
++        ws = Molly.create_lincs_workspace(data)
++
++        dt = 0.002
++        xp = x .+ v .* dt
++
++        diff = x[1] - x[2]
++        B = normalize(diff)
++        ws.B[1] = B
++
++        proj = dot(B, xp[1] - xp[2])
++        rhs_val = data.sdiag[1] * (proj - 0.15)
++        ws.rhs[1] = rhs_val
++        ws.sol[1] = rhs_val
++
++        xp_before = copy(xp)
++        Molly.lincs_solve!(xp, data, ws, 1.0)
++
++        invmass = 1.0 / 12.0
++        expected_delta = invmass * B * data.sdiag[1] * rhs_val
++        @test xp[1] ≈ xp_before[1] - expected_delta atol=1e-16
++        @test xp[2] ≈ xp_before[2] + expected_delta atol=1e-16
++    end
++
++    # increasing nrec improves constraint satisfaction
++    @testset begin
++        x, v, _, _ = make_lincs_triatomic(;
++            v=[SVector(0.05, 0.02, 0.0), SVector(-0.03, 0.01, 0.0), SVector(0.01, -0.02, 0.0)]
++        )
++        dt = 0.002
++        deviations = Float64[]
++
++        for nrec in [0, 1, 2, 4, 8]
++            dc = [DistanceConstraint(1, 2, 0.15), DistanceConstraint(2, 3, 0.15)]
++            masses_val = [12.0, 12.0, 12.0]
++            data = Molly.build_lincs_data(dc, masses_val; nrec, niter=1)
++            ws = Molly.create_lincs_workspace(data)
++            xp = x .+ v .* dt
++            Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++
++            max_dev = maximum(abs(norm(xp[data.atom1[i]] - xp[data.atom2[i]]) - data.lengths[i])
++                              for i in eachindex(data.atom1))
++            push!(deviations, max_dev)
++        end
++
++        for i in 2:length(deviations)
++            @test deviations[i] <= deviations[i-1] + 1e-15
++        end
++    end
++end
++
++@testset "LINCS algorithm" begin
++    # diatomic equal mass
++    @testset begin
++        x, v, data, ws = make_lincs_diatomic(;
++            v1=SVector(0.1, 0.05, 0.0), v2=SVector(-0.1, -0.05, 0.0)
++        )
++        dt = 0.002
++        xp = x .+ v .* dt
++        Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++
++        d = norm(xp[1] - xp[2])
++        @test d ≈ 0.15 atol=1e-10
++    end
++
++    # diatomic unequal mass - constraint + CoM conservation
++    @testset begin
++        x, v, data, ws = make_lincs_diatomic(;
++            mass1=1.0, mass2=16.0,
++            v1=SVector(0.2, 0.1, 0.0), v2=SVector(-0.05, 0.02, 0.0)
++        )
++        masses_val = [1.0, 16.0]
++        dt = 0.002
++        xp = x .+ v .* dt
++
++        com_before = lincs_center_of_mass(xp, masses_val)
++        Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++        com_after = lincs_center_of_mass(xp, masses_val)
++
++        d = norm(xp[1] - xp[2])
++        @test d ≈ 0.15 atol=1e-10
++        @test com_after ≈ com_before atol=1e-12
++    end
++
++    # triatomic chain
++    @testset begin
++        x, v, data, ws = make_lincs_triatomic(;
++            v=[SVector(0.05, 0.02, 0.0), SVector(-0.03, 0.01, 0.0), SVector(0.01, -0.02, 0.0)]
++        )
++        dt = 0.002
++        xp = x .+ v .* dt
++        Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++
++        @test lincs_check_constraints(xp, data; atol=1e-6)
++    end
++
++    # methane star
++    @testset begin
++        x, v, data, ws = make_lincs_methane()
++        v = [
++            SVector(0.0, 0.0, 0.0),
++            SVector(0.5, 0.3, -0.1),
++            SVector(-0.3, 0.5, 0.2),
++            SVector(0.2, -0.4, 0.5),
++            SVector(-0.4, -0.2, -0.3),
++        ]
++        dt = 0.002
++        xp = x .+ v .* dt
++        Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++
++        @test lincs_check_constraints(xp, data; atol=1e-6)
++    end
++
++    # zero displacement is no-op
++    @testset begin
++        x, v, data, ws = make_lincs_diatomic()
++        xp = copy(x)
++        x_orig = copy(x)
++        Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++
++        @test xp ≈ x_orig atol=1e-14
++    end
++
++    # niter > 1 improves accuracy
++    @testset begin
++        x, _, _, _ = make_lincs_methane()
++        v = [
++            SVector(0.0, 0.0, 0.0),
++            SVector(1.0, 0.5, -0.2),
++            SVector(-0.6, 1.0, 0.4),
++            SVector(0.4, -0.8, 1.0),
++            SVector(-0.8, -0.4, -0.6),
++        ]
++        dt = 0.002
++
++        deviations = Float64[]
++        for niter in [1, 2, 4]
++            x_copy, _, data, ws = make_lincs_methane(; niter)
++            xp = x .+ v .* dt
++            Molly.lincs_apply!(xp, x_copy, data, ws, CubicBoundary(5.0))
++            max_dev = maximum(abs(norm(xp[data.atom1[i]] - xp[data.atom2[i]]) - data.lengths[i])
++                              for i in eachindex(data.atom1))
++            push!(deviations, max_dev)
++        end
++
++        @test deviations[2] <= deviations[1] + 1e-15
++        @test deviations[3] <= deviations[2] + 1e-15
++    end
++
++    # triangle ring
++    @testset begin
++        x, v, data, ws = make_lincs_triangle(;
++            v=[SVector(0.05, 0.02, 0.0), SVector(-0.03, 0.04, 0.0), SVector(0.01, -0.03, 0.0)]
++        )
++        masses_val = [12.0, 12.0, 12.0]
++        dt = 0.002
++        xp = x .+ v .* dt
++
++        com_before = lincs_center_of_mass(xp, masses_val)
++        Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++        com_after = lincs_center_of_mass(xp, masses_val)
++
++        @test lincs_check_constraints(xp, data; atol=1e-4)
++        @test com_after ≈ com_before atol=1e-12
++    end
++
++    # square ring
++    @testset begin
++        x, v, data, ws = make_lincs_square(;
++            v=[SVector(0.05, 0.02, 0.0), SVector(-0.03, 0.04, 0.0),
++               SVector(0.01, -0.03, 0.0), SVector(-0.02, 0.01, 0.0)]
++        )
++        masses_val = [12.0, 12.0, 12.0, 12.0]
++        dt = 0.002
++        xp = x .+ v .* dt
++
++        com_before = lincs_center_of_mass(xp, masses_val)
++        Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++        com_after = lincs_center_of_mass(xp, masses_val)
++
++        @test lincs_check_constraints(xp, data; atol=1e-4)
++        @test com_after ≈ com_before atol=1e-12
++    end
++end
++
++@testset "LINCS integration with System" begin
++    r_cut = 8.5u"Å"
++    temp = 300.0u"K"
++    atom_mass = 1.00794u"g/mol"
++    n_atoms = 400
++    hydrogen_data = readdlm(joinpath(data_dir, "initial_hydrogen_data.atom"); skipstart=9)
++    coords_matrix = hydrogen_data[:, 2:4]
++    vel_matrix = hydrogen_data[:, 5:7]
++
++    bond_length = 0.74u"Å"
++    dist_constraints = [DistanceConstraint(j, j + 1, bond_length) for j in 1:2:n_atoms]
++    atoms = [Atom(index=j, mass=atom_mass, σ=2.8279u"Å", ϵ=0.074u"kcal* mol^-1") for j in 1:n_atoms]
++    atom_masses = [atom_mass for _ in 1:n_atoms]
++
++    cons = LINCS(masses=atom_masses, dist_tolerance=1e-8u"Å", vel_tolerance=1e-8u"Å^2 * ps^-1",
++                 dist_constraints=dist_constraints, iter_vel_correction=true)
++
++    @test length(cons.clusters) == (n_atoms ÷ 2)
++
++    boundary = CubicBoundary(200.0u"Å")
++    lj = LennardJones(cutoff=ShiftedPotentialCutoff(r_cut), use_neighbors=true)
++    neighbor_finder = DistanceNeighborFinder(
++        eligible=trues(n_atoms, n_atoms),
++        dist_cutoff=1.5*r_cut,
++    )
++
++    simulators = (
++        VelocityVerlet(dt=0.002u"ps"),
++        Verlet(dt=0.002u"ps"),
++        StormerVerlet(dt=0.002u"ps"),
++        Langevin(dt=0.002u"ps", temperature=temp, friction=1.0u"ps^-1"),
++    )
++
++    for simulator in simulators
++        coords = [SVector(coords_matrix[j, 1]u"Å", coords_matrix[j, 2]u"Å", coords_matrix[j, 3]u"Å")
++                  for j in 1:n_atoms]
++        velocities = [1000 * SVector(vel_matrix[j, :]u"Å/ps"...) for j in 1:n_atoms]
++
++        sys = System(
++            atoms=atoms,
++            coords=coords,
++            boundary=boundary,
++            velocities=velocities,
++            pairwise_inters=(lj,),
++            neighbor_finder=neighbor_finder,
++            constraints=(cons,),
++            force_units=u"kcal * mol^-1 * Å^-1",
++            energy_units=u"kcal * mol^-1",
++        )
++
++        simulate!(sys, simulator, 10_000)
++
++        @test check_position_constraints(sys, cons)
++        if simulator isa VelocityVerlet
++            @test check_velocity_constraints(sys, cons)
++        end
++    end
++end
++
++@testset "LINCS GPU integration" begin
++    T = Float32
++    n_atoms = 200
++    bond_length = T(0.74)u"Å"
++    atom_mass = T(1.00794)u"g/mol"
++    r_cut = T(8.5)u"Å"
++    temp = T(300.0)u"K"
++
++    dist_constraints = [DistanceConstraint(j, j + 1, bond_length) for j in 1:2:n_atoms]
++    atoms = [Atom(index=j, mass=atom_mass, σ=T(2.8279)u"Å", ϵ=T(0.074)u"kcal* mol^-1")
++             for j in 1:n_atoms]
++    atom_masses = [atom_mass for _ in 1:n_atoms]
++
++    cons = LINCS(masses=atom_masses, dist_tolerance=T(1e-4)u"Å", vel_tolerance=T(1e-4)u"Å^2 * ps^-1",
++                 dist_constraints=dist_constraints, iter_vel_correction=true)
++
++    boundary = CubicBoundary(T(200.0)u"Å")
++    lj = LennardJones(cutoff=ShiftedPotentialCutoff(r_cut), use_neighbors=true)
++
++    for AT in array_list[2:end]
++
++        if Molly.uses_gpu_neighbor_finder(AT)
++            neighbor_finder = GPUNeighborFinder(
++                eligible=to_device(trues(n_atoms, n_atoms), AT),
++                dist_cutoff=T(1.5)*r_cut,
++            )
++        else
++            neighbor_finder = DistanceNeighborFinder(
++                eligible=to_device(trues(n_atoms, n_atoms), AT),
++                dist_cutoff=T(1.5)*r_cut,
+             )
++        end
++
++        # Place molecules on a 2D grid with 5 Å spacing so adjacent molecules
++        # are ~4.26 Å apart (well above σ=2.83 Å to avoid LJ blowup)
++        n_mol = n_atoms ÷ 2
++        n_grid = isqrt(n_mol)
++        coords = [SVector{3, T}(
++            T(5.0) + T(5.0) * T(((j - 1) ÷ 2) % n_grid) + (isodd(j) ? T(-0.37) : T(0.37)),
++            T(5.0) + T(5.0) * T(((j - 1) ÷ 2) ÷ n_grid),
++            T(5.0),
++        )u"Å" for j in 1:n_atoms]
++
++        simulator = VelocityVerlet(dt=T(0.002)u"ps")
++
++        sys = System(
++            atoms=to_device(atoms, AT),
++            coords=to_device(coords, AT),
++            boundary=boundary,
++            pairwise_inters=(lj,),
++            neighbor_finder=neighbor_finder,
++            constraints=(cons,),
++            force_units=u"kcal * mol^-1 * Å^-1",
++            energy_units=u"kcal * mol^-1",
++        )
++        random_velocities!(sys, temp)
+ 
+-            simulate!(sys, minimizer)
+-            random_velocities!(sys, temp)
+-
+-            simulate!(sys, simulator, 20)
+-            @time simulate!(sys, simulator, 1000)
+-
+-            @test check_position_constraints(sys)
+-            @test check_velocity_constraints(sys)
+-            @test check_constraints(sys)
+-
+-            coords_copy = copy(sys.coords)
+-            coords_bump     = randn(SVector{3, T}, length(sys))u"nm"         ./ 100
+-            velocities_bump = randn(SVector{3, T}, length(sys))u"nm * ps^-1" ./ 100
+-            sys.coords     .+= to_device(coords_bump, AT)
+-            sys.velocities .+= to_device(velocities_bump, AT)
+-            @test !check_position_constraints(sys)
+-            @test !check_velocity_constraints(sys)
+-            @test !check_constraints(sys)
+-
+-            apply_position_constraints!(sys, coords_copy)
+-            apply_velocity_constraints!(sys)
+-            @test check_position_constraints(sys)
+-            @test check_velocity_constraints(sys)
+-            @test check_constraints(sys)
++        simulate!(sys, simulator, 500)
++
++        @test check_position_constraints(sys, cons)
++        if simulator isa VelocityVerlet
++            @test check_velocity_constraints(sys, cons)
+         end
+     end
+ end
++
++@testset "LINCS GPU block size validation" begin
++    # Chain of 130 constraints sharing atoms: 1-2, 2-3, ..., 130-131
++    # Forms a single connected component of 130 constraints
++    block_size = 128
++    atom1 = collect(1:130)
++    atom2 = collect(2:131)
++    @test_throws ErrorException Molly.group_constraints_for_gpu(atom1, atom2, block_size)
++
++    # Same chain should succeed with a large enough block size
++    perm = Molly.group_constraints_for_gpu(atom1, atom2, 256)
++    @test length(perm) % 256 == 0
++end
++
++@testset "LINCS angle constraints" begin
++    n_molecules = 10
++    n_atoms = 3 * n_molecules
++    mass_O = 15.999u"g/mol"
++    mass_H = 1.008u"g/mol"
++
++    atoms = Atom[]
++    for _ in 1:n_molecules
++        push!(atoms, Atom(mass=mass_O, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1"))
++        push!(atoms, Atom(mass=mass_H, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1"))
++        push!(atoms, Atom(mass=mass_H, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1"))
++    end
++    atom_masses = [a.mass for a in atoms]
++
++    boundary = CubicBoundary(3.0u"nm")
++    bond_length = 0.09572u"nm"
++    θ = deg2rad(104.52)
++
++    coords = place_atoms(n_molecules, boundary, min_dist=0.3u"nm")
++    full_coords = SVector{3, typeof(1.0u"nm")}[]
++    for i in 1:n_molecules
++        O_pos = coords[i]
++        H1_pos = O_pos .+ SVector(bond_length, 0.0u"nm", 0.0u"nm")
++        H2_pos = O_pos .+ SVector(bond_length * cos(θ), bond_length * sin(θ), 0.0u"nm")
++        push!(full_coords, O_pos)
++        push!(full_coords, H1_pos)
++        push!(full_coords, H2_pos)
++    end
++
++    temp = 100.0u"K"
++    velocities = [random_velocity(atoms[i].mass, temp) for i in 1:n_atoms]
++
++    angle_constraints = [AngleConstraint(3*(i-1)+2, 3*(i-1)+1, 3*(i-1)+3, θ, bond_length, bond_length)
++                         for i in 1:n_molecules]
++
++    cons = LINCS(masses=atom_masses, dist_tolerance=1e-5u"nm", vel_tolerance=1e-5u"nm^2 * ps^-1",
++                 angle_constraints=angle_constraints, nrec=8, niter=2)
++
++    @test !isnothing(cons.angle_constraints)
++    @test length(cons.angle_constraints) == n_molecules
++    @test length(cons.dist_constraints) == 3 * n_molecules
++
++    neighbor_finder = DistanceNeighborFinder(
++        eligible=trues(n_atoms, n_atoms),
++        n_steps=10,
++        dist_cutoff=1.5u"nm",
++    )
++
++    sys = System(
++        atoms=atoms,
++        coords=full_coords,
++        boundary=boundary,
++        velocities=velocities,
++        pairwise_inters=(LennardJones(use_neighbors=true),),
++        constraints=(cons,),
++        neighbor_finder=neighbor_finder,
++    )
++
++    simulate!(sys, VelocityVerlet(dt=0.001u"ps"), 1000)
++
++    @test check_position_constraints(sys, cons)
++
++    # isolation validation
++    @testset begin
++        dc = [DistanceConstraint(1, 4, 0.15u"nm")]
++        ac = [AngleConstraint(1, 2, 3, θ, bond_length, bond_length)]
++        @test_throws ArgumentError LINCS(masses=atom_masses, dist_constraints=dc, angle_constraints=ac)
++
++        ac_overlap = [
++            AngleConstraint(1, 2, 3, θ, bond_length, bond_length),
++            AngleConstraint(3, 4, 5, θ, bond_length, bond_length),
++        ]
++        @test_throws ArgumentError LINCS(masses=atom_masses, angle_constraints=ac_overlap)
++    end
++
++    # show method
++    @testset begin
++        s = sprint(show, cons)
++        @test occursin("distance", s)
++        @test occursin("angle", s)
++    end
++end
++
++@testset "LINCS benchmarks" begin
++    # Warmup
++    x_w, v_w, c_w, m_w = make_lincs_chain(10)
++    d_w = Molly.build_lincs_data(c_w, m_w)
++    ws_w = Molly.create_lincs_workspace(d_w)
++    xp_w = x_w .+ v_w .* 0.002
++    Molly.lincs_apply!(xp_w, x_w, d_w, ws_w, CubicBoundary(5.0))
++
++    # apply_lincs! zero allocations
++    @testset begin
++        for (label, nbackbone, nbranch) in [
++            ("small (7 constraints)", 2, 3),
++            ("medium (399 constraints)", 100, 3),
++        ]
++            x, v, c, m = make_lincs_branched(nbackbone; nbranch)
++            data = Molly.build_lincs_data(c, m)
++            ws = Molly.create_lincs_workspace(data)
++            xp = x .+ v .* 0.002
++
++            # Warmup
++            Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++            xp .= x .+ v .* 0.002
++
++            allocs = @allocated Molly.lincs_apply!(xp, x, data, ws, CubicBoundary(5.0))
++            @test allocs == 0
++        end
++    end
++
++    # solve! zero allocations
++    @testset begin
++        x, v, c, m = make_lincs_branched(100; nbranch=3)
++        data = Molly.build_lincs_data(c, m)
++        ws = Molly.create_lincs_workspace(data)
++        xp = x .+ v .* 0.002
++
++        K = length(data.atom1)
++        for i in 1:K
++            ws.B[i] = normalize(x[data.atom1[i]] - x[data.atom2[i]])
++        end
++        coupling = data.coupling
++        for i in 1:K
++            for n in coupling.range[i]:(coupling.range[i+1]-1)
++                j = coupling.neighbors[n]
++                ws.blcc[n] = coupling.coef[n] * dot(ws.B[i], ws.B[j])
++            end
++        end
++        for i in 1:K
++            ws.rhs[i] = data.sdiag[i] * (dot(ws.B[i], xp[data.atom1[i]] - xp[data.atom2[i]]) - data.lengths[i])
++        end
++        ws.sol .= ws.rhs
++
++        # Warmup
++        Molly.lincs_solve!(xp, data, ws, 1.0)
++        ws.sol .= ws.rhs
++        xp .= x .+ v .* 0.002
++
++        allocs = @allocated Molly.lincs_solve!(xp, data, ws, 1.0)
++        @test allocs == 0
++    end
++end

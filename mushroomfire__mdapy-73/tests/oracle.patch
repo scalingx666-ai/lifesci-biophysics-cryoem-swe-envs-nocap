@@ -1,0 +1,430 @@
+diff --git a/docs/about/release-notes.md b/docs/about/release-notes.md
+index 732b2fd0..0275cd15 100644
+--- a/docs/about/release-notes.md
++++ b/docs/about/release-notes.md
+@@ -202,6 +202,14 @@
+   from its core to the surface when a plane of atoms lies just below the plane of cut.
+   The displacement lifted such atoms across the plane, and they were moved back as if
+   they had been above it, as atomsk does; above and below are now where the atoms were.
++- `Box.minimum_image` gives the shortest vector in boxes of any tilt; with tilts beyond
++  half a box length it could give a longer image.
++- `Box.wrap` raises `InvalidParameter` for atoms so many boxes away that their image
++  flags do not fit in int64; it gave wrong flags.
++- Conditions such as `"element == 'cu'"` refuse texts that are not chemical symbols;
++  they selected nothing. `System` names such symbols when it refuses them.
++- The progress of `EAM` and `NEP` counts once from start to end over their passes; it
++  started again at each pass.
+ 
+ ## 2.0.0
+ 
+diff --git a/docs/reference/formats/extxyz.md b/docs/reference/formats/extxyz.md
+index 2c9c99bd..57b09e72 100644
+--- a/docs/reference/formats/extxyz.md
++++ b/docs/reference/formats/extxyz.md
+@@ -73,6 +73,10 @@ a frame has `species:S:1:pos:R:3`, as plain XYZ files do.
+ When writing, `element` is written as `species`, `positions` as `pos`,
+ `velocities` as `vel` in Å/fs, and `atomic_energies` as `energies`. Other
+ columns keep their names; nested array columns are flattened row by row.
++The file holds numbers and text without their widths, so integer columns of
++any width come back as `int64`, `float32` as `float64`, and nested arrays
++other than `atomic_virials` as their flat components; the
++[MDAPY format](mdapy.md) keeps every type and shape.
+ Columns of other types, missing values, and strings that are empty or
+ contain blanks cannot be written.
+ 
+diff --git a/docs/reference/formats/lammps-dump.md b/docs/reference/formats/lammps-dump.md
+index ef4a41e0..0f17c258 100644
+--- a/docs/reference/formats/lammps-dump.md
++++ b/docs/reference/formats/lammps-dump.md
+@@ -85,7 +85,9 @@ elements as for [LAMMPS data](lammps-data.md#types-masses-and-elements)),
+ `element` and `typelabel` if present, and `x y z` come first, followed by
+ `mol`, `q`, `mass`, `ix iy iz`, `vx vy vz` and `fx fy fz` for the columns
+ that exist, and then every other numeric column under its own name, array
+-columns as `name[1]` to `name[k]`. Booleans are written as 0 and 1. The
++columns as `name[1]` to `name[k]`. Booleans are written as 0 and 1, and
++columns other than those of LAMMPS's own integers come back as `float64`, as
++a dump holds no types; the [MDAPY format](mdapy.md) keeps them. The
+ first frame starts with `ITEM: UNITS`; `ITEM: TIME` is written when `info`
+ has `time`. Other `info` values are not written.
+ 
+diff --git a/src/cpp/calculators/eam.cpp b/src/cpp/calculators/eam.cpp
+index eb11899e..bcf9ada8 100644
+--- a/src/cpp/calculators/eam.cpp
++++ b/src/cpp/calculators/eam.cpp
+@@ -84,7 +84,7 @@ void compute_eam(const EamPotential& potential, std::int64_t n, const std::int32
+                 energies[i] = embedding;
+             }
+         },
+-        control);
++        stage(control, 0, 2));
+ 
+     // Forces, pair energies and virials; each atom gathers from its own pairs.
+     parallel_for(
+@@ -137,7 +137,7 @@ void compute_eam(const EamPotential& potential, std::int64_t n, const std::int32
+                 }
+             }
+         },
+-        control);
++        stage(control, 1, 2));
+ }
+ 
+ }  // namespace mdapy::calculators
+diff --git a/src/cpp/calculators/nep.cpp b/src/cpp/calculators/nep.cpp
+index eac2ef73..7df9b10e 100644
+--- a/src/cpp/calculators/nep.cpp
++++ b/src/cpp/calculators/nep.cpp
+@@ -550,7 +550,7 @@ void compute_nep(const NepModel& model, std::int64_t n, const std::int32_t* spec
+                 }
+             }
+         },
+-        control);
++        stage(control, 0, 2));
+ 
+     if (!derivatives) {
+         return;
+@@ -558,7 +558,9 @@ void compute_nep(const NepModel& model, std::int64_t n, const std::int32_t* spec
+     // Forces and virials: each atom gathers the derivatives of its own energy
+     // and those of its neighbors' energies by the reverse pairs, r_ji = -r_ij;
+     // the virial of a derivative of a neighbor's energy goes to the atom.
+-    const std::vector<std::int64_t> reverse = reverse_pairs(n, offsets, neighbors, shifts, control);
++    // the pairs reversed are quick: cancelled, but not in the progress
++    const std::vector<std::int64_t> reverse =
++        reverse_pairs(n, offsets, neighbors, shifts, {control.cancel, {}});
+     parallel_for(
+         n, 0,
+         [&](std::int64_t begin, std::int64_t end) {
+@@ -587,7 +589,7 @@ void compute_nep(const NepModel& model, std::int64_t n, const std::int32_t* spec
+                 }
+             }
+         },
+-        control);
++        stage(control, 1, 2));
+ }
+ 
+ void compute_nep_frames(const NepModel& model, const neighbor::Frames& frames,
+diff --git a/src/mdapy/core/_conditions.py b/src/mdapy/core/_conditions.py
+index a1193ed8..8de41f5a 100644
+--- a/src/mdapy/core/_conditions.py
++++ b/src/mdapy/core/_conditions.py
+@@ -15,6 +15,7 @@
+ 
+ import polars as pl
+ 
++from mdapy.elements import SYMBOLS
+ from mdapy.errors import InvalidParameter
+ 
+ # names of the components of array columns by their number; any component
+@@ -220,8 +221,29 @@ def visit_BinOp(self, node):
+             self.__refuse(f"the operator {type(node.op).__name__} is not supported")
+         return op(self.visit(node.left), self.visit(node.right))
+ 
++    def __symbols(self, node, values) -> None:
++        """Refuse texts that are not chemical symbols compared with the
++        element column, which would select nothing."""
++        if isinstance(node, ast.Name) and self.__name(node) == "element":
++            unknown = [v for v in values if isinstance(v, str) and v not in SYMBOLS]
++            if unknown:
++                self.__refuse(
++                    f"unknown chemical symbol {unknown[0]!r} (symbols are written "
++                    "as 'Cu')"
++                )
++
+     def visit_Compare(self, node):
+         parts, left = [], self.visit(node.left)
++        nodes = [node.left, *node.comparators]
++        for a, b in zip(nodes, nodes[1:]):
++            for one, other in ((a, b), (b, a)):
++                if isinstance(other, ast.Constant):
++                    self.__symbols(one, [other.value])
++                elif isinstance(other, (ast.List, ast.Tuple, ast.Set)):
++                    self.__symbols(
++                        one,
++                        [e.value for e in other.elts if isinstance(e, ast.Constant)],
++                    )
+         for op, comparator in zip(node.ops, node.comparators):
+             if isinstance(op, (ast.In, ast.NotIn)):
+                 if not isinstance(comparator, (ast.List, ast.Tuple, ast.Set)):
+diff --git a/src/mdapy/core/box.py b/src/mdapy/core/box.py
+index a001c880..3b5523b9 100644
+--- a/src/mdapy/core/box.py
++++ b/src/mdapy/core/box.py
+@@ -55,6 +55,26 @@ class LammpsBox(NamedTuple):
+     rotation: np.ndarray
+ 
+ 
++def _pairwise_reduced(vectors: np.ndarray) -> np.ndarray:
++    """The same lattice from vectors each made as short as the others allow,
++    by subtracting whole multiples of one from another until none grows
++    shorter: each pair then has |a.b| <= |b|²/2."""
++    rows = np.array(vectors, dtype=np.float64)
++    for _ in range(100):
++        changed = False
++        for i in range(len(rows)):
++            for j in range(len(rows)):
++                if i == j:
++                    continue
++                k = np.round(rows[i] @ rows[j] / (rows[j] @ rows[j]))
++                if k != 0:
++                    rows[i] = rows[i] - k * rows[j]
++                    changed = True
++        if not changed:
++            break
++    return rows
++
++
+ class Box:
+     """Simulation box: three lattice vectors, an origin and periodicity.
+ 
+@@ -401,8 +421,22 @@ def wrap(self, positions: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
+             (N, 3) int64 image flags, so that
+             ``positions = wrapped + image @ matrix`` up to rounding. Zero along
+             non-periodic directions.
++
++        Raises
++        ------
++        InvalidParameter
++            For positions so far from the box along a periodic direction that
++            the image flags would not fit in int64.
+         """
+         r = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
++        finite = r[np.isfinite(r).all(axis=1)]  # the others stay as they are
++        if len(finite):
++            images = np.abs((finite - self.__origin) @ self.__inverse)[:, self.__pbc]
++            if images.size and images.max() > 2.0**62:
++                raise InvalidParameter(
++                    f"positions {images.max():.3g} boxes away from the box: their "
++                    "image flags would not fit in int64"
++                )
+         return _core.core.wrap(
+             np.ascontiguousarray(r),
+             np.ascontiguousarray(self.__matrix),
+@@ -423,23 +457,21 @@ def minimum_image(self, vectors: ArrayLike) -> np.ndarray:
+         -------
+         numpy.ndarray
+             (N, 3) float64 vectors, each the shortest among all vectors that differ
+-            from the input by a lattice vector along periodic directions.
+-            Exact for boxes whose tilt factors stay within half the
+-            corresponding edge length, as LAMMPS requires.
++            from the input by a lattice vector along periodic directions, in a
++            box of any tilt.
+         """
+         d = np.asarray(vectors, dtype=np.float64).reshape(-1, 3)
+-        n = np.round(d @ self.__inverse)
+-        n[:, ~self.__pbc] = 0.0
+-        base = d - n @ self.__matrix
+-        # Rounding is not enough in skewed boxes: also try the neighboring images.
+-        shifts = [
+-            s
+-            for s in itertools.product((-1, 0, 1), repeat=3)
+-            if all(si == 0 or p for si, p in zip(s, self.__pbc))
+-        ]
+-        candidates = (
+-            base[:, None, :] + np.array(shifts, dtype=np.float64) @ self.__matrix
+-        )
++        periodic = self.__matrix[self.__pbc]
++        if len(periodic) == 0:
++            return d.copy()
++        # the vectors of the periodic lattice made short and nearly
++        # orthogonal, so that rounding and the neighboring images find the
++        # shortest image even in a box tilted far
++        lattice = _pairwise_reduced(periodic)
++        n = np.round(d @ np.linalg.pinv(lattice))
++        base = d - n @ lattice
++        shifts = np.array(list(itertools.product((-1, 0, 1), repeat=len(lattice))))
++        candidates = base[:, None, :] + (shifts @ lattice)[None]
+         best = np.argmin(np.einsum("nsk,nsk->ns", candidates, candidates), axis=1)
+         return candidates[np.arange(len(d)), best]
+ 
+diff --git a/src/mdapy/core/system.py b/src/mdapy/core/system.py
+index 1d131980..f9cbb0f9 100644
+--- a/src/mdapy/core/system.py
++++ b/src/mdapy/core/system.py
+@@ -17,7 +17,7 @@
+ from mdapy.core.box import Box
+ from mdapy.core.result import Result
+ from mdapy.core.topology import Topology
+-from mdapy.elements import ELEMENT_DTYPE
++from mdapy.elements import ELEMENT_DTYPE, SYMBOLS
+ from mdapy.errors import InvalidParameter
+ 
+ __all__ = ["System"]
+@@ -93,6 +93,13 @@ def _normalize_table(
+             values = flat.to_numpy()
+             if not np.array_equal(values, np.round(values)):
+                 raise InvalidParameter(f"column {name!r} must hold integers")
++        if name == "element" and source == pl.String:
++            unknown = set(table[name].drop_nulls().unique().to_list()) - set(SYMBOLS)
++            if unknown:
++                raise InvalidParameter(
++                    f"unknown chemical symbols {sorted(unknown)[:5]}; symbols are "
++                    "written as 'Cu', with one capital letter"
++                )
+         if inner == pl.Boolean and source_inner.is_numeric():
+             flat = table.select(pl.col(name).explode())[name].drop_nulls()
+             if not np.isin(flat.to_numpy(), (0, 1)).all():
+diff --git a/tests/calculators/test_eam.py b/tests/calculators/test_eam.py
+index f0b69b3c..c6a79991 100644
+--- a/tests/calculators/test_eam.py
++++ b/tests/calculators/test_eam.py
+@@ -131,3 +131,18 @@ def test_values_may_span_lines_and_have_comments(tmp_path):
+     b = EAM(path)
+     system = alloy(seed=7)
+     assert a.compute(system).energy == b.compute(system).energy
++
++
++def test_progress_runs_once_from_start_to_end(potential):
++    """The passes of the computation make one count: it never falls, and it
++    reaches its total at the end."""
++    from .eam_files import alloy
++
++    calls = []
++    potential.compute(
++        alloy(seed=1, repeat=8), progress=lambda d, t: calls.append((d, t))
++    )
++    done = [d for d, _ in calls]
++    assert len({t for _, t in calls}) == 1
++    assert done == sorted(done)
++    assert calls[-1][0] == calls[-1][1]
+diff --git a/tests/calculators/test_nep.py b/tests/calculators/test_nep.py
+index b12404a0..01b5c821 100644
+--- a/tests/calculators/test_nep.py
++++ b/tests/calculators/test_nep.py
+@@ -233,3 +233,17 @@ def test_neighbor_lists_must_be_symmetric(tmp_path):
+     )
+     with pytest.raises(ValueError, match="not symmetric"):
+         potential.compute(system, neighbors=broken)
++
++
++def test_progress_runs_once_from_start_to_end(tmp_path):
++    """The passes of the computation make one count: it never falls, and it
++    reaches its total at the end."""
++    potential = NEP(write_nep(tmp_path / "nep.txt"))
++    calls = []
++    potential.compute(
++        alloy(seed=1, repeat=6), progress=lambda d, t: calls.append((d, t))
++    )
++    done = [d for d, _ in calls]
++    assert len({t for _, t in calls}) == 1
++    assert done == sorted(done)
++    assert calls[-1][0] == calls[-1][1]
+diff --git a/tests/core/test_box.py b/tests/core/test_box.py
+index bac2f563..d3e1f396 100644
+--- a/tests/core/test_box.py
++++ b/tests/core/test_box.py
+@@ -225,6 +225,59 @@ def test_minimum_image_matches_brute_force(rng):
+         np.testing.assert_allclose(shift, np.round(shift), atol=1e-9)
+ 
+ 
++def shortest(d, lattice, reach):
++    """The shortest of the vectors d plus combinations, of whole numbers up to
++    reach, of the rows of lattice, around the nearest by rounding."""
++    base = d - np.round(d @ np.linalg.pinv(lattice)) @ lattice
++    steps = np.array(
++        list(itertools.product(range(-reach, reach + 1), repeat=len(lattice)))
++    )
++    return np.min(
++        np.linalg.norm(base[:, None, :] + (steps @ lattice)[None], axis=2), axis=1
++    )
++
++
++def test_minimum_image_in_boxes_tilted_far(rng):
++    """Tilts of many edge lengths and lattice vectors in any direction, as
++    LAMMPS does not allow: still the shortest image, against the shortest
++    found in a basis of the lattice reduced by the LLL method of the phonons."""
++    from mdapy.lattice_dynamics._phonons import _reduced
++
++    for k in range(40):
++        if k % 2:
++            matrix = np.diag(rng.uniform(2, 6, 3))
++            matrix[1, 0], matrix[2, 0], matrix[2, 1] = rng.uniform(-30, 30, 3)
++        else:
++            matrix = rng.normal(size=(3, 3)) * 5
++            if abs(np.linalg.det(matrix)) < 1:
++                continue
++        d = rng.normal(size=(40, 3)) * 20
++        got = Box(matrix).minimum_image(d)
++        expected = shortest(d, _reduced(matrix), 3)
++        np.testing.assert_allclose(np.linalg.norm(got, axis=1), expected, rtol=1e-12)
++        shift = (got - d) @ np.linalg.inv(matrix)
++        np.testing.assert_allclose(shift, np.round(shift), atol=1e-7)
++    # a sheet tilted far in its plane: against every image within 60 cells
++    matrix = np.array([[3.0, 0, 0], [40.0, 2.5, 0], [0, 0, 10.0]])
++    d = rng.normal(size=(40, 3)) * 20
++    got = Box(matrix, pbc=[True, True, False]).minimum_image(d)
++    np.testing.assert_allclose(
++        np.linalg.norm(got, axis=1), shortest(d, matrix[:2], 60), rtol=1e-12
++    )
++    np.testing.assert_allclose(got[:, 2], d[:, 2])
++    # a box periodic along no direction leaves the vectors as they are
++    d = rng.normal(size=(5, 3))
++    np.testing.assert_array_equal(Box(10.0, pbc=False).minimum_image(d), d)
++
++
++def test_wrap_refuses_atoms_too_far_away():
++    with pytest.raises(InvalidParameter, match="would not fit in int64"):
++        Box(1.0).wrap([[1e20, 0.0, 0.0]])
++    # far along a direction that is not periodic: left as it is
++    wrapped, image = Box(1.0, pbc=[True, True, False]).wrap([[0.5, 0.5, 1e20]])
++    np.testing.assert_array_equal(wrapped, [[0.5, 0.5, 1e20]])
++
++
+ def test_minimum_image_leaves_non_periodic_directions(rng):
+     b = Box(random_lammps_like_box(rng), pbc=[True, True, False])
+     d = rng.normal(scale=15, size=(50, 3))
+diff --git a/tests/core/test_conditions.py b/tests/core/test_conditions.py
+index 580a75fa..59e2c9ea 100644
+--- a/tests/core/test_conditions.py
++++ b/tests/core/test_conditions.py
+@@ -128,7 +128,8 @@ def test_components_by_name_and_index():
+     )
+     # numbers stay numbers, backticks and dots inside strings stay text
+     assert kept(s, "positions.x > 1.5") == where(s["positions"][:, 0] > 1.5)
+-    assert kept(s, "element == '`.1'") == []
++    with pytest.raises(InvalidParameter, match=r"unknown chemical symbol '`\.1'"):
++        kept(s, "element == '`.1'")
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -153,6 +154,9 @@ def test_components_by_name_and_index():
+         ("stress.xx > 0", "stress has no component 'xx'; write one of stress.0"),
+         ("group.2 > 0", "group has no component '2'"),
+         ("charge.x > 0", "charge has no components"),
++        ("element == 'cu'", "unknown chemical symbol 'cu'"),
++        ("'cu' != element", "unknown chemical symbol 'cu'"),
++        ("element in ['Cu', 'ni']", "unknown chemical symbol 'ni'"),
+     ],
+ )
+ def test_errors(condition, message):
+diff --git a/tests/core/test_system.py b/tests/core/test_system.py
+index 6814b829..b5fa3bea 100644
+--- a/tests/core/test_system.py
++++ b/tests/core/test_system.py
+@@ -121,7 +121,7 @@ def test_box_from_array():
+         ({"table": {"positions": [[0, 0, 0]]}}, "polars DataFrame"),
+         ({"table": pl.DataFrame({"x": [0.0]})}, "'positions' column"),
+         ({"positions": np.zeros((2, 3)), "elements": ["H"]}, "1 values for 2 atoms"),
+-        ({"positions": np.zeros((1, 3)), "elements": ["Hx"]}, "standard column"),
++        ({"positions": np.zeros((1, 3)), "elements": ["Hx"]}, "unknown chemical"),
+         ({"positions": np.zeros((1, 3)), "types": [0]}, "at least 1"),
+         ({"positions": np.zeros((1, 3)), "types": [1.5]}, "must hold integers"),
+         (
+@@ -155,6 +155,10 @@ def test_box_from_array():
+             "atom 2",
+         ),
+         ({"positions": np.zeros((2, 3)), "topology": "bonds"}, "Topology"),
++        (
++            {"positions": np.zeros((2, 3)), "elements": ["Cu", "cu"]},
++            r"unknown chemical symbols \['cu'\]",
++        ),
+     ],
+ )
+ def test_invalid_construction(kwargs, message):
+@@ -248,7 +252,7 @@ def test_with_columns():
+         s.with_columns(charge=[1.0, 2.0, 3.0])
+     with pytest.raises(InvalidParameter, match="cannot add columns"):
+         s.with_columns(pl.col("missing") * 2)
+-    with pytest.raises(InvalidParameter, match="standard column"):
++    with pytest.raises(InvalidParameter, match="unknown chemical"):
+         s.with_columns(element="Xx")
+ 
+ 

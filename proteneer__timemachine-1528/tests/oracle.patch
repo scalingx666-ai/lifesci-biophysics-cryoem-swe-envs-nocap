@@ -1,0 +1,224 @@
+diff --git a/tests/test_forcefields.py b/tests/test_forcefields.py
+index e2585a5996..fefd7f662b 100644
+--- a/tests/test_forcefields.py
++++ b/tests/test_forcefields.py
+@@ -8,13 +8,18 @@
+ import numpy as np
+ import pytest
+ from common import load_split_forcefields, temporary_working_dir
++from openmm import app
++from openmm import openmm as mm
+ from rdkit import Chem
+ 
+ from timemachine import constants
+ from timemachine.ff import Forcefield, combine_params
+ from timemachine.ff.handlers import nonbonded
+ from timemachine.ff.handlers.deserialize import deserialize_handlers
++from timemachine.ff.handlers.openmm_deserializer import deserialize_system
+ from timemachine.md import builders
++from timemachine.potentials.potentials import PeriodicTorsion
++from timemachine.utils import path_to_internal_file
+ 
+ pytestmark = [pytest.mark.nocuda]
+ 
+@@ -171,3 +176,51 @@ def test_amber14_tip3p_matches_tip3p():
+ 
+         # Amber14/tip3p handles ions without issue
+         builders.build_protein_system(temp.name, constants.DEFAULT_PROTEIN_FF, constants.DEFAULT_WATER_FF)
++
++
++def test_openmm_deserialize_system_handles_duplicate_bonded_forces():
++    """In some cases it may be useful to construct an OpenMM system that contains forces of the same type.
++    Expectation is that these forces get correctly converted to Timemachine bound potentials. Test only exercises
++    Periodic Torsions, but expected to work for bonds/angles.
++
++    Note that we do not handle duplicate Nonbonded potentials, mostly to avoid nuances of merging them.
++    """
++    ff = app.ForceField(f"{constants.DEFAULT_PROTEIN_FF}.xml")
++
++    with path_to_internal_file("timemachine.testsystems.data", "hif2a_nowater_min.pdb") as path_to_pdb:
++        host_pdb = app.PDBFile(str(path_to_pdb))
++
++    # Create empty topology and coordinates.
++    modeller = app.Modeller(host_pdb.topology, host_pdb.positions)
++
++    omm_host_system = ff.createSystem(
++        modeller.getTopology(), nonbondedMethod=app.NoCutoff, constraints=None, rigidWater=False
++    )
++
++    assert len([f for f in omm_host_system.getForces() if isinstance(f, mm.PeriodicTorsionForce)]) == 1
++
++    existing_torsion_force = next(f for f in omm_host_system.getForces() if isinstance(f, mm.PeriodicTorsionForce))
++    first_torsion = existing_torsion_force.getTorsionParameters(0)
++
++    initial_num_torsions = existing_torsion_force.getNumTorsions()
++    total_torsions = initial_num_torsions
++
++    torsion_idxs = first_torsion[:4]
++    period = 3
++    phase = 180.0
++    k = 10.0
++
++    # Add a new force that duplicates an existing torsion, the parameters of the torsion are unimportant
++    new_force = mm.PeriodicTorsionForce()
++    new_force.setName("dihedrals_a")
++    new_force.addTorsion(*torsion_idxs, period, phase, k)
++    omm_host_system.addForce(new_force)
++    total_torsions += new_force.getNumTorsions()
++
++    assert len([f for f in omm_host_system.getForces() if isinstance(f, mm.PeriodicTorsionForce)]) == 2
++
++    bps, _ = deserialize_system(omm_host_system, cutoff=1.2)
++    # We separate the torsions in the OpenMM system into periodic/improper, have to get both and combine indices
++    tm_torsions = [bp.potential for bp in bps if isinstance(bp.potential, PeriodicTorsion)]
++    tm_torsion_idxs = np.concatenate([pot.idxs for pot in tm_torsions])
++    assert tm_torsion_idxs.shape == (total_torsions, 4)
+diff --git a/timemachine/ff/handlers/openmm_deserializer.py b/timemachine/ff/handlers/openmm_deserializer.py
+index f5f633a085..4fbff3b851 100644
+--- a/timemachine/ff/handlers/openmm_deserializer.py
++++ b/timemachine/ff/handlers/openmm_deserializer.py
+@@ -156,13 +156,17 @@ def deserialize_system(system: mm.System, cutoff: float) -> tuple[list[potential
+ 
+     # this should not be a dict since we may have more than one instance of a given
+     # force.
++    omm_forces = system.getForces()
+ 
+-    # process bonds and angles first to instantiate bond_idxs and angle_idxs
+-    for force in system.getForces():
+-        if isinstance(force, mm.HarmonicBondForce):
+-            bond_idxs_ = []
+-            bond_params_ = []
++    def get_forces_by_type(forces, force_type):
++        return [f for f in forces if isinstance(f, force_type)]
+ 
++    # process bonds and angles first to instantiate bond_idxs and angle_idxs
++    bonded_forces = get_forces_by_type(omm_forces, mm.HarmonicBondForce)
++    if len(bonded_forces) > 0:
++        bond_idxs_ = []
++        bond_params_ = []
++        for force in bonded_forces:
+             for b_idx in range(force.getNumBonds()):
+                 src_idx, dst_idx, length, k = force.getBondParameters(b_idx)
+                 length = value(length)
+@@ -171,14 +175,16 @@ def deserialize_system(system: mm.System, cutoff: float) -> tuple[list[potential
+                 bond_idxs_.append([src_idx, dst_idx])
+                 bond_params_.append((k, length))
+ 
+-            bond_idxs = np.array(bond_idxs_, dtype=np.int32)
+-            bond_params = np.array(bond_params_, dtype=np.float64)
+-            bond = potentials.HarmonicBond(bond_idxs).bind(bond_params)
++        bond_idxs = np.array(bond_idxs_, dtype=np.int32)
++        bond_params = np.array(bond_params_, dtype=np.float64)
++        bond = potentials.HarmonicBond(bond_idxs).bind(bond_params)
+ 
+-        if isinstance(force, mm.HarmonicAngleForce):
+-            angle_idxs_ = []
+-            angle_params_ = []
++    angle_forces = get_forces_by_type(omm_forces, mm.HarmonicAngleForce)
++    if len(angle_forces) > 0:
++        angle_idxs_ = []
++        angle_params_ = []
+ 
++        for force in angle_forces:
+             for a_idx in range(force.getNumAngles()):
+                 src_idx, mid_idx, dst_idx, angle, k = force.getAngleParameters(a_idx)
+                 angle = value(angle)
+@@ -187,15 +193,16 @@ def deserialize_system(system: mm.System, cutoff: float) -> tuple[list[potential
+                 angle_idxs_.append([src_idx, mid_idx, dst_idx])
+                 angle_params_.append((k, angle, 0.0))  # 0.0 is for epsilon
+ 
+-            angle_idxs = np.array(angle_idxs_, dtype=np.int32)
+-            angle_params = np.array(angle_params_, dtype=np.float64)
+-            angle = potentials.HarmonicAngle(angle_idxs).bind(angle_params)
++        angle_idxs = np.array(angle_idxs_, dtype=np.int32)
++        angle_params = np.array(angle_params_, dtype=np.float64)
++        angle = potentials.HarmonicAngle(angle_idxs).bind(angle_params)
+ 
+-    for force in system.getForces():
+-        if isinstance(force, mm.PeriodicTorsionForce):
+-            torsion_idxs_ = []
+-            torsion_params_ = []
++    torsion_forces = get_forces_by_type(omm_forces, mm.PeriodicTorsionForce)
++    if len(torsion_forces) > 0:
++        torsion_idxs_ = []
++        torsion_params_ = []
+ 
++        for force in torsion_forces:
+             for t_idx in range(force.getNumTorsions()):
+                 a_idx, b_idx, c_idx, d_idx, period, phase, k = force.getTorsionParameters(t_idx)
+ 
+@@ -205,39 +212,41 @@ def deserialize_system(system: mm.System, cutoff: float) -> tuple[list[potential
+                 torsion_params_.append((k, phase, period))
+                 torsion_idxs_.append([a_idx, b_idx, c_idx, d_idx])
+ 
+-            torsion_idxs = np.array(torsion_idxs_, dtype=np.int32)
+-            torsion_params = np.array(torsion_params_, dtype=np.float64)
+-
+-            # (ytz): split torsion into proper and impropers, if both angles are present
+-            # then it's a proper torsion, otherwise it's an improper torsion
+-            canonical_angle_idxs = set(canonicalize_bond(tuple(idxs)) for idxs in angle_idxs)
+-
+-            proper_idxs = []
+-            proper_params = []
+-            improper_idxs = []
+-            improper_params = []
+-
+-            for idxs, params in zip(torsion_idxs, torsion_params):
+-                i, j, k, l = idxs
+-                angle_ijk = canonicalize_bond((i, j, k))
+-                angle_jkl = canonicalize_bond((j, k, l))
+-                if angle_ijk in canonical_angle_idxs and angle_jkl in canonical_angle_idxs:
+-                    proper_idxs.append(idxs)
+-                    proper_params.append(params)
+-                elif angle_ijk not in canonical_angle_idxs and angle_jkl not in canonical_angle_idxs:
+-                    assert 0
+-                else:
+-                    # xor case imply improper
+-                    improper_idxs.append(idxs)
+-                    improper_params.append(params)
+-
+-            proper = potentials.PeriodicTorsion(np.array(proper_idxs)).bind(np.array(proper_params))
+-            improper = potentials.PeriodicTorsion(np.array(improper_idxs)).bind(np.array(improper_params))
+-
+-        if isinstance(force, mm.NonbondedForce):
+-            nb_params, exclusion_idxs, beta, scale_factors = deserialize_nonbonded_force(force, N)
+-
+-            nonbonded = potentials.Nonbonded(N, exclusion_idxs, scale_factors, beta, cutoff).bind(nb_params)
++        torsion_idxs = np.array(torsion_idxs_, dtype=np.int32)
++        torsion_params = np.array(torsion_params_, dtype=np.float64)
++
++        # (ytz): split torsion into proper and impropers, if both angles are present
++        # then it's a proper torsion, otherwise it's an improper torsion
++        canonical_angle_idxs = set(canonicalize_bond(tuple(idxs)) for idxs in angle_idxs)
++
++        proper_idxs = []
++        proper_params = []
++        improper_idxs = []
++        improper_params = []
++
++        for idxs, params in zip(torsion_idxs, torsion_params):
++            i, j, k, l = idxs
++            angle_ijk = canonicalize_bond((i, j, k))
++            angle_jkl = canonicalize_bond((j, k, l))
++            if angle_ijk in canonical_angle_idxs and angle_jkl in canonical_angle_idxs:
++                proper_idxs.append(idxs)
++                proper_params.append(params)
++            elif angle_ijk not in canonical_angle_idxs and angle_jkl not in canonical_angle_idxs:
++                assert 0
++            else:
++                # xor case imply improper
++                improper_idxs.append(idxs)
++                improper_params.append(params)
++
++        proper = potentials.PeriodicTorsion(np.array(proper_idxs, dtype=np.int32)).bind(np.array(proper_params))
++        improper = potentials.PeriodicTorsion(np.array(improper_idxs, dtype=np.int32)).bind(np.array(improper_params))
++
++    nb_forces = get_forces_by_type(omm_forces, mm.NonbondedForce)
++    if len(nb_forces) > 0:
++        assert len(nb_forces) == 1, "Only supports a single nonbonded force"
++        nb_params, exclusion_idxs, beta, scale_factors = deserialize_nonbonded_force(nb_forces[0], N)
++
++        nonbonded = potentials.Nonbonded(N, exclusion_idxs, scale_factors, beta, cutoff).bind(nb_params)
+ 
+     assert bond
+     assert angle

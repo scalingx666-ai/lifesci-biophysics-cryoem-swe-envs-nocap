@@ -1,0 +1,179 @@
+diff --git a/xfel/merging/application/filter/factory.py b/xfel/merging/application/filter/factory.py
+index fb06e357e44..ad6a70dabcc 100644
+--- a/xfel/merging/application/filter/factory.py
++++ b/xfel/merging/application/filter/factory.py
+@@ -1,6 +1,7 @@
+ from __future__ import absolute_import, division, print_function
+ from xfel.merging.application.filter.experiment_filter import experiment_filter
+ from xfel.merging.application.filter.reflection_filter import reflection_filter
++from xfel.merging.application.filter.global_filter import GlobalFilter
+ from xfel.merging.application.worker import factory as factory_base
+ 
+ class factory(factory_base):
+@@ -9,8 +10,13 @@ class factory(factory_base):
+   def from_parameters(params, additional_info=None, mpi_helper=None, mpi_logger=None):
+     """ """
+     workers = []
+-    if params.filter.algorithm != None:
+-      workers.append(experiment_filter(params, mpi_helper, mpi_logger))
+-    if params.select.algorithm != None:
+-      workers.append(reflection_filter(params, mpi_helper, mpi_logger))
++    if additional_info and additional_info[0] == 'global':
++      workers.append(GlobalFilter(params, mpi_helper, mpi_logger))
++    elif additional_info:
++      raise KeyError('Unknown worker: filter_' + '_'.join(additional_info))
++    else:  # if not additional_info
++      if params.filter.algorithm is not None:
++        workers.append(experiment_filter(params, mpi_helper, mpi_logger))
++      if params.select.algorithm is not None:
++        workers.append(reflection_filter(params, mpi_helper, mpi_logger))
+     return workers
+diff --git a/xfel/merging/application/filter/global_filter.py b/xfel/merging/application/filter/global_filter.py
+new file mode 100644
+index 00000000000..4d7ed56cf41
+--- /dev/null
++++ b/xfel/merging/application/filter/global_filter.py
+@@ -0,0 +1,112 @@
++from __future__ import division
++
++from collections import Counter
++from enum import Enum
++from itertools import chain
++
++import numpy as np
++
++from dials.array_family import flex
++from dxtbx.model import ExperimentList
++from xfel.merging.application.utils.data_counter import data_counter
++from xfel.merging.application.worker import worker
++
++
++def flat_array(iterable):
++  """Return the contents of all input iterables flattened into a 1d np.array"""
++  return np.array(list(chain.from_iterable(iterable)))
++
++
++def uniques(*iterables):
++  """Return a set of unique elements across all input iterables"""
++  return set(sum([list(i) for i in iterables], []))
++
++
++class FilterReasons(Enum):
++  """Enumerator documenting all possible reasons for filtering expts/refls"""
++  intensity_extremum_iqr_dist = "Intensity extremum outside IQR dist threshold"
++  # add subsequent global filtering reasons here (step 1/3)
++
++  @classmethod
++  def max_reason_len(cls):
++    return max(len(r.value) for r in cls)
++
++  @classmethod
++  def report_line(cls, reason, filtered_expts, filtered_refls):
++    """Return a line for the report listing all input in nice format"""
++    fmt = '- {:' + str(cls.max_reason_len() + 1) + '} {:6d} expts, {:9d} refls'
++    return fmt.format(str(reason) + ':', filtered_expts, filtered_refls)
++
++
++class GlobalFilter(worker):
++  """Filter experiments & reflections based on their aggregated statistics"""
++
++  def __init__(self, params, mpi_helper=None, mpi_logger=None):
++    self.expt_filter_reasons = Counter()
++    self.refl_filter_reasons = Counter()
++    super(GlobalFilter, self).__init__(params=params, mpi_helper=mpi_helper,
++                                       mpi_logger=mpi_logger)
++
++  def __repr__(self):
++    return """Filter expts & refls based on their aggregated statistics"""
++
++  def filter_intensity_extrema(self, expts, refls):
++    """Filter expts whose refls' intensity extrema don't fit the population"""
++    iqr_lim = self.params.filter_global.intensity_extrema_iqr_dist_threshold
++    maxima = []
++    minima = []
++    refl_list = []
++    for iid, expt in enumerate(expts):
++      refl = refls.select(refls["id"] == iid)
++      maxima.append(max(refl['intensity.sum.value']))
++      minima.append(min(refl['intensity.sum.value']))
++      refl_list.append(refl)
++    all_maxima = flat_array(self.mpi_helper.comm.allgather(maxima))
++    all_minima = flat_array(self.mpi_helper.comm.allgather(minima))
++    maxima_quartiles = np.nanpercentile(all_maxima, [25, 50, 75])
++    minima_quartiles = np.nanpercentile(all_minima, [25, 50, 75])
++    maxima_iqr = maxima_quartiles[2] - maxima_quartiles[0]
++    minima_iqr = minima_quartiles[2] - minima_quartiles[0]
++    maxima_upper_lim = maxima_quartiles[1] + iqr_lim * maxima_iqr
++    minima_lower_lim = minima_quartiles[1] - iqr_lim * minima_iqr
++    filtered_expts = ExperimentList()
++    filtered_refls = flex.reflection_table()
++    for expt, refl, minimum, maximum in zip(expts, refl_list, minima, maxima):
++      if minimum < minima_lower_lim or maximum > maxima_upper_lim:
++        filter_reason = FilterReasons.intensity_extremum_iqr_dist
++        self.expt_filter_reasons[filter_reason] += 1
++        self.refl_filter_reasons[filter_reason] += refl.size()
++      else:
++        filtered_expts.append(expt)
++        filtered_refls.extend(refl)
++    return filtered_expts, filtered_refls
++
++  # implement subsequent global filtering algorithms here (step 2/3)
++
++  def report_filter_reasons(self):
++    self.logger.log('Experiments/reflections filtered on this rank due to:')
++    for r in uniques(self.expt_filter_reasons, self.refl_filter_reasons):
++      te = self.expt_filter_reasons[r]
++      tr = self.refl_filter_reasons[r]
++      self.logger.log(FilterReasons.report_line(r.value, te, tr))
++    te = sum(self.expt_filter_reasons.values())
++    tr = sum(self.refl_filter_reasons.values())
++    self.logger.log(FilterReasons.report_line('TOTAL', te, tr))
++    if self.mpi_helper.rank == 0:
++      self.logger.main_log('Experiments/reflections filtered due to:')
++      expt_filter_reasons = self.mpi_helper.count(self.expt_filter_reasons)
++      refl_filter_reasons = self.mpi_helper.count(self.refl_filter_reasons)
++      for r in uniques(expt_filter_reasons, refl_filter_reasons):
++        te = expt_filter_reasons[r]
++        tr = refl_filter_reasons[r]
++        self.logger.main_log(FilterReasons.report_line(r.value, te, tr))
++      te = sum(expt_filter_reasons.values())
++      tr = sum(refl_filter_reasons.values())
++      self.logger.main_log(FilterReasons.report_line('TOTAL', te, tr))
++
++  def run(self, experiments, reflections):
++    expts, refls = self.filter_intensity_extrema(experiments, reflections)
++    # call subsequent global filtering algorithms here (step 3/3)
++    self.report_filter_reasons()
++    data_counter(self.params).count(expts, refls)
++    return expts, refls
+diff --git a/xfel/merging/application/phil/phil.py b/xfel/merging/application/phil/phil.py
+index 26aa16b010e..c580bbac79e 100644
+--- a/xfel/merging/application/phil/phil.py
++++ b/xfel/merging/application/phil/phil.py
+@@ -714,6 +714,17 @@
+ """
+ 
+ 
++filter_global_phil = """
++filter_global {
++  intensity_extrema_iqr_dist_threshold = 1000.0
++    .type = float(value_min=0, value_max=None)
++    .help = Maximum tolerated deviation of max(intensity.sum.value)
++    .help = and min(intensity.sum.value) from expts' population's respective
++    .help = medians, expressed in population's interquartile range units.
++}
++"""
++
++
+ # A place to override any defaults included from elsewhere
+ program_defaults_phil_str = """
+ modify.cosym.use_curvatures=False
+@@ -722,7 +733,7 @@
+ master_phil = dispatch_phil + input_phil + tdata_phil + filter_phil + modify_phil + \
+               select_phil + scaling_phil + postrefinement_phil + merging_phil + \
+               output_phil + statistics_phil + group_phil + lunus_phil + \
+-              publish_phil + diffbragg_phil + monitor_phil
++              publish_phil + diffbragg_phil + monitor_phil + filter_global_phil
+ 
+ import os, importlib
+ custom_phil_pathstr = os.environ.get('XFEL_CUSTOM_WORKER_PATH')

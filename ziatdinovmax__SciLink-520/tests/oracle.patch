@@ -1,0 +1,826 @@
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator_tools.py b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+index 070d0b5f8..b3fc70c9b 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator_tools.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+@@ -3091,6 +3091,18 @@ def _resolve_one(s):
+                             response["reuse_warning"] = reuse_validity.get(
+                                 "message", ""
+                             )
++                    # Hyperspectral locked-replay summary (#509/#518): carries
++                    # verbatim-ness and any degraded-harmonization scoping
++                    # warnings — a harmonized fan-out follower must narrate a
++                    # scoping it could not reproduce, so fusion can discount.
++                    if result.get("script_reuse"):
++                        response["script_reuse"] = result["script_reuse"]
++                        if result["script_reuse"].get("scope_degraded"):
++                            response["reuse_warning"] = (
++                                (response.get("reuse_warning", "") + " ").lstrip()
++                                + "DEGRADED HARMONIZATION: "
++                                + " | ".join(result["script_reuse"].get(
++                                    "scope_warnings") or []))
+                     # Best-of-N: compact candidate table + judge reasoning so
+                     # the orchestrator can narrate the comparison.
+                     if result.get("anchor_candidates"):
+diff --git a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+index aed44da24..e60b52e22 100644
+--- a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
++++ b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+@@ -1226,6 +1226,89 @@ def _grid_scale(hw):
+         return None
+ 
+ 
++def _fit_mask_recipe(components, comp_idx, fit_mask, logger):
++    """Persist the cube-independent recipe behind a component fit-mask (#518).
++
++    The mask itself is donor geometry, but its RULE — "the half-max footprint
++    of the component carrying this signal" — transfers to a sibling cube if
++    the record keeps the component's endmember spectrum. Stored on the
++    dynamic-analysis record so a harmonized locked replay (which bypasses
++    decomposition) can re-derive the same scoping on the follower's own data.
++    """
++    try:
++        comps = np.asarray(components, float)
++        if comps.ndim != 2:
++            return None
++        idx = int(comp_idx)
++        # Same 1-based "Component N" contract (0 tolerated) as _build_fit_mask.
++        if 1 <= idx <= comps.shape[0]:
++            k = idx - 1
++        elif idx == 0:
++            k = 0
++        else:
++            return None
++        return {
++            "fit_scope": "component_mask",
++            "mask_component_index": idx,
++            "component_spectrum": [float(v) for v in comps[k]],
++            "mask_fraction": round(float(fit_mask.mean()), 4),
++        }
++    except Exception as e:  # noqa: BLE001 - recipe is provenance, never fatal
++        logger.warning(f"    Fit-mask recipe not persisted: {e}")
++        return None
++
++
++def _rebuild_fit_mask_from_recipe(data, recipe, shape, logger):
++    """Re-derive a donor's component-mask scoping on a follower cube (#518).
++
++    Locked replay bypasses decomposition, so the abundance map the donor's
++    mask came from does not exist here. Rebuild an abundance-like map by
++    projecting each pixel spectrum onto the donor's persisted endmember
++    (non-negative least-squares coefficient for a single component), then
++    apply the identical half-max + dilation rule via ``_build_fit_mask``.
++    Returns a bool (h, w) array, or None when the recipe is unusable —
++    the caller must then flag the replay's scoping as degraded, never
++    silently run full-frame.
++    """
++    try:
++        spec = np.asarray((recipe or {}).get("component_spectrum"), float)
++        h, w, e = data.shape
++        if spec.ndim != 1 or spec.size != e:
++            logger.warning(
++                f"    Replay mask recipe unusable: donor endmember has "
++                f"{getattr(spec, 'size', 0)} channels, this cube has {e}.")
++            return None
++        denom = float(spec @ spec)
++        if not np.isfinite(denom) or denom <= 0:
++            logger.warning("    Replay mask recipe unusable: degenerate "
++                           "donor endmember spectrum.")
++            return None
++        amap = np.clip(
++            data.reshape(-1, e) @ spec / denom, 0.0, None).reshape(h, w)
++        mask = _build_fit_mask(amap[..., None], 1, shape, logger)
++        if mask is not None:
++            logger.info(
++                "    🔒 Replay scoping reproduced: donor component mask "
++                "re-derived on this cube from the persisted endmember "
++                f"(donor coverage {recipe.get('mask_fraction')}, "
++                f"this cube {mask.mean():.1%}).")
++        return mask
++    except Exception as e:  # noqa: BLE001 - degraded flag handled by caller
++        logger.warning(f"    Replay mask re-derivation failed: {e}")
++        return None
++
++
++def _script_declares_fit_mask(script: str) -> bool:
++    """True when a supplied script's ``analyze_feature`` accepts ``fit_mask``
++    — the replay-time detector for a mask-scoped donor whose record predates
++    the persisted recipe (#518)."""
++    try:
++        m = re.search(r"def\s+analyze_feature\s*\(([^)]*)\)", script or "")
++        return bool(m and "fit_mask" in m.group(1))
++    except Exception:  # noqa: BLE001
++        return False
++
++
+ def _invoke_analyze_feature(func, data, axis, reconstruction=None, *,
+                             auxiliary=None, fit_mask=None):
+     """Call the generated ``analyze_feature``, passing the optional operands
+@@ -2147,6 +2230,14 @@ def execute(self, state: dict) -> dict:
+                                 else "replay of a prior approved analysis script"),
+                 "required_outputs": list(rec.get("required_outputs") or []),
+                 "supplied_script": rec["script"],
++                # #518: the donor's fit-scoping travels with the script — a
++                # replay must reproduce the donor's SCOPING, not only its
++                # arithmetic (the mask is re-derived on this cube downstream).
++                **({"fit_mask_recipe": rec["fit_mask_recipe"],
++                    "fit_scope": "component_mask",
++                    "mask_component_index":
++                        rec["fit_mask_recipe"].get("mask_component_index")}
++                   if isinstance(rec.get("fit_mask_recipe"), dict) else {}),
+             } for rec in state["reuse_records"]]
+             state["refinement_decision"] = {
+                 "refinement_needed": True,
+@@ -2957,8 +3048,40 @@ def execute(self, state: dict) -> dict:
+             # dilated high-abundance region of a decomposition component.
+             # A failed mask construction falls back to full-frame (logged) —
+             # the mask is an optimization, never a gate on correctness.
++            # Locked replay (#518): decomposition is bypassed, so a mask-
++            # scoped donor's mask is RE-DERIVED on this cube from the record's
++            # persisted recipe; failing that, the replay's scoping is flagged
++            # degraded — never silently full-frame.
+             fit_mask = None
+-            if str(target.get("fit_scope") or "full_frame") == "component_mask":
++            fit_mask_recipe = None
++            replay_scope_degraded = None
++            if target.get("supplied_script"):
++                _recipe = target.get("fit_mask_recipe")
++                if _recipe:
++                    fit_mask = _rebuild_fit_mask_from_recipe(
++                        optimal_data, _recipe, (h, w), self.logger)
++                    if fit_mask is not None:
++                        # Carry the donor's recipe forward (coverage restated
++                        # for THIS cube) so a chained replay keeps the scoping.
++                        fit_mask_recipe = {
++                            **_recipe,
++                            "mask_fraction": round(float(fit_mask.mean()), 4)}
++                    else:
++                        replay_scope_degraded = (
++                            "the donor scoped its fit to a component mask but "
++                            "the mask could not be re-derived on this cube — "
++                            "replayed FULL-FRAME: the donor's scoping is NOT "
++                            "reproduced and region signals may be diluted.")
++                elif _script_declares_fit_mask(target["supplied_script"]):
++                    replay_scope_degraded = (
++                        "the donor script declares a fit_mask parameter but "
++                        "the donor record carries no mask recipe (pre-#518 "
++                        "donor) — replayed FULL-FRAME: the donor's scoping "
++                        "is NOT reproduced and region signals may be diluted.")
++                if replay_scope_degraded:
++                    self.logger.warning(
++                        f"    ⚠️ DEGRADED HARMONIZATION: {replay_scope_degraded}")
++            elif str(target.get("fit_scope") or "full_frame") == "component_mask":
+                 fit_mask = _build_fit_mask(
+                     state.get("final_abundance_maps"),
+                     target.get("mask_component_index"), (h, w), self.logger)
+@@ -2966,6 +3089,11 @@ def execute(self, state: dict) -> dict:
+                     self.logger.warning(
+                         "    fit_scope=component_mask requested but no usable "
+                         "abundance mask — falling back to full_frame.")
++                else:
++                    fit_mask_recipe = _fit_mask_recipe(
++                        state.get("final_components"),
++                        target.get("mask_component_index"), fit_mask,
++                        self.logger)
+ 
+             # 1. Define Prompt for this specific task. Built by a per-level
+             # function so the retry ladder (qc_refine) can re-render it with
+@@ -2991,7 +3119,8 @@ def _render_base_prompt(level: int = 0) -> str:
+                     reconstruction_available=reconstruction is not None,
+                     auxiliary_operands={k: v.shape for k, v in auxiliary_operands.items()},
+                     fit_mask_pixels=((int(fit_mask.sum()), int(fit_mask.size),
+-                                      int(target.get("mask_component_index")))
++                                      int(target.get("mask_component_index")
++                                          or 0))
+                                      if fit_mask is not None else None),
+                 )
+ 
+@@ -3108,6 +3237,8 @@ def _render_base_prompt(level: int = 0) -> str:
+                 "reconstruction": reconstruction,
+                 "auxiliary_operands": auxiliary_operands,
+                 "fit_mask": fit_mask,
++                "fit_mask_recipe": fit_mask_recipe,
++                "replay_scope_degraded": replay_scope_degraded,
+                 "processing_note": processing_note,
+                 "all_valid_maps": all_valid_maps,
+                 "all_valid_meta": all_valid_meta,
+@@ -3497,6 +3628,15 @@ def _build_target_record(self, ctx: QCItemContext, task_success: bool):
+                     "replay_verbatim": (ctx.last_code
+                                         == getattr(ctx, "locked_script", None))}
+                    if getattr(ctx, "locked_script", None) else {}),
++                # #518: the mask recipe makes a component-scoped fit
++                # replayable (the mask is re-derived on the follower cube);
++                # replay_scope_degraded marks a replay that could NOT
++                # reproduce the donor's scoping and ran full-frame.
++                **({"fit_mask_recipe": ctx.session.get("fit_mask_recipe")}
++                   if ctx.session.get("fit_mask_recipe") else {}),
++                **({"replay_scope_degraded":
++                        ctx.session.get("replay_scope_degraded")}
++                   if ctx.session.get("replay_scope_degraded") else {}),
+                 # Adapt provenance survives ONLY when the accepted result
+                 # IS the adapted attempt (a ladder refit replaces it and
+                 # the provenance rightly drops with it).
+diff --git a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+index 86b2412ba..f93e56622 100644
+--- a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
++++ b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+@@ -499,6 +499,12 @@ def analyze(
+         if reuse_records:
+             _new_recs = result_json.get("dynamic_analysis_records") or []
+             _supplied = {r.get("script") for r in reuse_records}
++            # #518: a replay that could not reproduce a mask-scoped donor's
++            # scoping ran full-frame — a degraded harmonization the caller
++            # (and fusion) must see, not a silent methodological drift.
++            _scope_warnings = [
++                (nr or {}).get("replay_scope_degraded") for nr in _new_recs
++                if (nr or {}).get("replay_scope_degraded")]
+             response["script_reuse"] = {
+                 "prior_analysis_paths": [str(p) for p in prior_analysis_paths],
+                 "n_replayed": len(reuse_records),
+@@ -506,6 +512,9 @@ def analyze(
+                 # script — the run then is NOT byte-comparable to the donor.
+                 "verbatim": bool(_new_recs) and all(
+                     (nr or {}).get("script") in _supplied for nr in _new_recs),
++                **({"scope_degraded": True,
++                    "scope_warnings": _scope_warnings}
++                   if _scope_warnings else {}),
+             }
+         if literature_files:
+             response["literature_files"] = literature_files
+@@ -543,6 +552,13 @@ def analyze(
+                 f"outputs and the descriptive analysis (if any) are "
+                 f"unaffected.")
+ 
++        # #518: degraded-harmonization warnings land AFTER the status blocks
++        # above (the partial branch ASSIGNS response["warnings"], which would
++        # drop an earlier append).
++        for _sw in (response.get("script_reuse") or {}).get(
++                "scope_warnings", []):
++            response.setdefault("warnings", []).append(
++                f"DEGRADED HARMONIZATION: {_sw}")
+ 
+         # Stage novel hot-annealing successes (method-family abandoned and a
+         # later attempt approved) for review-gated skill distillation —
+diff --git a/tests/test_518_mask_replay_live.py b/tests/test_518_mask_replay_live.py
+new file mode 100644
+index 000000000..f1181237a
+--- /dev/null
++++ b/tests/test_518_mask_replay_live.py
+@@ -0,0 +1,365 @@
++"""Live validation for #518 on Bedrock Opus 4.8: a harmonized locked replay
++must reproduce a mask-scoped donor's SCOPING, not only its arithmetic.
++
++Synthetic sibling XRF-style cubes (160x160x96): a decaying continuum
++everywhere plus a small disk-shaped emitter inclusion carrying a Mn-Ka-like
++Gaussian at 5.9 keV. The inclusion sits at a DIFFERENT location in every
++sibling and its amplitude ramps with the (synthetic) sintering temperature —
++so the donor's mask geometry cannot transfer; only the persisted recipe
++(endmember + half-max rule) can.
++
++  1. donor    — fresh analysis of cube A steered to fit_scope=component_mask;
++                the approved record must persist fit_mask_recipe.
++  2. follower — locked replay on cube B: the mask is re-derived from the
++                recipe on B's own data (B's inclusion is elsewhere), record
++                stays clean and carries the recipe forward.
++  3. legacy   — replay on B against a STRIPPED copy of the donor records
++                (recipe removed, pre-#518 shape): loud DEGRADED HARMONIZATION
++                on the record and on the analyze() response.
++  4. fanout   — meta-level delegate_to_analyses(harmonize=True) over A/B/C:
++                both followers replay with reproduced scoping; fusion runs.
++
++Run (creds auto-loaded from ~/.scilink/credentials.env):
++    UNSAFE_EXECUTION_OK=true python tests/test_518_mask_replay_live.py [1 2 3 4]
++"""
++from __future__ import annotations
++
++import contextlib
++import io
++import json
++import logging
++import shutil
++import sys
++from pathlib import Path
++
++import numpy as np
++
++# Script mode puts tests/ (not the repo root) on sys.path, so without this an
++# editable install of another checkout would shadow the tree under test.
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++MODEL = "bedrock/us.anthropic.claude-opus-4-8"
++BASE = Path("tests/_518_mask_replay_live_runs").resolve()
++H, W, E = 160, 160, 96
++AXIS = np.linspace(1.0, 10.5, E)          # keV
++PEAK_KEV = 5.9
++BLOBS = {"A": (40, 40), "B": (115, 90), "C": (80, 125)}   # (row, col)
++AMPS = {"A": 0.7, "B": 1.0, "C": 1.3}
++TEMPS = {"A": 600, "B": 700, "C": 800}
++BLOB_R = 10
++
++results = {}
++
++
++def check(name, cond):
++    results[name] = bool(cond)
++    print(f"  [{'PASS' if cond else 'FAIL'}] {name}", flush=True)
++
++
++class Tee(io.StringIO):
++    def write(self, s):
++        sys.__stdout__.write(s)
++        return super().write(s)
++
++
++@contextlib.contextmanager
++def capture_all(buf):
++    root = logging.getLogger()
++    prev_level = root.level
++    h = logging.StreamHandler(buf)
++    root.addHandler(h)
++    root.setLevel(logging.INFO)
++    try:
++        with contextlib.redirect_stdout(buf):
++            yield
++    finally:
++        root.removeHandler(h)
++        root.setLevel(prev_level)
++
++
++def make_cube(key, seed):
++    rng = np.random.default_rng(seed)
++    cont = 40.0 * np.exp(-AXIS / 3.0)                       # shared continuum
++    scale = 1.0 + 0.1 * rng.standard_normal((H, W, 1))      # spatial mottle
++    cube = cont[None, None, :] * scale
++    yy, xx = np.mgrid[0:H, 0:W]
++    r0, c0 = BLOBS[key]
++    disk = ((yy - r0) ** 2 + (xx - c0) ** 2) <= BLOB_R ** 2
++    peak = AMPS[key] * 60.0 * np.exp(-0.5 * ((AXIS - PEAK_KEV) / 0.15) ** 2)
++    cube[disk] += peak[None, :]
++    cube += rng.normal(0, 0.6, cube.shape)
++    return np.clip(cube, 0, None).astype(np.float32), disk
++
++
++def cube_path(key):
++    return BASE / "data" / f"coupon_{TEMPS[key]}C.npy"
++
++
++def write_data():
++    (BASE / "data").mkdir(parents=True, exist_ok=True)
++    for i, key in enumerate("ABC"):
++        cube, _ = make_cube(key, seed=100 + i)
++        np.save(cube_path(key), cube)
++        meta = dict(si_for(key))
++        cube_path(key).with_suffix(".json").write_text(json.dumps(meta))
++
++
++def si_for(key):
++    return {
++        "experiment_type": "Spectroscopy",
++        "experiment": {
++            "technique": "XRF spectrum imaging (SEM-EDS style datacube)",
++            "details": (f"160x160 px, 96 channels 1.0-10.5 keV. Mn-bearing "
++                        f"inclusion in a light matrix; coupon sintered at "
++                        f"{TEMPS[key]} C (sibling series 600/700/800 C)."),
++        },
++        "sample": {"material": "Mn-doped ceramic coupon",
++                   "description": f"sintered at {TEMPS[key]} C; one small "
++                   "Mn-rich inclusion in an otherwise uniform matrix."},
++        "energy_range": {"start": 1.0, "end": 10.5, "units": "keV"},
++    }
++
++
++OBJECTIVE = (
++    "Quantify the Mn Ka emission (5.90 keV) of the Mn-rich inclusion: run the "
++    "unsupervised decomposition first to locate the inclusion component, then "
++    "fit a Gaussian + linear background per pixel over 5.0-6.8 keV and return "
++    "Amplitude_Map and Center_Map. The inclusion occupies only a small part "
++    "of the frame, so scope the per-pixel fit to the high-abundance region "
++    "of the inclusion component (set fit_scope=component_mask with that "
++    "component's number on the custom_code target) instead of fitting the "
++    "full frame."
++)
++
++
++def agent(out):
++    from scilink.agents.exp_agents.hyperspectral_analysis_agent import (
++        HyperspectralAnalysisAgent)
++    return HyperspectralAnalysisAgent(
++        api_key=None, model_name=MODEL, output_dir=str(out),
++        enable_human_feedback=False, max_verification_iterations=1)
++
++
++def load_records(run_dir):
++    out = []
++    for f in sorted(Path(run_dir).rglob("dynamic_analysis_records.json")):
++        try:
++            out.extend(r for r in json.loads(f.read_text())
++                       if isinstance(r, dict))
++        except Exception:
++            continue
++    return out
++
++
++def records_dir(run_dir):
++    for f in sorted(Path(run_dir).rglob("dynamic_analysis_records.json")):
++        return f.parent
++    return None
++
++
++def run_analysis(name, key, **kw):
++    out = BASE / name
++    if out.exists():
++        shutil.rmtree(out)
++    buf = Tee()
++    with capture_all(buf):
++        res = agent(out).analyze(
++            data=str(cube_path(key)), system_info=si_for(key),
++            objective=OBJECTIVE, **kw)
++    return res, buf.getvalue(), out
++
++
++def part1_donor():
++    print("\n=== 1. Donor (cube A, 600 C): fresh masked analysis ===")
++    res, log, out = run_analysis("donor_A", "A")
++    if "Fit mask from Component" not in log:
++        print("     (donor retry — planner skipped the component mask)")
++        res, log, out = run_analysis("donor_A_retry", "A")
++    check("p1 donor completed", res.get("status") in ("success", "partial"))
++    check("p1 fit mask was built", "Fit mask from Component" in log)
++    recs = [r for r in load_records(out) if r.get("task_success")]
++    recipes = [r.get("fit_mask_recipe") for r in recs if r.get("fit_mask_recipe")]
++    check("p1 approved record persists fit_mask_recipe", bool(recipes))
++    if recipes:
++        rec = recipes[0]
++        check("p1 recipe spectrum has cube channel count",
++              len(rec.get("component_spectrum") or []) == E)
++        spec = np.asarray(rec.get("component_spectrum") or [0])
++        check("p1 recipe endmember peaks near Mn Ka",
++              abs(AXIS[int(np.argmax(spec))] - PEAK_KEV) < 0.8)
++        check("p1 recipe mask fraction plausible",
++              0 < rec.get("mask_fraction", 0) < 0.5)
++    results["_donor_dir"] = str(records_dir(out) or "")
++    return out
++
++
++def part2_follower():
++    print("\n=== 2. Follower (cube B, 700 C): locked replay, mask re-derived ===")
++    donor_dir = results.get("_donor_dir") or ""
++    if not donor_dir:
++        for cand in ("donor_A", "donor_A_retry"):
++            d = records_dir(BASE / cand)
++            if d and any(r.get("fit_mask_recipe")
++                         for r in load_records(d)):
++                donor_dir = str(d)
++        results["_donor_dir"] = donor_dir
++    check("p2 donor records available", bool(donor_dir))
++    if not donor_dir:
++        return
++    res, log, out = run_analysis("follower_B", "B",
++                                 prior_analysis_paths=[donor_dir],
++                                 reuse_locked_script=True)
++    check("p2 replay plan (no planning LLM)",
++          "Locked-script replay plan" in log)
++    check("p2 scoping reproduced on B", "Replay scoping reproduced" in log)
++    check("p2 no degraded warning", "DEGRADED HARMONIZATION" not in log)
++    recs = load_records(out)
++    replayed = [r for r in recs if r.get("locked_replay")]
++    check("p2 replay record exists", bool(replayed))
++    if replayed:
++        r = replayed[0]
++        check("p2 task_success on follower", r.get("task_success") is True)
++        check("p2 replay verbatim", r.get("replay_verbatim") is True)
++        check("p2 recipe carried forward", bool(r.get("fit_mask_recipe")))
++        check("p2 record not scope-degraded",
++              not r.get("replay_scope_degraded"))
++    sr = res.get("script_reuse") or {}
++    check("p2 response script_reuse verbatim", sr.get("verbatim") is True)
++    check("p2 response not scope-degraded", not sr.get("scope_degraded"))
++
++    # Deterministic localization proof (same code path the live run took):
++    # the donor recipe must mask B's OWN inclusion, which sits elsewhere.
++    from scilink.agents.exp_agents.controllers import (
++        hyperspectral_controllers as hc)
++    recipe = next((r["fit_mask_recipe"] for r in load_records(donor_dir)
++                   if r.get("fit_mask_recipe")), None)
++    cube_b = np.load(cube_path("B"))
++    mask = hc._rebuild_fit_mask_from_recipe(
++        cube_b.astype(float), recipe, (H, W),
++        logging.getLogger("p2.mask"))
++    check("p2 recipe re-derives a mask on B", mask is not None)
++    if mask is not None:
++        ys, xs = np.nonzero(mask)
++        cy, cx = float(ys.mean()), float(xs.mean())
++        r0, c0 = BLOBS["B"]
++        check("p2 mask centred on B's inclusion (not A's)",
++              abs(cy - r0) < BLOB_R and abs(cx - c0) < BLOB_R)
++        check("p2 mask is a small footprint", mask.mean() < 0.25)
++
++
++def part3_legacy_degraded():
++    print("\n=== 3. Legacy donor (recipe stripped): loud degraded flag ===")
++    donor_dir = results.get("_donor_dir") or ""
++    check("p3 donor records available", bool(donor_dir))
++    if not donor_dir:
++        return
++    legacy = BASE / "legacy_donor"
++    if legacy.exists():
++        shutil.rmtree(legacy)
++    legacy.mkdir(parents=True)
++    recs = json.loads(
++        (Path(donor_dir) / "dynamic_analysis_records.json").read_text())
++    for r in recs:
++        r.pop("fit_mask_recipe", None)
++    (legacy / "dynamic_analysis_records.json").write_text(
++        json.dumps(recs, default=str))
++
++    res, log, out = run_analysis("follower_B_legacy", "B",
++                                 prior_analysis_paths=[str(legacy)],
++                                 reuse_locked_script=True)
++    check("p3 degraded warning in log", "DEGRADED HARMONIZATION" in log)
++    replayed = [r for r in load_records(out) if r.get("locked_replay")]
++    check("p3 record flagged scope-degraded",
++          any("NOT reproduced" in str(r.get("replay_scope_degraded"))
++              for r in replayed))
++    sr = res.get("script_reuse") or {}
++    check("p3 response script_reuse.scope_degraded", sr.get("scope_degraded") is True)
++    check("p3 response warnings carry the flag",
++          any("DEGRADED HARMONIZATION" in w
++              for w in (res.get("warnings") or [])))
++    outcome = [(r.get("task_success"), r.get("salvaged")) for r in replayed]
++    print(f"     full-frame replay outcome (task_success, salvaged): {outcome}")
++
++
++def part4_fanout():
++    print("\n=== 4. Meta fan-out harmonize=True over A/B/C ===")
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent, MetaMode)
++    session = BASE / "meta_session"
++    if session.exists():
++        shutil.rmtree(session)
++    ag = MetaOrchestratorAgent(
++        base_dir=str(session), api_key=None, model_name=MODEL,
++        meta_mode=MetaMode.AUTONOMOUS)
++    branches = [{
++        "data_path": str(cube_path(k)),
++        "metadata": str(cube_path(k).with_suffix(".json")),
++        "label": f"coupon {TEMPS[k]} C",
++        "task": (f"Analyze the XRF datacube {cube_path(k)} of the Mn-doped "
++                 f"coupon sintered at {TEMPS[k]} C (sibling series "
++                 f"600/700/800 C). {OBJECTIVE} Complete this as ONE "
++                 "run_analysis call."),
++    } for k in "ABC"]
++    buf = Tee()
++    with capture_all(buf):
++        out = json.loads(ag._run_fanout(branches, harmonize=True))
++    log = buf.getvalue()
++    (BASE / "fanout_result.json").write_text(
++        json.dumps(out, indent=2, default=str))
++    check("p4 fanout succeeded", out.get("status") == "success")
++    check("p4 harmonized mode engaged",
++          (out.get("harmonized") or {}).get("status") == "harmonized")
++    check("p4 followers reproduced scoping",
++          log.count("Replay scoping reproduced") >= 2)
++    check("p4 no degraded harmonization", "DEGRADED HARMONIZATION" not in log)
++    fan_recs = load_records(session)
++    replayed = [r for r in fan_recs if r.get("locked_replay")]
++    check("p4 two follower replay records", len(replayed) >= 2)
++    # The #518 invariant: every replay is verbatim WITH the donor's scoping
++    # reproduced (recipe carried, no degraded flag). The per-map QC verdict
++    # on each follower is the judge's independent (stochastic) call on that
++    # cube — reported, not asserted, beyond one clean success.
++    check("p4 replays verbatim with scoping reproduced",
++          len(replayed) >= 2 and all(
++              r.get("replay_verbatim") and r.get("fit_mask_recipe")
++              and not r.get("replay_scope_degraded") for r in replayed))
++    check("p4 at least one follower passed QC cleanly",
++          any(r.get("task_success") for r in replayed))
++    print("     follower QC outcomes (task_success, salvaged): "
++          + str([(r.get("task_success"), r.get("salvaged"))
++                 for r in replayed]))
++    idx = [r["delegation_index"] for r in out.get("results", [])
++           if r.get("produced_output")]
++    if len(idx) >= 2:
++        buf2 = Tee()
++        with capture_all(buf2):
++            fout = json.loads(ag._fuse_delegations(
++                idx, focus=("Does the inclusion's Mn Ka amplitude ramp with "
++                            "sintering temperature across the harmonized "
++                            "600/700/800 C siblings?")))
++        (BASE / "fusion_result.json").write_text(
++            json.dumps(fout, indent=2, default=str))
++        check("p4 fusion completed", fout.get("status") == "success")
++        check("p4 fusion sees harmonized branches",
++              bool(fout.get("harmonized_branches")))
++
++
++if __name__ == "__main__":
++    from scilink.mcp_server import _load_shared_credentials
++    _load_shared_credentials()
++    parts = [int(a) for a in sys.argv[1:]] or [1, 2, 3, 4]
++    BASE.mkdir(parents=True, exist_ok=True)
++    write_data()
++    import time
++    t0 = time.time()
++    for p in parts:
++        {1: part1_donor, 2: part2_follower,
++         3: part3_legacy_degraded, 4: part4_fanout}[p]()
++    fails = [k for k, v in results.items()
++             if not k.startswith("_") and not v]
++    print(f"\n=== {sum(1 for k, v in results.items() if v and not k.startswith('_'))}"
++          f"/{sum(1 for k in results if not k.startswith('_'))} checks passed "
++          f"({time.time()-t0:.0f}s) ===")
++    if fails:
++        print("FAILED:", fails)
++    sys.exit(1 if fails else 0)
+diff --git a/tests/test_hs_locked_replay.py b/tests/test_hs_locked_replay.py
+index bafca1909..38d90bdd2 100644
+--- a/tests/test_hs_locked_replay.py
++++ b/tests/test_hs_locked_replay.py
+@@ -193,6 +193,188 @@ def test_loader_finds_records_in_nested_result_dirs(tmp_path):
+     assert len(recs2) == 1
+ 
+ 
++# ---------------------------------------------------------------------------
++# #518: a harmonized replay must reproduce the donor's fit-mask SCOPING
++# (re-derived on the follower cube from the record's persisted recipe), or
++# be explicitly flagged degraded — never silently full-frame.
++# ---------------------------------------------------------------------------
++
++E518 = 6
++SPEC_LOCAL = [0.0, 0.0, 10.0, 10.0, 0.0, 0.0]   # localized component endmember
++
++
++def _mask_cube(h=24, w=24):
++    """Flat background with a bright 3x3 corner region carrying SPEC_LOCAL —
++    projection onto SPEC_LOCAL separates region from background at half-max."""
++    cube = np.ones((h, w, E518))
++    cube[:3, :3, :] = np.array(SPEC_LOCAL) * 5.0
++    return cube
++
++
++def _recipe(spec=SPEC_LOCAL, idx=1):
++    return {"fit_scope": "component_mask", "mask_component_index": idx,
++            "component_spectrum": list(spec), "mask_fraction": 0.05}
++
++
++MASKED_SCRIPT = '''
++def analyze_feature(data, axis, fit_mask=None):
++    assert fit_mask is not None, "fit_mask missing on a mask-scoped replay"
++    assert 0 < fit_mask.sum() < fit_mask.size, "mask does not scope the frame"
++    m = data.mean(axis=2) * (1.0 * fit_mask)
++    return {"maps": {"Mean_Map": m}, "units": "a.u.", "description": "d"}
++'''
++
++DECLARES_ONLY_SCRIPT = '''
++def analyze_feature(data, axis, fit_mask=None):
++    m = data.mean(axis=2)
++    return {"maps": {"Mean_Map": m}, "units": "a.u.", "description": "d"}
++'''
++
++
++def _mask_state(tmp_path, records):
++    state = _replay_state(tmp_path, records)
++    state["hspy_data"] = _mask_cube()
++    state["original_hspy_data"] = _mask_cube()
++    state["energy_axis"] = np.linspace(400, 900, E518)
++    return state
++
++
++def test_script_declares_fit_mask_detector():
++    assert hc._script_declares_fit_mask(MASKED_SCRIPT) is True
++    assert hc._script_declares_fit_mask(DECLARES_ONLY_SCRIPT) is True
++    assert hc._script_declares_fit_mask(SCRIPT) is False
++    assert hc._script_declares_fit_mask("") is False
++
++
++def test_rebuild_mask_from_recipe_localizes():
++    mask = hc._rebuild_fit_mask_from_recipe(
++        _mask_cube(), _recipe(), (24, 24), LOGGER)
++    assert mask is not None and mask.dtype == bool
++    assert mask[0, 0] and not mask[23, 23]          # region in, far corner out
++    assert 0 < mask.sum() < mask.size / 2
++
++
++def test_rebuild_mask_channel_mismatch_returns_none():
++    bad = _recipe(spec=[1.0] * 9)                    # 9 channels vs cube's 6
++    assert hc._rebuild_fit_mask_from_recipe(
++        _mask_cube(), bad, (24, 24), LOGGER) is None
++
++
++def test_replay_target_carries_recipe():
++    ctrl = hc.SelectRefinementTargetController(
++        _ExplodingModel(), LOGGER, generation_config=None,
++        safety_settings=None, parse_fn=lambda r: ({}, None))
++    recs = _records(script=MASKED_SCRIPT)
++    recs[0]["fit_mask_recipe"] = _recipe()
++    state = ctrl.execute(_mask_state("unused", recs))
++    t = state["refinement_decision"]["targets"][0]
++    assert t["fit_mask_recipe"] == _recipe()
++    assert t["fit_scope"] == "component_mask"
++    assert t["mask_component_index"] == 1
++
++
++def test_replay_rederives_mask_and_reproduces_scoping(tmp_path, monkeypatch):
++    """Recipe present -> mask re-derived on the follower cube, the supplied
++    script actually receives it (it asserts so), record stays clean and
++    carries the recipe forward for chained replays."""
++    recs = _records(script=MASKED_SCRIPT)
++    recs[0]["fit_mask_recipe"] = _recipe()
++    monkeypatch.setenv("UNSAFE_EXECUTION_OK", "true")
++    plan = hc.SelectRefinementTargetController(
++        _ExplodingModel(), LOGGER, generation_config=None,
++        safety_settings=None, parse_fn=lambda r: ({}, None))
++    state = plan.execute(_mask_state(tmp_path, recs))
++    ctrl = hc.RunDynamicAnalysisController(
++        _ExplodingModel(), LOGGER, generation_config=None,
++        safety_settings=None, parse_fn=lambda r: ({}, None))
++    ctrl._review_required_output = lambda *a, **k: (True, "")
++    ctrl._check_result_visually = lambda *a, **k: (True, "")
++    state = ctrl.execute(state)
++    rec = (state.get("dynamic_analysis_records") or [])[0]
++    assert rec["task_success"] is True
++    assert rec["replay_verbatim"] is True
++    assert "replay_scope_degraded" not in rec
++    assert rec["fit_mask_recipe"]["mask_component_index"] == 1
++    assert rec["fit_mask_recipe"]["component_spectrum"] == SPEC_LOCAL
++    assert 0 < rec["fit_mask_recipe"]["mask_fraction"] < 0.5
++
++
++def test_replay_without_recipe_flags_degraded(tmp_path, monkeypatch):
++    """Pre-#518 donor record (mask-dependent script, no recipe) -> loud
++    degraded flag on the record; the script still runs (full-frame)."""
++    state = _run_dynamic_masked(tmp_path, _records(script=DECLARES_ONLY_SCRIPT),
++                                monkeypatch)
++    rec = (state.get("dynamic_analysis_records") or [])[0]
++    assert rec["task_success"] is True
++    assert "NOT reproduced" in rec["replay_scope_degraded"]
++    assert "fit_mask_recipe" not in rec
++
++
++def test_replay_unusable_recipe_flags_degraded(tmp_path, monkeypatch):
++    """Recipe present but unusable on this cube (channel mismatch) ->
++    degraded flag, full-frame execution."""
++    recs = _records(script=DECLARES_ONLY_SCRIPT)
++    recs[0]["fit_mask_recipe"] = _recipe(spec=[1.0] * 9)
++    state = _run_dynamic_masked(tmp_path, recs, monkeypatch)
++    rec = (state.get("dynamic_analysis_records") or [])[0]
++    assert rec["task_success"] is True
++    assert "could not be re-derived" in rec["replay_scope_degraded"]
++
++
++def _run_dynamic_masked(tmp_path, records, monkeypatch):
++    monkeypatch.setenv("UNSAFE_EXECUTION_OK", "true")
++    plan = hc.SelectRefinementTargetController(
++        _ExplodingModel(), LOGGER, generation_config=None,
++        safety_settings=None, parse_fn=lambda r: ({}, None))
++    state = plan.execute(_mask_state(tmp_path, records))
++    ctrl = hc.RunDynamicAnalysisController(
++        _ExplodingModel(), LOGGER, generation_config=None,
++        safety_settings=None, parse_fn=lambda r: ({}, None))
++    ctrl._review_required_output = lambda *a, **k: (True, "")
++    ctrl._check_result_visually = lambda *a, **k: (True, "")
++    return ctrl.execute(state)
++
++
++def test_donor_record_persists_recipe(tmp_path, monkeypatch):
++    """Fresh (non-replay) component-mask target -> the approved record
++    persists the cube-independent mask recipe (#518 spot 3)."""
++    monkeypatch.setenv("UNSAFE_EXECUTION_OK", "true")
++    state = _mask_state(tmp_path, None)
++    del state["reuse_records"]
++    # Donor-side decomposition state: component 1 is the localized region.
++    amap = np.zeros((24, 24)); amap[:3, :3] = 1.0
++    state["final_abundance_maps"] = np.dstack([amap, np.ones((24, 24)) * 0.1])
++    state["final_components"] = np.array([SPEC_LOCAL, [1.0] * E518])
++    state["refinement_decision"] = {
++        "refinement_needed": True, "requires_custom_code": True,
++        "targets": [{"type": "custom_code", "description": "masked mean map",
++                     "required_outputs": ["Mean_Map"],
++                     "fit_scope": "component_mask",
++                     "mask_component_index": 1}],
++    }
++
++    class _CodegenModel:
++        def generate_content(self, *a, **k):
++            return json.dumps({"code": MASKED_SCRIPT})
++
++    ctrl = hc.RunDynamicAnalysisController(
++        _CodegenModel(), LOGGER, generation_config=None,
++        safety_settings=None, parse_fn=lambda r: ({}, None))
++    ctrl._review_required_output = lambda *a, **k: (True, "")
++    ctrl._check_result_visually = lambda *a, **k: (True, "")
++    state = ctrl.execute(state)
++    rec = (state.get("dynamic_analysis_records") or [])[0]
++    assert rec["task_success"] is True
++    recipe = rec["fit_mask_recipe"]
++    assert recipe["fit_scope"] == "component_mask"
++    assert recipe["mask_component_index"] == 1
++    assert recipe["component_spectrum"] == SPEC_LOCAL
++    assert 0 < recipe["mask_fraction"] < 0.5
++    # Round-trip: the persisted record is exactly what a follower replays.
++    replayed = json.loads(json.dumps(rec, default=str))
++    assert replayed["fit_mask_recipe"]["component_spectrum"] == SPEC_LOCAL
++
++
+ if __name__ == "__main__":
+     import sys
+     sys.exit(pytest.main([__file__, "-q"]))

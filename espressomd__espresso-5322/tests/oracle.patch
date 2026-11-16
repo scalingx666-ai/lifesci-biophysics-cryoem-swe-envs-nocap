@@ -1,0 +1,254 @@
+diff --git a/src/core/bond_pressure_kokkos.hpp b/src/core/bond_pressure_kokkos.hpp
+index b24775d575..c99cbaaefe 100644
+--- a/src/core/bond_pressure_kokkos.hpp
++++ b/src/core/bond_pressure_kokkos.hpp
+@@ -152,6 +152,54 @@ struct AngleBondsPressureKernel {
+   }
+ };
+ 
+-struct NullDihedralPressureKernel {
+-  KOKKOS_INLINE_FUNCTION void operator()(std::size_t) const {}
++struct DihedralBondsPressureKernel {
++  BondsPressureKernelData data;
++  LocalBondState::DihedralBondlistType bond_list;
++  LocalBondState::DihedralBondIDType bond_ids;
++
++  DihedralBondsPressureKernel(BondsPressureKernelData data_,
++                              LocalBondState::DihedralBondlistType bond_list_,
++                              LocalBondState::DihedralBondIDType bond_ids_)
++      : data(std::move(data_)), bond_list(std::move(bond_list_)),
++        bond_ids(std::move(bond_ids_)) {}
++
++  ESPRESSO_ATTR_ALWAYS_INLINE KOKKOS_INLINE_FUNCTION void
++  operator()(std::size_t idx) const {
++    auto const &bonded_ias = data.bonded_ias;
++    auto const &box_geo = data.box_geo;
++    auto &local_pressure = data.local_pressure;
++    auto const &layout = data.layout;
++    auto const &aosoa = data.aosoa;
++    auto const bond_id = bond_ids(idx);
++
++    // TODO: omp_get_thread_num() is only available for the OpenMP backend.
++    // This should be updated when using other Kokkos backends.
++    auto const thread_id = omp_get_thread_num();
++
++    auto const i = bond_list(idx, 0);
++    auto const j = bond_list(idx, 1);
++    auto const k = bond_list(idx, 2);
++    auto const m = bond_list(idx, 3);
++    auto const &iaparams = *bonded_ias.at(bond_id);
++
++    auto const pos1 = aosoa.get_vector_at(aosoa.position, i);
++    auto const pos2 = aosoa.get_vector_at(aosoa.position, j);
++    auto const pos3 = aosoa.get_vector_at(aosoa.position, k);
++    auto const pos4 = aosoa.get_vector_at(aosoa.position, m);
++
++    std::optional<Utils::Matrix<double, 3, 3>> pressure =
++        calc_bonded_four_body_pressure_tensor(iaparams, pos1, pos2, pos3, pos4,
++                                              box_geo);
++
++    if (pressure) {
++      auto const flat = Utils::flatten(*pressure);
++      for (std::size_t k3 = 0; k3 < 9; ++k3)
++        local_pressure(thread_id,
++                       layout.tensor_offset(layout.bonded_idx(bond_id), k3)) +=
++            flat[k3];
++    } else {
++      std::array<int, 3> pids = {aosoa.id(j), aosoa.id(k), aosoa.id(m)};
++      bond_broken_error(aosoa.id(i), {pids.data(), 3});
++    }
++  }
+ };
+diff --git a/src/core/forces_inline.hpp b/src/core/forces_inline.hpp
+index 28799406a6..19cf232faf 100644
+--- a/src/core/forces_inline.hpp
++++ b/src/core/forces_inline.hpp
+@@ -254,6 +254,24 @@ calc_bonded_three_body_force(Bonded_IA_Parameters const &iaparams,
+   throw BondUnknownTypeError();
+ }
+ 
++ESPRESSO_ATTR_ALWAYS_INLINE
++inline std::optional<std::tuple<Utils::Vector3d, Utils::Vector3d,
++                                Utils::Vector3d, Utils::Vector3d>>
++calc_bonded_dihedral_force(Bonded_IA_Parameters const &iaparams,
++                           Utils::Vector3d const &v12,
++                           Utils::Vector3d const &v23,
++                           Utils::Vector3d const &v34) {
++  if (auto const *iap = std::get_if<DihedralBond>(&iaparams)) {
++    return iap->forces(v12, v23, v34);
++  }
++#ifdef ESPRESSO_TABULATED
++  if (auto const *iap = std::get_if<TabulatedDihedralBond>(&iaparams)) {
++    return iap->forces(v12, v23, v34);
++  }
++#endif
++  throw BondUnknownTypeError();
++}
++
+ ESPRESSO_ATTR_ALWAYS_INLINE
+ inline std::optional<std::tuple<Utils::Vector3d, Utils::Vector3d,
+                                 Utils::Vector3d, Utils::Vector3d>>
+@@ -278,13 +296,5 @@ calc_bonded_four_body_force(
+   auto const v12 = box_geo.get_mi_vector(pos1, pos2);
+   auto const v23 = box_geo.get_mi_vector(pos3, pos1);
+   auto const v34 = box_geo.get_mi_vector(pos4, pos3);
+-  if (auto const *iap = std::get_if<DihedralBond>(&iaparams)) {
+-    return iap->forces(v12, v23, v34);
+-  }
+-#ifdef ESPRESSO_TABULATED
+-  if (auto const *iap = std::get_if<TabulatedDihedralBond>(&iaparams)) {
+-    return iap->forces(v12, v23, v34);
+-  }
+-#endif
+-  throw BondUnknownTypeError();
++  return calc_bonded_dihedral_force(iaparams, v12, v23, v34);
+ }
+diff --git a/src/core/pressure.cpp b/src/core/pressure.cpp
+index e468928c62..2130adf849 100644
+--- a/src/core/pressure.cpp
++++ b/src/core/pressure.cpp
+@@ -122,9 +122,10 @@ std::shared_ptr<Observable_stat> System::calculate_pressure() {
+       bonds_p_data, bs.pair_list, bs.pair_ids, get_ptr(coulomb_force_kernel)};
+   AngleBondsPressureKernel angle_bp_kernel{bonds_p_data, bs.angle_list,
+                                            bs.angle_ids};
+-  NullDihedralPressureKernel null_dih_kernel{};
++  DihedralBondsPressureKernel dih_bp_kernel{bonds_p_data, bs.dihedral_list,
++                                            bs.dihedral_ids};
+ 
+-  cabana_short_range(pair_bp_kernel, angle_bp_kernel, null_dih_kernel,
++  cabana_short_range(pair_bp_kernel, angle_bp_kernel, dih_bp_kernel,
+                      pair_p_kernel, *cell_structure, get_interaction_range(),
+                      bonded_ias->maximal_cutoff(), verlet_criterion,
+                      propagation->integ_switch);
+diff --git a/src/core/pressure_inline.hpp b/src/core/pressure_inline.hpp
+index 02209c0974..5c40b88c04 100644
+--- a/src/core/pressure_inline.hpp
++++ b/src/core/pressure_inline.hpp
+@@ -111,3 +111,39 @@ calc_bonded_three_body_pressure_tensor(Bonded_IA_Parameters const &iaparams,
+   }
+   return {};
+ }
++
++inline std::optional<Utils::Matrix<double, 3, 3>>
++calc_bonded_four_body_pressure_tensor(Bonded_IA_Parameters const &iaparams,
++                                      Utils::Vector3d const &pos1,
++                                      Utils::Vector3d const &pos2,
++                                      Utils::Vector3d const &pos3,
++                                      Utils::Vector3d const &pos4,
++                                      BoxGeometry const &box_geo) {
++  if (std::holds_alternative<DihedralBond>(iaparams)
++#ifdef ESPRESSO_TABULATED
++      or std::holds_alternative<TabulatedDihedralBond>(iaparams)
++#endif
++  ) {
++    auto const v12 = box_geo.get_mi_vector(pos1, pos2);
++    auto const v23 = box_geo.get_mi_vector(pos3, pos1);
++    auto const v34 = box_geo.get_mi_vector(pos4, pos3);
++
++    auto const result = calc_bonded_dihedral_force(iaparams, v12, v23, v34);
++
++    if (result) {
++      Utils::Vector3d force2, force3, force4;
++      std::tie(std::ignore, force2, force3, force4) = result.value();
++
++      return -Utils::tensor_product(force2, v12) +
++             Utils::tensor_product(force3, v23) +
++             Utils::tensor_product(force4, v23 + v34);
++    }
++  } else {
++    runtimeWarningMsg() << "Unsupported bond type " +
++                               std::to_string(iaparams.index()) +
++                               " in pressure calculation.";
++    return Utils::Matrix<double, 3, 3>{};
++  }
++
++  return {};
++}
+diff --git a/testsuite/python/interactions_dihedral.py b/testsuite/python/interactions_dihedral.py
+index 45a4b56313..4523f9e41d 100644
+--- a/testsuite/python/interactions_dihedral.py
++++ b/testsuite/python/interactions_dihedral.py
+@@ -89,6 +89,28 @@ def check_values(self, E_ref, forces_ref, tol=1e-12):
+             np.testing.assert_allclose(np.copy(f2), f2_ref, atol=tol)
+             np.testing.assert_allclose(np.copy(f3), f3_ref, atol=tol)
+ 
++    def check_singularity(self):
++        p0 = self.system.part.by_id(0)
++        p1 = self.system.part.by_id(1)
++        p2 = self.system.part.by_id(2)
++        p3 = self.system.part.by_id(3)
++        p1.pos = [5., 5., 5.]
++        p2.pos = p1.pos + [1., 0., 0.]
++        p3.pos = p1.pos + [2., 0., 0.]
++        p0.pos = p1.pos + [-1., 0., 0.]
++        with self.assertRaisesRegex(Exception, "bond broken"):
++            self.system.analysis.energy()
++        with self.assertRaisesRegex(Exception, "bond broken"):
++            self.system.integrator.run(steps=0, recalc_forces=True)
++        with self.assertRaisesRegex(Exception, "bond broken"):
++            self.system.analysis.pressure_tensor()["bonded"]
++        # in the core, the dihedral bond did not contribute to the forces
++        f0, f1, f2, f3 = self.system.part.all().f
++        np.testing.assert_array_equal(np.copy(f0), np.zeros(3))
++        np.testing.assert_array_equal(np.copy(f1), np.zeros(3))
++        np.testing.assert_array_equal(np.copy(f2), np.zeros(3))
++        np.testing.assert_array_equal(np.copy(f3), np.zeros(3))
++
+     def check_undefined_angle(self):
+         p0 = self.system.part.by_id(0)
+         p1 = self.system.part.by_id(1)
+@@ -104,6 +126,32 @@ def check_undefined_angle(self):
+         np.testing.assert_array_equal(np.copy(f2), np.zeros(3))
+         np.testing.assert_array_equal(np.copy(f3), np.zeros(3))
+ 
++    def check_pressure_tensor(self, tol=1e-12):
++        p0, p1, p2, p3 = self.system.part.all()
++        # p1 is the bond owner (reference particle)
++        # P_ij = 1/V * sum F_{1,k}_i * r_{1,k}_j
++        p_tensor_ref = (
++            np.outer(np.copy(p0.f), self.system.distance_vec(p1, p0))
++            + np.outer(np.copy(p2.f), self.system.distance_vec(p1, p2))
++            + np.outer(np.copy(p3.f), self.system.distance_vec(p1, p3))
++        ) / self.system.volume()
++        p_tensor_sim = self.system.analysis.pressure_tensor()["bonded"]
++        np.testing.assert_allclose(p_tensor_sim,
++                                   p_tensor_ref,
++                                   atol=tol)
++        np.testing.assert_allclose(self.system.analysis.pressure()["bonded"],
++                                   0.0,
++                                   atol=tol)
++        # consistency: trace / 3 == scalar pressure
++        np.testing.assert_allclose(np.trace(p_tensor_sim) / 3.,
++                                   self.system.analysis.pressure()["bonded"],
++                                   atol=tol)
++        # symmetry: dihedral angle is rotationally invariant, so
++        # sum_i r_i x F_i = 0, which implies p_ab = p_ba
++        np.testing.assert_allclose(p_tensor_sim,
++                                   p_tensor_sim.T,
++                                   atol=tol)
++
+     # Test Dihedral Angle
+     def test_dihedral(self):
+         axis = np.array([1., 0., 0.])
+@@ -133,8 +181,10 @@ def test_dihedral(self):
+                         dh_k, dh_n, dh_phi0, p0.pos, p1.pos, p2.pos, p3.pos)
+ 
+                     self.check_values(E_ref, forces_ref)
++                    self.check_pressure_tensor()
+ 
+         self.check_undefined_angle()
++        self.check_singularity()
+ 
+     # Test Tabulated Dihedral Angle
+     @utx.skipIfMissingFeatures(["TABULATED"])
+@@ -180,8 +230,10 @@ def test_tabulated_dihedral(self):
+                         forces_ref = None
+ 
+                     self.check_values(E_ref, forces_ref)
++                    self.check_pressure_tensor()
+ 
+         self.check_undefined_angle()
++        self.check_singularity()
+ 
+ 
+ if __name__ == '__main__':

@@ -1,0 +1,257 @@
+diff --git a/CHANGES/v2.11.md b/CHANGES/v2.11.md
+index f99a3f3f83..f6110b1fe3 100644
+--- a/CHANGES/v2.11.md
++++ b/CHANGES/v2.11.md
+@@ -449,6 +449,12 @@ The entries below give the details; the main cases are:
+ 
+ #### Core, performance and input
+ 
++  - Less work for every action that uses atoms at every step: the periodic boundary conditions are copied into the action only when the box changes
++    (and are not recomputed when the MD code passes the same box), and constant masses and charges are copied only once.
++    With 200 [DISTANCE](DISTANCE.md) the calculation is about 18% faster, with 20 [GYRATION](GYRATION.md) of 1000 atoms about 4%.
++
++  - Making the molecules whole no longer opens an OpenMP parallel region when it runs on one thread, which happens for every action with few atoms
++    (e.g. [DISTANCE](DISTANCE.md)) at every step. With 200 [DISTANCE](DISTANCE.md) and a [RESTRAINT](RESTRAINT.md) on them the calculation is almost twice as fast.
+   - The virial of the collective variables that compute it from the atomic derivatives (e.g. [DISTANCE](DISTANCE.md), [GYRATION](GYRATION.md) and the multicolvars)
+     is computed about four times faster: the loop over the atoms stalled on a temporary tensor. With 20 [GYRATION](GYRATION.md) of 1000 atoms the forward loop is 20% faster,
+     with 200 [DISTANCE](DISTANCE.md) 10% faster. The results are identical.
+diff --git a/src/core/ActionAtomistic.cpp b/src/core/ActionAtomistic.cpp
+index 697fc4fd0c..e001c4133a 100644
+--- a/src/core/ActionAtomistic.cpp
++++ b/src/core/ActionAtomistic.cpp
+@@ -109,6 +109,7 @@ void ActionAtomistic::requestAtoms(const std::vector<AtomNumber> & a, const bool
+   }
+ 
+   atom_value_ind_grouped.clear();
++  massesAndChargesRetrieved=false;
+ 
+   if(atom_value_ind.size()>0) {
+     auto prev_nn=atom_value_ind[0].first;
+@@ -406,7 +407,10 @@ void ActionAtomistic::retrieveAtoms( const bool& force ) {
+     plumed_assert(ptr); // needed for following calls, see #1046
+     PbcAction* pbca = ptr->castToPbcAction();
+     plumed_assert( pbca );
+-    actionPbc=pbca->pbc;
++    // the copy is needed only when the box changed (or when this action changed its copy, e.g. with changeBox)
++    if( actionPbc.getVersion()!=pbca->pbc.getVersion() ) {
++      actionPbc=pbca->pbc;
++    }
+   }
+   if( donotretrieve || indexes.size()==0 ) {
+     return;
+@@ -427,26 +431,42 @@ void ActionAtomistic::retrieveAtoms( const bool& force ) {
+   } else if( (chargev[0]->getPntrToAction())->getName()=="CONSTANT" ) {
+     chargesWereSet=true;  // Read masses from PDB file
+   }
++  // masses and charges are usually constant: copy them only when they can have changed
++  bool constantMassesAndCharges=true;
++  for(const auto & a : atom_value_ind_grouped) {
++    if( !masv[a.first]->isConstant() || !chargev[a.first]->isConstant() ) {
++      constantMassesAndCharges=false;
++      break;
++    }
++  }
++  const bool copyMassesAndCharges=!(massesAndChargesRetrieved && constantMassesAndCharges);
+   unsigned j = 0;
+-
+-
+   for(const auto & a : atom_value_ind_grouped) {
+     const auto nn=a.first;
+     auto & xp=xpos[nn]->data;
+     auto & yp=ypos[nn]->data;
+     auto & zp=zpos[nn]->data;
+-    auto & ch=chargev[nn]->data;
+-    auto & ma=masv[nn]->data;
+-    for(const auto & kk : a.second) {
+-      actionPositions[j][0] = xp[kk];
+-      actionPositions[j][1] = yp[kk];
+-      actionPositions[j][2] = zp[kk];
+-      charges[j] = ch[kk];
+-      masses[j] = ma[kk];
+-      j++;
++    if( copyMassesAndCharges ) {
++      auto & ch=chargev[nn]->data;
++      auto & ma=masv[nn]->data;
++      for(const auto & kk : a.second) {
++        actionPositions[j][0] = xp[kk];
++        actionPositions[j][1] = yp[kk];
++        actionPositions[j][2] = zp[kk];
++        charges[j] = ch[kk];
++        masses[j] = ma[kk];
++        j++;
++      }
++    } else {
++      for(const auto & kk : a.second) {
++        actionPositions[j][0] = xp[kk];
++        actionPositions[j][1] = yp[kk];
++        actionPositions[j][2] = zp[kk];
++        j++;
++      }
+     }
+   }
+-
++  massesAndChargesRetrieved=constantMassesAndCharges;
+ }
+ 
+ void ActionAtomistic::setForcesOnAtoms(const std::vector<double>& forcesToApply, unsigned& ind) {
+diff --git a/src/core/ActionAtomistic.h b/src/core/ActionAtomistic.h
+index 25613e18fe..07a2af7644 100644
+--- a/src/core/ActionAtomistic.h
++++ b/src/core/ActionAtomistic.h
+@@ -87,6 +87,8 @@ class ActionAtomistic :
+ protected:
+   bool                  massesWereSet;
+   bool                  chargesWereSet;
++/// masses and charges are constant and were copied for the current list of atoms: they are not copied again
++  bool                  massesAndChargesRetrieved=false;
+   void setExtraCV(const std::string &name);
+ /// Used to interpret whether this index is a virtual atom or a real atom
+   std::pair<std::size_t, std::size_t> getValueIndices( const AtomNumber& i ) const ;
+diff --git a/src/core/PbcAction.cpp b/src/core/PbcAction.cpp
+index 38fd147a0f..b1d6b5a3a4 100644
+--- a/src/core/PbcAction.cpp
++++ b/src/core/PbcAction.cpp
+@@ -94,11 +94,19 @@ void PbcAction::setPbc() {
+   if( interface ) {
+     interface->broadcastToDomains( getPntrToValue() );
+   }
++  // setBox is expensive (and the actions copy the Pbc when its version changes): skip it when the box is the same
++  bool changed=(pbc.getVersion()==0);
++  const Tensor& oldbox(pbc.getBox());
+   for(unsigned i=0; i<3; ++i)
+     for(unsigned j=0; j<3; ++j) {
+       box(i,j) = getPntrToValue()->get(3*i+j);
++      if( box(i,j)!=oldbox(i,j) ) {
++        changed=true;
++      }
+     }
+-  pbc.setBox(box);
++  if( changed ) {
++    pbc.setBox(box);
++  }
+ }
+ 
+ void PbcAction::wait() {
+diff --git a/src/core/PlumedMain.cpp b/src/core/PlumedMain.cpp
+index c5bce0759e..14e4752c04 100644
+--- a/src/core/PlumedMain.cpp
++++ b/src/core/PlumedMain.cpp
+@@ -1727,7 +1727,7 @@ void PlumedMain::update() {
+   for(const auto & p : actionSet) {
+     p->beforeUpdate();
+     if(p->isActive() && p->checkUpdate() && updateFlagsTop()) {
+-      ActionWithValue* av=dynamic_cast<ActionWithValue*>(p.get());
++      ActionWithValue* av=p->castToActionWithValue();
+       if( av && av->calculateOnUpdate() ) {
+         p->prepare();
+         if(!hasArgumentWithNoValues(p.get())) {
+diff --git a/src/tools/Pbc.cpp b/src/tools/Pbc.cpp
+index 9d9951d705..7b6c1e521b 100644
+--- a/src/tools/Pbc.cpp
++++ b/src/tools/Pbc.cpp
+@@ -25,6 +25,7 @@
+ #include "LatticeReduction.h"
+ #include "OpenMP.h"
+ #include <array>
++#include <atomic>
+ #include <cmath>
+ 
+ namespace PLMD {
+@@ -166,6 +167,8 @@ void Pbc::fullSearch(Vector&d)const {
+ }
+ 
+ void Pbc::setBox(const Tensor&b) {
++  static std::atomic<std::uint64_t> lastVersion{0};
++  version=++lastVersion;
+   box=b;
+ // detect type:
+   constexpr double boxEpsilon=1e-28;
+@@ -550,8 +553,10 @@ void Pbc::makeWhole(std::vector<Vector>& pos, const std::size_t nlinks,
+   // shift of each link, in lattice vectors, from the original positions (a shift of the
+   // parent does not change the minimum image); it is stored in the child
+   std::vector<std::array<int,3> > shift(pos.size(), std::array<int,3> {0,0,0});
+-  #pragma omp parallel for num_threads(OpenMP::getGoodNumThreads(pos))
+-  for(std::size_t l=0; l<nlinks; ++l) {
++  // opening an OpenMP region costs microseconds even with one thread, and this is called
++  // for every action at every step: the loops are run in a region only with more than one thread
++  const unsigned nt=OpenMP::getGoodNumThreads(pos);
++  auto linkShift=[&](const std::size_t l) {
+     const Vector & a = pos[par(l)];
+     const Vector & b = pos[chi(l)];
+     const double d0=b[0]-a[0], d1=b[1]-a[1], d2=b[2]-a[2];
+@@ -578,6 +583,16 @@ void Pbc::makeWhole(std::vector<Vector>& pos, const std::size_t nlinks,
+     sh[0]=-static_cast<int>(n0);
+     sh[1]=-static_cast<int>(n1);
+     sh[2]=-static_cast<int>(n2);
++  };
++  if(nt>1) {
++    #pragma omp parallel for num_threads(nt)
++    for(std::size_t l=0; l<nlinks; ++l) {
++      linkShift(l);
++    }
++  } else {
++    for(std::size_t l=0; l<nlinks; ++l) {
++      linkShift(l);
++    }
+   }
+   // total shift of each atom: exact integer sums, parents before children
+   for(std::size_t l=0; l<nlinks; ++l) {
+@@ -587,14 +602,23 @@ void Pbc::makeWhole(std::vector<Vector>& pos, const std::size_t nlinks,
+     sc[1]+=sp[1];
+     sc[2]+=sp[2];
+   }
+-  #pragma omp parallel for num_threads(OpenMP::getGoodNumThreads(pos))
+-  for(std::size_t i=0; i<pos.size(); ++i) {
++  auto move=[&](const std::size_t i) {
+     const auto & t = shift[i];
+     if(t[0]!=0 || t[1]!=0 || t[2]!=0) {
+       for(unsigned k=0; k<3; ++k) {
+         pos[i][k]+=t[0]*box(0,k)+t[1]*box(1,k)+t[2]*box(2,k);
+       }
+     }
++  };
++  if(nt>1) {
++    #pragma omp parallel for num_threads(nt)
++    for(std::size_t i=0; i<pos.size(); ++i) {
++      move(i);
++    }
++  } else {
++    for(std::size_t i=0; i<pos.size(); ++i) {
++      move(i);
++    }
+   }
+ }
+ 
+diff --git a/src/tools/Pbc.h b/src/tools/Pbc.h
+index 58169d3b10..e484143d3b 100644
+--- a/src/tools/Pbc.h
++++ b/src/tools/Pbc.h
+@@ -28,6 +28,7 @@
+ #include "View2D.h"
+ #include <vector>
+ #include <cstddef>
++#include <cstdint>
+ #include <limits>
+ 
+ namespace PLMD {
+@@ -77,6 +78,9 @@ class Pbc {
+ /// Not really used, but could be used to optimize search in
+ /// orthorhombic cells.
+   Vector diag,hdiag,mdiag;
++/// Changes at every setBox, and is unique among all the Pbc objects: a copy of a Pbc
++/// has the same version as the original until one of the two is changed
++  std::uint64_t version=0;
+ /// Build list of shifts.
+ /// This is expensive, and must be called only when box is
+ /// reset. It allows building a minimal set of shifts
+@@ -112,6 +116,10 @@ class Pbc {
+ /// Returns the box
+ #pragma acc routine seq
+   const Tensor& getBox()const;
++/// Version of the box (see version)
++  std::uint64_t getVersion()const {
++    return version;
++  }
+ /// Returns the inverse matrix of box.
+ /// Thus: pbc.getInvBox() == inverse(pbc.getBox()).
+ #pragma acc routine seq

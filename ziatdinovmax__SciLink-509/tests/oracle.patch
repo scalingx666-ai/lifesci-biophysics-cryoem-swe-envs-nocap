@@ -1,0 +1,940 @@
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator_tools.py b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+index 27ffddb1e..f98ac623a 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator_tools.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+@@ -3299,7 +3299,10 @@ def _resolve_one(s):
+                         "catalog). Consumed by the image-analysis agent and "
+                         "the curve-fitting agent — for a prior curve-fit run "
+                         "the saved fitting script and fit summary are surfaced "
+-                        "to its planning and script-generation stages.\n"
++                        "to its planning and script-generation stages. The "
++                        "hyperspectral agent consumes it ONLY together with "
++                        "`reuse_locked_script=true` (locked replay of the "
++                        "prior run's approved per-pixel script).\n"
+                         "By default the prior run is REFERENCE MATERIAL: the "
+                         "agent decides for itself whether to reuse, adapt, or "
+                         "rewrite the prior script given the goal. Pass this for "
+@@ -3329,7 +3332,14 @@ def _resolve_one(s):
+                         "and act on a non-`good` verdict. Do NOT set it for "
+                         "verification or deeper-analysis follow-ups, or for a "
+                         "different kind of measurement — leave it false so the "
+-                        "agent decides how to use the prior run as reference."
++                        "agent decides how to use the prior run as reference. "
++                        "ALSO valid for hyperspectral: with a prior "
++                        "hyperspectral run dir it replays that run's approved "
++                        "dynamic-analysis script(s) VERBATIM on the new cube "
++                        "(harmonized re-run across sibling datasets — same "
++                        "technique, e.g. one cube per experimental condition) "
++                        "so extracted magnitudes are method-comparable; "
++                        "decomposition and fresh planning are skipped."
+                     )
+                 },
+                 "script_edits": {
+diff --git a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+index fe5d9d692..aed44da24 100644
+--- a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
++++ b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+@@ -1949,6 +1949,21 @@ def __init__(self, model, logger, generation_config, safety_settings,
+     def execute(self, state: dict) -> dict:
+         if state.get("error_dict"):
+             return state
++        if state.get("reuse_records"):
++            # Locked-script replay: bypass the whole decomposition composite —
++            # including its skip-decision LLM call, which would otherwise
++            # overwrite the pre-seeded skip_decomposition flag. The replayed
++            # per-pixel scripts consume the raw cube; seed the minimal
++            # contract that downstream prompts read.
++            self.logger.info(
++                "🔒 Locked-script replay → decomposition bypassed entirely.")
++            state["skip_decomposition"] = True
++            if "preprocessing_mask" not in state:
++                state["preprocessing_mask"] = np.ones(
++                    state["hspy_data"].shape[:2], dtype=bool)
++            state.setdefault("data_quality", {
++                "reasoning": "Decomposition bypassed (locked-script replay)."})
++            return state
+         self.logger.info("\n\n🧩 --- SPECTRAL DECOMPOSITION --- 🧩\n")
+         for stage in self.stages:
+             state = stage.execute(state)
+@@ -2121,6 +2136,33 @@ def __init__(self, model, logger, generation_config, safety_settings, parse_fn:
+ 
+     def execute(self, state: dict) -> dict:
+         if state.get("error_dict"): return state
++        # Locked-script replay (harmonized re-run): the plan is DETERMINED by
++        # the prior run's approved records — no planning LLM call. Each record
++        # becomes one custom_code target carrying its script verbatim.
++        if state.get("reuse_records"):
++            targets = [{
++                "type": "custom_code",
++                "description": (str(rec.get("target"))
++                                if rec.get("target")
++                                else "replay of a prior approved analysis script"),
++                "required_outputs": list(rec.get("required_outputs") or []),
++                "supplied_script": rec["script"],
++            } for rec in state["reuse_records"]]
++            state["refinement_decision"] = {
++                "refinement_needed": True,
++                "reasoning": ("Locked-script replay: executing the prior "
++                              "run's approved script(s) verbatim on this "
++                              "dataset (harmonized re-run)."),
++                "targets": targets,
++                "requires_custom_code": True,
++            }
++            _log_structured_block(
++                self.logger,
++                f"🔒 Locked-script replay plan: {len(targets)} prior "
++                f"approved target(s), no planning LLM call",
++                [(f"Target {i}", t["description"]) for i, t in
++                 enumerate(targets, 1)], level=logging.INFO)
++            return state
+         # Log header reflects whether this is "select a plan from scratch"
+         # (skip-decomposition mode — no prior analysis to refine) vs.
+         # "refine the existing decomposition results".
+@@ -3003,6 +3045,16 @@ def _render_base_prompt(level: int = 0) -> str:
+             )
+             ctx.target_index = i
+             ctx.required_outputs = required_outputs
++            # Locked-script replay: the target carries a prior run's approved
++            # script — execute it instead of generating (retry budget is 0 in
++            # this mode, so no regeneration can replace the frozen method).
++            if target.get("supplied_script"):
++                ctx.supplied_script = target["supplied_script"]
++                ctx.locked_script = target["supplied_script"]
++                self.logger.info(
++                    "    🔒 Locked-script replay for this target: executing "
++                    "the prior approved script (generation skipped; per-map "
++                    "QC still verifies).")
+             ctx.base_prompt = base_prompt
+             ctx.base_prompt_builder = _render_base_prompt
+             ctx.current_prompt = base_prompt
+@@ -3010,7 +3062,7 @@ def _render_base_prompt(level: int = 0) -> str:
+             # prompt only — retries rebuild from the clean base_prompt, so
+             # the escalation ladder (up to "abandon the method family")
+             # stays exemplar-free. Failure-isolated.
+-            if _bank_cube_fp is not None:
++            if _bank_cube_fp is not None and not target.get("supplied_script"):
+                 try:
+                     from scilink.skills._shared import _script_bank
+                     matches = _script_bank.find_exemplar(
+@@ -3438,6 +3490,13 @@ def _build_target_record(self, ctx: QCItemContext, task_success: bool):
+                 "task_success": bool(task_success),
+                 "salvaged": (not task_success) and ctx.best_attempt["valid_count"] > 0,
+                 "script": ctx.last_code or None,
++                # Locked-replay provenance: replay_verbatim=False means a
++                # mechanical execution repair modified the frozen script, so
++                # this run is NOT byte-comparable to the donor.
++                **({"locked_replay": True,
++                    "replay_verbatim": (ctx.last_code
++                                        == getattr(ctx, "locked_script", None))}
++                   if getattr(ctx, "locked_script", None) else {}),
+                 # Adapt provenance survives ONLY when the accepted result
+                 # IS the adapted attempt (a ladder refit replaces it and
+                 # the provenance rightly drops with it).
+@@ -3510,7 +3569,7 @@ def _run_attempt(self, ctx: QCItemContext) -> dict:
+                     # same as any generated script.
+                     self.logger.info(
+                         f"    (Attempt {retries+1}) Executing supplied "
+-                        f"script (bank edit-adapt)...")
++                        f"script (bank edit-adapt / locked replay)...")
+                     code_str, response = ctx.supplied_script, "(supplied)"
+                 else:
+                     if _exec_try == 0:
+diff --git a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+index 7a6644ac0..86b2412ba 100644
+--- a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
++++ b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+@@ -213,6 +213,14 @@ def analyze(
+         # accepted when the task succeeds; higher => more retries. None
+         # falls back to the construction default.
+         max_verification_iterations: int | None = None,
++        # Locked-script replay (harmonized re-run across sibling datasets):
++        # prior_analysis_paths + reuse_locked_script=True replays the prior
++        # run's APPROVED dynamic-analysis script(s) verbatim on THIS cube —
++        # no fresh analysis plan, no codegen, decomposition skipped; the
++        # per-map QC still verifies every output on this dataset. Mirrors
++        # the curve/image locked-reuse surface (#172).
++        prior_analysis_paths: list | None = None,
++        reuse_locked_script: bool = False,
+         # Operating profile (#346): plumbed for parity with the curve agent;
+         # realtime toggles are wired for curve only in v1 (hyperspectral
+         # per-frame cost is numerics-dominated). Thorough is unaffected.
+@@ -295,6 +303,50 @@ def analyze(
+         if effective_max_verification is not None and effective_max_verification < 0:
+             raise ValueError("max_verification_iterations must be >= 0")
+ 
++        # --- Locked-script replay (harmonized re-run) -----------------------
++        reuse_records = None
++        if reuse_locked_script:
++            if not prior_analysis_paths:
++                return {
++                    "status": "error",
++                    "error": {
++                        "error": "reuse_locked_script requires prior_analysis_paths",
++                        "details": ("Pass prior_analysis_paths=[<prior "
++                                    "hyperspectral run dir>] whose "
++                                    "dynamic_analysis_records.json holds the "
++                                    "approved script(s) to replay."),
++                    },
++                    "output_directory": str(self.output_dir),
++                }
++            reuse_records = self._load_prior_dynamic_records(prior_analysis_paths)
++            if not reuse_records:
++                return {
++                    "status": "error",
++                    "error": {
++                        "error": "No approved prior script to replay",
++                        "details": (
++                            f"None of {list(prior_analysis_paths)!r} carries a "
++                            "dynamic_analysis_records.json with an approved "
++                            "(task_success) script. Run the donor analysis "
++                            "first, then point prior_analysis_paths at its "
++                            "result directory."),
++                    },
++                    "output_directory": str(self.output_dir),
++                }
++            # Verbatim replay is a single-attempt contract: a failure must be
++            # reported (or salvaged), never regenerated into a different
++            # method — that would silently break cross-dataset comparability.
++            effective_max_verification = 0
++            self.logger.info(
++                f"🔒 Locked-script replay: {len(reuse_records)} approved "
++                f"prior script(s) will be executed verbatim (no fresh plan, "
++                f"no codegen; retry budget forced to 0).")
++        elif prior_analysis_paths:
++            self.logger.warning(
++                "prior_analysis_paths without reuse_locked_script is not "
++                "used by the hyperspectral agent yet — ignoring. Pass "
++                "reuse_locked_script=True for a locked replay.")
++
+         from ._qc_profile import resolve_profile
+         if resolve_profile(profile).name == "realtime":
+             self.logger.warning(
+@@ -400,6 +452,7 @@ def analyze(
+             auxiliary_state=auxiliary_state,
+             literature_context=literature_context,
+             max_verification_iterations=effective_max_verification,
++            reuse_records=reuse_records,
+         )
+         
+         # Handle Errors
+@@ -443,6 +496,17 @@ def analyze(
+         # counterpart of curve/image quality_history.
+         if result_json.get("dynamic_analysis_records"):
+             response["dynamic_analysis_records"] = result_json["dynamic_analysis_records"]
++        if reuse_records:
++            _new_recs = result_json.get("dynamic_analysis_records") or []
++            _supplied = {r.get("script") for r in reuse_records}
++            response["script_reuse"] = {
++                "prior_analysis_paths": [str(p) for p in prior_analysis_paths],
++                "n_replayed": len(reuse_records),
++                # False when a mechanical execution repair had to modify a
++                # script — the run then is NOT byte-comparable to the donor.
++                "verbatim": bool(_new_recs) and all(
++                    (nr or {}).get("script") in _supplied for nr in _new_recs),
++            }
+         if literature_files:
+             response["literature_files"] = literature_files
+ 
+@@ -684,6 +748,37 @@ def _llm_call(prompt: str) -> str:
+             )
+         return staged
+ 
++    def _load_prior_dynamic_records(self, prior_analysis_paths: list) -> list:
++        """Collect the APPROVED dynamic-analysis records of prior runs.
++
++        Each path may be a result directory, a directory of result
++        directories, or a direct path to ``dynamic_analysis_records.json``.
++        Returns the records with ``task_success`` and a saved ``script`` —
++        the replayable pipeline of the donor run.
++        """
++        records: list = []
++        for p in (prior_analysis_paths or []):
++            base = Path(p)
++            candidates: list = []
++            if base.is_file() and base.name == "dynamic_analysis_records.json":
++                candidates = [base]
++            elif base.is_dir():
++                direct = base / "dynamic_analysis_records.json"
++                candidates = ([direct] if direct.is_file() else
++                              sorted(base.glob("*/dynamic_analysis_records.json"))
++                              + sorted(base.glob("results/*/dynamic_analysis_records.json")))
++            for cand in candidates:
++                try:
++                    recs = json.loads(read_text_utf8(cand))
++                except Exception as e:  # noqa: BLE001 - skip unreadable, keep looking
++                    self.logger.warning(f"Could not read {cand}: {e}")
++                    continue
++                for rec in (recs if isinstance(recs, list) else []):
++                    if (isinstance(rec, dict) and rec.get("script")
++                            and rec.get("task_success")):
++                        records.append(rec)
++        return records
++
+     def _maybe_bank_scripts(self, records: list, skill_state: dict,
+                             data_path: str, system_info) -> list:
+         """Bank every approved working script in the script bank (#346).
+@@ -1155,6 +1250,7 @@ def _run_analysis_pipeline(
+         auxiliary_state: Dict[str, Any] | None = None,
+         literature_context: str | None = None,
+         max_verification_iterations: int | None = None,
++        reuse_records: list | None = None,
+     ) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
+         """
+         Main execution engine using Queue-Based Branching architecture.
+@@ -1229,6 +1325,11 @@ def _run_analysis_pipeline(
+                 "analysis_objective": objective,
+                 "prior_knowledge": prior_knowledge or [],
+                 "literature_context": literature_context,
++                # Locked-script replay: SelectRefinementTarget builds the plan
++                # deterministically from these records, and decomposition is
++                # skipped — the replayed per-pixel scripts use the raw cube.
++                **({"reuse_records": reuse_records,
++                    "skip_decomposition": True} if reuse_records else {}),
+                 "analysis_images": [],
+                 "error_dict": None,
+                 # Per-run retry-budget override (#271) — read by
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index e0194798b..4b009e65e 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -475,7 +475,8 @@ def _operand_mesh(verdict: dict) -> bool:
+ 
+ 
+ def _confirm_fanout(orch, verdict: dict, fanout_set: List[str],
+-                    branches_by_id: Dict[str, dict]) -> tuple:
++                    branches_by_id: Dict[str, dict],
++                    harmonize: bool = False) -> tuple:
+     """Decide whether to fire the fan-out. Returns (proceed: bool, reason: str).
+ 
+     AUTOPILOT (human attached): show the verdict + the exact plan and ask the
+@@ -498,6 +499,17 @@ def _confirm_fanout(orch, verdict: dict, fanout_set: List[str],
+         # mutually-complementary subset it vouches for — refusing it would
+         # make partition-then-prune impossible without a human (found live
+         # on a 4-modality study pruned to a coherent pair).
++        if harmonize:
++            # Harmonized replay is an explicit caller declaration of a
++            # same-technique series comparison; the same-subject prune has
++            # already run, so a "redundant" verdict is the EXPECTED reading
++            # of the set, not a reason to decline. Caps still apply.
++            if n > FANOUT_SOFT_CAP:
++                return False, (f"Autonomous mode declines a {n}-way "
++                               f"harmonized run (> soft cap "
++                               f"{FANOUT_SOFT_CAP}); too expensive to fire "
++                               "unattended.")
++            return True, "autonomous: harmonized series declared by caller"
+         v = (verdict.get("verdict") or "").lower()
+         conf = float(verdict.get("confidence") or 0.0)
+         if (v not in ("complementary", "partially_complementary")
+@@ -813,7 +825,8 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+ 
+ def run_fanout(orch, branches: List[dict],
+                branch_time_budget_s: Optional[float] = None,
+-               figure_style: Optional[str] = None) -> str:
++               figure_style: Optional[str] = None,
++               harmonize: bool = False) -> str:
+     """Gate → confirm → run branches concurrently. Returns JSON.
+ 
+     `branches` is a list of ``{"data_path", "task", "label", "metadata"?,
+@@ -828,6 +841,18 @@ def run_fanout(orch, branches: List[dict],
+     ``FANOUT_BRANCH_TIME_BUDGET_S``, <= 0 disables): an overdue branch is
+     recorded degraded and abandoned so the fan-out completes and fusion runs
+     over the productive branches.
++
++    ``harmonize=True`` (same-technique sibling datasets): the FIRST branch
++    runs alone as the pipeline DONOR; the rest then replay its approved
++    analysis script verbatim (locked reuse), so cross-branch magnitudes come
++    from ONE frozen pipeline. Followers' ledger entries are stamped
++    ``harmonized_with`` and fusion is told the magnitudes are
++    method-comparable. Falls back loudly to independent branches when the
++    donor yields no approved script. The complementarity gate changes role
++    in this mode: a same-technique series is by construction "redundant"
++    under the gate's rubric — which is the point — so only the same-subject
++    criterion is enforced (datasets the gate calls unrelated are pruned);
++    the non-redundancy criterion is waived by the caller's declaration.
+     """
+     # --- normalize input ---
+     norm: List[dict] = []
+@@ -902,12 +927,27 @@ def run_fanout(orch, branches: List[dict],
+                  "files": b.get("files")}
+                 for b in norm]
+     verdict = assess_complementarity(orch, datasets)
+-    fanout_set = [i for i in (verdict.get("fanout_set") or []) if i in by_id]
++    if harmonize:
++        # Harmonized replay deliberately INVERTS the gate's non-redundancy
++        # criterion: a same-technique per-condition/series set — which the
++        # gate rightly calls "redundant ... a per-condition series to be
++        # compared" — is exactly this mode's use case. Keep criterion 1
++        # (same subject): prune only what the gate calls unrelated; a
++        # redundant cluster IS the series.
++        _unrelated = set(verdict.get("unrelated") or [])
++        fanout_set = [i for i in by_id if i not in _unrelated]
++        if _unrelated:
++            print(f"  🚪 Harmonized gate: pruned {len(_unrelated)} "
++                  f"unrelated dataset(s); keeping the same-subject series.")
++    else:
++        fanout_set = [i for i in (verdict.get("fanout_set") or [])
++                      if i in by_id]
+ 
+     if len(fanout_set) < 2:
+         return json.dumps({
+             "status": "declined",
+-            "reason": "not_complementary",
++            "reason": ("not_same_subject" if harmonize
++                       else "not_complementary"),
+             "verdict": verdict,
+             "message": (
+                 "The datasets are not genuinely complementary (no 2+ that share "
+@@ -919,7 +959,8 @@ def run_fanout(orch, branches: List[dict],
+         }, indent=2, default=str)
+ 
+     # --- confirmation ---
+-    proceed, reason = _confirm_fanout(orch, verdict, fanout_set, by_id)
++    proceed, reason = _confirm_fanout(orch, verdict, fanout_set, by_id,
++                                      harmonize=harmonize)
+     if not proceed:
+         return json.dumps({"status": "declined", "reason": reason,
+                            "verdict": verdict,
+@@ -1022,8 +1063,74 @@ def _companions_for(i):
+             entry["join_axis"] = verdict.get("join_axis")
+             entries.append(entry)
+ 
++    # --- harmonized pipeline replay (donor-first) ---
++    # The FIRST branch is the pipeline donor: it runs alone under the normal
++    # analysis path; its approved dynamic-analysis script(s) are then
++    # replayed VERBATIM by every follower (via the hyperspectral agent's
++    # locked-reuse surface), so cross-branch magnitudes are measured by ONE
++    # frozen pipeline instead of N independently generated ones — the
++    # methodological confound fusion otherwise has to discount. A donor that
++    # yields no approved replayable script falls back loudly to today's
++    # independent branches (never worse).
++    follower_start = 0
++    harmonized_info = None
++    if harmonize and len(run_branches) >= 2:
++        donor = run_branches[0]
++        donor_label = donor.get("label") or "donor"
++        print(f"  🧬 Harmonized mode: running pipeline donor '{donor_label}' "
++              "first (followers will replay its approved script)...")
++        _run_one_branch(orch, donor, branch_companions[0], entries[0],
++                        None, None)
++        follower_start = 1
++        reuse_dir = None
++        if entries[0].get("status") == "success":
++            _donor_dir = (orch.fanout_dir
++                          / f"{entries[0]['index']:02d}_{_slug(donor_label)}")
++            _cands = sorted(_donor_dir.rglob("dynamic_analysis_records.json"),
++                            key=lambda p: p.stat().st_mtime)
++            for _c in reversed(_cands):
++                try:
++                    _recs = json.loads(_c.read_text(encoding="utf-8"))
++                except Exception:  # noqa: BLE001 - keep looking
++                    continue
++                if any(isinstance(r, dict) and r.get("script")
++                       and r.get("task_success") for r in _recs):
++                    reuse_dir = _c.parent
++                    break
++        if reuse_dir is None:
++            msg = (f"harmonize requested but donor '{donor_label}' produced "
++                   "no approved replayable script — followers run "
++                   "independently (unharmonized fallback).")
++            print(f"  ⚠️  {msg}")
++            logger.warning(f"fan-out: {msg}")
++            harmonized_info = {"donor": donor_label, "status": "fallback",
++                               "reason": "no approved donor script"}
++        else:
++            print(f"  🧬 Donor script approved — followers will replay "
++                  f"{reuse_dir.name} verbatim.")
++            harm_block = (
++                "\n\nHARMONIZED PIPELINE REPLAY (mandatory): a sibling "
++                f"dataset (donor '{donor_label}') was already analyzed and "
++                "its approved analysis script must be REPLAYED VERBATIM on "
++                "this dataset so the results are method-comparable. When "
++                "calling run_analysis, pass EXACTLY: prior_analysis_paths="
++                f"[\"{reuse_dir}\"] and reuse_locked_script=true. Do NOT "
++                "run a fresh analysis plan or alter the script.")
++            for _i in range(1, len(run_branches)):
++                run_branches[_i]["task"] = run_branches[_i]["task"] + harm_block
++                entries[_i]["task"] = _mesh_task(run_branches[_i],
++                                                 branch_companions[_i])
++                entries[_i]["harmonized_with"] = donor_label
++                entries[_i]["harmonized_donor_index"] = entries[0]["index"]
++            harmonized_info = {
++                "donor": donor_label, "status": "harmonized",
++                "reuse_dir": str(reuse_dir),
++                "followers": [b.get("label") for b in run_branches[1:]],
++            }
++
+     # --- run concurrently; wiring per the mesh policy ---
+-    print(f"  🔀 Launching {len(run_branches)} parallel analysis branches "
++    print(f"  🔀 Launching {len(run_branches) - follower_start} parallel "
++          f"analysis branches "
+           f"(group {group_id}, "
+           f"{'operand mesh — co-registered set' if mesh else 'independent branches'})...")
+ 
+@@ -1047,7 +1154,7 @@ def _companions_for(i):
+     pool = ThreadPoolExecutor(max_workers=max_workers)
+     try:
+         fut_label, fut_entry = {}, {}
+-        for i in range(n_total):
++        for i in range(follower_start, n_total):
+             fut = pool.submit(_run_one_branch, orch, run_branches[i],
+                               branch_companions[i], entries[i],
+                               queue_channel, branch_autonomy)
+@@ -1151,6 +1258,7 @@ def _productive(e):
+         "join_axis": verdict.get("join_axis"),
+         "join_type": verdict.get("join_type"),
+         "mesh": "operand" if mesh else "independent",
++        **({"harmonized": harmonized_info} if harmonized_info else {}),
+         "branches_run": len(results),
+         "branches_with_output": len(productive),
+         "results": results,
+@@ -2022,6 +2130,29 @@ def fuse_delegations(orch, indices: List[int], focus: Optional[str] = None) -> s
+                 "construction and must not be counted as independent "
+                 "corroboration.")
+ 
++    # Harmonized replay — METHOD coupling, the opposite of an independence
++    # spend: branches that replayed the donor's approved script verbatim are
++    # measured by ONE frozen pipeline, so their magnitudes are comparable
++    # across datasets and differences reflect the data, not pipeline
++    # variance. No branch saw another's results, so observational
++    # independence is intact.
++    harmonized = {(e.get("label") or f"delegation {e['index']}"):
++                  e.get("harmonized_with")
++                  for e in ok if e.get("harmonized_with")}
++    harmonized_note = ""
++    if harmonized:
++        _pairs = "; ".join(f"'{lbl}' ← donor '{d}'"
++                           for lbl, d in harmonized.items())
++        harmonized_note = (
++            "\n\nHARMONIZED BRANCHES (single frozen pipeline): " + _pairs
++            + ". These branches REPLAYED the donor branch's approved "
++            "analysis script verbatim, so their extracted magnitudes ARE "
++            "method-comparable across datasets — treat differences between "
++            "them as properties of the data, never as analysis-pipeline "
++            "variance. This couples METHOD only, not findings: no branch "
++            "saw another's results, so cross-branch agreement still counts "
++            "as independent observation.\n")
++
+     blocks = []
+     branch_numerics: Dict[str, Any] = {}   # label -> numerics dict (audit trail)
+     for e in ok:
+@@ -2120,6 +2251,7 @@ def fuse_delegations(orch, indices: List[int], focus: Optional[str] = None) -> s
+            if ungated_warning else "")
+         + (f"\n\nFUSION FOCUS (weight your synthesis toward this): {focus}\n"
+            if focus else "")
++        + harmonized_note
+         + ("\n\nFIGURES: one representative figure per dataset is attached after "
+            "this text, labeled by dataset. Use them to verify spatial/visual "
+            "correlations DIRECTLY rather than relying on the text descriptions "
+@@ -2231,6 +2363,7 @@ def fuse_delegations(orch, indices: List[int], focus: Optional[str] = None) -> s
+         "branch_numerics": branch_numerics or None,
+         "computed_reconciliation": computed,
+         "independence": informed or None,
++        "harmonized_branches": harmonized or None,
+         "branch_reanalysis": reanalysis or None,
+         "detailed_analysis": (
+             (f"⚠️ UNGATED FUSION — {ungated_warning}\n\n" if ungated_warning else "")
+@@ -2297,6 +2430,7 @@ def fuse_delegations(orch, indices: List[int], focus: Optional[str] = None) -> s
+         "numerics_branches": len(branch_numerics),
+         "computed_reconciliation": computed,
+         "independence": informed or None,
++        "harmonized_branches": harmonized or None,
+         "branch_reanalysis": reanalysis or None,
+         "suggested_followups": reanalysis_followups,
+         "figures_used": len(figures),
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index 6161c6b7d..bfa20f52d 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -1518,12 +1518,14 @@ def _assess_complementarity(self, datasets: list) -> str:
+ 
+     def _run_fanout(self, branches: list,
+                     branch_time_budget_s: Optional[float] = None,
+-                    figure_style: Optional[str] = None) -> str:
++                    figure_style: Optional[str] = None,
++                    harmonize: bool = False) -> str:
+         """Gate, confirm, then run analysis branches concurrently."""
+         from .fanout import run_fanout
+         return run_fanout(self, branches,
+                           branch_time_budget_s=branch_time_budget_s,
+-                          figure_style=figure_style)
++                          figure_style=figure_style,
++                          harmonize=harmonize)
+ 
+     def _fuse_delegations(self, indices: list, focus: Optional[str] = None) -> str:
+         """Reconcile finished complementary branch findings into one narrative."""
+diff --git a/scilink/agents/meta_agent/meta_orchestrator_tools.py b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+index 3532072ec..e1554d015 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator_tools.py
++++ b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+@@ -598,9 +598,13 @@ def assess_complementarity(datasets: list) -> str:
+ 
+         # -- delegate_to_analyses (parallel fan-out, full-mesh aux) ----------
+         def delegate_to_analyses(branches: list,
+-                                 figure_style: str = None) -> str:
+-            print(f"  🔀 Parallel analysis over {len(branches or [])} dataset(s)...")
+-            return self.orch._run_fanout(branches, figure_style=figure_style)
++                                 figure_style: str = None,
++                                 harmonize: bool = False) -> str:
++            print(f"  🔀 Parallel analysis over {len(branches or [])} dataset(s)"
++                  + (" (harmonized pipeline replay)" if harmonize else "")
++                  + "...")
++            return self.orch._run_fanout(branches, figure_style=figure_style,
++                                         harmonize=harmonize)
+ 
+         self._register_tool(
+             func=delegate_to_analyses,
+@@ -692,6 +696,32 @@ def delegate_to_analyses(branches: list,
+                         "should look; leave unset otherwise."
+                     ),
+                 },
++                "harmonize": {
++                    "type": "boolean",
++                    "description": (
++                        "Opt-in (default false): harmonized pipeline replay "
++                        "for SAME-TECHNIQUE sibling datasets (e.g. one "
++                        "hyperspectral cube per experimental condition). The "
++                        "FIRST branch runs as the pipeline DONOR; every other "
++                        "branch then REPLAYS the donor's approved analysis "
++                        "script verbatim, so extracted magnitudes are "
++                        "measured by ONE frozen pipeline and are directly "
++                        "comparable across datasets (fusion is told). Use it "
++                        "when the goal is a cross-condition comparison of "
++                        "the same observable — and put the most "
++                        "representative dataset FIRST as the donor. In this "
++                        "mode the complementarity gate only checks that the "
++                        "datasets measure the SAME system (unrelated ones "
++                        "are pruned); its redundancy criterion is waived — "
++                        "a same-technique series is the intended input, so "
++                        "do NOT avoid this tool because the cubes 'look "
++                        "redundant'. Leave "
++                        "false for cross-modality sets (different techniques "
++                        "cannot share a script). Falls back loudly to "
++                        "independent branches if the donor yields no "
++                        "approved script."
++                    ),
++                },
+             },
+             required=["branches"],
+         )
+diff --git a/tests/test_hs_locked_replay.py b/tests/test_hs_locked_replay.py
+new file mode 100644
+index 000000000..bafca1909
+--- /dev/null
++++ b/tests/test_hs_locked_replay.py
+@@ -0,0 +1,198 @@
++"""Offline tests: hyperspectral locked-script replay (harmonized re-run).
++
++The gap this closes (found live): the fusion stage can PRESCRIBE "re-run the
++sibling cubes with a single harmonized pipeline" but nothing could EXECUTE
++it — every branch regenerated its own script with its own segmentation and
++continuum choices, confounding cross-dataset magnitude comparisons.
++
++Now `analyze(prior_analysis_paths=[...], reuse_locked_script=True)` replays a
++prior run's APPROVED dynamic-analysis script(s) verbatim: no planning LLM
++call, no codegen, decomposition bypassed, retry budget forced to 0 so a
++failure can never be silently regenerated into a different method. Per-map
++QC still verifies the outputs on the new dataset.
++
++  conda run -n scilink python -m pytest tests/test_hs_locked_replay.py -q
++"""
++import json
++import logging
++import os
++
++import numpy as np
++import pytest
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++# Agent construction probes for an execution sandbox; none exists in CI.
++os.environ.setdefault("UNSAFE_EXECUTION_OK", "true")
++
++from scilink.agents.exp_agents.controllers import hyperspectral_controllers as hc
++
++LOGGER = logging.getLogger("test.locked_replay")
++
++SCRIPT = '''
++def analyze_feature(data, axis):
++    m = data.mean(axis=2)
++    return {"maps": {"Mean_Map": m}, "units": "a.u.", "description": "d"}
++'''
++
++AXIS_OK = {
++    "axis_spec": {
++        "axis_2": {"name": "wavelength", "units": "nm", "start": 400, "end": 900},
++    }
++}
++
++
++class _ExplodingModel:
++    """Any LLM call in replay mode is a regression — fail loudly."""
++
++    def generate_content(self, *a, **k):
++        raise AssertionError("LLM was called during locked-script replay")
++
++
++def _records(script=SCRIPT, approved=True):
++    return [{"target": "mean map (donor)", "task_success": approved,
++             "required_outputs": ["Mean_Map"], "script": script,
++             "quality_history": {"approved": approved}}]
++
++
++def _replay_state(tmp_path, records=None):
++    return {
++        "hspy_data": np.random.rand(5, 5, 8),
++        "original_hspy_data": np.random.rand(5, 5, 8),
++        "system_info": dict(AXIS_OK),
++        "energy_axis": np.linspace(400, 900, 8),
++        "settings": {"output_dir": str(tmp_path)},
++        "reuse_records": records if records is not None else _records(),
++        "max_verification_iterations": 0,
++        "iteration_title": "T",
++        "analysis_objective": "obj",
++    }
++
++
++# ---------------------------------------------------------------------------
++# Plan short-circuit: no planning LLM call, targets carry the scripts
++# ---------------------------------------------------------------------------
++
++def test_select_refinement_short_circuits_without_llm(tmp_path):
++    ctrl = hc.SelectRefinementTargetController(
++        _ExplodingModel(), LOGGER, generation_config=None,
++        safety_settings=None, parse_fn=lambda r: ({}, None))
++    state = ctrl.execute(_replay_state(tmp_path))
++    dec = state["refinement_decision"]
++    assert dec["requires_custom_code"] is True
++    assert len(dec["targets"]) == 1
++    t = dec["targets"][0]
++    assert t["type"] == "custom_code"
++    assert t["supplied_script"] == SCRIPT
++    assert t["required_outputs"] == ["Mean_Map"]
++
++
++def test_decomposition_bypassed_without_llm(tmp_path):
++    ctrl = hc.DecompositionController(
++        _ExplodingModel(), LOGGER, generation_config=None,
++        safety_settings=None, settings={"output_dir": str(tmp_path)},
++        preprocessor=None, parse_fn=lambda r: ({}, None))
++    state = ctrl.execute(_replay_state(tmp_path))
++    assert state["skip_decomposition"] is True
++    assert state["preprocessing_mask"].shape == (5, 5)
++
++
++# ---------------------------------------------------------------------------
++# Execution: supplied script runs verbatim, zero generation calls
++# ---------------------------------------------------------------------------
++
++def _run_dynamic(tmp_path, records, monkeypatch, model=None):
++    monkeypatch.setenv("UNSAFE_EXECUTION_OK", "true")
++    plan = hc.SelectRefinementTargetController(
++        _ExplodingModel(), LOGGER, generation_config=None,
++        safety_settings=None, parse_fn=lambda r: ({}, None))
++    state = plan.execute(_replay_state(tmp_path, records))
++    ctrl = hc.RunDynamicAnalysisController(
++        model or _ExplodingModel(), LOGGER, generation_config=None,
++        safety_settings=None, parse_fn=lambda r: ({}, None))
++    ctrl._review_required_output = lambda *a, **k: (True, "")
++    ctrl._check_result_visually = lambda *a, **k: (True, "")
++    return ctrl.execute(state)
++
++
++def test_supplied_script_runs_verbatim_zero_llm_calls(tmp_path, monkeypatch):
++    state = _run_dynamic(tmp_path, _records(), monkeypatch)
++    names = [m["name"] for m in state.get("custom_analysis_metadata_list") or []]
++    assert names == ["Mean_Map"]
++    rec = (state.get("dynamic_analysis_records") or [])[0]
++    assert rec["task_success"] is True
++    assert rec["locked_replay"] is True
++    assert rec["replay_verbatim"] is True
++    assert rec["script"] == SCRIPT          # byte-identical to the donor's
++
++
++def test_repaired_replay_flagged_not_verbatim(tmp_path, monkeypatch):
++    """A broken supplied script may be mechanically repaired, but the record
++    must say the run is no longer byte-comparable to the donor."""
++    broken = SCRIPT.replace("axis=2)", "axis=2")   # syntax error
++    calls = []
++
++    class _RepairModel:
++        def generate_content(self, contents, **kw):
++            calls.append(str(contents))
++            return json.dumps({"code": SCRIPT})
++
++    state = _run_dynamic(tmp_path, _records(script=broken), monkeypatch,
++                         model=_RepairModel())
++    rec = (state.get("dynamic_analysis_records") or [])[0]
++    assert rec["task_success"] is True
++    assert rec["locked_replay"] is True
++    assert rec["replay_verbatim"] is False
++    assert len(calls) == 1 and "MECHANICAL CORRECTION" in calls[0]
++
++
++# ---------------------------------------------------------------------------
++# analyze() entry contract (no LLM reached — errors happen before any call)
++# ---------------------------------------------------------------------------
++
++def _agent():
++    from scilink.agents.exp_agents.hyperspectral_analysis_agent import (
++        HyperspectralAnalysisAgent)
++    return HyperspectralAnalysisAgent(api_key="sk-dummy",
++                                      model_name="claude-opus-4-6")
++
++
++def test_reuse_without_paths_is_refused(tmp_path):
++    ag = _agent()
++    np.save(tmp_path / "cube.npy", np.random.rand(4, 4, 6))
++    res = ag.analyze(str(tmp_path / "cube.npy"), system_info=dict(AXIS_OK),
++                     reuse_locked_script=True)
++    assert res["status"] == "error"
++    assert "prior_analysis_paths" in res["error"]["error"]
++
++
++def test_reuse_with_no_approved_records_is_refused(tmp_path):
++    ag = _agent()
++    np.save(tmp_path / "cube.npy", np.random.rand(4, 4, 6))
++    prior = tmp_path / "prior"
++    prior.mkdir()
++    (prior / "dynamic_analysis_records.json").write_text(
++        json.dumps(_records(approved=False)))
++    res = ag.analyze(str(tmp_path / "cube.npy"), system_info=dict(AXIS_OK),
++                     prior_analysis_paths=[str(prior)],
++                     reuse_locked_script=True)
++    assert res["status"] == "error"
++    assert "No approved prior script" in res["error"]["error"]
++
++
++def test_loader_finds_records_in_nested_result_dirs(tmp_path):
++    ag = _agent()
++    nested = tmp_path / "results" / "analysis_x"
++    nested.mkdir(parents=True)
++    (nested / "dynamic_analysis_records.json").write_text(
++        json.dumps(_records() + _records(approved=False)))
++    recs = ag._load_prior_dynamic_records([str(tmp_path)])
++    assert len(recs) == 1 and recs[0]["script"] == SCRIPT
++    # direct file path also works
++    recs2 = ag._load_prior_dynamic_records(
++        [str(nested / "dynamic_analysis_records.json")])
++    assert len(recs2) == 1
++
++
++if __name__ == "__main__":
++    import sys
++    sys.exit(pytest.main([__file__, "-q"]))
+diff --git a/tests/test_meta_fanout_robustness.py b/tests/test_meta_fanout_robustness.py
+index 8772a1625..715f01f0f 100644
+--- a/tests/test_meta_fanout_robustness.py
++++ b/tests/test_meta_fanout_robustness.py
+@@ -391,6 +391,113 @@ def fake(orch, prompt, extra_parts=None):
+     print("13) pattern-aware dedup:")
+     check("distinct patterns kept as 2 branches", out.get("branches_run") == 2)
+ 
++    # 14) Harmonized pipeline replay (donor-first): the first branch runs
++    #     alone; followers are instructed to replay its approved script via
++    #     the locked-reuse surface, and their ledger entries are stamped.
++    ag, A, B, C = _agent()
++    order = []
++
++    def _harm_child(orch, base_dir):
++        class H:
++            def run_task(self, task, context=None, autonomy=None):
++                CAPTURED_TASKS.append(task)
++                import re as _re
++                m = _re.search(r"PRIMARY dataset for THIS analysis: (\S+)", task)
++                order.append(os.path.basename(m.group(1)) if m else "?")
++                rdir = os.path.join(base_dir, "results", "analysis_fake")
++                os.makedirs(rdir, exist_ok=True)
++                with open(os.path.join(rdir, "dynamic_analysis_records.json"),
++                          "w") as fh:
++                    json.dump([{"target": "t", "task_success": True,
++                                "required_outputs": [],
++                                "script": "print(1)"}], fh)
++                return {"status": "success", "summary": "ok",
++                        "key_findings": ["finding"],
++                        "files_produced": ["/x/v.png"]}
++        return H()
++
++    fo._make_ephemeral_analysis_child = _harm_child
++    _install_fake_gate([A, B, C]); ag._complementarity_cache.clear()
++    CAPTURED_TASKS.clear()
++    out = json.loads(ag._run_fanout(_branches(A, B, C), harmonize=True))
++    print("14) harmonized replay (donor-first):")
++    check("harmonized run success + 3 branches",
++          out.get("status") == "success" and out.get("branches_run") == 3)
++    check("harmonized info on the result",
++          (out.get("harmonized") or {}).get("status") == "harmonized")
++    check("donor ran first", bool(order) and order[0] == os.path.basename(A))
++    follower_tasks = CAPTURED_TASKS[1:]
++    check("followers told to replay (locked reuse)",
++          len(follower_tasks) == 2
++          and all("reuse_locked_script=true" in t
++                  and "prior_analysis_paths" in t for t in follower_tasks))
++    reuse_dir = (out.get("harmonized") or {}).get("reuse_dir") or ""
++    check("followers point at the donor's result dir",
++          bool(reuse_dir) and all(reuse_dir in t for t in follower_tasks))
++    fan_entries = [e for e in ag._delegation_ledger if e.get("fanout")]
++    stamped = [e for e in fan_entries if e.get("harmonized_with")]
++    check("2 follower entries stamped harmonized_with",
++          len(stamped) == 2
++          and all(e["harmonized_with"] == fan_entries[0]["label"]
++                  for e in stamped))
++    check("ledger task carries the replay instruction",
++          all("reuse_locked_script=true" in e["task"] for e in stamped))
++    idxs14 = [r["delegation_index"] for r in out["results"]
++              if r["produced_output"]]
++    f14 = json.loads(ag._fuse_delegations(idxs14))
++    with open(f14["report_path"]) as fh:
++        _rep14 = json.load(fh)
++    check("fusion records harmonized_branches",
++          f14.get("status") == "success"
++          and bool(_rep14.get("harmonized_branches")))
++
++    # 14c) A REDUNDANT gate verdict must NOT block harmonized mode (found
++    #      live: a same-technique condition series is by construction
++    #      "redundant" — which is the point). Unrelated datasets are still
++    #      pruned (same-subject criterion survives).
++    ag, A, B, C = _agent()
++    fo._make_ephemeral_analysis_child = _harm_child
++
++    def _redundant_gate(orch, prompt, extra_parts=None):
++        GATE_PROMPTS.append(prompt)
++        if "complementary measurements of ONE system" in prompt:
++            return {"detailed_analysis": "fused narrative",
++                    "scientific_claims": [{"claim": "c", "keywords": ["k"]}]}
++        return {"verdict": "redundant", "confidence": 0.9, "rationale": "r",
++                "join_axis": "condition_index", "join_type": None,
++                "fanout_set": [], "redundant_clusters": [[A, B]],
++                "unrelated": [C], "excluded_notes": ""}
++    fo._llm_json = _redundant_gate
++    ag._complementarity_cache.clear()
++    CAPTURED_TASKS.clear(); order.clear()
++    out = json.loads(ag._run_fanout(_branches(A, B, C), harmonize=True))
++    print("14c) harmonize proceeds on a redundant verdict:")
++    check("redundant series still runs harmonized",
++          out.get("status") == "success"
++          and (out.get("harmonized") or {}).get("status") == "harmonized")
++    check("unrelated dataset pruned (same-subject criterion kept)",
++          out.get("branches_run") == 2)
++    check("non-harmonize path still declines redundant sets",
++          json.loads(ag._run_fanout(_branches(A, B)))
++          .get("status") == "declined")
++
++    # 14b) Donor yields no replayable script -> loud fallback: followers run
++    #      unharmonized, nothing stamped, the result says so.
++    ag, A, B, C = _agent()
++    _install_fake_child()   # standard fake child: writes no records
++    _install_fake_gate([A, B]); ag._complementarity_cache.clear()
++    CAPTURED_TASKS.clear()
++    out = json.loads(ag._run_fanout(_branches(A, B), harmonize=True))
++    print("14b) harmonize fallback (no donor script):")
++    check("fallback still succeeds",
++          out.get("status") == "success" and out.get("branches_run") == 2)
++    check("fallback recorded on the result",
++          (out.get("harmonized") or {}).get("status") == "fallback")
++    check("follower NOT told to replay",
++          all("reuse_locked_script" not in t for t in CAPTURED_TASKS[1:]))
++    check("no harmonized_with stamps",
++          not any(e.get("harmonized_with") for e in ag._delegation_ledger))
++
+     print("\n" + "=" * 50)
+     npass = sum(results.values())
+     print(f"ROBUSTNESS: {npass}/{len(results)} checks passed")

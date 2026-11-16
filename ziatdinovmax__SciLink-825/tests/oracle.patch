@@ -1,0 +1,522 @@
+diff --git a/docs/cli_reference.md b/docs/cli_reference.md
+index 95d9833d..bf916be8 100644
+--- a/docs/cli_reference.md
++++ b/docs/cli_reference.md
+@@ -222,3 +222,11 @@ Set the key matching your model provider — `ANTHROPIC_API_KEY`,
+ proxy, `SCILINK_API_KEY` together with `--base-url`. The proxy key is not a
+ vendor credential; vendor endpoints reject it. MCP-server deployments can keep
+ all of these in `~/.scilink/credentials.env` instead of the client config.
++
++The terminal shell, headless `-p` and `scilink serve` resolve the key the same way: `--api-key` wins; with
++`--base-url` the key is `SCILINK_API_KEY`; a `bedrock/...` model uses
++`AWS_BEARER_TOKEN_BEDROCK` or the AWS credential chain; otherwise the key of
++the model's own vendor. Several vendors' keys can be set at once — each model
++is called with its own.
++A vendor's key is never sent to a `--base-url` endpoint: a local
++OpenAI-compatible server that accepts any key needs one passed with `--api-key`.
+diff --git a/docs/vscode_copilot_integration.md b/docs/vscode_copilot_integration.md
+index 46f73039..e93a01d9 100644
+--- a/docs/vscode_copilot_integration.md
++++ b/docs/vscode_copilot_integration.md
+@@ -82,7 +82,7 @@ Add the following configuration (replace the `command` path with the output from
+ 
+ - **`command`**: The absolute path to your `scilink` binary. Using the full path avoids PATH-resolution issues when VS Code is launched from the OS app launcher rather than a terminal.
+ - **`args`**: The `serve` subcommand starts SciLink's MCP server. `--mode both` exposes both analysis and planning tools (use `analyze` or `plan` for just one set). `--autonomy autonomous` lets the LLM chain tools without pausing for approval. `--model` sets the LLM that SciLink's internal agents use (see "Choosing a model" below).
+-- **`env`**: API keys for SciLink's LLM backend. The `${input:...}` syntax tells VS Code to prompt you for the key on first use and store it securely in the system keychain — the key is never written to disk. Swap `ANTHROPIC_API_KEY` for `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `SCILINK_API_KEY` depending on your provider.
++- **`env`**: API keys for SciLink's LLM backend. The `${input:...}` syntax tells VS Code to prompt you for the key on first use and store it securely in the system keychain — the key is never written to disk. Swap `ANTHROPIC_API_KEY` for `GEMINI_API_KEY` or `OPENAI_API_KEY` to match the vendor of the `--model` you chose (the server uses the key of the model's own vendor, whichever others are set). `SCILINK_API_KEY` is the key of an OpenAI-compatible proxy and is used only together with `--base-url`.
+ - **`inputs`**: Defines the secure prompt that `${input:anthropic_api_key}` references. Set `password: true` so VS Code masks the input field.
+ 
+ ### Why not use the "Add MCP Server" button?
+diff --git a/scilink/auth.py b/scilink/auth.py
+index 1a5cd5aa..0b777c86 100644
+--- a/scilink/auth.py
++++ b/scilink/auth.py
+@@ -58,6 +58,7 @@ def infer_provider(model_name: str) -> Optional[str]:
+     
+     Returns:
+         Provider name ('google', 'openai', 'anthropic', 'bedrock') or None
++        (also for a "<prefix>/..." name whose prefix is not one of these).
+     """
+     if not model_name:
+         return None
+@@ -77,7 +78,13 @@ def infer_provider(model_name: str) -> Optional[str]:
+         }
+         if prefix in prefix_map:
+             return prefix_map[prefix]
+-    
++        # Any other prefix is a route of its own (vertex_ai/, openrouter/,
++        # azure/, ollama/, ...): the name after it says which model, not
++        # whose key. "vertex_ai/gemini-…" authenticates through ADC and
++        # "openrouter/google/gemini-…" with an OpenRouter key; matching
++        # "gemini" in them handed both the Google key.
++        return None
++
+     # Infer from model name patterns
+     if model_lower.startswith(('gpt-', 'o1-', 'o3-')):
+         return 'openai'
+@@ -143,6 +150,40 @@ def find_env_var_for_model(model_name: str) -> Optional[tuple]:
+     return find_env_var(provider) if provider else None
+ 
+ 
++def resolve_llm_key(model_name: str, base_url: Optional[str] = None,
++                    api_key: Optional[str] = None) -> tuple:
++    """Which key a chat model is called with, and where it came from.
++
++    The one rule every command-line entry point shares (the terminal shell,
++    headless ``-p``, ``scilink serve``), read from the environment only —
++    nothing is asked:
++
++    * an explicit ``api_key`` wins;
++    * with a ``base_url`` the endpoint is the internal proxy, whose key is
++      ``SCILINK_API_KEY`` and never a vendor's;
++    * a Bedrock model carries no key: its bearer token or the AWS credential
++      chain is read from the environment by the client;
++    * otherwise the conventional env var of THE MODEL'S vendor — never
++      another vendor's key, and never the proxy key.
++
++    Returns ``(key, source)``. ``source`` names where the credential was
++    found (``"flag"``, an env var, ``"AWS environment"``) and is ``None``
++    when nothing was: the caller then asks, warns or lets the client
++    library auto-detect. ``key`` is ``None`` for Bedrock by design.
++    """
++    if api_key:
++        return api_key, "flag"
++    if base_url:
++        key = get_internal_proxy_key()
++        return (key, INTERNAL_PROXY_KEY) if key else (None, None)
++    if infer_provider(model_name) == 'bedrock':
++        if os.getenv("AWS_BEARER_TOKEN_BEDROCK") or os.getenv("AWS_ACCESS_KEY_ID"):
++            return None, "AWS environment"
++        return None, None
++    found = find_env_var_for_model(model_name)
++    return (found[1], found[0]) if found else (None, None)
++
++
+ class APIKeyManager:
+     """Simple API key management with environment variable auto-discovery."""
+     
+diff --git a/scilink/cli/serve.py b/scilink/cli/serve.py
+index 4df8c2ac..ce91688a 100644
+--- a/scilink/cli/serve.py
++++ b/scilink/cli/serve.py
+@@ -66,6 +66,44 @@ def _print_mcp_json(args) -> int:
+     return 0
+ 
+ 
++def resolve_api_key(model: str, base_url, api_key):
++    """The key this server's orchestrators are built with.
++
++    The rule is the terminal shell's (``auth.resolve_llm_key``): the key of
++    the MODEL'S vendor, the proxy key only with ``--base-url``, none for
++    Bedrock. It used to be the first of SCILINK / GEMINI / OPENAI / ANTHROPIC
++    that was set, whatever the model — so a machine with two vendors' keys
++    sent one vendor's key to the other, and a proxy key went to a vendor.
++
++    Nothing is asked here (stdin is the transport). A proxy with no key
++    cannot work, and is an error. A missing key of a vendor SciLink knows is
++    a warning on stderr and ``None``, which leaves the client library to
++    find one; nothing is said about Bedrock (the AWS credential chain has
++    sources this cannot see) or a model whose provider is not recognised (a
++    local model needs no key, and another route's key is the client
++    library's to find).
++    """
++    from scilink import auth
++
++    key, source = auth.resolve_llm_key(model, base_url, api_key)
++    if source:
++        return key
++    if base_url:
++        raise ValueError(
++            f"--base-url needs a key: set {auth.INTERNAL_PROXY_KEY} (in the "
++            "environment or ~/.scilink/credentials.env) or pass --api-key. A "
++            "vendor's key in the environment is never sent to a --base-url "
++            "endpoint; for a local endpoint that takes any key, pass one with "
++            "--api-key.")
++    provider = auth.infer_provider(model)
++    if provider in ("anthropic", "openai", "google"):
++        print(f"Warning: no {' or '.join(auth.ENV_VARS[provider])} found for model "
++              f"{model!r} (in the environment or ~/.scilink/credentials.env). "
++              "Starting anyway; model calls will fail unless the client library "
++              "finds a credential.", file=sys.stderr)
++    return None
++
++
+ def main():
+     parser = argparse.ArgumentParser(
+         prog="scilink serve",
+@@ -82,13 +120,17 @@ def main():
+         "--api-key",
+         type=str,
+         default=None,
+-        help="API key (default: auto-detect from env vars)",
++        help=("API key (default: the model's own vendor's key from the "
++              "environment or ~/.scilink/credentials.env; SCILINK_API_KEY "
++              "with --base-url; none for a bedrock/... model)"),
+     )
+     parser.add_argument(
+         "--base-url",
+         type=str,
+         default=None,
+-        help="OpenAI-compatible endpoint URL",
++        help=("OpenAI-compatible endpoint URL (an internal proxy or a local "
++              "server). Its key is SCILINK_API_KEY or --api-key, never a "
++              "vendor's key from the environment"),
+     )
+     parser.add_argument(
+         "--mode",
+@@ -175,19 +217,6 @@ def main():
+     if args.print_mcp_json:
+         return _print_mcp_json(args)
+ 
+-    # Resolve API key
+-    api_key = args.api_key
+-    if api_key is None:
+-        for env_var in [
+-            "SCILINK_API_KEY",
+-            "GEMINI_API_KEY",
+-            "OPENAI_API_KEY",
+-            "ANTHROPIC_API_KEY",
+-        ]:
+-            api_key = os.environ.get(env_var)
+-            if api_key:
+-                break
+-
+     # The MCP stdio transport reads sys.stdin.buffer and writes
+     # sys.stdout.buffer.  Save the real stdout before redirecting
+     # Python-level sys.stdout to stderr, so print() calls from
+@@ -203,7 +232,8 @@ def main():
+     sys.stdout = sys.stderr
+ 
+     try:
+-        from scilink.mcp_server import create_server, run_stdio, run_sse
++        from scilink.mcp_server import (create_server, run_stdio, run_sse,
++                                        _load_shared_credentials)
+     except ImportError as exc:
+         print(
+             f"Error: {exc}\n"
+@@ -212,6 +242,15 @@ def main():
+         )
+         return 1
+ 
++    # ~/.scilink/credentials.env first: the key is resolved from the
++    # environment, and that file is where a secret-free client config keeps it.
++    _load_shared_credentials()
++    try:
++        api_key = resolve_api_key(args.model, args.base_url, args.api_key)
++    except ValueError as exc:
++        print(f"Error: {exc}", file=sys.stderr)
++        return 1
++
+     server = create_server(
+         api_key=api_key,
+         model_name=args.model,
+diff --git a/scilink/cli/shell/bootstrap.py b/scilink/cli/shell/bootstrap.py
+index 42e2e2a7..1e7b2665 100644
+--- a/scilink/cli/shell/bootstrap.py
++++ b/scilink/cli/shell/bootstrap.py
+@@ -52,30 +52,23 @@ def resolve_llm_credentials(model: str, base_url: Optional[str],
+     Enter meaning "let LiteLLM auto-detect".
+     """
+     spec = provider_for(model)
+-    if api_key:
+-        return Credentials(api_key, base_url, spec.name, "flag")
++    key, source = auth.resolve_llm_key(model, base_url, api_key)
++    if source:
++        return Credentials(key, base_url, spec.name, source)
+     if base_url:
+-        key = auth.get_internal_proxy_key()
+-        if key:
+-            return Credentials(key, base_url, spec.name, auth.INTERNAL_PROXY_KEY)
+         key = ask(f"Proxy API key ({auth.INTERNAL_PROXY_KEY}): ", secret=True).strip()
+         if not key:
+             raise BootstrapError(
+                 "An API key is required for the internal proxy: set "
+                 f"{auth.INTERNAL_PROXY_KEY} or pass --api-key.")
+         return Credentials(key, base_url, spec.name, "prompt")
+-    if model.startswith("bedrock/"):
+-        if os.getenv("AWS_BEARER_TOKEN_BEDROCK") or os.getenv("AWS_ACCESS_KEY_ID"):
+-            return Credentials(None, None, spec.name, "AWS environment")
++    if auth.infer_provider(model) == "bedrock":
+         token = ask("Bedrock bearer token (Enter = default AWS credential "
+                     "discovery): ", secret=True).strip()
+         if token:
+             os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
+             return Credentials(None, None, spec.name, "prompt")
+         return Credentials(None, None, spec.name, "auto")
+-    kv = auth.find_env_var_for_model(model)
+-    if kv:
+-        return Credentials(kv[1], None, spec.name, kv[0])
+     key = ask(f"{spec.name} {spec.key_label} (Enter = let LiteLLM auto-detect): ",
+               secret=True).strip()
+     return Credentials(key or None, None, spec.name, "prompt" if key else "auto")
+diff --git a/tests/test_serve_key_resolution.py b/tests/test_serve_key_resolution.py
+new file mode 100644
+index 00000000..3325080b
+--- /dev/null
++++ b/tests/test_serve_key_resolution.py
+@@ -0,0 +1,265 @@
++"""Which key a command-line entry point builds its agents with.
++
++One rule (``auth.resolve_llm_key``) for the terminal shell, headless ``-p``
++and ``scilink serve``: the key of the model's own vendor, the proxy key only
++beside a base URL, none for Bedrock. ``scilink serve`` used to take the first
++of SCILINK / GEMINI / OPENAI / ANTHROPIC that was set, whatever the model.
++"""
++import importlib.util
++import os
++import sys
++
++import pytest
++
++from scilink import auth
++from scilink.cli.shell import bootstrap
++
++_KEY_VARS = ("SCILINK_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY",
++             "ANTHROPIC_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AWS_ACCESS_KEY_ID")
++
++
++@pytest.fixture
++def clean_env(monkeypatch, tmp_path):
++    for var in _KEY_VARS:
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("HOME", str(tmp_path))      # no real credentials.env
++    return monkeypatch
++
++
++def _all_keys(env):
++    env.setenv("SCILINK_API_KEY", "proxy-key")
++    env.setenv("GEMINI_API_KEY", "gemini-key")
++    env.setenv("OPENAI_API_KEY", "openai-key")
++    env.setenv("ANTHROPIC_API_KEY", "anthropic-key")
++
++
++# ── the rule ─────────────────────────────────────────────────────
++
++@pytest.mark.parametrize("model, key, source", [
++    ("claude-opus-5-5", "anthropic-key", "ANTHROPIC_API_KEY"),
++    ("anthropic/claude-opus-5-5", "anthropic-key", "ANTHROPIC_API_KEY"),
++    ("gpt-6", "openai-key", "OPENAI_API_KEY"),
++    ("gemini/gemini-4-argon", "gemini-key", "GEMINI_API_KEY"),
++])
++def test_each_model_gets_its_own_vendors_key(clean_env, model, key, source):
++    _all_keys(clean_env)
++    assert auth.resolve_llm_key(model) == (key, source)
++
++
++def test_proxy_key_only_beside_a_base_url(clean_env):
++    _all_keys(clean_env)
++    assert auth.resolve_llm_key("claude-opus-5-5", "https://proxy/v1") == \
++        ("proxy-key", "SCILINK_API_KEY")
++    # with every other key unset the proxy key still never goes to a vendor
++    for var in ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
++        clean_env.delenv(var)
++    assert auth.resolve_llm_key("claude-opus-5-5") == (None, None)
++
++
++def test_a_vendor_key_never_goes_to_the_proxy(clean_env):
++    clean_env.setenv("ANTHROPIC_API_KEY", "anthropic-key")
++    assert auth.resolve_llm_key("claude-opus-5-5", "https://proxy/v1") == (None, None)
++
++
++def test_another_vendors_key_is_not_used(clean_env):
++    clean_env.setenv("GEMINI_API_KEY", "gemini-key")
++    assert auth.resolve_llm_key("claude-opus-5-5") == (None, None)
++
++
++@pytest.mark.parametrize("model", [
++    "vertex_ai/gemini-2.5-pro", "openrouter/google/gemini-2.5-pro",
++    "openrouter/anthropic/claude-opus-5-5", "azure/gpt-4o",
++])
++def test_a_routed_model_is_not_handed_a_vendors_key(clean_env, model):
++    """The name after another route's prefix says which model, not whose key."""
++    _all_keys(clean_env)
++    assert auth.infer_provider(model) is None
++    assert auth.resolve_llm_key(model) == (None, None)
++
++
++def test_bedrock_carries_no_key(clean_env):
++    _all_keys(clean_env)
++    model = "bedrock/us.anthropic.claude-opus-4-8"
++    assert auth.resolve_llm_key(model) == (None, None)
++    clean_env.setenv("AWS_BEARER_TOKEN_BEDROCK", "token")
++    assert auth.resolve_llm_key(model) == (None, "AWS environment")
++    clean_env.delenv("AWS_BEARER_TOKEN_BEDROCK")
++    clean_env.setenv("AWS_ACCESS_KEY_ID", "AKIA")
++    assert auth.resolve_llm_key(model) == (None, "AWS environment")
++
++
++def test_an_explicit_key_wins(clean_env):
++    _all_keys(clean_env)
++    assert auth.resolve_llm_key("claude-opus-5-5", None, "given") == ("given", "flag")
++    assert auth.resolve_llm_key("claude-opus-5-5", "https://proxy/v1", "given") == \
++        ("given", "flag")
++
++
++# ── the shell asks only when the rule finds nothing ──────────────
++
++def _asker(answer=""):
++    asked = []
++
++    def ask(prompt="", *, secret=False, default=""):
++        asked.append(prompt)
++        return answer
++    return ask, asked
++
++
++def test_shell_does_not_ask_when_the_environment_answers(clean_env):
++    _all_keys(clean_env)
++    ask, asked = _asker()
++    creds = bootstrap.resolve_llm_credentials("claude-opus-5-5", None, None, ask)
++    assert (creds.api_key, creds.source, asked) == ("anthropic-key", "ANTHROPIC_API_KEY", [])
++    creds = bootstrap.resolve_llm_credentials("gpt-6", "https://proxy/v1", None, ask)
++    assert (creds.api_key, creds.base_url, creds.source) == \
++        ("proxy-key", "https://proxy/v1", "SCILINK_API_KEY")
++    assert asked == []
++
++
++def test_shell_asks_for_what_is_missing(clean_env):
++    ask, asked = _asker("typed")
++    creds = bootstrap.resolve_llm_credentials("claude-opus-5-5", None, None, ask)
++    assert (creds.api_key, creds.source) == ("typed", "prompt") and len(asked) == 1
++
++    ask, asked = _asker("")
++    creds = bootstrap.resolve_llm_credentials("claude-opus-5-5", None, None, ask)
++    assert (creds.api_key, creds.source) == (None, "auto")
++    with pytest.raises(bootstrap.BootstrapError):
++        bootstrap.resolve_llm_credentials("claude-opus-5-5", "https://proxy/v1", None, ask)
++
++    ask, asked = _asker("bearer")
++    creds = bootstrap.resolve_llm_credentials("bedrock/us.anthropic.claude-opus-4-8",
++                                              None, None, ask)
++    assert (creds.api_key, creds.source) == (None, "prompt")
++    assert os.environ.pop("AWS_BEARER_TOKEN_BEDROCK") == "bearer"
++
++
++# ── scilink serve ────────────────────────────────────────────────
++
++from scilink.cli import serve  # noqa: E402
++
++# Only the tests that start the server need the MCP package; the rule itself
++# is tested without it.
++needs_mcp = pytest.mark.skipif(importlib.util.find_spec("mcp") is None,
++                               reason="mcp is not installed")
++
++
++def test_serve_warns_and_starts_without_a_vendor_key(clean_env, capsys):
++    clean_env.setenv("GEMINI_API_KEY", "gemini-key")
++    assert serve.resolve_api_key("claude-opus-5-5", None, None) is None
++    err = capsys.readouterr().err
++    assert "ANTHROPIC_API_KEY" in err and "gemini-key" not in err
++
++
++@pytest.mark.parametrize("model", [
++    "bedrock/us.anthropic.claude-opus-4-8",     # AWS profile, instance role, ...
++    "ollama/llama3", "azure/gpt-4o", "o4-mini", "my-local-model",
++    "vertex_ai/gemini-2.5-pro",                 # ADC, not a Google API key
++    "openrouter/google/gemini-2.5-pro", "openrouter/anthropic/claude-opus-5-5",
++])
++def test_serve_says_nothing_where_it_cannot_know(clean_env, capsys, model):
++    """A warning is for a vendor whose env var is known and unset. The AWS
++    credential chain and an unrecognised provider are not that."""
++    clean_env.setenv("OPENAI_API_KEY", "openai-key")
++    assert serve.resolve_api_key(model, None, None) is None
++    assert capsys.readouterr().err == ""
++
++
++def test_serve_refuses_a_proxy_without_its_key(clean_env):
++    clean_env.setenv("ANTHROPIC_API_KEY", "anthropic-key")
++    with pytest.raises(ValueError, match="SCILINK_API_KEY"):
++        serve.resolve_api_key("claude-opus-5-5", "https://proxy/v1", None)
++
++
++def _run_serve(monkeypatch, argv):
++    """``scilink serve`` up to the transport, with the server faked; returns
++    what ``create_server`` was called with."""
++    import scilink.mcp_server as ms
++    seen = {}
++
++    class _Server:
++        def eager_init(self):
++            pass
++
++    def fake_create_server(**kwargs):
++        seen.update(kwargs)
++        return _Server()
++
++    async def fake_run_stdio(server, real_stdout=None):
++        return None
++
++    monkeypatch.setattr(ms, "create_server", fake_create_server)
++    monkeypatch.setattr(ms, "run_stdio", fake_run_stdio)
++    monkeypatch.setattr(sys, "argv", ["scilink serve", *argv])
++    stdout = sys.stdout                                  # main() redirects it
++    try:
++        code = serve.main()
++    finally:
++        # restored here, not by monkeypatch: under `pytest -s` capsys tears
++        # down first and monkeypatch then put back a closed buffer
++        sys.stdout = stdout
++    return code, seen
++
++
++@needs_mcp
++def test_serve_passes_the_models_key_not_the_first_one_set(clean_env):
++    _all_keys(clean_env)
++    code, seen = _run_serve(clean_env, ["--model", "claude-opus-5-5"])
++    assert code == 0 and seen["api_key"] == "anthropic-key"
++    code, seen = _run_serve(clean_env, ["--model", "gpt-6"])
++    assert seen["api_key"] == "openai-key"
++    code, seen = _run_serve(clean_env, ["--model", "claude-opus-5-5",
++                                        "--base-url", "https://proxy/v1"])
++    assert seen["api_key"] == "proxy-key" and seen["base_url"] == "https://proxy/v1"
++
++
++@needs_mcp
++def test_serve_bedrock_passes_no_key(clean_env):
++    _all_keys(clean_env)
++    clean_env.setenv("AWS_BEARER_TOKEN_BEDROCK", "token")
++    code, seen = _run_serve(clean_env, ["--model", "bedrock/us.anthropic.claude-opus-4-8"])
++    assert code == 0 and seen["api_key"] is None
++
++
++@needs_mcp
++def test_serve_reads_the_key_from_the_credentials_file(clean_env, tmp_path):
++    """The file is loaded BEFORE the key is resolved: it used to be read
++    inside create_server, after the environment had already been scanned."""
++    d = tmp_path / ".scilink"
++    d.mkdir()
++    (d / "credentials.env").write_text("ANTHROPIC_API_KEY=from-file\n")
++    clean_env.setenv("GEMINI_API_KEY", "gemini-key")
++    try:
++        code, seen = _run_serve(clean_env, ["--model", "claude-opus-5-5"])
++        assert code == 0 and seen["api_key"] == "from-file"
++    finally:
++        # The loader wrote the variable itself. monkeypatch.delenv here would
++        # record "from-file" as the original and restore it at teardown, into
++        # every later test of the session; pop it, as the Bedrock test does.
++        os.environ.pop("ANTHROPIC_API_KEY", None)
++
++
++def test_the_credentials_file_test_leaves_no_key_behind():
++    """Runs after it: the fake key must not outlive the test above."""
++    if os.environ.get("ANTHROPIC_API_KEY") == "from-file":
++        pytest.fail("a fake ANTHROPIC_API_KEY leaked into the session")
++
++
++@needs_mcp
++def test_serve_exits_on_a_proxy_without_its_key(clean_env, capsys):
++    code, seen = _run_serve(clean_env, ["--base-url", "https://proxy/v1"])
++    assert code == 1 and seen == {}
++    assert "SCILINK_API_KEY" in capsys.readouterr().err
++
++
++@needs_mcp
++def test_serve_never_sends_a_vendor_key_to_a_base_url(clean_env, capsys):
++    """A local OpenAI-compatible endpoint used to be handed whichever vendor
++    key was set. It now needs --api-key (any value the endpoint accepts)."""
++    clean_env.setenv("OPENAI_API_KEY", "openai-key")
++    local = ["--model", "llama3", "--base-url", "http://localhost:11434/v1"]
++    code, seen = _run_serve(clean_env, local)
++    assert code == 1 and seen == {} and "--api-key" in capsys.readouterr().err
++    code, seen = _run_serve(clean_env, local + ["--api-key", "unused"])
++    assert code == 0 and seen["api_key"] == "unused"

@@ -1,0 +1,1041 @@
+diff --git a/so3lr/config/finetune.yaml b/so3lr/config/finetune.yaml
+index f06e802c..3c6a377e 100644
+--- a/so3lr/config/finetune.yaml
++++ b/so3lr/config/finetune.yaml
+@@ -1,4 +1,31 @@
+ workdir: null  # Working directory, i.e., for saving the checkpoints and log. During finetuning, this is set via the CLI command so keep as null.
++# Fine-tuning on energies and forces only. The data cannot tell short-range from
++# long-range energy, so plain full fine-tuning (--strategy full) drifts the predicted
++# charges and a0/C6 ratios: C6 by 15-67 % and dipole angles 2-4x worse in our tests.
++# --strategy freeze_long_range does NOT prevent this (the frozen heads read a backbone
++# that keeps training). Use one of these, with energy weight 1.0 (see loss_weights):
++#   1. Anchors (best accuracy): --strategy full + training.long_range_anchor_weights.
++#      a0/C6 stay within ~1 % of the pretrained model, charges ~0.006 e; out-of-domain
++#      dipoles still degrade, by about half as much as full fine-tuning.
++#   2. Exact long range: --strategy readout_only + the residual readout below. Charges,
++#      a0/C6 and dipoles stay bit-identical to the pretrained model; 85-100 % of the
++#      force gain of recipe 1.
++#   3. Pseudo-labels (recipe 1 offline, e.g. a different teacher model; matched recipe 1
++#      to the third digit, tested at energy weight 0.01 only): write the
++#      teacher's predictions into the data and train them as targets, --strategy full:
++#        so3lr eval --datafile data.extxyz --save-to teacher.extxyz
++#            --targets energy,forces,partial_charges,a0_ratios,c6_ratios
++#      then copy the partial_charges_so3lr / a0_ratios_so3lr / c6_ratios_so3lr arrays
++#      into data.extxyz as partial_charges / a0_ratios / c6_ratios and set
++#      loss_weights partial_charges, hirshfeld_ratios and c6_ratios to 1.0.
++# The labels must treat dispersion like SO3LR does: SO3LR keeps its own dispersion term,
++# so fitting dispersion-free energies (plain DFT without D3/D4/MBD) teaches every
++# recipe to underbind non-covalent complexes.
++# The checkpoint defines the model; a finetune config can only ADD a residual energy
++# readout: a per-atom MLP added to the pretrained one, zero at the start (recipe 2).
++# model:
++#   energy_residual_mlp_widths: [512, 512]
++#   energy_residual_inputs: all_layers  # or 'last': only the final-layer features
+ neighborlist_format_lr: sparse
+ data:
+   filepath: null  # Path to the data file. During finetuning, this is set via the CLI command so keep as null.
+@@ -47,10 +74,19 @@ training:
+   loss_weights:
+     forces: 1.00  # Loss weight for the forces.
+     # Uncomment if energy, dipole_vec and/or hirshfeld ratios are in the dataset and should be used in the loss.
+-    # energy: 0.01  # Loss weight for the energy.
++    # energy: 1.0  # Loss weight for the energy. Pretraining used 0.01 on this per-atom loss, but at 0.01 energies barely train in a fine-tune; 1.0 trains them at no force cost.
+     # dipole_vec: 0.01 
+     # hirshfeld_ratios: 0.01
+     # c6_ratios: 0.01
++    # partial_charges: 0.01  # Per-atom charges, read from a 'partial_charges' array column.
++  # Recipe 1 (see the top of this file): anchor the charge / a0 / C6 heads to the
++  # pretrained model's own predictions on every batch (a frozen copy of the starting
++  # weights is the teacher; one extra forward pass per batch, 2-6 % longer runs):
++  # long_range_anchor_weights:
++  #   partial_charges: 1.0
++  #   a0_ratios: 1.0  # 'hirshfeld_ratios' for the legacy so3lr model
++  #   c6_ratios: 1.0  # not predicted by the legacy so3lr model
++  #   dipole_vec: 0.1  # optional; the three above were enough in our tests
+   use_robust_loss: false  # Use robust loss function. See https://arxiv.org/abs/1701.03077.
+   robust_loss_alpha: 1.00 # Alpha parameter for the robust loss function.
+   model_seed: 42  # Seed used for the initialization of the model parameters.
+diff --git a/so3lr/finetuning_strategies.py b/so3lr/finetuning_strategies.py
+index 82c00ea6..6559d573 100644
+--- a/so3lr/finetuning_strategies.py
++++ b/so3lr/finetuning_strategies.py
+@@ -90,11 +90,16 @@ def _last_layer(num_layers: int) -> str:
+     'll_obs_023': lambda n: (
+         [_last_layer(n), 'observables_0', 'observables_2', 'observables_3'], None
+     ),
+-    # Forces-only fine-tuning: train the short-range representation + energy
+-    # head, but FREEZE the long-range heads so the (unlabelled) electrostatics
+-    # and dispersion keep their physically-meaningful pretrained predictions.
++    # Freeze the long-range head weights, train everything else. NOTE: the heads
++    # read the shared backbone features, which keep training, so the predicted
++    # charges and a0/C6 ratios still drift. To keep them fixed use 'readout_only',
++    # or anchor them (training.long_range_anchor_weights).
+     'freeze_long_range': lambda n: (None, list(_LONG_RANGE_KEYS)),
+     'forces_only': lambda n: (None, list(_LONG_RANGE_KEYS)),
++    # Freeze the backbone and the long-range heads; train the energy readout and
++    # the residual readout (model.energy_residual_mlp_widths in the finetune
++    # config). Charges and a0/C6 ratios stay exactly the pretrained ones.
++    'readout_only': lambda n: (list(_FINAL_MLP_KEYS) + ['observables_0/energy_residual*'], None),
+ }
+ 
+ FINETUNING_STRATEGY_NAMES: Tuple[str, ...] = tuple(FINETUNING_STRATEGIES)
+diff --git a/so3lr/mlff/config/from_config.py b/so3lr/mlff/config/from_config.py
+index 6d52753b..5c27485f 100644
+--- a/so3lr/mlff/config/from_config.py
++++ b/so3lr/mlff/config/from_config.py
+@@ -14,7 +14,10 @@
+ import yaml
+ import logging
+ import os
++import jax
+ import jax.numpy as jnp
++from flax import traverse_util
++from flax.core.frozen_dict import unfreeze
+ 
+ from ..utils import checkpoint_utils
+ from ..utils.param_utils import (
+@@ -200,6 +203,8 @@ def make_so3krates_sparse_from_config(
+         use_spin_embed=model_config.use_spin_embed,
+         energy_regression_dim=model_config.energy_regression_dim,
+         energy_final_mlp_widths=model_config.get('energy_final_mlp_widths', None),
++        energy_residual_mlp_widths=model_config.get('energy_residual_mlp_widths', None),
++        energy_residual_inputs=model_config.get('energy_residual_inputs', 'last'),
+         energy_activation_fn=model_config.energy_activation_fn,
+         energy_learn_atomic_type_scales=model_config.energy_learn_atomic_type_scales,
+         energy_learn_atomic_type_shifts=model_config.energy_learn_atomic_type_shifts,
+@@ -323,7 +328,12 @@ def run_training(config: config_dict.ConfigDict, model: str = 'so3krates'):
+ 
+     opt = make_optimizer_from_config(config)
+     if model == 'so3krates':
+-        net = make_so3krates_sparse_from_config(config)
++        net = make_so3krates_sparse_from_config(
++            config,
++            output_intermediate_quantities=(
++                ['partial_charges'] if 'partial_charges' in config.training.loss_weights else None
++            ),
++        )
+     else:
+         raise ValueError(
+             f'{model=} is not a valid model.'
+@@ -540,6 +550,124 @@ def run_training(config: config_dict.ConfigDict, model: str = 'so3krates'):
+     logger.info('Training has finished!')
+ 
+ 
++# Model keys a finetune config may set: they ADD modules to the checkpoint's
++# architecture without changing any pretrained one. Everything else in a
++# finetune `model:` block is dropped, because the checkpoint defines the model.
++FINETUNE_MODEL_OVERRIDES = ('energy_residual_mlp_widths', 'energy_residual_inputs')
++
++# Quantities `training.long_range_anchor_weights` can anchor to the pretrained
++# model's predictions.
++LONG_RANGE_ANCHOR_KEYS = ('partial_charges', 'a0_ratios', 'hirshfeld_ratios', 'c6_ratios', 'dipole_vec')
++
++
++def _apply_finetune_model_overrides(user_model, checkpoint_model):
++    """Copy the allowed `model:` keys of a finetune config onto the checkpoint's
++    model config. A checkpoint that already has a residual readout (a fine-tuned
++    model fine-tuned again) must be given the same one, or its saved residual
++    weights would not fit."""
++    had_residual = checkpoint_model.get('energy_residual_mlp_widths', None) is not None
++    for key in FINETUNE_MODEL_OVERRIDES:
++        value = user_model.get(key, None)
++        if value is None:
++            continue
++        if isinstance(value, (list, tuple)):
++            value = [int(v) for v in value]
++        existing = checkpoint_model.get(key, None)
++        if existing is None and had_residual and key == 'energy_residual_inputs':
++            existing = 'last'  # the default the checkpoint's residual was built with
++        if existing is not None and existing != value:
++            raise ValueError(
++                f'The checkpoint already has model.{key}={existing!r}; the finetune '
++                f'config asks for {value!r}. Remove the key or set the same value.'
++            )
++        with checkpoint_model.unlocked():
++            checkpoint_model[key] = value
++    if (checkpoint_model.get('energy_residual_inputs', None) is not None
++            and checkpoint_model.get('energy_residual_mlp_widths', None) is None):
++        raise ValueError(
++            'model.energy_residual_inputs is set but model.energy_residual_mlp_widths is not; '
++            'set the widths of the residual readout, e.g. [256, 256].'
++        )
++
++
++def _fill_missing_params(params, fresh):
++    """`params` with every entry it lacks taken from `fresh` (a new model's
++    initialisation). Returns the merged tree and the module paths that were filled."""
++    flat = traverse_util.flatten_dict(unfreeze(params))
++    new = {k: v for k, v in traverse_util.flatten_dict(unfreeze(fresh)).items() if k not in flat}
++    filled = sorted({'/'.join(k[:-1]) for k in new})
++    return traverse_util.unflatten_dict({**flat, **new}), filled
++
++
++def _init_residual_readout(net, params, config, training_data, tf_record_present, graph_to_batch_fn):
++    """Add the (zero-initialised) residual-readout weights to pretrained `params`.
++
++    The pretrained checkpoint has no entry for them, so the model is initialised
++    once on a real batch and only the missing entries are taken from it. The last
++    residual layer starts at zero, so the model's energy is unchanged at step 0.
++    """
++    if tf_record_present:
++        raise NotImplementedError(
++            'model.energy_residual_mlp_widths is not supported with TFDS fine-tuning data yet; '
++            'use an extxyz/npz data file.'
++        )
++    graph_batch, lr_batch = next(jraph_utils.dynamically_batch_with_lr(
++        iter(training_data),
++        n_node=config.training.batch_max_num_nodes,
++        n_edge=config.training.batch_max_num_edges,
++        n_graph=config.training.batch_max_num_graphs,
++        n_pairs=config.training.batch_max_num_pairs,
++    ))
++    batch = jax.tree_util.tree_map(jnp.array, graph_to_batch_fn(graph_batch, lr_batch))
++    fresh = net.init(jax.random.PRNGKey(config.training.model_seed), batch)
++    params, filled = _fill_missing_params(params, fresh)
++    if not filled:
++        return params
++    unexpected = [p for p in filled if 'energy_residual' not in p]
++    if unexpected:
++        raise ValueError(
++            f'Initialising the residual readout would also create {unexpected}, which the '
++            f'checkpoint lacks. The checkpoint does not match its hyperparameters.'
++        )
++    n_new = count_trainable_params(params, trainable_keys=filled)
++    logger.info(f'Residual energy readout: initialised {filled} ({n_new:,} new parameters).')
++    return params
++
++
++def _with_long_range_anchor(graph_to_batch_fn, net, params, anchor_keys):
++    """Wrap `graph_to_batch_fn` so every batch also carries 'anchor_<key>' labels:
++    the pretrained model's prediction of <key> for that batch.
++
++    The teacher is a frozen copy of the starting `params`, evaluated in its own
++    jitted call with the parameters as an argument (closed-over parameters would
++    be baked into the training step as constants). Applies to the training and
++    the validation batches alike.
++    """
++    from so3lr.mlff.nn.stacknet.observable_function_sparse import (
++        get_long_range_anchor_fn_sparse, _OPTIONAL_INPUTS
++    )
++    alias = training_utils._RATIO_ALIAS
++    teacher_keys = sorted(set(anchor_keys) | {alias[k] for k in anchor_keys if k in alias})
++    teacher = jax.jit(get_long_range_anchor_fn_sparse(net, teacher_keys))
++    ref_params = jax.device_put(params)  # updates are functional: these stay the starting weights
++    input_keys = ('positions', 'atomic_numbers', 'idx_i', 'idx_j') + _OPTIONAL_INPUTS
++
++    def graph_to_batch_with_anchor(graph, lr_batch):
++        batch = graph_to_batch_fn(graph, lr_batch)
++        out = teacher(ref_params, **{k: batch[k] for k in input_keys if batch.get(k) is not None})
++        for key in anchor_keys:
++            value = out.get(training_utils._prediction_key(key, out))
++            if value is None:
++                raise ValueError(
++                    f'Cannot anchor {key!r}: the pretrained model does not predict it '
++                    f'(it predicts {sorted(out)}).'
++                )
++            batch[training_utils.ANCHOR_PREFIX + key] = value
++        return batch
++
++    return graph_to_batch_with_anchor
++
++
+ def run_fine_tuning(
+         config: config_dict.ConfigDict,
+         start_from_workdir: str,
+@@ -619,16 +747,20 @@ def run_fine_tuning(
+     user_message_normalization = None
+     user_avg_num_neighbors = config.data.get('avg_num_neighbors', None)
+     if 'model' in config and config.model is not None:
+-        user_model_keys = sorted(config.model.keys())
++        user_model_keys = sorted(
++            k for k in config.model.keys() if k not in FINETUNE_MODEL_OVERRIDES
++        )
+         user_message_normalization = config.model.get('message_normalization', None)
+         if user_model_keys:
+             logger.warning(
+                 'Ignoring user-supplied `model:` block in finetune config; '
+                 'the checkpoint at %s defines the model architecture. '
+-                'Dropped keys: %s',
++                'Dropped keys: %s (only %s can be set when fine-tuning)',
+                 start_from_workdir,
+                 user_model_keys,
++                list(FINETUNE_MODEL_OVERRIDES),
+             )
++        _apply_finetune_model_overrides(config.model, config_start_from_workdir.model)
+ 
+     # Check that message normalization has not changed from the original model
+     # to the fine-tuning model. Fails before any data is loaded.
+@@ -688,12 +820,30 @@ def run_fine_tuning(
+             "Please enable only one."
+         )
+ 
+-    adaptive_robust_loss_targets = list(config.training.loss_weights.keys()) if use_adaptive_robust_loss else None
++    # Long-range anchoring: keep the charges / a0 / C6 ratios (or the dipole) of the
++    # model being fine-tuned close to those of the frozen pretrained model, on every
++    # fine-tuning batch. For data with energies and forces only, which cannot tell
++    # short-range from long-range energy, so the long-range heads would otherwise
++    # be used as extra fitting knobs. Enters the loss as 'anchor_<key>' targets.
++    anchor_weights = dict(config.training.get('long_range_anchor_weights', None) or {})
++    unknown = sorted(set(anchor_weights) - set(LONG_RANGE_ANCHOR_KEYS))
++    if unknown:
++        raise ValueError(
++            f'training.long_range_anchor_weights has unknown keys {unknown}; '
++            f'choose from {list(LONG_RANGE_ANCHOR_KEYS)}.'
++        )
++    loss_weights = dict(config.training.loss_weights)
++    loss_weights.update({training_utils.ANCHOR_PREFIX + k: float(w) for k, w in anchor_weights.items()})
++    needs_charges = 'partial_charges' in loss_weights or 'partial_charges' in anchor_weights
++    output_intermediate_quantities = ['partial_charges'] if needs_charges else None
++
++    adaptive_robust_loss_targets = list(loss_weights.keys()) if use_adaptive_robust_loss else None
+     adaptive_robust_loss_init_alpha = config.training.get('adaptive_robust_loss_init_alpha', 1.5)
+     adaptive_robust_loss_init_scale = config.training.get('adaptive_robust_loss_init_scale', 1.0)
+ 
+     # Load the parameters from the model for fine-tuning.
+     params = checkpoint_utils.load_params_from_workdir(start_from_workdir)
++    has_residual_readout = config_start_from_workdir.model.get('energy_residual_mlp_widths', None) is not None
+ 
+     # Expand a single-theory-level checkpoint to the multi-head energy readout.
+     # Shared with fit()/fit_from_iterator() so the three call sites cannot drift.
+@@ -707,6 +857,9 @@ def run_fine_tuning(
+     if selection_keys:
+         available_modules = sorted(params.get('params', params).keys())
+         unmatched = unmatched_param_keys(params, selection_keys)
++        if has_residual_readout:
++            # Created (zero-initialised) below, once a batch is at hand.
++            unmatched = [k for k in unmatched if 'energy_residual' not in k]
+         if unmatched:
+             logger.warning(
+                 'Fine-tuning strategy %r selects %s, which match no parameter in the '
+@@ -790,7 +943,10 @@ def run_fine_tuning(
+         )
+ 
+     if model == 'so3krates':
+-        net = make_so3krates_sparse_from_config(config_start_from_workdir)
++        net = make_so3krates_sparse_from_config(
++            config_start_from_workdir,
++            output_intermediate_quantities=output_intermediate_quantities
++        )
+     else:
+         raise ValueError(
+             f'{model=} is not a valid model.'
+@@ -798,7 +954,7 @@ def run_fine_tuning(
+ 
+     loss_fn = training_utils.make_loss_fn(
+         get_energy_and_force_fn_sparse(net),
+-        weights=config.training.loss_weights,
++        weights=loss_weights,
+         use_robust_loss=use_robust_loss,
+         robust_loss_alpha=robust_loss_alpha,
+         use_adaptive_robust_loss=use_adaptive_robust_loss,
+@@ -806,7 +962,7 @@ def run_fine_tuning(
+ 
+     val_fn = training_utils.make_val_fn(
+         get_energy_and_force_fn_sparse(net),
+-        weights=config.training.loss_weights,
++        weights=loss_weights,
+         use_robust_loss=config.training.get('use_robust_loss_validation', use_robust_loss),
+         robust_loss_alpha=config.training.get('robust_loss_alpha_validation', robust_loss_alpha),
+         use_adaptive_robust_loss=use_adaptive_robust_loss,
+@@ -891,6 +1047,26 @@ def run_fine_tuning(
+ 
+     _graph_to_batch_fn = _make_graph_to_batch_fn(config, training_data, tf_record_present)
+ 
++    if has_residual_readout:
++        params = _init_residual_readout(
++            net, params, config, training_data, tf_record_present, _graph_to_batch_fn
++        )
++        flat = traverse_util.flatten_dict(unfreeze(params))
++        residual = traverse_util.unflatten_dict(
++            {k: v for k, v in flat.items() if any(c.startswith('energy_residual') for c in k)}
++        )
++        if count_trainable_params(residual, trainable_subset_keys, frozen_subset_keys) == 0:
++            logger.warning(
++                'Fine-tuning strategy %r freezes the residual energy readout '
++                '(model.energy_residual_mlp_widths); a new one stays zero. Use '
++                '--strategy readout_only or full to train it.', strategy
++            )
++
++    if anchor_weights:
++        _graph_to_batch_fn = _with_long_range_anchor(
++            _graph_to_batch_fn, net, params, list(anchor_weights)
++        )
++
+     if tf_record_present is True:
+         training_utils.fit_from_iterator(
+             model=net,
+diff --git a/so3lr/mlff/data/dataloader_sparse_ase.py b/so3lr/mlff/data/dataloader_sparse_ase.py
+index 15c56f41..665ee049 100644
+--- a/so3lr/mlff/data/dataloader_sparse_ase.py
++++ b/so3lr/mlff/data/dataloader_sparse_ase.py
+@@ -282,6 +282,14 @@ def ASE_to_jraph(
+     else:
+         c6_ratios = np.array(c6_ratios).reshape(num_atoms, )
+ 
++    # Per-atom partial charges: an optional target for the charge head that drives
++    # the electrostatic energy (e.g. pseudo-labels from a pretrained model, which
++    # anchor the charges during energy/force-only fine-tuning). NaN when absent, so
++    # frames without them are masked out of the loss.
++    partial_charges = mol.arrays.get('partial_charges')
++    partial_charges = (np.full((num_atoms,), np.nan) if partial_charges is None
++                       else np.array(partial_charges).reshape(num_atoms))
++
+     # Initialize monomer-specific information for dimer binding energy calculations,
+     # as described in the Methods section of SO3LR paper.
+     residue_charge = None
+@@ -384,7 +392,8 @@ def ASE_to_jraph(
+             "atomic_numbers": atomic_numbers.reshape(num_atoms),
+             "forces": forces.reshape(num_atoms, 3),
+             "hirshfeld_ratios": hirshfeld_ratios.reshape(num_atoms),
+-            "c6_ratios": c6_ratios.reshape(num_atoms)
++            "c6_ratios": c6_ratios.reshape(num_atoms),
++            "partial_charges": partial_charges.reshape(num_atoms)
+             }
+     if residue_segments is not None:
+         node_features["residue_segments"] = residue_segments
+diff --git a/so3lr/mlff/nn/observable/observable_sparse.py b/so3lr/mlff/nn/observable/observable_sparse.py
+index 52ab36b5..aa506674 100644
+--- a/so3lr/mlff/nn/observable/observable_sparse.py
++++ b/so3lr/mlff/nn/observable/observable_sparse.py
+@@ -223,6 +223,18 @@ class EnergySparse(BaseSubModule):
+     # initialise fresh. When None, falls back to the single `regression_dim`
+     # layer (or no hidden layer), preserving the original architecture exactly.
+     final_mlp_widths: Optional[Sequence[int]] = None
++    # Optional residual energy readout, for fine-tuning with a frozen backbone. A
++    # second per-atom MLP whose output is ADDED to the pretrained readout. Its last
++    # layer is always zero-initialised, so attaching it to a pretrained model leaves
++    # the energy unchanged at step 0. `final_mlp_widths` cannot do this: it inserts
++    # fresh layers between the loaded 'energy_dense_regression' and
++    # 'energy_dense_final', which changes the energy before training starts.
++    residual_mlp_widths: Optional[Sequence[int]] = None
++    # Input of the residual readout: 'last' = the final node features x;
++    # 'all_layers' = x after the embedding and after every message-passing layer,
++    # concatenated. A frozen backbone's last layer may have discarded information
++    # the new data needs; the earlier layers are free to read.
++    residual_inputs: str = 'last'
+     activation_fn: Callable[[Any], Any] = lambda u: u
+     learn_atomic_type_scales: bool = False
+     learn_atomic_type_shifts: bool = False
+@@ -341,6 +353,30 @@ def __call__(self, inputs: Dict, *args, **kwargs):
+             )(x) # (num_nodes, num_levels_of_theory)
+ 
+         atomic_energy = atomic_energy * atomic_scales
++
++        if self.residual_mlp_widths is not None:
++            if self.residual_inputs == 'last':
++                y = x
++            elif self.residual_inputs == 'all_layers':
++                y = inputs['x_layers']  # (num_nodes, (num_layers + 1) * num_features)
++            else:
++                raise ValueError(
++                    f"residual_inputs must be 'last' or 'all_layers', got {self.residual_inputs!r}."
++                )
++            for i, width in enumerate(self.residual_mlp_widths):
++                y = nn.Dense(
++                    width,
++                    kernel_init=nn.initializers.lecun_normal(),
++                    name=f'energy_residual_dense_{i}'
++                )(y)  # (num_nodes, width)
++                y = self.activation_fn(y)  # (num_nodes, width)
++            atomic_energy += nn.Dense(
++                num_theory_levels,
++                kernel_init=nn.initializers.zeros_init(),
++                use_bias=False,
++                name='energy_residual_dense_final'
++            )(y)  # (num_nodes, num_levels_of_theory)
++
+         atomic_energy += energy_offset  # (num_nodes, num_levels_of_theory)
+ 
+         atomic_energy = jnp.where(
+diff --git a/so3lr/mlff/nn/representation/so3krates_sparse.py b/so3lr/mlff/nn/representation/so3krates_sparse.py
+index 9714466c..26c6ad6f 100644
+--- a/so3lr/mlff/nn/representation/so3krates_sparse.py
++++ b/so3lr/mlff/nn/representation/so3krates_sparse.py
+@@ -54,6 +54,8 @@ def init_so3krates_sparse(
+         use_spin_embed: bool = False,
+         energy_regression_dim: int = 128,
+         energy_final_mlp_widths: Optional[Sequence[int]] = None,
++        energy_residual_mlp_widths: Optional[Sequence[int]] = None,
++        energy_residual_inputs: str = 'last',
+         energy_activation_fn: str = 'identity',
+         energy_learn_atomic_type_scales: bool = False,
+         energy_learn_atomic_type_shifts: bool = False,
+@@ -198,6 +200,8 @@ def init_so3krates_sparse(
+         output_is_zero_at_init=output_is_zero_at_init,
+         regression_dim=energy_regression_dim,
+         final_mlp_widths=energy_final_mlp_widths,
++        residual_mlp_widths=energy_residual_mlp_widths,
++        residual_inputs=energy_residual_inputs,
+         activation_fn=getattr(
+             nn.activation, energy_activation_fn
+         ) if energy_activation_fn != 'identity' else lambda u: u,
+diff --git a/so3lr/mlff/nn/stacknet/observable_function_sparse.py b/so3lr/mlff/nn/stacknet/observable_function_sparse.py
+index c68717cc..7ecc136f 100644
+--- a/so3lr/mlff/nn/stacknet/observable_function_sparse.py
++++ b/so3lr/mlff/nn/stacknet/observable_function_sparse.py
+@@ -26,6 +26,22 @@ def _model_inputs(positions, atomic_numbers, idx_i, idx_j, **kwargs):
+     return inputs
+ 
+ 
++# Per-atom outputs forwarded next to energy, forces and dipole: the ratio heads
++# ('a0_ratios' for so3lr-tauri-s/m/l, 'hirshfeld_ratios' for legacy so3lr, mapped
++# onto each other by make_loss_fn's _RATIO_ALIAS) and the partial charges, which
++# the model only emits when built with output_intermediate_quantities=['partial_charges'].
++_NODE_OUTPUTS = ('a0_ratios', 'hirshfeld_ratios', 'c6_ratios', 'partial_charges')
++
++
++def _masked_outputs(model_output, inputs, keys):
++    """The `keys` of `model_output` that the model emits, zeroed on padding."""
++    masks = {'dipole_vec': inputs['graph_mask'][:, None]}
++    return {
++        k: safe_scale(model_output[k], masks.get(k, inputs['node_mask']))
++        for k in keys if k in model_output
++    }
++
++
+ def get_observable_fn_sparse(model):
+     """All observables of `model` (a StackNetSparse) as a function of (params, **inputs)."""
+     def observable_fn(params, positions, atomic_numbers, idx_i, idx_j, **kwargs):
+@@ -37,7 +53,7 @@ def observable_fn(params, positions, atomic_numbers, idx_i, idx_j, **kwargs):
+ def get_energy_and_force_fn_sparse(model):
+     def energy_and_force_and_dipole_and_hirsh_fn(params, positions, atomic_numbers, idx_i, idx_j, **kwargs):
+         inputs = _model_inputs(positions, atomic_numbers, idx_i, idx_j, **kwargs)
+-        graph_mask, node_mask = inputs['graph_mask'], inputs['node_mask']
++        graph_mask = inputs['graph_mask']
+ 
+         def energy_fn(positions):
+             # The whole model output is the aux, so dipole_vec and the ratio heads
+@@ -48,23 +64,26 @@ def energy_fn(positions):
+ 
+         (_, (energy, model_output)), forces = jax.value_and_grad(energy_fn, has_aux=True)(positions)
+ 
+-        result = dict(
++        return dict(
+             energy=energy,
+-            forces=forces
++            forces=forces,
++            **_masked_outputs(model_output, inputs, ('dipole_vec',) + _NODE_OUTPUTS),
+         )
+ 
+-        if 'dipole_vec' in model_output:
+-            dipole_vec = model_output['dipole_vec']  # (num_graphs)
+-            dipole_vec = safe_scale(dipole_vec, graph_mask[:, None])  # (num_graphs)
+-            result['dipole_vec'] = dipole_vec
++    return energy_and_force_and_dipole_and_hirsh_fn
+ 
+-        # Per-atom ratio heads: 'a0_ratios' (so3lr-tauri-s/m/l) or 'hirshfeld_ratios'
+-        # (legacy so3lr) for the same quantity, and 'c6_ratios'. Forward whichever
+-        # the model has; make_loss_fn's _RATIO_ALIAS maps between the two names.
+-        for ratio_key in ('a0_ratios', 'hirshfeld_ratios', 'c6_ratios'):
+-            if ratio_key in model_output:
+-                result[ratio_key] = safe_scale(model_output[ratio_key], node_mask)
+ 
+-        return result
++def get_long_range_anchor_fn_sparse(model, keys):
++    """Forward-only long-range quantities of `model` as a function of (params, **inputs).
+ 
+-    return energy_and_force_and_dipole_and_hirsh_fn
++    Used as the frozen teacher when anchoring the long-range heads during
++    fine-tuning: partial charges and the a0/C6 ratio heads need no positional
++    derivative, so this skips the force pass that get_energy_and_force_fn_sparse
++    does. `model` must emit 'partial_charges' (output_intermediate_quantities) if
++    it is among `keys`.
++    """
++    def anchor_fn(params, positions, atomic_numbers, idx_i, idx_j, **kwargs):
++        inputs = _model_inputs(positions, atomic_numbers, idx_i, idx_j, **kwargs)
++        return _masked_outputs(model.apply(params, inputs), inputs, keys)
++
++    return anchor_fn
+diff --git a/so3lr/mlff/nn/stacknet/stacknet_sparse.py b/so3lr/mlff/nn/stacknet/stacknet_sparse.py
+index 1cae4200..6d5a7187 100644
+--- a/so3lr/mlff/nn/stacknet/stacknet_sparse.py
++++ b/so3lr/mlff/nn/stacknet/stacknet_sparse.py
+@@ -71,6 +71,10 @@ def __call__(self,
+             )
+             x0 = x  # Save initial embedding for skip connection
+ 
++        # Node features after the embedding and after every layer, for readouts that
++        # look past the last layer (EnergySparse residual_inputs='all_layers'). XLA
++        # drops the concatenation when no observable reads it.
++        x_layers = [quantities['x']]
+         for (n, layer) in enumerate(self.layers):
+             if self.use_residual_scalars:
+                 # Scale residual stream and blend in initial embedding
+@@ -78,6 +82,8 @@ def __call__(self,
+                 quantities['x'] = resid_lambdas[n] * x_current + x0_lambdas[n] * x0
+             updated_quantities = layer(**quantities)
+             quantities.update(updated_quantities)
++            x_layers.append(quantities['x'])
++        quantities['x_layers'] = jnp.concatenate(x_layers, axis=-1)
+ 
+         if self.return_representations_bool:
+             return {
+diff --git a/so3lr/mlff/utils/jraph_utils.py b/so3lr/mlff/utils/jraph_utils.py
+index e6900448..f52d12e4 100644
+--- a/so3lr/mlff/utils/jraph_utils.py
++++ b/so3lr/mlff/utils/jraph_utils.py
+@@ -56,6 +56,7 @@ def graph_to_batch_fn(graph: jraph.GraphsTuple, lr_batch: dict, kspace_constants
+         dipole_vec=graph.globals.get('dipole_vec'),
+         hirshfeld_ratios=graph.nodes.get('hirshfeld_ratios'),
+         c6_ratios=graph.nodes.get('c6_ratios'),
++        partial_charges=graph.nodes.get('partial_charges'),
+         idx_i_lr=lr_batch['idx_i_lr'],
+         idx_j_lr=lr_batch['idx_j_lr'],
+         cell_offset_lr=lr_batch.get('cell_offsets_lr'),
+diff --git a/so3lr/mlff/utils/training_utils.py b/so3lr/mlff/utils/training_utils.py
+index 573fb4c6..c05701e9 100644
+--- a/so3lr/mlff/utils/training_utils.py
++++ b/so3lr/mlff/utils/training_utils.py
+@@ -636,6 +636,7 @@ def graph_mae_loss_per_atom(
+     'hirshfeld_ratios': node_mae_loss,
+     'a0_ratios': node_mae_loss,
+     'c6_ratios': node_mae_loss,
++    'partial_charges': node_mae_loss,
+ }
+ 
+ property_to_loss = {
+@@ -646,6 +647,7 @@ def graph_mae_loss_per_atom(
+     'hirshfeld_ratios': node_mse_loss,
+     'a0_ratios': node_mse_loss,
+     'c6_ratios': node_mse_loss,
++    'partial_charges': node_mse_loss,
+ }
+ 
+ # Ratio-head alias: legacy SO3LR emits 'hirshfeld_ratios'; the new so3lr-tauri-s/m/l
+@@ -654,6 +656,26 @@ def graph_mae_loss_per_atom(
+ # and remap at the loss-fn entry point so users do not see a KeyError.
+ _RATIO_ALIAS = {'hirshfeld_ratios': 'a0_ratios', 'a0_ratios': 'hirshfeld_ratios'}
+ 
++# Anchor targets ('anchor_<quantity>'): <quantity> as predicted by the model being
++# fine-tuned, labelled by a frozen copy of the pretrained model. The labels are put
++# into each batch under the target name by run_fine_tuning, and the loss is the
++# one of <quantity>. Used to keep the long-range heads (partial charges, a0/C6
++# ratios) at their pretrained predictions when the fine-tuning data has no labels
++# for them.
++ANCHOR_PREFIX = 'anchor_'
++
++
++def _base_target(target: str) -> str:
++    return target[len(ANCHOR_PREFIX):] if target.startswith(ANCHOR_PREFIX) else target
++
++
++def _prediction_key(target: str, outputs_predict: Dict) -> str:
++    """The model-output key a target is scored on (trace-time only)."""
++    key = _base_target(target)
++    if key not in outputs_predict and _RATIO_ALIAS.get(key) in outputs_predict:
++        key = _RATIO_ALIAS[key]
++    return key
++
+ def make_loss_fn(
+     obs_fn: Callable, weights: Dict, scales: Dict = None,
+     use_robust_loss: bool = False, robust_loss_alpha: float = 1.99,
+@@ -696,16 +718,13 @@ def loss_fn(params, batch: Dict[str, jnp.ndarray]):
+         outputs_true = {k: v for k, v in batch.items() if k in targets}
+         outputs_predict = obs_fn(params, **inputs)
+ 
+-        # Rename ratio-head key if the model emits 'a0_ratios' while the user
+-        # weighted 'hirshfeld_ratios' (or vice-versa). Trace-time only: the
+-        # dict keys are Python-level so this does not affect the jitted graph.
+-        outputs_predict = dict(outputs_predict)
++        # Ratio-head alias ('a0_ratios' vs 'hirshfeld_ratios'): predictions are
++        # resolved per target by _prediction_key; labels are renamed here.
++        # Trace-time only: the dict keys are Python-level.
+         for _t in targets:
+             _alias = _RATIO_ALIAS.get(_t)
+             if _alias is None:
+                 continue
+-            if _t not in outputs_predict and _alias in outputs_predict:
+-                outputs_predict[_t] = outputs_predict.pop(_alias)
+             if _t not in outputs_true and _alias in outputs_true:
+                 outputs_true[_t] = outputs_true.pop(_alias)
+ 
+@@ -722,9 +741,11 @@ def loss_fn(params, batch: Dict[str, jnp.ndarray]):
+         metrics = {}
+ 
+         for target in targets:
+-            target_mae_fn = property_to_mae[target]
++            base_target = _base_target(target)
++            y_pred = outputs_predict[_prediction_key(target, outputs_predict)]
++            target_mae_fn = property_to_mae[base_target]
+             _mae = target_mae_fn(
+-                y=outputs_predict[target],
++                y=y_pred,
+                 y_label=outputs_true[target],
+                 scale=_scales[target],
+                 batch_segments=inputs['batch_segments'],
+@@ -743,9 +764,9 @@ def loss_fn(params, batch: Dict[str, jnp.ndarray]):
+                 target_adaptive_alpha = adaptive_alphas[idx]
+                 target_adaptive_scale = adaptive_scales[idx]
+ 
+-            target_loss_fn = property_to_loss[target]
++            target_loss_fn = property_to_loss[base_target]
+             _l = target_loss_fn(
+-                y=outputs_predict[target],
++                y=y_pred,
+                 y_label=outputs_true[target],
+                 scale=_scales[target],
+                 batch_segments=inputs['batch_segments'],
+@@ -806,14 +827,11 @@ def val_fn(params, batch: Dict[str, jnp.ndarray]):
+         outputs_true = {k: v for k, v in batch.items() if k in targets}
+         outputs_predict = obs_fn(params, **inputs)
+ 
+-        # Mirror the ratio-head alias rename used in make_loss_fn.
+-        outputs_predict = dict(outputs_predict)
++        # Mirror the ratio-head label rename used in make_loss_fn.
+         for _t in targets:
+             _alias = _RATIO_ALIAS.get(_t)
+             if _alias is None:
+                 continue
+-            if _t not in outputs_predict and _alias in outputs_predict:
+-                outputs_predict[_t] = outputs_predict.pop(_alias)
+             if _t not in outputs_true and _alias in outputs_true:
+                 outputs_true[_t] = outputs_true.pop(_alias)
+ 
+@@ -828,9 +846,11 @@ def val_fn(params, batch: Dict[str, jnp.ndarray]):
+             adaptive_alphas, adaptive_scales = transform_adaptive_robust_params(alpha_raw, scale_raw)
+ 
+         for target in targets:
+-            target_mae_fn = property_to_mae[target]
++            base_target = _base_target(target)
++            y_pred = outputs_predict[_prediction_key(target, outputs_predict)]
++            target_mae_fn = property_to_mae[base_target]
+             _mae = target_mae_fn(
+-                y=outputs_predict[target],
++                y=y_pred,
+                 y_label=outputs_true[target],
+                 scale=_scales[target],
+                 batch_segments=inputs['batch_segments'],
+@@ -848,9 +868,9 @@ def val_fn(params, batch: Dict[str, jnp.ndarray]):
+                 target_adaptive_alpha = adaptive_alphas[idx]
+                 target_adaptive_scale = adaptive_scales[idx]
+ 
+-            target_loss_fn = property_to_loss[target]
++            target_loss_fn = property_to_loss[base_target]
+             _mse = target_loss_fn(
+-                y=outputs_predict[target],
++                y=y_pred,
+                 y_label=outputs_true[target],
+                 scale=_scales[target],
+                 batch_segments=inputs['batch_segments'],
+diff --git a/tests/mlff_tests/test_finetune_long_range.py b/tests/mlff_tests/test_finetune_long_range.py
+new file mode 100644
+index 00000000..5345a41f
+--- /dev/null
++++ b/tests/mlff_tests/test_finetune_long_range.py
+@@ -0,0 +1,205 @@
++"""Fine-tuning on energy/force-only data without corrupting the long-range heads.
++
++Two mechanisms, both checked here at the model/loss level (the CLI runs live in
++tests/test_cli_finetune.py):
++
++* a residual energy readout (model.energy_residual_mlp_widths), trained with
++  `--strategy readout_only` on a frozen backbone. Attaching it must not change the
++  pretrained model: its last layer starts at zero.
++* anchor targets ('anchor_<quantity>', training.long_range_anchor_weights), which
++  pull the charges / a0 / C6 ratios towards a frozen copy of the pretrained model,
++  and the per-atom 'partial_charges' target they rely on.
++"""
++import functools
++import json
++import pathlib
++import pickle
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++import pytest
++from ase import Atoms
++from ml_collections import config_dict
++
++from so3lr.finetuning_strategies import resolve_finetuning_strategy
++from so3lr.mlff.config.from_config import (
++    _apply_finetune_model_overrides,
++    _fill_missing_params,
++    make_so3krates_sparse_from_config,
++)
++from so3lr.mlff.data.dataloader_sparse_ase import ASE_to_jraph
++from so3lr.mlff.nn.stacknet.observable_function_sparse import (
++    get_energy_and_force_fn_sparse,
++    get_long_range_anchor_fn_sparse,
++)
++from so3lr.mlff.utils import training_utils
++from so3lr.mlff.utils.param_utils import count_trainable_params
++
++MODELS_DIR = pathlib.Path(__file__).resolve().parents[2] / 'so3lr' / 'models'
++MODEL = 'so3lr-tauri-s-2606'
++
++
++def _water_inputs():
++    return dict(
++        positions=jnp.array([[0., 0., 0.], [0.96, 0., 0.], [-0.24, 0.93, 0.]]),
++        atomic_numbers=jnp.array([8, 1, 1]),
++        idx_i=jnp.array([0, 0, 1, 1, 2, 2]), idx_j=jnp.array([1, 2, 0, 2, 0, 1]),
++        idx_i_lr=jnp.array([0, 0, 1, 1, 2, 2]), idx_j_lr=jnp.array([1, 2, 0, 2, 0, 1]),
++        batch_segments=jnp.zeros(3, dtype=int),
++        node_mask=jnp.ones(3, dtype=bool),
++        graph_mask=jnp.ones(1, dtype=bool),
++        total_charge=jnp.zeros(1), num_unpaired_electrons=jnp.zeros(1),
++        theory_mask=jnp.eye(16)[5].reshape(1, -1),
++    )
++
++
++@functools.lru_cache(maxsize=None)
++def _pretrained():
++    d = MODELS_DIR / MODEL
++    hyper = json.loads((d / 'hyperparameters.json').read_text())
++    params = training_utils.expand_observables_to_theory_levels(
++        pickle.load(open(d / 'params.pkl', 'rb'))
++    )
++    return hyper, params
++
++
++def _net(residual_widths=None, residual_inputs=None, intermediates=None):
++    hyper, _ = _pretrained()
++    cfg = config_dict.ConfigDict(json.loads(json.dumps(hyper)))
++    override = config_dict.ConfigDict({
++        'energy_residual_mlp_widths': residual_widths,
++        'energy_residual_inputs': residual_inputs,
++    })
++    _apply_finetune_model_overrides(override, cfg.model)
++    return make_so3krates_sparse_from_config(cfg, output_intermediate_quantities=intermediates)
++
++
++def _with_residual(net):
++    """Pretrained params plus the fresh residual readout, as run_fine_tuning builds them."""
++    _, params = _pretrained()
++    fresh = net.init(jax.random.PRNGKey(0), _water_inputs())
++    return _fill_missing_params(params, fresh)
++
++
++@pytest.mark.parametrize('residual_inputs', [None, 'all_layers'])
++def test_residual_readout_leaves_the_pretrained_model_unchanged(residual_inputs):
++    """Zero last layer: energy and forces are the pretrained ones (up to the
++    floating-point reassociation a different XLA fusion may bring)."""
++    base_net = _net()
++    _, params = _pretrained()
++    net = _net([32, 16], residual_inputs)
++    merged, filled = _with_residual(net)
++
++    assert filled and all('energy_residual' in p for p in filled), filled
++    base = get_energy_and_force_fn_sparse(base_net)(params, **_water_inputs())
++    new = get_energy_and_force_fn_sparse(net)(merged, **_water_inputs())
++    np.testing.assert_allclose(np.asarray(new['energy']), np.asarray(base['energy']), rtol=1e-6)
++    # float32 GPU sums run in no fixed order: a few 1e-6 eV/A between the two programs
++    np.testing.assert_allclose(np.asarray(new['forces']), np.asarray(base['forces']),
++                               rtol=1e-5, atol=1e-5)
++
++    # ...but it is not dead: a non-zero last layer moves the energy.
++    bumped = jax.tree_util.tree_map(lambda a: a, merged)
++    final = bumped['params']['observables_0']['energy_residual_dense_final']
++    final['kernel'] = jnp.ones_like(final['kernel'])
++    moved = get_energy_and_force_fn_sparse(net)(bumped, **_water_inputs())
++    assert not np.allclose(np.asarray(moved['energy']), np.asarray(base['energy']))
++
++
++def test_all_layers_input_is_wider_than_the_last_layer():
++    hyper, _ = _pretrained()
++    net = _net([16], 'all_layers')
++    merged, _ = _with_residual(net)
++    kernel = merged['params']['observables_0']['energy_residual_dense_0']['kernel']
++    m = hyper['model']
++    assert kernel.shape == ((m['num_layers'] + 1) * m['num_features'], 16)
++
++
++def test_readout_only_trains_the_readouts_and_freezes_the_long_range_heads():
++    hyper, _ = _pretrained()
++    net = _net([32, 16])
++    merged, _ = _with_residual(net)
++    trainable_keys, frozen_keys = resolve_finetuning_strategy(
++        'readout_only', hyper['model']['num_layers']
++    )
++    assert frozen_keys is None
++    obs0 = merged['params']['observables_0']
++    readouts = {k: v for k, v in obs0.items()
++                if k.startswith(('energy_dense', 'energy_residual'))
++                or k in ('energy_offset', 'atomic_scales')}
++    expected = sum(int(np.prod(np.shape(x))) for x in jax.tree_util.tree_leaves(readouts))
++    assert count_trainable_params(merged, trainable_keys=trainable_keys) == expected
++
++    # The charge, a0 and C6 heads, and the whole backbone, are frozen.
++    labels = training_utils.make_annotation_fn(trainable_keys)(merged)['params']
++    assert set(jax.tree_util.tree_leaves(labels['observables_0']['electrostatic_energy'])) == {'frozen'}
++    for name in ('observables_2', 'observables_3', 'layers_0'):
++        assert set(jax.tree_util.tree_leaves(labels[name])) == {'frozen'}
++
++
++def test_a_changed_residual_readout_is_refused():
++    """Fine-tuning a fine-tuned model must keep its residual readout's shape."""
++    model = config_dict.ConfigDict({'energy_residual_mlp_widths': [64]})
++    with pytest.raises(ValueError, match='already has model.energy_residual_mlp_widths'):
++        _apply_finetune_model_overrides(
++            config_dict.ConfigDict({'energy_residual_mlp_widths': [32]}), model
++        )
++    # A residual saved without energy_residual_inputs was built with the default 'last'.
++    with pytest.raises(ValueError, match='already has model.energy_residual_inputs'):
++        _apply_finetune_model_overrides(
++            config_dict.ConfigDict({'energy_residual_inputs': 'all_layers'}),
++            config_dict.ConfigDict({'energy_residual_mlp_widths': [64]}),
++        )
++    with pytest.raises(ValueError, match='energy_residual_mlp_widths is not'):
++        _apply_finetune_model_overrides(
++            config_dict.ConfigDict({'energy_residual_inputs': 'all_layers'}),
++            config_dict.ConfigDict({'num_layers': 2}),
++        )
++
++
++def test_anchor_targets_vanish_at_the_teacher_and_grow_away_from_it():
++    """'anchor_<q>' scores the model's <q> against the label put into the batch;
++    with the pretrained model's own prediction as label it is exactly zero."""
++    net = _net(intermediates=['partial_charges'])
++    _, params = _pretrained()
++    keys = ['partial_charges', 'a0_ratios', 'c6_ratios', 'dipole_vec']
++    teacher = get_long_range_anchor_fn_sparse(net, keys)(params, **_water_inputs())
++    assert set(teacher) == set(keys)
++
++    weights = {'forces': 1.0}
++    weights.update({training_utils.ANCHOR_PREFIX + k: 1.0 for k in keys})
++    loss_fn = training_utils.make_loss_fn(get_energy_and_force_fn_sparse(net), weights=weights)
++    batch = dict(_water_inputs())
++    batch['forces'] = get_energy_and_force_fn_sparse(net)(params, **_water_inputs())['forces']
++    batch.update({training_utils.ANCHOR_PREFIX + k: v for k, v in teacher.items()})
++    _, metrics = loss_fn(params, batch)
++    for k in keys:
++        assert np.asarray(metrics[f'anchor_{k}_mse']).item() == pytest.approx(0.0, abs=1e-12)
++
++    batch['anchor_partial_charges'] = teacher['partial_charges'] + jnp.array([0.1, -0.05, -0.05])
++    _, metrics = loss_fn(params, batch)
++    assert np.asarray(metrics['anchor_partial_charges_mse']).item() > 1e-3
++
++
++def test_hirshfeld_spelling_anchors_the_a0_head():
++    """The legacy name works for the current generation, as for ordinary targets."""
++    net = _net()
++    _, params = _pretrained()
++    out = get_long_range_anchor_fn_sparse(net, ['hirshfeld_ratios', 'a0_ratios'])(
++        params, **_water_inputs())
++    loss_fn = training_utils.make_loss_fn(
++        get_energy_and_force_fn_sparse(net), weights={'anchor_hirshfeld_ratios': 1.0})
++    batch = dict(_water_inputs(), anchor_hirshfeld_ratios=out['a0_ratios'])
++    loss, _ = loss_fn(params, batch)
++    assert float(loss) == pytest.approx(0.0, abs=1e-12)
++
++
++def test_partial_charges_are_read_from_extxyz_and_nan_when_absent():
++    atoms = Atoms('OH2', positions=[[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]])
++    graph, _ = ASE_to_jraph(atoms, cutoff=5.0, calculate_neighbors_lr=False)
++    assert np.isnan(graph.nodes['partial_charges']).all()
++
++    atoms.arrays['partial_charges'] = np.array([-0.8, 0.4, 0.4])
++    graph, _ = ASE_to_jraph(atoms, cutoff=5.0, calculate_neighbors_lr=False)
++    np.testing.assert_allclose(graph.nodes['partial_charges'], [-0.8, 0.4, 0.4])
+diff --git a/tests/test_cli_finetune.py b/tests/test_cli_finetune.py
+index d6c33d39..1ca44d5f 100644
+--- a/tests/test_cli_finetune.py
++++ b/tests/test_cli_finetune.py
+@@ -198,3 +198,87 @@ def test_cli_finetune_water_pbc(workdir, test_config_water):
+     assert total is not None and trainable == total, (
+         f"strategy=full trained {trainable}/{total} parameters"
+     )
++
++
++def _write_config(test_config, tmp_path, name, **sections):
++    """`test_config` with extra (nested) sections merged in."""
++    with open(test_config) as f:
++        cfg = yaml.safe_load(f)
++    for section, values in sections.items():
++        cfg.setdefault(section, {})
++        cfg[section].update(values)
++    path = tmp_path / name
++    with open(path, 'w') as f:
++        yaml.dump(cfg, f)
++    return path
++
++
++def test_cli_finetune_readout_only_keeps_the_long_range_heads(workdir, test_config, tmp_path):
++    """A residual readout on a frozen backbone: the charge, a0 and C6 heads and the
++    backbone come out of training bit-identical, the residual readout does not."""
++    import numpy as np
++    import jax
++    from so3lr.model_registry import resolve_model
++    from so3lr.mlff.utils import checkpoint_utils
++
++    config = _write_config(
++        test_config, tmp_path, 'readout_only.yaml',
++        model={'energy_residual_mlp_widths': [32], 'energy_residual_inputs': 'all_layers'},
++    )
++    result = subprocess.run(
++        [
++            'so3lr', 'finetune',
++            '--datafile', str(DATAFILE),
++            '--workdir', str(workdir),
++            '--num-train', '20',
++            '--num-valid', '5',
++            '--config', str(config),
++            '--strategy', 'readout_only',
++        ],
++        capture_output=True,
++        text=True,
++        timeout=180,
++        env=so3lr_subprocess_env(),
++    )
++    _assert_finetuning_succeeded(result, workdir, max_loss=0.1)
++    assert 'Residual energy readout: initialised' in (result.stdout + result.stderr)
++
++    before = checkpoint_utils.load_params_from_workdir(resolve_model(None).dir)['params']
++    after = checkpoint_utils.load_params_from_workdir(workdir)['params']
++    for path in (('observables_0', 'electrostatic_energy'), ('observables_2',),
++                 ('observables_3',), ('layers_0',)):
++        a, b = before, after
++        for key in path:
++            a, b = a[key], b[key]
++        for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b)):
++            np.testing.assert_array_equal(np.asarray(x), np.asarray(y), err_msg=str(path))
++    residual = after['observables_0']['energy_residual_dense_final']['kernel']
++    assert np.abs(np.asarray(residual)).max() > 0, 'the residual readout did not train'
++
++
++@pytest.mark.slow
++def test_cli_finetune_with_long_range_anchors(workdir, test_config, tmp_path):
++    """Full fine-tuning with the charges / a0 / C6 anchored to the pretrained model:
++    the anchor terms are scored (and logged) next to the forces."""
++    config = _write_config(
++        test_config, tmp_path, 'anchored.yaml',
++        training={'long_range_anchor_weights': {'partial_charges': 1.0, 'a0_ratios': 1.0,
++                                                'c6_ratios': 1.0}},
++    )
++    result = subprocess.run(
++        [
++            'so3lr', 'finetune',
++            '--datafile', str(DATAFILE),
++            '--workdir', str(workdir),
++            '--num-train', '20',
++            '--num-valid', '5',
++            '--config', str(config),
++            '--strategy', 'full',
++        ],
++        capture_output=True,
++        text=True,
++        timeout=240,
++        env=so3lr_subprocess_env(),
++    )
++    _assert_finetuning_succeeded(result, workdir, max_loss=0.2)
++    assert 'anchor_partial_charges' in (result.stdout + result.stderr)
+diff --git a/tests/test_finetuning_strategies.py b/tests/test_finetuning_strategies.py
+index e1b80250..fffdc4a3 100644
+--- a/tests/test_finetuning_strategies.py
++++ b/tests/test_finetuning_strategies.py
+@@ -102,10 +102,13 @@ def test_strategy_selects_real_parameters(strategy, model_name):
+         )
+ 
+     # Every key must select something, so a typo or a renamed head cannot pass
+-    # unnoticed. The legacy `so3lr` checkpoint genuinely has no C6 head.
++    # unnoticed. The legacy `so3lr` checkpoint genuinely has no C6 head, and no
++    # shipped checkpoint has the residual readout, which fine-tuning creates.
+     if model_name == 'so3lr' and (strategy in _OBS_3_STRATEGIES
+                                   or strategy in ('freeze_long_range', 'forces_only')):
+         assert unmatched == ['observables_3']
++    elif strategy == 'readout_only':
++        assert unmatched == ['observables_0/energy_residual*']
+     else:
+         assert unmatched == [], f'{strategy} on {model_name}: {unmatched} match nothing'
+ 

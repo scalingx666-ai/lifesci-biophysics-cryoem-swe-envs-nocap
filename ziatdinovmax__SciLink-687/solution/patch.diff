@@ -1,0 +1,231 @@
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index 5df1d17f..f5e87aad 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -647,13 +647,16 @@ def set_meta_mode(self, mode: MetaMode) -> None:
+         self.meta_mode = mode
+         self._enable_human_feedback = self._should_enable_human_feedback()
+ 
+-        new_system_prompt = get_system_prompt(mode) + self._kb_note()
+-        self._system_prompt = new_system_prompt
+-        if self.messages and self.messages[0]["role"] == "system":
+-            self.messages[0]["content"] = new_system_prompt
+-
++        self._refresh_system_prompt()
+         logging.info(f"🔄 Meta mode changed: {old_mode.value} → {mode.value}")
+ 
++    def _refresh_system_prompt(self) -> None:
++        """Rebuild the system prompt (the mode's prompt plus the knowledge
++        base note) and put it in the message history."""
++        self._system_prompt = get_system_prompt(self.meta_mode) + self._kb_note()
++        if self.messages and self.messages[0]["role"] == "system":
++            self.messages[0]["content"] = self._system_prompt
++
+     @staticmethod
+     def _kb_source_names(kb_dir: Path) -> list:
+         """Source-document basenames of a KB dir (best-effort, index files
+@@ -674,16 +677,55 @@ def _kb_source_names(kb_dir: Path) -> list:
+         except Exception:  # noqa: BLE001 - listing is best-effort context
+             return []
+ 
++    @staticmethod
++    def _sources_detail(srcs) -> str:
++        """' Sources: a, b, c.' for a prompt note, at most 15 names, with a
++        count of the rest so a document left off the list is not read as
++        absent from the KB."""
++        srcs = [str(x) for x in (srcs or [])]
++        if not srcs:
++            return ""
++        more = f" (+{len(srcs) - 15} more)" if len(srcs) > 15 else ""
++        return f" Sources: {', '.join(srcs[:15])}{more}."
++
++    def _attached_kb_note(self) -> str:
++        """System-prompt note naming the attached knowledge base. Without it
++        the meta's model was never told a KB was attached (the note below
++        lists only detached ones), and live it searched uploads for facts
++        the KB held instead of delegating to planning, which is grounded in
++        it."""
++        kb = Path(self.knowledge_dir)
++        manifest = None
++        try:
++            from ...knowledge.kb_store import read_manifest
++            manifest = read_manifest(kb)
++        except Exception:  # noqa: BLE001 - the note is best-effort context
++            manifest = None
++        if manifest and manifest.get("name"):
++            label = f"'{manifest['name']}'"
++            if manifest.get("description"):
++                label += f" — {manifest['description']}"
++            srcs = list(manifest.get("sources") or [])
++        else:
++            label = str(kb)
++            srcs = self._kb_source_names(kb)
++        detail = self._sources_detail(srcs)
++        return (
++            "\n\n## KNOWLEDGE BASE (attached)\n"
++            f"- {label} at {kb}.{detail}\n"
++            "Every planning delegation is grounded in it, so a task that needs "
++            "what it records goes to `delegate_to_planning`."
++        )
++
+     def _kb_note(self) -> str:
+-        """System-prompt note listing detached knowledge bases: the launch
+-        directory's shared KB (if any) plus the named KBs from the
+-        persistent store."""
++        """System-prompt note on knowledge bases: the attached one, or else
++        the detached ones (the launch directory's shared KB, if any, plus
++        the named KBs from the persistent store)."""
+         if self.knowledge_dir:
+-            return ""
++            return self._attached_kb_note()
+         lines = []
+         if self._shared_kb_candidate:
+-            srcs = self._kb_source_names(self._shared_kb_candidate)[:15]
+-            detail = f" Sources: {', '.join(srcs)}." if srcs else ""
++            detail = self._sources_detail(self._kb_source_names(self._shared_kb_candidate))
+             lines.append(
+                 f"- (unnamed, launch directory) {self._shared_kb_candidate} — "
+                 f"attach with attach_knowledge_base() [no argument].{detail}"
+@@ -692,8 +734,7 @@ def _kb_note(self) -> str:
+             from ...knowledge.kb_store import list_kbs
+             for m in list_kbs():
+                 desc = f" — {m['description']}" if m.get("description") else ""
+-                srcs = (m.get("sources") or [])[:15]
+-                detail = f" Sources: {', '.join(srcs)}." if srcs else ""
++                detail = self._sources_detail(m.get("sources"))
+                 lines.append(
+                     f"- '{m['name']}'{desc} — attach with "
+                     f"attach_knowledge_base(path='{m['name']}').{detail}"
+@@ -765,7 +806,7 @@ def attach_knowledge_dir(self, path: Optional[str] = None) -> str:
+                 child.planner.rebind_kb(str(target / "default_kb"))
+ 
+         # The detached-KB note no longer applies — refresh the system prompt.
+-        self.set_meta_mode(self.meta_mode)
++        self._refresh_system_prompt()
+         self._auto_checkpoint()
+         logging.info(f"📚 Knowledge base attached: {target}")
+         return str(target)
+@@ -1114,6 +1155,9 @@ def add_documents_to_kb(self, paths: List[str],
+             cache = child.base_dir / "kb_cache"
+             snapshot_kb(self.knowledge_dir, cache)
+             child.planner.rebind_kb(str(cache / "default_kb"))
++        # The attached-KB note lists the sources: refresh it, or the model
++        # routes on a list without the document it just added.
++        self._refresh_system_prompt()
+         return updated
+ 
+     def register_skill(self, skill_path: str) -> str:
+diff --git a/tests/test_meta_attached_kb_note.py b/tests/test_meta_attached_kb_note.py
+new file mode 100644
+index 00000000..1b42b344
+--- /dev/null
++++ b/tests/test_meta_attached_kb_note.py
+@@ -0,0 +1,108 @@
++"""The meta's prompt names the knowledge base that is attached.
++
++`_kb_note` listed only DETACHED knowledge bases and returned "" once one was
++attached, so the meta's model was never told a KB was attached, although the
++meta passes it to its planning child. Live, asked for a plan that needed facts
++recorded in the attached KB, the meta searched uploads and session state and
++never delegated to planning.
++"""
++
++import json
++from pathlib import Path
++
++import pytest
++
++from scilink.agents.meta_agent.meta_orchestrator import (
++    MetaMode, MetaOrchestratorAgent, get_system_prompt)
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("SCILINK_HOME", str(tmp_path / "home"))
++    return tmp_path / "home"
++
++
++def _store_kb(home: Path, name="lab-kb", sources=("lab.md",), description=""):
++    d = home / "knowledge_bases" / name
++    d.mkdir(parents=True)
++    (d / "manifest.json").write_text(json.dumps(
++        {"name": name, "embedding_model": "m", "sources": list(sources),
++         "description": description}))
++    return d
++
++
++def _meta(knowledge_dir=None):
++    m = MetaOrchestratorAgent.__new__(MetaOrchestratorAgent)
++    m.knowledge_dir = knowledge_dir
++    m._shared_kb_candidate = None
++    m.meta_mode = MetaMode.AUTONOMOUS
++    m.messages = [{"role": "system", "content": "stale"}]
++    return m
++
++
++def test_an_attached_store_kb_is_named_with_its_sources(home):
++    kb = _store_kb(home, description="lab records for batch A7")
++    note = _meta(kb)._kb_note()
++    assert "KNOWLEDGE BASE (attached)" in note
++    assert "'lab-kb'" in note and "lab records for batch A7" in note and "lab.md" in note
++    assert "delegate_to_planning" in note
++    assert "NOT attached" not in note
++
++
++def test_an_attached_plain_directory_is_named_by_path(home, tmp_path):
++    d = tmp_path / "my_kb"
++    d.mkdir()
++    (d / "default_kb_docs.sources.json").write_text(json.dumps([{"path": "x", "files": ["notes.pdf"]}]))
++    note = _meta(d)._kb_note()
++    assert str(d) in note and "notes.pdf" in note and "(attached)" in note
++
++
++def test_detached_kbs_are_still_listed_when_none_is_attached(home):
++    _store_kb(home, name="other-kb", sources=("paper.pdf",))
++    note = _meta(None)._kb_note()
++    assert "KNOWLEDGE BASES (detached)" in note and "'other-kb'" in note
++    assert "(attached)" not in note
++
++
++def test_attaching_moves_the_prompt_from_detached_to_attached(home):
++    kb = _store_kb(home)
++    m = _meta(None)
++    m.set_meta_mode(MetaMode.AUTONOMOUS)
++    assert "NOT attached" in m.messages[0]["content"]
++    m.knowledge_dir = kb                      # what attach_knowledge_dir sets
++    m.set_meta_mode(m.meta_mode)              # and how it refreshes the prompt
++    prompt = m.messages[0]["content"]
++    assert prompt.startswith(get_system_prompt(MetaMode.AUTONOMOUS))
++    assert "(attached)" in prompt and "'lab-kb'" in prompt and "NOT attached" not in prompt
++
++
++def test_adding_to_the_attached_kb_refreshes_the_listed_sources(home, tmp_path, monkeypatch):
++    from scilink.knowledge import kb_store
++
++    def fake_build(target, *a, **k):
++        for suffix, data in ((".faiss", b"i"), (".json", "[]"), (".sources.json", "[]")):
++            f = (target / "default_kb_docs").with_suffix(suffix)
++            f.write_bytes(data) if isinstance(data, bytes) else f.write_text(data)
++        return 1, 1
++
++    monkeypatch.setattr(kb_store, "_build_index_into", fake_build)
++    monkeypatch.setattr(kb_store, "_append_index_into", lambda t, n, *a, **k: (len(n), len(n)))
++    base = tmp_path / "base.md"
++    base.write_text("base")
++    kb_store.create_kb("lab-kb", [str(base)], embedding_model="m")
++    m = _meta(kb_store.kb_path("lab-kb"))
++    m.embedding_api_key = m.embedding_base_url = m.base_url = None
++    m.embedding_model = "m"
++    m._children = {}
++    m.set_meta_mode(MetaMode.AUTONOMOUS)
++    assert "base.md" in m.messages[0]["content"] and "new_record.md" not in m.messages[0]["content"]
++    new = tmp_path / "new_record.md"
++    new.write_text("more")
++    m.add_documents_to_kb([str(new)])
++    assert "new_record.md" in m.messages[0]["content"]
++
++
++def test_a_long_source_list_says_how_many_more(home):
++    kb = _store_kb(home, sources=[f"doc{i:02d}.pdf" for i in range(20)])
++    note = _meta(kb)._kb_note()
++    assert "doc14.pdf" in note and "doc15.pdf" not in note and "(+5 more)" in note

@@ -1,0 +1,705 @@
+diff --git a/cryosparc/column.py b/cryosparc/column.py
+index 52b630d9..3e84ee69 100644
+--- a/cryosparc/column.py
++++ b/cryosparc/column.py
+@@ -68,6 +68,15 @@ def __array_wrap__(self, obj, context=None, return_scalar=False):
+         # or n.median
+         return obj[()] if obj.shape == () else super().__array_wrap__(obj, context, return_scalar)  # type: ignore
+ 
++    def __setitem__(self, key, value):
++        if isinstance(value, n.ndarray):
++            # parse fixed-size size strings
++            if value.dtype.char == "S":
++                value = n.vectorize(hashcache(bytes.decode), otypes="O")(value)
++            elif value.dtype.char == "U":
++                value = n.vectorize(hashcache(str), otypes="O")(value)
++        return super().__setitem__(key, value)
++
+     def to_fixed(self) -> "Column":
+         """
+         If this Column is composed of Python objects, convert to fixed-size
+diff --git a/cryosparc/dataset.py b/cryosparc/dataset.py
+index 4790cbfe..d2486a24 100644
+--- a/cryosparc/dataset.py
++++ b/cryosparc/dataset.py
+@@ -61,15 +61,15 @@
+     decode_dataset_header,
+     encode_dataset_header,
+     fielddtype,
++    filter_descr,
+     get_data_field,
+     get_data_field_dtype,
+-    makefield,
+-    safe_makefield,
++    normalize_field,
+ )
+ from .errors import DatasetLoadError
+ from .row import R, Row, Spool
+ from .stream import AsyncBinaryIO, Streamable
+-from .util import bopen, default_rng, hashcache, random_integers, u32bytesle, u32intle
++from .util import bopen, default_rng, random_integers, u32bytesle, u32intle
+ 
+ if TYPE_CHECKING:
+     from numpy.typing import ArrayLike, DTypeLike, NDArray
+@@ -537,7 +537,40 @@ def common_fields(cls, *datasets: "Dataset", assert_same_fields=False) -> List[F
+         return [f for f in datasets[0].descr() if f in fields]
+ 
+     @classmethod
+-    def load(cls, file: Union[str, PurePath, IO[bytes]], cstrs: bool = False):
++    def inspect(cls, file: Union[str, PurePath]) -> DatasetHeader:
++        """
++        Given a path to a dataset file, get information included in its header.
++
++        Args:
++            file: (str | Path): Readable file path.
++
++        Returns:
++            DatasetHeader: Dictionary with dataset
++
++        """
++        try:
++            with open(file, "rb") as f:
++                prefix = f.read(6)
++                if prefix == FORMAT_MAGIC_PREFIXES[NUMPY_FORMAT]:
++                    f.seek(0)  # will be done after context block for mmapping
++                elif prefix == FORMAT_MAGIC_PREFIXES[CSDAT_FORMAT]:
++                    return cls._load_stream_header(f)
++                else:
++                    raise ValueError(f"Could not determine dataset format (prefix is {prefix})")
++            # numpy format
++            return cls._load_numpy_header(file)
++        except Exception as err:
++            raise DatasetLoadError(f"Could not load dataset from file {file}") from err
++
++    @classmethod
++    def load(
++        cls,
++        file: Union[str, PurePath, IO[bytes]],
++        *,
++        prefixes: Optional[Sequence[str]] = None,
++        fields: Optional[Sequence[str]] = None,
++        cstrs: bool = False,
++    ):
+         """
+         Read a dataset from path or file handle.
+ 
+@@ -549,6 +582,10 @@ def load(cls, file: Union[str, PurePath, IO[bytes]], cstrs: bool = False):
+             file (str | Path | IO): Readable file path or handle. Must be
+                 seekable if loading a dataset saved in the default
+                 ``NUMPY_FORMAT``
++            prefixes (list[str], optional): Which field prefixes to load. If
++                not specified, loads either all or specified `fields`.
++            fields (list[str], optional): Which fields to load. If not
++                specified, loads either all or specified `prefixes`.
+             cstrs (bool): If True, load internal string columns as C strings
+                 instead of Python strings. Defaults to False.
+ 
+@@ -563,48 +600,119 @@ def load(cls, file: Union[str, PurePath, IO[bytes]], cstrs: bool = False):
+             with bopen(file, "rb") as f:
+                 prefix = f.read(6)
+                 if prefix == FORMAT_MAGIC_PREFIXES[NUMPY_FORMAT]:
+-                    f.seek(0)
+-                    indata = n.load(f, allow_pickle=False)
+-                    dset = cls(indata)
+-                    if cstrs:
+-                        dset.to_cstrs()
+-                    return dset
+-                elif prefix != FORMAT_MAGIC_PREFIXES[CSDAT_FORMAT]:
+-                    raise TypeError(f"Could not determine dataset format (prefix is {prefix})")
+-
+-                headersize = u32intle(f.read(4))
+-                header = decode_dataset_header(f.read(headersize))
+-
+-                # Calling addrows separately to minimizes column-based
+-                # allocations, improves performance by ~20%
+-                dset = cls.allocate(0, header["dtype"])
+-                data = dset._data
+-                data.addrows(header["length"])
+-                loader = Stream(data)
+-                for field in header["dtype"]:
+-                    colsize = u32intle(f.read(4))
+-                    buffer = f.read(colsize)
+-                    if field[0] in header["compressed_fields"]:
+-                        loader.decompress_col(field[0], buffer)
+-                    else:
+-                        data.getbuf(field[0])[:] = buffer
+-
+-                # Read in the string heap (rest of stream)
+-                # NOTE: There will be a bug here for long column keys that are
+-                # added when there's already an allocated string in a T_STR
+-                # column in the saved dataset (should be rare).
+-                heap = f.read()
+-                data.setstrheap(heap)
+-
+-                # Convert C strings to Python strings
+-                loader.cast_objs_to_strs()  # dtype may be T_OBJ but actually all are T_STR
+-                if not cstrs:
+-                    dset.to_pystrs()
+-                return dset
+-
++                    f.seek(0)  # will be done after context block for mmapping
++                elif prefix == FORMAT_MAGIC_PREFIXES[CSDAT_FORMAT]:
++                    return cls._load_stream(
++                        f,
++                        prefixes=prefixes,
++                        fields=fields,
++                        cstrs=cstrs,
++                        seekable=isinstance(file, (str, PurePath)),
++                    )
++                else:
++                    raise ValueError(f"Could not determine dataset format (prefix is {prefix})")
++            # numpy
++            return cls._load_numpy(file, prefixes=prefixes, fields=fields, cstrs=cstrs)
+         except Exception as err:
+             raise DatasetLoadError(f"Could not load dataset from file {file}") from err
+ 
++    @classmethod
++    def _load_numpy_header(cls, file: Union[str, PurePath]) -> DatasetHeader:
++        indata = n.load(str(file), mmap_mode="r", allow_pickle=False)
++        fields = [normalize_field(f[0], fielddtype(f)) for f in indata.dtype.descr]
++        return DatasetHeader(length=len(indata), dtype=fields, compression=None, compressed_fields=[])
++
++    @classmethod
++    def _load_numpy(
++        cls,
++        file: Union[str, PurePath, IO[bytes]],
++        prefixes: Optional[Sequence[str]] = None,
++        fields: Optional[Sequence[str]] = None,
++        cstrs: bool = False,
++    ):
++        import os
++
++        # disable mmap by setting CRYOSPARC_DATASET_MMAP=false
++        if os.getenv("CRYOSPARC_DATASET_MMAP", "true").lower() == "true" and isinstance(file, (str, PurePath)):
++            # Use mmap to avoid loading full record array into memory
++            # cast path to a string for older numpy/python
++            mmap_mode, f = "r", str(file)
++            chunk_size = 2**14  # magic number optimizes memory and performance
++        else:
++            mmap_mode, f = None, file
++            chunk_size = 2**60  # huge enough number so you don't use chunks
++
++        indata = n.load(f, mmap_mode=mmap_mode, allow_pickle=False)
++        size = len(indata)
++        descr = filter_descr(indata.dtype.descr, keep_prefixes=prefixes, keep_fields=fields)
++        dset = cls.allocate(size, descr)
++        offset = 0
++        while offset < size:
++            end = min(offset + chunk_size, size)
++            chunk = indata[offset:end]
++            for field in descr:
++                dset[field[0]][offset:end] = chunk[field[0]]
++            offset += chunk_size
++            if mmap_mode and offset < size:
++                # reset mmap to avoid excessive memory usage
++                del indata
++                indata = n.load(f, mmap_mode=mmap_mode, allow_pickle=False)
++
++        if cstrs:
++            dset.to_cstrs()
++        return dset
++
++    @classmethod
++    def _load_stream_header(cls, f: IO[bytes]) -> DatasetHeader:
++        # NOTE: assumes prefix header bytes have already been read
++        headersize = u32intle(f.read(4))
++        return decode_dataset_header(f.read(headersize))
++
++    @classmethod
++    def _load_stream(
++        cls,
++        f: IO[bytes],
++        prefixes: Optional[Sequence[str]] = None,
++        fields: Optional[Sequence[str]] = None,
++        cstrs: bool = False,
++        seekable: bool = False,
++    ):
++        # NOTE: assumes prefix header bytes have already been read
++        header = cls._load_stream_header(f)
++        descr = filter_descr(header["dtype"], keep_prefixes=prefixes, keep_fields=fields)
++        field_names = {field[0] for field in descr}
++
++        # Calling addrows separately to minimizes column-based
++        # allocations, improves performance by ~20%
++        dset = cls.allocate(0, descr)
++        data = dset._data
++        data.addrows(header["length"])
++        loader = Stream(data)
++        for field in header["dtype"]:
++            colsize = u32intle(f.read(4))
++            if field[0] not in field_names:
++                # try to seek instead of read to reduce memory usage
++                f.seek(colsize, 1) if seekable else f.read(colsize)
++                continue  # skip fields that were not selected
++            buffer = f.read(colsize)
++            if field[0] in header["compressed_fields"]:
++                loader.decompress_col(field[0], buffer)
++            else:
++                data.getbuf(field[0])[:] = buffer
++
++        # Read in the string heap (rest of stream)
++        # NOTE: There will be a bug here for long column keys that are
++        # added when there's already an allocated string in a T_STR
++        # column in the saved dataset (should be rare).
++        heap = f.read()
++        data.setstrheap(heap)
++
++        # Convert C strings to Python strings
++        loader.cast_objs_to_strs()  # dtype may be T_OBJ but actually all are T_STR
++        if not cstrs:
++            dset.to_pystrs()
++        return dset
++
+     @classmethod
+     async def from_async_stream(cls, stream: AsyncBinaryIO):
+         headersize = u32intle(await stream.read(4))
+@@ -668,6 +776,9 @@ def stream(self, compression: Literal["lz4", None] = None) -> Generator[bytes, N
+         ``format=CSDAT_FORMAT``. Call ``Dataset.load`` on the resulting
+         file/buffer to retrieve the original data.
+ 
++        Args:
++            compression (Literal["lz4", None], optional):
++
+         Yields:
+             bytes: Dataset file chunks
+         """
+@@ -679,7 +790,10 @@ def stream(self, compression: Literal["lz4", None] = None) -> Generator[bytes, N
+         compressed_fields = [f for f in self if compression and f not in NEVER_COMPRESS_FIELDS]
+         header = encode_dataset_header(
+             DatasetHeader(
+-                length=len(self), dtype=self.descr(), compression=compression, compressed_fields=compressed_fields
++                length=len(self),
++                dtype=self.descr(),
++                compression=compression,
++                compressed_fields=compressed_fields,
+             )
+         )
+         yield u32bytesle(len(header))
+@@ -734,16 +848,16 @@ def __init__(
+         elif isinstance(allocate, n.ndarray):  # record array
+             for field in allocate.dtype.descr:
+                 assert field[0], f"Cannot initialize with record array of dtype {allocate.dtype}"
+-                field = ("uid", "u8") if field[0] == "uid" else field
+-                populate.append((field, allocate[field[0]]))
++                a = allocate[field[0]]
++                populate.append((normalize_field(field[0], fielddtype(field)), a))
+         elif isinstance(allocate, Mapping):
+             for f, v in allocate.items():
+                 a = n.asarray(v)
+-                populate.append((safe_makefield(f, arraydtype(a)), a))
++                populate.append((normalize_field(f, arraydtype(a)), a))
+         else:
+             for f, v in allocate:
+                 a = n.asarray(v)
+-                populate.append((safe_makefield(f, arraydtype(a)), a))
++                populate.append((normalize_field(f, arraydtype(a)), a))
+ 
+         # Check that all entries are the same length
+         nrows = 0
+@@ -818,11 +932,6 @@ def __setitem__(self, key: str, val: "ArrayLike"):
+             val (ArrayLike): numpy array or value to assign
+         """
+         assert self._data.has(key), f"Cannot set non-existing dataset key {key}; use add_fields() first"
+-        if isinstance(val, n.ndarray):
+-            if val.dtype.char == "S":
+-                val = n.vectorize(hashcache(bytes.decode), otypes="O")(val)
+-            elif val.dtype.char == "U":
+-                val = n.vectorize(hashcache(str), otypes="O")(val)
+         self[key][:] = val
+ 
+     def __delitem__(self, key: str):
+@@ -1021,7 +1130,7 @@ def add_fields(
+         if dtypes:
+             dt = dtypes.split(",") if isinstance(dtypes, str) else dtypes
+             assert len(fields) == len(dt), "Incorrect dtype spec"
+-            desc = [safe_makefield(str(f), dt) for f, dt in zip(fields, dt)]
++            desc = [normalize_field(str(f), dt) for f, dt in zip(fields, dt)]
+         else:
+             desc = fields  # type: ignore
+ 
+@@ -1210,7 +1319,7 @@ def copy_fields(self, old_fields: List[str], new_fields: List[str]):
+         assert len(old_fields) == len(new_fields), "Number of old and new fields must match"
+         current_fields = self.fields()
+         missing_fields = [
+-            makefield(new, get_data_field_dtype(self._data, old))
++            normalize_field(new, get_data_field_dtype(self._data, old))
+             for old, new in zip(old_fields, new_fields)
+             if new not in current_fields
+         ]
+diff --git a/cryosparc/dtype.py b/cryosparc/dtype.py
+index 0e7dd7f0..c5e350ba 100644
+--- a/cryosparc/dtype.py
++++ b/cryosparc/dtype.py
+@@ -3,10 +3,10 @@
+ """
+ 
+ import json
+-from typing import TYPE_CHECKING, Dict, List, Tuple, Type, Union
++from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type, Union
+ 
+ import numpy as n
+-from typing_extensions import Literal, TypedDict
++from typing_extensions import Literal, Sequence, TypedDict
+ 
+ from .core import Data, DsetType
+ 
+@@ -42,13 +42,22 @@
+ 
+ class DatasetHeader(TypedDict):
+     """
+-    Dataset header description when saving in CSDAT format.
++    Encoded dataset file description.
+     """
+ 
+     length: int
++    """Number of rows in the dataset"""
++
+     dtype: List[Field]
++    """
++    Column description
++    """
++
+     compression: Literal["lz4", None]
++    """Compression library used for in the dataset"""
++
+     compressed_fields: List[str]
++    """Field names that require decompression."""
+ 
+ 
+ DSET_TO_TYPE_MAP: Dict[DsetType, Type] = {
+@@ -84,13 +93,18 @@ class DatasetHeader(TypedDict):
+ NEVER_COMPRESS_FIELDS = {"uid"}
+ 
+ 
+-def makefield(name: str, dtype: "DTypeLike") -> Field:
++def normalize_field(name: str, dtype: "DTypeLike") -> Field:
++    # Note: field name "uid" is always uint64, regardless of given dtype
++    # Note: sd
+     dt = n.dtype(dtype)
+-    return (name, dt.base.str, dt.shape) if dt.shape else (name, dt.str)
+-
+-
+-def safe_makefield(name: str, dtype: "DTypeLike") -> Field:
+-    return ("uid", n.dtype(n.uint64).str) if name == "uid" else makefield(name, dtype)
++    if name == "uid":
++        return name, n.dtype(n.uint64).str
++    elif dt.char in {"O", "S", "U"}:  # all python string object types
++        return name, n.dtype(object).str
++    elif dt.shape:
++        return name, dt.base.str, dt.shape
++    else:
++        return name, dt.str
+ 
+ 
+ def fielddtype(field: Field) -> DType:
+@@ -113,7 +127,7 @@ def dtypestr(dtype: "DTypeLike") -> str:
+ 
+ 
+ def get_data_field(data: Data, field: str) -> Field:
+-    return makefield(field, get_data_field_dtype(data, field))
++    return normalize_field(field, get_data_field_dtype(data, field))
+ 
+ 
+ def get_data_field_dtype(data: Data, field: str) -> "DTypeLike":
+@@ -125,6 +139,27 @@ def get_data_field_dtype(data: Data, field: str) -> "DTypeLike":
+     return (dt.str, shape) if shape else dt.str
+ 
+ 
++def filter_descr(
++    descr: List[Field],
++    *,
++    keep_prefixes: Optional[Sequence[str]] = None,
++    keep_fields: Optional[Sequence[str]] = None,
++) -> List[Field]:
++    # Get a filtered list of fields based on the user-specified prefixies
++    # and/or fields. Returns all fields if no filter params are specified.
++    # Always returns at least uid field, if it exists.
++    filtered: List[Field] = []
++    for field in descr:
++        if (
++            field[0] == "uid"
++            or (keep_prefixes is None and keep_fields is None)
++            or (keep_prefixes is not None and any(field[0].startswith(f"{p}/") for p in keep_prefixes))
++            or (keep_fields is not None and field[0] in keep_fields)
++        ):
++            filtered.append(field)
++    return filtered
++
++
+ def encode_dataset_header(fields: DatasetHeader) -> bytes:
+     return json.dumps(fields).encode()
+ 
+@@ -152,6 +187,11 @@ def decode_dataset_header(data: Union[bytes, dict]) -> DatasetHeader:
+         compression: Literal["lz4", None] = header["compression"]
+         compressed_fields: List[str] = header["compressed_fields"]
+ 
+-        return DatasetHeader(length=length, dtype=dtype, compression=compression, compressed_fields=compressed_fields)
++        return DatasetHeader(
++            length=length,
++            dtype=dtype,
++            compression=compression,
++            compressed_fields=compressed_fields,
++        )
+     except Exception as e:
+         raise ValueError(f"Incorrect dataset field format: {data.decode() if isinstance(data, bytes) else data}") from e
+diff --git a/cryosparc/job.py b/cryosparc/job.py
+index fe71f2f4..14ccf40d 100644
+--- a/cryosparc/job.py
++++ b/cryosparc/job.py
+@@ -1517,7 +1517,7 @@ def save_output(self, name: str, dataset: Dataset, *, refresh: bool = True):
+ 
+         """
+         url = f"/external/projects/{self.project_uid}/jobs/{self.uid}/outputs/{name}/dataset"
+-        with make_request(self.cs.vis, url=url, data=dataset.stream()) as res:
++        with make_request(self.cs.vis, url=url, data=dataset.stream(compression="lz4")) as res:
+             result = res.read().decode()
+             assert res.status >= 200 and res.status < 400, f"Save output failed with message: {result}"
+         if refresh:
+diff --git a/tests/conftest.py b/tests/conftest.py
+index de700483..0d2b0b7a 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -295,18 +295,14 @@ def request_callback_rtp(request, uri, response_headers):
+ 
+ 
+ @pytest.fixture(scope="session")
+-def big_dset():
++def big_dset_path():
+     basename = "bench_big_dset"
+     existing_path = Path.home() / f"{basename}.cs"
+ 
+     print("")  # Keeps printing clean
+     if existing_path.exists():
+         print(f"Using local sample data {existing_path}; loading...", end="\r")
+-        tic = time()
+-
+-        dset = Dataset.load(existing_path)
+-        print(f"Using local sample data {existing_path}; loaded in {time() - tic:.3f} seconds")
+-        yield dset
++        yield existing_path
+     else:
+         import gzip
+         import tempfile
+@@ -322,16 +318,20 @@ def download_report_hook(chunk, chunk_size, total_size):
+                 print(f"Downloading big dataset sample data ({total_size} bytes, {progress:.0f}%)", end="\r")
+ 
+             urllib.request.urlretrieve(download_url, compressed_path, reporthook=download_report_hook)
+-            with gzip.open(compressed_path, "rb") as compressed_file:
+-                with open(cs_path, "wb") as cs_file:
+-                    shutil.copyfileobj(compressed_file, cs_file)
++            with gzip.open(compressed_path, "rb") as compressed_file, open(cs_path, "wb") as cs_file:
++                shutil.copyfileobj(compressed_file, cs_file)
+ 
+             print("")
+             print("Downloaded big dataset sample data; loading...", end="\r")
+-            tic = time()
+-            dset = Dataset.load(cs_path)
+-            print(f"Downloaded big dataset sample data; loaded in {time() - tic:.3f} seconds")
+-            yield dset
++            yield cs_path
++
++
++@pytest.fixture(scope="session")
++def big_dset(big_dset_path):
++    tic = time()
++    dset = Dataset.load(big_dset_path)
++    print(f"Loaded big dataset in {time() - tic:.3f} seconds")
++    return dset
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/test_dataset.py b/tests/test_dataset.py
+index 2c09a082..519e6730 100644
+--- a/tests/test_dataset.py
++++ b/tests/test_dataset.py
+@@ -4,7 +4,7 @@
+ import numpy as n
+ import pytest
+ 
+-from cryosparc.dataset import Column
++from cryosparc.dataset import CSDAT_FORMAT, Column
+ from cryosparc.row import Row
+ 
+ from .conftest import Dataset
+@@ -24,6 +24,38 @@ def io_data():
+     return BytesIO(data)
+ 
+ 
++@pytest.fixture
++def small_dset():
++    field3 = "long/fieldwithsuperduperlongcolumnnamethatislongandtestable"
++    dset = Dataset.allocate(
++        4,
++        fields=[
++            ("field/1", "u8", (2,)),
++            ("field/2", "f4"),
++            (field3, "O"),
++        ],
++    )
++    dset["field/1"] = (42, 43)
++    dset["field/2"] = n.array([3.14, 2.73, 1.62, 3.14], dtype="f8")
++    dset[field3][:] = n.array(["Hello", "World", "!", "!"])
++    return dset
++
++
++@pytest.fixture
++def small_dset_path(tmp_path, small_dset):
++    path = tmp_path / "small_dset.cs"
++    small_dset.save(path, format=CSDAT_FORMAT)
++    return path
++
++
++@pytest.fixture
++def small_dset_stream(small_dset):
++    stream = BytesIO()
++    small_dset.save(stream, format=CSDAT_FORMAT)
++    stream.seek(0)
++    return stream
++
++
+ def test_allocate():
+     storage = Dataset.allocate(size=2000000, fields=[("field1", "u8"), ("field2", "f4"), ("field3", "O")])
+     assert storage is not None
+@@ -173,7 +205,7 @@ def test_to_list_exclude_uid():
+     assert lst == [[0, 0.0, "Hello"]]
+ 
+ 
+-def test_to_file():
++def test_save():
+     dtype = [("uid", "u8"), ("field1", "u4"), ("field2", "f4"), ("field3", "S6"), ("field4", "f8")]
+     expected = n.array([(1, 42, 3.14, "Hello", 1.0), (2, 42, 2.73, "World", 0.0)], dtype=dtype)
+     dset = Dataset(expected)
+@@ -186,18 +218,28 @@ def test_to_file():
+     assert all(e.decode() == a.decode() for e, a in zip(expected["field3"], actual["field3"]))
+ 
+ 
+-def test_from_file(io_data):
++def test_load(io_data):
+     dtype = [("field1", "u4"), ("field2", "f4"), ("field3", "O"), ("field4", "f8"), ("field5", "i8")]
+-
+-    result = Dataset.load(io_data)
+     expected = Dataset.allocate(size=2, fields=dtype)
+-
+     expected["field1"] = 42
+     expected["field2"] = n.array([3.14, 2.73], dtype="f8")
+     expected["field3"][:] = n.array(["Hello", "World"])
+     expected["field4"][1] = 1.0
+     expected["field5"][0:] = 43
+ 
++    result = Dataset.load(io_data)
++    assert expected.descr() == result.descr()
++    assert all([n.equal(expected[d[0]], result[d[0]]).all() for d in dtype if d[0] != "uid"])
++
++
++def test_load_fields(io_data):
++    dtype = [("field2", "f4"), ("field3", "O"), ("field5", "i8")]
++    expected = Dataset.allocate(size=2, fields=dtype)
++    expected["field2"] = n.array([3.14, 2.73], dtype="f8")
++    expected["field3"][:] = n.array(["Hello", "World"])
++    expected["field5"][0:] = 43
++
++    result = Dataset.load(io_data, fields=["field2", "field3", "field5"])
+     assert expected.descr() == result.descr()
+     assert all([n.equal(expected[d[0]], result[d[0]]).all() for d in dtype if d[0] != "uid"])
+ 
+@@ -213,27 +255,19 @@ def test_from_data_none():
+     assert len(data) == 0
+ 
+ 
+-def test_streaming_bytes():
+-    field3 = "fieldwithsuperduperlongcolumnnamethatislongandtestable"
+-    dset = Dataset.allocate(
+-        4,
+-        fields=[
+-            ("field1", "u8"),
+-            ("field2", "f4"),
+-            (field3, "O"),
+-        ],
+-    )
+-    dset["field1"] = 42
+-    dset["field2"] = n.array([3.14, 2.73, 1.62, 3.14], dtype="f8")
+-    dset[field3][:] = n.array(["Hello", "World", "!", "!"])
++def test_load_stream(small_dset, small_dset_path):
++    result = Dataset.load(small_dset_path)
++    assert result == small_dset
++
++
++def test_load_stream_prefixes(small_dset, small_dset_path):
++    result = Dataset.load(small_dset_path, prefixes=["field"])
++    assert result == small_dset.filter_prefixes(["field"], copy=True)
+ 
+-    stream = BytesIO()
+-    for dat in dset.stream():
+-        stream.write(dat)
+-    stream.seek(0)
+-    result = dset.load(stream)
+ 
+-    assert dset == result
++def test_load_stream_fields(small_dset, small_dset_stream):
++    result = Dataset.load(small_dset_stream, fields=["field/2"])
++    assert result == small_dset.filter_fields(["field/2"], copy=True)
+ 
+ 
+ def test_pickle_unpickle():
+diff --git a/tests/test_dataset_bench.py b/tests/test_dataset_bench.py
+index c9d2b015..a7147f94 100644
+--- a/tests/test_dataset_bench.py
++++ b/tests/test_dataset_bench.py
+@@ -414,3 +414,57 @@ def test_to_cstrs(benchmark, dset: Dataset):
+ def test_to_pystrs(benchmark, dset_cstrs: Dataset):
+     result: Dataset = benchmark(dset_cstrs.to_pystrs, copy=True)
+     assert result["ctf/type"].dtype.type == n.object_
++
++
++def test_inspect(big_dset_path, fields):
++    result = Dataset.inspect(big_dset_path)
++    assert result["length"] == 1961726
++    assert result["dtype"] == fields
++    assert result["compression"] is None
++    assert result["compressed_fields"] == []
++
++
++def test_load(benchmark, big_dset_path, fields):
++    result = benchmark(Dataset.load, big_dset_path)
++    assert len(result) == 1961726
++    assert result.descr() == fields
++
++
++def test_load_prefixes(benchmark, big_dset_path, fields):
++    keep_prefixes = ["location", "pick_stats"]
++    expected_fields = [
++        field
++        for field in fields
++        if field[0] == "uid" or field[0].startswith("location/") or field[0].startswith("pick_stats/")
++    ]
++    result = benchmark(Dataset.load, big_dset_path, prefixes=keep_prefixes)
++    assert len(result) == 1961726
++    assert result.descr() == expected_fields
++
++
++def test_load_fields(benchmark, big_dset_path, fields):
++    keep_fields = ["ctf/type", "ctf/shift_A", "location/micrograph_uid"]
++    result = benchmark(Dataset.load, big_dset_path, fields=keep_fields)
++    assert len(result) == 1961726
++    assert result.descr() == [
++        ("uid", "<u8"),
++        ("ctf/type", "|O"),
++        ("ctf/shift_A", "<f4", (2,)),
++        ("location/micrograph_uid", "<u8"),
++    ]
++
++
++def test_load_prefixes_fields(benchmark, big_dset_path, fields):
++    keep_prefixes = ["location", "pick_stats"]
++    keep_fields = ["ctf/type", "ctf/shift_A", "location/micrograph_uid"]
++    result = benchmark(Dataset.load, big_dset_path, prefixes=keep_prefixes, fields=keep_fields)
++    expected_fields = [
++        field
++        for field in fields
++        if field[0] == "uid"
++        or field[0].startswith("location/")
++        or field[0].startswith("pick_stats/")
++        or field[0] in keep_fields
++    ]
++    assert len(result) == 1961726
++    assert result.descr() == expected_fields

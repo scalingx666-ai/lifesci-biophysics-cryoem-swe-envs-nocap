@@ -1,0 +1,13 @@
+# Issue
+
+**Title:** LigNetwork & to_networkx improvements
+
+## Description
+
+- Migrate LigNetwork to use `to_networkx` export instead of dataframe as underlying data model.
+- slight refactor of the `to_networkx` code to reduce duplication and fix linting / typing issues
+- change of default values and algorithm to fix the "residue stuck inside a ring" issue
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `23e9224c9bac`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

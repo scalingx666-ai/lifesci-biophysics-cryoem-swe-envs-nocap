@@ -1,0 +1,539 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ffc822b88..26e257085 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ Most recent change on the bottom.
+ ### Added
+ - BETA! Support for stress in training and inference
+ - `EMTTestDataset` for quick synthetic fake PBC data
++- multiprocessing for ASE dataset loading/processing
+ 
+ ### Fixed
+ - Equivariance testing correctly handles output cells
+diff --git a/nequip/data/dataset.py b/nequip/data/dataset.py
+index 0d7c96962..2e2a7e97a 100644
+--- a/nequip/data/dataset.py
++++ b/nequip/data/dataset.py
+@@ -2,14 +2,18 @@
+ import logging
+ import tempfile
+ import inspect
++import functools
++import itertools
+ import yaml
+ import hashlib
+ from os.path import dirname, basename, abspath
+ from typing import Tuple, Dict, Any, List, Callable, Union, Optional, Sequence
+ 
+ import ase
++import ase.io
+ 
+ import torch
++import torch.multiprocessing as mp
+ 
+ from torch_runstats.scatter import scatter_std, scatter_mean
+ 
+@@ -27,6 +31,7 @@
+ from nequip.utils.batch_ops import bincount
+ from nequip.utils.regressor import solver
+ from nequip.utils.savenload import atomic_write
++from nequip.utils.multiprocessing import num_tasks
+ from .transforms import TypeMapper
+ from .AtomicData import _process_dict
+ 
+@@ -727,6 +732,59 @@ def get_data(self):
+         return fields, fixed_fields
+ 
+ 
++def _ase_dataset_reader(
++    rank: int,
++    world_size: int,
++    tmpdir: str,
++    ase_kwargs: dict,
++    atomicdata_kwargs: dict,
++    include_frames,
++    global_options: dict,
++) -> Union[str, List[AtomicData]]:
++    """Parallel reader for all frames in file."""
++    if world_size > 1:
++        from nequip.utils._global_options import _set_global_options
++
++        # ^ avoid import loop
++        # we only `multiprocessing` if world_size > 1
++        _set_global_options(global_options)
++    # interleave--- in theory it is better for performance for the ranks
++    # to read consecutive blocks, but the way ASE is written the whole
++    # file gets streamed through all ranks anyway, so just trust the OS
++    # to cache things sanely, which it will.
++    # ASE handles correctly the case where there are no frames in index
++    # and just gives an empty list, so that will succeed:
++    index = slice(rank, None, world_size)
++    if include_frames is None:
++        # count includes 0, 1, ..., inf
++        include_frames = itertools.count()
++
++    datas = []
++    # stream them from ase too using iread
++    for i, atoms in enumerate(ase.io.iread(**ase_kwargs, index=index, parallel=False)):
++        global_index = rank + (world_size * i)
++        datas.append(
++            (
++                global_index,
++                AtomicData.from_ase(atoms=atoms, **atomicdata_kwargs)
++                if global_index in include_frames
++                # in-memory dataset will ignore this later, but needed for indexing to work out
++                else None,
++            )
++        )
++    # Save to a tempfile---
++    # there can be a _lot_ of tensors here, and rather than dealing with
++    # the complications of running out of file descriptors and setting
++    # sharing methods, since this is a one time thing, just make it simple
++    # and avoid shared memory entirely.
++    if world_size > 1:
++        path = f"{tmpdir}/rank{rank}.pth"
++        torch.save(datas, path)
++        return path
++    else:
++        return datas
++
++
+ class ASEDataset(AtomicInMemoryDataset):
+     """
+ 
+@@ -790,10 +848,11 @@ def __init__(
+         key_mapping: Optional[dict] = None,
+         include_keys: Optional[List[str]] = None,
+     ):
+-
+-        self.ase_args = dict(index=":")
++        self.ase_args = {}
+         self.ase_args.update(getattr(type(self), "ASE_ARGS", dict()))
+         self.ase_args.update(ase_args)
++        assert "index" not in self.ase_args
++        assert "filename" not in self.ase_args
+ 
+         self.include_keys = include_keys
+         self.key_mapping = key_mapping
+@@ -851,15 +910,9 @@ def raw_file_names(self):
+     def raw_dir(self):
+         return dirname(abspath(self.file_name))
+ 
+-    def get_atoms(self):
+-        from ase.io import read as aseread
+-
+-        return aseread(self.raw_dir + "/" + self.raw_file_names[0], **self.ase_args)
+-
+     def get_data(self):
+-
+-        # Get our data
+-        atoms_list = self.get_atoms()
++        ase_args = {"filename": self.raw_dir + "/" + self.raw_file_names[0]}
++        ase_args.update(self.ase_args)
+ 
+         # skip the None arguments
+         kwargs = dict(
+@@ -868,17 +921,35 @@ def get_data(self):
+         )
+         kwargs = {k: v for k, v in kwargs.items() if v is not None}
+         kwargs.update(self.extra_fixed_fields)
+-
+-        if self.include_frames is None:
+-            return (
+-                [AtomicData.from_ase(atoms=atoms, **kwargs) for atoms in atoms_list],
+-            )
+-        else:
+-            return (
+-                [
+-                    AtomicData.from_ase(atoms=atoms_list[i], **kwargs)
+-                    if i in self.include_frames
+-                    else None  # in-memory dataset will ignore this later, but needed for indexing to work out
+-                    for i in range(len(atoms_list))
+-                ],
++        n_proc = num_tasks()
++        with tempfile.TemporaryDirectory() as tmpdir:
++            from nequip.utils._global_options import _get_latest_global_options
++
++            # ^ avoid import loop
++            reader = functools.partial(
++                _ase_dataset_reader,
++                world_size=n_proc,
++                tmpdir=tmpdir,
++                ase_kwargs=ase_args,
++                atomicdata_kwargs=kwargs,
++                include_frames=self.include_frames,
++                # get the global options of the parent to initialize the worker correctly
++                global_options=_get_latest_global_options(),
+             )
++            if n_proc > 1:
++                # things hang for some obscure OpenMP reason on some systems when using `fork` method
++                ctx = mp.get_context("forkserver")
++                with ctx.Pool(processes=n_proc) as p:
++                    # map it over the `rank` argument
++                    datas = p.map(reader, list(range(n_proc)))
++                # clean up the pool before loading the data
++                datas = [torch.load(d) for d in datas]
++                datas = sum(datas, [])
++                # un-interleave the datas
++                datas = sorted(datas, key=lambda e: e[0])
++            else:
++                datas = reader(rank=0)
++                # datas here is already in order, stride 1 start 0
++                # no need to un-interleave
++        # return list of AtomicData:
++        return ([e[1] for e in datas],)
+diff --git a/nequip/scripts/benchmark.py b/nequip/scripts/benchmark.py
+index 327f90169..1a432c9fa 100644
+--- a/nequip/scripts/benchmark.py
++++ b/nequip/scripts/benchmark.py
+@@ -15,7 +15,8 @@
+ from nequip.data import AtomicData, dataset_from_config
+ from nequip.model import model_from_config
+ from nequip.scripts.deploy import _compile_for_deploy
+-from nequip.scripts.train import _set_global_options, default_config, check_code_version
++from nequip.scripts.train import default_config, check_code_version
++from nequip.utils._global_options import _set_global_options
+ 
+ 
+ def main(args=None):
+diff --git a/nequip/scripts/deploy.py b/nequip/scripts/deploy.py
+index 48cc187ee..25d4932f4 100644
+--- a/nequip/scripts/deploy.py
++++ b/nequip/scripts/deploy.py
+@@ -8,7 +8,6 @@
+ import argparse
+ import pathlib
+ import logging
+-import warnings
+ import yaml
+ 
+ # This is a weird hack to avoid Intel MKL issues on the cluster when this is called as a subprocess of a process that has itself initialized PyTorch.
+@@ -22,10 +21,11 @@
+ from e3nn.util.jit import script
+ 
+ from nequip.model import model_from_config
+-from nequip.scripts.train import _set_global_options, default_config
+ from nequip.train import Trainer
+ from nequip.utils import Config
+ from nequip.utils.versions import check_code_version, get_config_code_versions
++from nequip.scripts.train import default_config
++from nequip.utils._global_options import _set_global_options
+ 
+ CONFIG_KEY: Final[str] = "config"
+ NEQUIP_VERSION_KEY: Final[str] = "nequip_version"
+@@ -103,43 +103,28 @@ def load_deployed_model(
+     # Set up global settings:
+     assert set_global_options in (True, False, "warn")
+     if set_global_options:
+-        # Set TF32 support
+-        # See https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+-        if torch.cuda.is_available() and metadata[TF32_KEY] != "":
+-            allow_tf32 = bool(int(metadata[TF32_KEY]))
+-            if torch.torch.backends.cuda.matmul.allow_tf32 is not allow_tf32:
+-                # Update setting
+-                if set_global_options == "warn":
+-                    warnings.warn(
+-                        "Loaded model had a different value for allow_tf32 than was currently set; changing the GLOBAL setting!"
+-                    )
+-                torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+-                torch.backends.cudnn.allow_tf32 = allow_tf32
+-
+-        # JIT bailout
+-        if int(torch.__version__.split(".")[1]) >= 11:
+-            strategy = metadata.get(JIT_FUSION_STRATEGY, "")
+-            if strategy != "":
+-                strategy = [e.split(",") for e in strategy.split(";")]
+-                strategy = [(e[0], int(e[1])) for e in strategy]
+-            else:
+-                strategy = default_config[JIT_FUSION_STRATEGY]
+-            old_strat = torch.jit.set_fusion_strategy(strategy)
+-            if set_global_options == "warn" and old_strat != strategy:
+-                warnings.warn(
+-                    f"Loaded model had a different value for _jit_fusion_strategy ({strategy}) than was currently set ({old_strat}); changing the GLOBAL setting!"
+-                )
++        global_config_dict = {}
++        global_config_dict["allow_tf32"] = bool(int(metadata[TF32_KEY]))
++        # JIT strategy
++        strategy = metadata.get(JIT_FUSION_STRATEGY, "")
++        if strategy != "":
++            strategy = [e.split(",") for e in strategy.split(";")]
++            strategy = [(e[0], int(e[1])) for e in strategy]
+         else:
+-            jit_bailout: int = metadata.get(JIT_BAILOUT_KEY, "")
+-            if jit_bailout == "":
+-                jit_bailout = default_config[JIT_BAILOUT_KEY]
+-            jit_bailout = int(jit_bailout)
+-            # no way to get current value, so assume we are overwriting it
+-            if set_global_options == "warn":
+-                warnings.warn(
+-                    "Loaded model had a different value for _jit_bailout_depth than was currently set; changing the GLOBAL setting!"
+-                )
+-            torch._C._jit_set_bailout_depth(jit_bailout)
++            strategy = default_config[JIT_FUSION_STRATEGY]
++        global_config_dict["_jit_fusion_strategy"] = strategy
++        # JIT bailout
++        # _set_global_options will check torch version
++        jit_bailout: int = metadata.get(JIT_BAILOUT_KEY, "")
++        if jit_bailout == "":
++            jit_bailout = default_config[JIT_BAILOUT_KEY]
++        jit_bailout = int(jit_bailout)
++        global_config_dict["_jit_bailout_depth"] = jit_bailout
++        # call to actually set the global options
++        _set_global_options(
++            global_config_dict,
++            warn_on_override=set_global_options == "warn",
++        )
+     return model, metadata
+ 
+ 
+diff --git a/nequip/scripts/evaluate.py b/nequip/scripts/evaluate.py
+index 093bc6633..708db43ac 100644
+--- a/nequip/scripts/evaluate.py
++++ b/nequip/scripts/evaluate.py
+@@ -14,7 +14,8 @@
+ from nequip.data import AtomicData, Collater, dataset_from_config, register_fields
+ from nequip.scripts.deploy import load_deployed_model, R_MAX_KEY
+ from nequip.scripts._logger import set_up_script_logger
+-from nequip.scripts.train import default_config, _set_global_options, check_code_version
++from nequip.scripts.train import default_config, check_code_version
++from nequip.utils._global_options import _set_global_options
+ from nequip.train import Trainer, Loss, Metrics
+ from nequip.utils import load_file, instantiate, Config
+ 
+diff --git a/nequip/scripts/train.py b/nequip/scripts/train.py
+index 67cbdcc8e..c6aa7785e 100644
+--- a/nequip/scripts/train.py
++++ b/nequip/scripts/train.py
+@@ -12,15 +12,13 @@
+ 
+ import torch
+ 
+-import e3nn
+-import e3nn.util.jit
+-
+ from nequip.model import model_from_config
+-from nequip.utils import Config, instantiate
+-from nequip.data import dataset_from_config, register_fields
+-from nequip.utils import load_file, dtype_from_name
+-from nequip.utils.test import assert_AtomicData_equivariant, set_irreps_debug
++from nequip.utils import Config
++from nequip.data import dataset_from_config
++from nequip.utils import load_file
++from nequip.utils.test import assert_AtomicData_equivariant
+ from nequip.utils.versions import check_code_version
++from nequip.utils._global_options import _set_global_options
+ from nequip.scripts._logger import set_up_script_logger
+ 
+ default_config = dict(
+@@ -117,37 +115,6 @@ def parse_command_line(args=None):
+     return config
+ 
+ 
+-def _set_global_options(config):
+-    """Configure global options of libraries like `torch` and `e3nn` based on `config`."""
+-    # Set TF32 support
+-    # See https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+-    if torch.cuda.is_available():
+-        if torch.torch.backends.cuda.matmul.allow_tf32 and not config.allow_tf32:
+-            # it is enabled, and we dont want it to, so disable:
+-            torch.backends.cuda.matmul.allow_tf32 = False
+-            torch.backends.cudnn.allow_tf32 = False
+-
+-    if int(torch.__version__.split(".")[1]) >= 11:
+-        # PyTorch >= 1.11
+-        k = "_jit_fusion_strategy"
+-        torch.jit.set_fusion_strategy(config.get(k))
+-    else:
+-        # For avoiding 20 steps of painfully slow JIT recompilation
+-        # See https://github.com/pytorch/pytorch/issues/52286
+-        torch._C._jit_set_bailout_depth(config["_jit_bailout_depth"])
+-
+-    if config.model_debug_mode:
+-        set_irreps_debug(enabled=True)
+-    torch.set_default_dtype(dtype_from_name(config.default_dtype))
+-    if config.grad_anomaly_mode:
+-        torch.autograd.set_detect_anomaly(True)
+-
+-    e3nn.set_optimization_defaults(**config.get("e3nn_optimization_defaults", {}))
+-
+-    # Register fields:
+-    instantiate(register_fields, all_args=config)
+-
+-
+ def fresh_start(config):
+     # we use add_to_config cause it's a fresh start and need to record it
+     check_code_version(config, add_to_config=True)
+diff --git a/nequip/utils/_global_options.py b/nequip/utils/_global_options.py
+new file mode 100644
+index 000000000..907a9ed90
+--- /dev/null
++++ b/nequip/utils/_global_options.py
+@@ -0,0 +1,85 @@
++import warnings
++
++import torch
++
++import e3nn
++import e3nn.util.jit
++
++from nequip.data import register_fields
++from .misc import dtype_from_name
++from .auto_init import instantiate
++from .test import set_irreps_debug
++
++
++# for multiprocessing, we need to keep track of our latest global options so
++# that we can reload/reset them in worker processes. While we could be more careful here,
++# to keep only relevant keys, configs should have only small values (no big objects)
++# and those should have references elsewhere anyway, so keeping references here is fine.
++_latest_global_config = {}
++
++
++def _get_latest_global_options() -> dict:
++    """Get the config used latest to ``_set_global_options``.
++
++    This is useful for getting worker processes into the same state as the parent.
++    """
++    global _latest_global_config
++    return _latest_global_config
++
++
++def _set_global_options(config, warn_on_override: bool = False) -> None:
++    """Configure global options of libraries like `torch` and `e3nn` based on `config`.
++
++    Args:
++        warn_on_override: if True, will try to warn if new options are inconsistant with previously set ones.
++    """
++    # update these options into the latest global config.
++    global _latest_global_config
++    _latest_global_config.update(dict(config))
++    # Set TF32 support
++    # See https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
++    if torch.cuda.is_available() and "allow_tf32" in config:
++        if torch.torch.backends.cuda.matmul.allow_tf32 is not config["allow_tf32"]:
++            # update the setting
++            if warn_on_override:
++                warnings.warn(
++                    f"Setting the GLOBAL value for allow_tf32 to {config['allow_tf32']} which is different than the previous value of {torch.torch.backends.cuda.matmul.allow_tf32}"
++                )
++            torch.backends.cuda.matmul.allow_tf32 = config["allow_tf32"]
++            torch.backends.cudnn.allow_tf32 = config["allow_tf32"]
++
++    if int(torch.__version__.split(".")[1]) >= 11:
++        # PyTorch >= 1.11
++        k = "_jit_fusion_strategy"
++        if k in config:
++            new_strat = config.get(k)
++            old_strat = torch.jit.set_fusion_strategy(new_strat)
++            if warn_on_override and old_strat != new_strat:
++                warnings.warn(
++                    f"Setting the GLOBAL value for jit fusion strategy to `{new_strat}` which is different than the previous value of `{old_strat}`"
++                )
++    else:
++        # For avoiding 20 steps of painfully slow JIT recompilation
++        # See https://github.com/pytorch/pytorch/issues/52286
++        k = "_jit_bailout_depth"
++        if k in config:
++            new_depth = config[k]
++            old_depth = torch._C._jit_set_bailout_depth(new_depth)
++            if warn_on_override and old_depth != new_depth:
++                warnings.warn(
++                    f"Setting the GLOBAL value for jit bailout depth to `{new_depth}` which is different than the previous value of `{old_depth}`"
++                )
++
++    # TODO: warn_on_override for the rest here?
++    if config.get("model_debug_mode", False):
++        set_irreps_debug(enabled=True)
++    if "default_dtype" in config:
++        torch.set_default_dtype(dtype_from_name(config["default_dtype"]))
++    if config.get("grad_anomaly_mode", False):
++        torch.autograd.set_detect_anomaly(True)
++
++    e3nn.set_optimization_defaults(**config.get("e3nn_optimization_defaults", {}))
++
++    # Register fields:
++    instantiate(register_fields, all_args=config)
++    return
+diff --git a/nequip/utils/multiprocessing.py b/nequip/utils/multiprocessing.py
+new file mode 100644
+index 000000000..c27013a28
+--- /dev/null
++++ b/nequip/utils/multiprocessing.py
+@@ -0,0 +1,13 @@
++import os
++
++
++def num_tasks() -> int:
++    # sched_getaffinity gives number of _allowed_ cores
++    # this is correct for SLURM jobs, for example
++    num_avail: int = len(os.sched_getaffinity(0))
++    n_proc: int = int(os.environ.get("NEQUIP_NUM_TASKS", num_avail))
++    assert n_proc > 0
++    assert (
++        n_proc <= num_avail
++    ), f"Asked for more worker tasks NEQUIP_NUM_TASKS={n_proc} than available CPU cores {num_avail}"
++    return n_proc
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 0222a8a94..060e5e7b7 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -3,6 +3,7 @@
+ import pathlib
+ import pytest
+ import tempfile
++import os
+ 
+ from ase.atoms import Atoms
+ from ase.build import molecule
+@@ -15,16 +16,42 @@
+ from nequip.data import AtomicData, ASEDataset
+ from nequip.data.transforms import TypeMapper
+ from nequip.utils.torch_geometric import Batch
++from nequip.utils._global_options import _set_global_options
++from nequip.utils.misc import dtype_from_name
++
++if "NEQUIP_NUM_TASKS" not in os.environ:
++    # Test parallelization, but don't waste time spawning tons of workers if lots of cores available
++    os.environ["NEQUIP_NUM_TASKS"] = "2"
++
++# The default float tolerance
++FLOAT_TOLERANCE = {
++    t: torch.as_tensor(v, dtype=dtype_from_name(t))
++    for t, v in {"float32": 1e-3, "float64": 1e-10}.items()
++}
++
++
++@pytest.fixture(scope="session", autouse=True, params=["float32", "float64"])
++def float_tolerance(request):
++    """Run all tests with various PyTorch default dtypes.
++
++    This is a session-wide, autouse fixture — you only need to request it explicitly if a test needs to know the tolerance for the current default dtype.
++
++    Returns
++    --------
++        A precision threshold to use for closeness tests.
++    """
++    old_dtype = torch.get_default_dtype()
++    dtype = request.param
++    _set_global_options({"default_dtype": dtype})
++    yield FLOAT_TOLERANCE[dtype]
++    _set_global_options(
++        {
++            "default_dtype": {torch.float32: "float32", torch.float64: "float64"}[
++                old_dtype
++            ]
++        }
++    )
+ 
+-# For good practice, we *should* do this:
+-# See https://docs.pytest.org/en/stable/fixture.html#using-fixtures-from-other-projects
+-# pytest_plugins = ['e3nn.util.test']
+-# But doing so exposes float_tolerance to doctests, which don't support parametrized, autouse fixtures.
+-# Importing directly somehow only brings in the fixture later, preventing the issue.
+-from e3nn.util.test import float_tolerance
+-
+-# Suppress linter errors
+-float_tolerance = float_tolerance
+ 
+ # - Ampere and TF32 -
+ # Many of the tests for NequIP involve numerically checking

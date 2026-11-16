@@ -1,0 +1,688 @@
+diff --git a/.gitignore b/.gitignore
+index 04f7bf6a4..0f73b5d7a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -126,3 +126,27 @@ interfaces/lammps/examples/*/deployed_model
+ 
+ # batchwise optimizer examples
+ examples/howtos/howto_batchwise_relaxations_outputs/*
++tests/testdata/testing_qmugs.py
++tests/testdata/test_ensemble_calculator.py
++tests/testdata/compare_performance.py
++.gitignore
++tests/testdata/batchwise_ensemble_with_average_strategy.npz
++tests/testdata/batchwise_ensemble_without_strategy.npz
++tests/testdata/batchwise_single.npz
++src/schnetpack/datasets/qmugs.py
++tests/testdata/testing_batchwise_ensemble.py
++tests/testdata/psa_labels.pkl
++tests/testdata/psa_orig-traj-names.pkl
++tests/testdata/psa_top-name.pkl
++tests/testdata/fitted_trajs/ase-cpu-opt_psa001.xyz
++tests/testdata/fitted_trajs/ase-cuda-opt_psa003.xyz
++tests/testdata/fitted_trajs/ase-cuda-opt_psa004.xyz
++tests/testdata/fitted_trajs/batchwise-cpu-opt_psa001.xyz
++tests/testdata/fitted_trajs/batchwise-cuda-opt_psa004.xyz
++tests/testdata/fitted_trajs/batchwise-cpu-opt_psa002.xyz
++tests/testdata/fitted_trajs/batchwise-cuda-opt_psa005.xyz
++tests/testdata/fitted_trajs/ensemble-cpu-opt_psa002.xyz
++tests/testdata/fitted_trajs/ensemble-cpu-opt_psa003.xyz
++tests/testdata/fitted_trajs/ensemble-cuda-opt_psa005.xyz
++tests/testdata/fitted_trajs/ensemble-cuda-opt_psa006.xyz
++initial_structures.xyz
+diff --git a/src/schnetpack/interfaces/__init__.py b/src/schnetpack/interfaces/__init__.py
+index 90301e69f..10ef9f18b 100644
+--- a/src/schnetpack/interfaces/__init__.py
++++ b/src/schnetpack/interfaces/__init__.py
+@@ -1,2 +1,3 @@
+ from .ase_interface import *
+ from .batchwise_optimization import *
++from .ensemble_calculator import *
+diff --git a/src/schnetpack/interfaces/batchwise_optimization.py b/src/schnetpack/interfaces/batchwise_optimization.py
+index 1bc8842f3..e9c532f46 100644
+--- a/src/schnetpack/interfaces/batchwise_optimization.py
++++ b/src/schnetpack/interfaces/batchwise_optimization.py
+@@ -904,4 +904,4 @@ def func(self, x):
+ 
+     def line_search(self, r, g, e):
+         self.alpha_k = None
+-        raise NotImplementedError("LineSearch not implemented yet")
++        raise NotImplementedError("LineSearch not implemented yet")
+\ No newline at end of file
+diff --git a/src/schnetpack/interfaces/ensemble_calculator.py b/src/schnetpack/interfaces/ensemble_calculator.py
+new file mode 100644
+index 000000000..cd96f724b
+--- /dev/null
++++ b/src/schnetpack/interfaces/ensemble_calculator.py
+@@ -0,0 +1,389 @@
++import pickle
++import time
++import random
++from copy import deepcopy
++import numpy as np
++from math import sqrt
++from os.path import isfile
++
++from ase.optimize.optimize import Dynamics
++from ase.parallel import world, barrier
++from ase.io import write
++from ase import Atoms
++from ase.calculators.calculator import Calculator, all_changes
++
++import torch
++from torch import nn
++from schnetpack.units import convert_units
++from schnetpack.model import NeuralNetworkPotential
++
++from typing import List, Optional, Dict, Callable, Union
++
++class EnsembleAverageStrategy:
++
++    '''
++    base class for Ensemble Average Stragies
++    '''
++
++    def __init__(self):
++
++        pass
++
++
++    def uncertainty_estimation(self,inputs,device,**kwargs):
++        
++        '''
++        Args:
++            inputs: kwargs["inputs"] torch.Tensor
++            stacked output tensors of predicted property (e.g Energy or Forces)
++
++            device: kwargs["device"] torch.device
++            device used for calculations (default="cpu") 
++
++        Returns:
++            ensemble averages based on user defined uncertainty estimation 
++        
++        '''
++        raise NotImplementedError
++
++
++
++class SimpleEnsembleAverage(EnsembleAverageStrategy):
++
++    '''
++    simply ensemble average function, mostly for testing only
++    Model outputs are dropped if exceeding mean +/- factor*standarddeviation
++    
++    '''
++    def __init__(self,
++                 mode="single",
++                 batchsize = torch.tensor([1],dtype=torch.int8),
++                 criteria: Optional[torch.Tensor] = torch.tensor([1.])):
++
++        self.criteria = torch.Tensor([criteria])
++        self.mode = mode
++        self.batchsize = batchsize 
++
++    def uncertainty_estimation(
++            self,
++            inputs,
++            device
++            ):
++
++        '''
++        inputs: torch.Tensor
++            stacked output tensors of predicted property (e.g Energy or Forces)
++
++        device: torch.device
++            device used for calculations (default="cpu")  
++
++        criteria: torch.Tensor
++            factor to be multiplied with standard deviation default value 1
++        '''
++
++        num_dim = inputs.size()[-1]
++        batchsize = self.batchsize.to(device)
++        criteria = self.criteria.to(device)
++        mean = torch.mean(inputs,dim=0)
++        std = torch.std(inputs,dim=0) * criteria
++
++        condition = torch.logical_and(inputs >= (mean-std), inputs <= (mean + std))
++
++        if self.mode == "single":
++            if num_dim > 1:
++                num_models, num_atoms, num_dim = inputs.size()
++                N = torch.tensor(condition.size()[1] * condition.size()[2],device=device)
++
++                new_dim = 0
++                for n in range(condition.size()[0]):
++
++                    if torch.round(condition[n].sum()) > torch.round(N/2):
++                        condition[n].fill_(True)
++                        new_dim +=1
++                    else:
++                        condition[n].fill_(False)
++
++                processed_input = torch.reshape(inputs[condition],(new_dim,num_atoms,num_dim))
++
++            else:
++                processed_input = inputs[condition]
++        
++
++        if self.mode == "batchwise":
++
++
++            if inputs.dim() == 2:
++                num_models, batchsize = inputs.size()
++                N = torch.tensor(num_models,device=device)
++                idx = tuple(range(num_models))
++                new_dim = 0
++                for n in range(batchsize):
++
++                    if torch.round(condition[idx,n].sum()) >= torch.round(N/2):
++                        condition[idx,n].fill_(True)
++                        new_dim +=1
++                    else:
++                        condition[idx,n].fill_(False)
++
++                processed_input = torch.reshape(inputs[condition],
++                                                (int(inputs[condition].size()[0] / (batchsize)),
++                                                batchsize))
++
++
++
++            if inputs.dim() == 3:
++
++
++                num_models, (num_atoms) , num_dim = inputs.size()
++                mean = torch.mean(inputs,dim=0)
++                std = torch.std(inputs,dim=0) * criteria
++
++                condition = torch.logical_and(inputs >= (mean-std), inputs <= (mean + std))
++                
++                N = torch.tensor(condition.size()[1] * condition.size()[2],device=device)
++
++                new_dim = 0
++                for n in range(condition.size()[0]):
++
++                    if torch.round(condition[n].sum()) > torch.round(N/2):
++                        condition[n].fill_(True)
++                        new_dim +=1
++                    else:
++                        condition[n].fill_(False)
++
++                processed_input = torch.reshape(inputs[condition],(new_dim,num_atoms,num_dim))
++
++
++
++        return torch.mean(processed_input,dim=0)
++
++
++
++class EnsembleCalculator(Calculator):
++    """
++    Calculator for neural network models for ensemble calculations.
++    Requires multiple models
++    """
++
++    energy = "energy"
++    forces = "forces"
++    stress = "stress"
++
++    def __init__(
++        self,
++        model_file: Union[List[str],List[nn.Module]],
++        atoms_converter,
++        device="cpu",
++        auxiliary_output_modules=None,
++        energy_key="energy",
++        force_key="forces",
++        stress_key="stress",
++        energy_unit="kcal/mol",
++        position_unit="Ang",
++        dtype = torch.float32,
++        ensemble_average_strategy : Optional[EnsembleAverageStrategy] = None):
++        """
++        model_file: str
++            path to trained models
++            has to be a list of paths
++            OR
++            list of preloaded models
++
++        atoms_converter: schnetpack.interfaces.AtomsConverter
++            Class used to convert ase Atoms objects to schnetpack input
++
++        device: torch.device
++            device used for calculations (default="cpu")
++
++        energy_key: str
++            name of energies in model (default="energy")
++
++        force_key: str
++            name of forces in model (default="forces")
++
++        energy_unit: str, float
++            energy units used by model (default="eV")
++
++        position_unit: str, float
++            position units used by model (default="Angstrom")
++
++        ensemble_average_strategy : User defined class to
++            to calculate ensemble average
++        """
++
++        super(EnsembleCalculator, self).__init__()
++
++        self.device = device
++        self.atoms_converter = atoms_converter
++        self.model_results = None
++        self.model_file = model_file 
++        self.dtype = dtype
++        self.ensemble_average_strategy = ensemble_average_strategy
++
++        # TODO if auxiliary_output_modules must have same len as model list
++        self.auxiliary_output_modules = auxiliary_output_modules or []
++
++        self.energy_key = energy_key
++        self.force_key = force_key
++        self.stress_key = stress_key
++
++        # set up basic conversion factors
++        self.energy_conversion = convert_units(energy_unit, "eV")
++        self.position_conversion = convert_units(position_unit, "Angstrom")
++
++        # Unit conversion to default ASE units
++        self.property_units = {
++            self.energy: self.energy_conversion,
++            self.forces: self.energy_conversion / self.position_conversion,
++            self.stress: self.energy_conversion / self.position_conversion**3,
++        }
++
++        self._load_model(model_file)
++
++    def _load_model(self, model_file):
++        
++        if isinstance(model_file[0],NeuralNetworkPotential):
++
++            model = nn.ModuleDict(
++                {"model"+str(n): model_file[n].to(self.device) for n in range(len(model_file))}
++            )
++
++        # specific user uncertainity calculation function an uncertainity for every model could be provided
++        else:
++            model = nn.ModuleDict(
++                {"model"+str(n): torch.load(model_file[n],map_location=self.device) for n in range(len(model_file))}
++            )
++
++        for auxiliary_output_module in self.auxiliary_output_modules:
++            for key in self.model.keys():
++                self.model[key].output_modules.insert(1, auxiliary_output_module)
++        self.model = model.eval()
++        self.model.to(device=self.device,dtype=self.dtype)
++
++    def _update_model_inputs(self, atoms):
++        self.model_inputs = self.atoms_converter(atoms)
++
++    def _requires_calculation(self, property_keys, atoms):
++        if self.model_results is None:
++            return True
++        for name in property_keys:
++            if name not in self.model_results:
++                return True
++        if len(self.atoms) != len(atoms):
++            return True
++        for atom, atom_ref in zip(atoms, self.atoms):
++            if atom != atom_ref:
++                return True
++            
++    def get_forces(self, atoms, fixed_atoms_mask=None):
++        if self._requires_calculation(
++            property_keys=[self.energy_key, self.force_key], atoms=atoms
++        ):
++            self.calculate(atoms)
++        f = (
++            self.model_results[self.force_key]
++            * self.property_units[self.forces]
++        )
++        if fixed_atoms_mask is not None:
++            f[fixed_atoms_mask] *= 0.0
++        return f
++
++    def get_potential_energy(self, atoms):
++        if self._requires_calculation(property_keys=[self.energy_key], atoms=atoms):
++            self.calculate(atoms)
++        return (
++            self.model_results[self.energy_key]
++            * self.property_units[self.energy]
++        )
++
++    def calculate(
++            self,
++            atoms):
++
++        inputs = deepcopy(self.atoms_converter(atoms))
++
++        self.accumulated_results = {key: self.model[key](deepcopy(inputs)) for key in list(self.model.keys())  }
++        self.model_results = {}
++
++        # property names (keys)
++        props = list(self.accumulated_results[list(self.accumulated_results.keys())[0]].keys())
++        for p in props:
++
++            
++            # applying user defined ensemble average strategy based on uncertainty estimation
++            stacked_prop = torch.stack([ (self.accumulated_results[result][p] *torch.tensor(random.uniform(1.0,1.10))) for result in self.accumulated_results])
++            
++            if self.ensemble_average_strategy:
++
++                stacked_prop = self.ensemble_average_strategy.uncertainty_estimation(
++                    inputs=stacked_prop,
++                    device=self.device
++                    ) 
++            
++                self.model_results[p] = stacked_prop.detach().cpu().numpy()
++
++            else:
++
++                # tmp fix for ase-gui error: setting an array element with a sequence. The requested array would exceed
++                # the maximum number of dimension of 1
++                # only effects energy
++
++                if stacked_prop.dim() == 2:
++
++                    self.model_results[p] = torch.mean(stacked_prop,dim=0)[0].detach().cpu().numpy()
++                    self.model_results[p+"_std"] = torch.std(stacked_prop,dim=0)[0].detach().cpu().numpy()
++                else:
++                   self.model_results[p] = torch.mean(stacked_prop,dim=0).detach().cpu().numpy()
++                   self.model_results[p+"_std"] = torch.std(stacked_prop,dim=0).detach().cpu().numpy() 
++
++
++        self.atoms = atoms.copy()
++    
++
++
++
++
++
++# class Calculator:
++
++#     """
++#     Base class for ase calculators.
++#     """
++
++#     def __init__(self):
++#         self.results = None
++#         self.atoms = None
++
++#     def calculation_required(self, atoms, properties=None):
++#         if self.atoms is None or not self.atoms == atoms:
++#             return True
++#         return False
++
++#     def get_forces(
++#         self,
++#         atoms,
++#     ):
++#         if self.calculation_required(atoms):
++#             self.calculate(atoms)
++#         return self.results["forces"]
++
++#     def get_potential_energy(
++#         self,
++#         atoms,
++#     ):
++#         if self.calculation_required(atoms):
++#             self.calculate(atoms)
++#         return self.results["energy"]
++
++#     # TODO not implemented and I am not sure how to implement it
++#     #if view(mol) or Trajcetory writer of ASE called, this causes an error, if not uncommented
++#     def get_stress(
++#         self,
++#         atoms,
++#     ):
++#         if self.calculation_required(atoms):
++#             self.calculate(atoms)
++#         return self.results["stress"]
++
++#     def calculate(self, atoms):
++#         pass
+\ No newline at end of file
+diff --git a/tests/testdata/jl_compare.py b/tests/testdata/jl_compare.py
+new file mode 100644
+index 000000000..0e6bcfe0f
+--- /dev/null
++++ b/tests/testdata/jl_compare.py
+@@ -0,0 +1,224 @@
++
++#Batch-wise Structure Relaxation
++
++#In this tutorial, we show how to use the ASEBatchwiseLBFGS. It enables relaxation of structures in a batch-wise manner, i.e. it optimizes multiple structures in parallel. This is particularly useful, when many relatively similar structures (--> similar time until convergence) should be relaxed while requiring possibly short simulation time.
++
++import os
++import torch
++import random
++import shutil
++import time
++import numpy as np
++from tqdm import tqdm 
++from matplotlib import pyplot as plt
++
++import ase
++from ase.io import read, write
++from ase import Atoms
++from ase.optimize.lbfgs import LBFGS
++
++import schnetpack as spk
++from schnetpack import properties
++from schnetpack.interfaces.ase_interface import AtomsConverter, AseInterface
++from schnetpack.interfaces.batchwise_optimization import ASEBatchwiseLBFGS, BatchwiseCalculator
++
++#First, we load the force field model that provides the forces for the relaxation process. Furthermore, we define the atoms converter, which is used to convert ase Atoms objects to SchNetPack input. Eventually the calculator is initialized. The latter provides the necessary functionality to load a model and calculates forces and energy for the respective structures.
++
++random.seed(42)
++batch_size = 30
++batch_mode = "random_distortion"
++
++model_path = "tests/testdata/md_ethanol2.model"
++
++# set device
++device = torch.device("cuda")
++
++# load model
++model = torch.load(model_path, map_location=device)
++
++# define neighbor list
++cutoff = model.representation.cutoff.item()
++nbh_list=spk.transform.MatScipyNeighborList(cutoff=cutoff)
++
++# build atoms converter
++atoms_converter = AtomsConverter(
++    neighbor_list=nbh_list,
++    device=device,
++)
++
++# build calculator
++calculator = BatchwiseCalculator(
++    model=model_path,
++    atoms_converter=atoms_converter,
++    device=device,
++    energy_unit="kcal/mol",
++    position_unit="Ang",
++    dtype=torch.float32
++)
++
++#Subsequently, we load an initial ethanol structure utilizing ASE (supports xyz, db and more) and create a batch of initial structures by random distortion.
++
++if not os.path.exists('howto_batchwise_relaxations_outputs'):
++    os.makedirs('howto_batchwise_relaxations_outputs')
++    
++if batch_mode == "md_samples":
++    
++    ats = read("../../tests/testdata/md_ethanol_batch.xyz", index=":")
++    for at_idx, at in enumerate(ats):
++        write("./howto_batchwise_relaxations_outputs/init_ethanol_{}.xyz".format(at_idx), at, format="xyz")  
++        
++elif batch_mode == "random_distortion":
++    
++    input_structure_file = "tests/testdata/md_ethanol.xyz"
++
++    # load initial structure
++    mol = read(input_structure_file)
++    pos = mol.get_positions()
++    # distort the structures and store them
++    for at_idx in range(batch_size):
++        for n in range(pos.shape[0]):
++            pos[n] = pos[n] * random.uniform(0.95,1.15)
++        at = Atoms(positions=pos, numbers=mol.get_atomic_numbers())
++        write("./howto_batchwise_relaxations_outputs/init_ethanol_{}.xyz".format(at_idx), at, format="xyz")    
++        pos = mol.get_positions()
++
++    # get list of initial structures
++    ats = []
++    for at_idx in range(batch_size):
++        ats.append(read("./howto_batchwise_relaxations_outputs/init_ethanol_{}.xyz".format(at_idx)))
++
++#For some systems it helps to fix the positions of certain atoms during the relaxation. This can be achieved by providing a mask of boolean entries to ASEBatchwiseLBFGS. The mask is a list of
++
++#entries, indicating atoms, which positions are fixed during the relaxation. Here, we do not fix any atoms. Hence, the mask only contains False.
++
++# define structure mask for optimization (True for fixed, False for non-fixed)
++n_atoms = len(ats[0].get_atomic_numbers())
++single_structure_mask = [False for _ in range(n_atoms)]
++# expand mask by number of input structures (fixed atoms are equivalent for all input structures)
++mask = single_structure_mask * len(ats)
++
++#Finally, we run the optimization:
++
++# Initialize optimizer
++optimizer = ASEBatchwiseLBFGS(
++    calculator=calculator,
++    atoms=ats,
++    trajectory="./howto_batchwise_relaxations_outputs/relax_traj",
++    log_every_step=False,
++    fixed_atoms_mask=mask
++)
++
++# run optimization
++t_start_bw = time.time()
++optimizer.run(fmax=0.0005, steps=1000)
++t_end_bw = time.time()
++relaxation_time_bw = t_end_bw - t_start_bw
++
++#To show the advantage of batch-wise relaxations, in the following, we run the structure optimizations sequentially and compare the total computation time both approaches (batch-wise and sequentially).
++
++# run individual structure optimizations as reference
++t_start_indiv = time.time()
++for at_idx in range(batch_size):
++
++    relax_dir = "howto_batchwise_relaxations_outputs/relax_{}".format(at_idx)
++    if os.path.exists(relax_dir):
++        shutil.rmtree(relax_dir)
++    os.makedirs(relax_dir)
++
++    ase_interface = AseInterface(
++        molecule_path="./howto_batchwise_relaxations_outputs/init_ethanol_{}.xyz".format(at_idx),
++        working_dir=relax_dir,
++        model_file=model_path,
++        neighbor_list=nbh_list,
++        device=device,
++        dtype=torch.float32,
++        energy_unit="kcal/mol",
++        position_unit="Ang",
++        optimizer_class=LBFGS,
++    )
++    ase_interface.optimize(fmax=0.0005, steps=1000)
++
++t_end_indiv = time.time()
++relaxation_time_indiv = t_end_indiv - t_start_indiv
++
++# print out time difference
++print("\n" \
++      "The batch-wise relaxation took %.3f seconds on your %s device\n" \
++      "while individual structure relaxations would take %.3f seconds on the same device.\n" \
++      "You saved %.3f seconds" % 
++      (relaxation_time_bw, device, relaxation_time_indiv, relaxation_time_indiv - relaxation_time_bw))
++
++#Optimzed structures (in the form of ASE Atoms) and properties can be obtained with the get_relaxation_results function.
++
++# get list of optimized structures and properties
++opt_atoms, opt_props = optimizer.get_relaxation_results()
++
++for oatoms in opt_atoms:
++    print(oatoms.get_positions())
++    
++print(opt_props)
++
++#Neglecting small variations due to numerical errors, both approaches provide the same results. We verify this by comparing the root mean square distances (RMSD) between the relaxed structures.
++
++# get all rmsds
++rmsds = []
++for traj_idx in range(batch_size):
++
++    traj_file_1 = "./howto_batchwise_relaxations_outputs/relax_traj_{}.xyz".format(traj_idx)
++    traj_file_2 = "./howto_batchwise_relaxations_outputs/relax_{}/optimization.traj".format(traj_idx)
++
++    traj_ats_1 = read(traj_file_1, index="-1:")
++    traj_ats_2 = read(traj_file_2, index="-1:")
++
++    for step_idx, (at_i, at_j) in enumerate(zip(traj_ats_1, traj_ats_2)):
++        # rotate and translate to minimize rmsd
++        ase.build.minimize_rotation_and_translation(at_i, at_j)
++
++        # store reference and current structure in one atom object for visual comparison with "ase gui"
++        pos_store = np.concatenate((at_i.get_positions(), at_j.get_positions()), axis=0)
++        at_nums_store = np.concatenate((at_i.get_atomic_numbers(), at_j.get_atomic_numbers()), axis=0)
++        at_store = Atoms(positions=pos_store, numbers=at_nums_store)
++        write(
++            os.path.join("./howto_batchwise_relaxations_outputs/comp.xyz"),
++            at_store,
++            format="extxyz",
++            append=False if step_idx == 0 and traj_idx == 0 else True,
++        )
++
++        # calculate rmsd
++        squared_distances = (at_i.get_positions() - at_j.get_positions()) ** 2
++        rmsds.append(squared_distances.sum(1).mean())
++
++print("RMSD_max = %.2fe-9 A" % (max(rmsds) * 1e9))
++
++figure = plt.figure()
++plt.scatter(range(len(rmsds)), rmsds)
++plt.xlabel("sample index")
++plt.ylabel("RMSD (Angstrom)")
++plt.show()
++
++#Now we concatenate the relaxation results of the batch-wise and sequential relaxation, respectively.
++
++ats_sequ = []
++ats_batch = []
++for traj_idx in range(batch_size):
++    
++    traj_file_1 = "./howto_batchwise_relaxations_outputs/relax_traj_{}.xyz".format(traj_idx)
++    traj_file_2 = "./howto_batchwise_relaxations_outputs/relax_{}/optimization.traj".format(traj_idx)
++    
++    ats_batch.append(read(traj_file_1))
++    ats_sequ.append(read(traj_file_2))
++    
++write(
++    os.path.join("./howto_batchwise_relaxations_outputs/sequ_ats.xyz"),
++    ats_sequ,
++    format="extxyz",
++)
++write(
++    os.path.join("./howto_batchwise_relaxations_outputs/batch_ats.xyz"),
++    ats_batch,
++    format="extxyz",
++)
++
++ 
++
+diff --git a/tests/testdata/md_ethanol2.model b/tests/testdata/md_ethanol2.model
+new file mode 100644
+index 000000000..46e399418
+Binary files /dev/null and b/tests/testdata/md_ethanol2.model differ
+diff --git a/tests/testdata/test_qm9.db b/tests/testdata/test_qm9.db
+deleted file mode 100644
+index ec57f6dab..000000000
+Binary files a/tests/testdata/test_qm9.db and /dev/null differ
+diff --git a/tests/testdata/tmp/.gitkeep b/tests/testdata/tmp/.gitkeep
+deleted file mode 100644
+index e69de29bb..000000000

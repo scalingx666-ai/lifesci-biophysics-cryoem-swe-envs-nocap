@@ -1,0 +1,274 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 302d4e1b8..cb628befc 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -54,6 +54,7 @@ jobs:
+         run: |
+           # install packages that aren't required dependencies but that the tests do need
+           pip install h5py vesin
++          #pip install schedulefree  #Disabled to reduce CI runtime; uncomment to test ScheduleFreeLightningModule
+           # install OpenEquivariance only if torch >= 2.4 and CUDA is available
+           if python3 -c "import torch; import packaging.version; exit(0 if packaging.version.parse(torch.__version__).base_version >= '2.4' else 1)"; then
+             if python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)"; then
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b49c59af0..53228d8c6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,8 @@ Most recent change on the top.
+ 
+ ## Unreleased
+ 
++### Added
++- ScheduleFreeLightningModule: New LightningModule subclass that integrates Facebook's Schedule-Free optimizer to enable schedule-free training in NequIP.
+ 
+ ## [0.13.0]
+ 
+diff --git a/docs/api/lightning_module.rst b/docs/api/lightning_module.rst
+index 15f7c182b..75e222574 100644
+--- a/docs/api/lightning_module.rst
++++ b/docs/api/lightning_module.rst
+@@ -12,3 +12,6 @@ NequIPLightningModule
+ 
+ .. autoclass:: nequip.train.EMAConFIGLightningModule
+     :members:
++
++.. autoclass:: nequip.train.ScheduleFreeLightningModule
++    :members:
+\ No newline at end of file
+diff --git a/nequip/train/__init__.py b/nequip/train/__init__.py
+index 45d840e07..07541f45c 100644
+--- a/nequip/train/__init__.py
++++ b/nequip/train/__init__.py
+@@ -20,12 +20,14 @@
+ from .ema import EMALightningModule
+ from .config import ConFIGLightningModule, EMAConFIGLightningModule
+ from .simple_ddp import SimpleDDPStrategy
++from .schedulefree import ScheduleFreeLightningModule
+ 
+ __all__ = [
+     "NequIPLightningModule",
+     "EMALightningModule",
+     "ConFIGLightningModule",
+     "EMAConFIGLightningModule",
++    "ScheduleFreeLightningModule",
+     "MetricsManager",
+     "EnergyForceLoss",
+     "EnergyForceMetrics",
+diff --git a/nequip/train/schedulefree.py b/nequip/train/schedulefree.py
+new file mode 100644
+index 000000000..75565e144
+--- /dev/null
++++ b/nequip/train/schedulefree.py
+@@ -0,0 +1,101 @@
++from .lightning import NequIPLightningModule
++from typing import Dict, Any
++from lightning.pytorch.utilities.exceptions import MisconfigurationException
++from nequip.utils import RankedLogger
++import torch
++
++logger = RankedLogger(__name__, rank_zero_only=True)
++
++
++class ScheduleFreeLightningModule(NequIPLightningModule):
++    """
++    NequIP LightningModule using Facebook's Schedule-Free optimizer.
++
++    This module wraps the model's optimizer in one of Facebook's Schedule-Free variants.
++    See: https://github.com/facebookresearch/schedule_free
++
++    Note: Manual `.train()`/`.eval()` mode control for optimizer is required
++    to ensure smoothed weights are captured at the right time
++
++    Related discussion on Lightning timing hooks:
++    https://github.com/Lightning-AI/pytorch-lightning/discussions/19759
++
++    Args:
++        optimizer (Dict[str, Any]): Dictionary that must include a _target_
++            corresponding to one of the Schedule-Free optimizers and other keyword arguments
++            compatible with the Schedule-Free variants.
++    """
++
++    def __init__(self, optimizer: Dict[str, Any], **kwargs):
++        valid_targets = {
++            "AdamWScheduleFree",
++            "SGDScheduleFree",
++            "RAdamScheduleFree",
++        }
++        target = optimizer.get("_target_")
++        if not target or not any(target.endswith(name) for name in valid_targets):
++            raise MisconfigurationException(
++                f"Invalid optimizer: expected Schedule-Free optimizer (_target_ ending with one of {valid_targets}), "
++                f"but found '{target}'"
++            )
++
++        # Will be used to lazily restore optimizer state in evaluation_model
++        self._schedulefree_state_dict: Dict[str, Any] = {}
++
++        super().__init__(optimizer=optimizer, **kwargs)
++
++    #  Lightning Hook
++    def on_save_checkpoint(self, checkpoint: dict):
++        # Schedule-Free optimizers require .eval() to expose smoothed weights.
++        # This hook is called AFTER Lightning has already saved model/optimizer state,
++        # so we only store the smoothed state_dict here for packaging.
++        opt = self.optimizers()
++        if opt is not None:
++            checkpoint["schedulefree_optimizer_state_dict"] = opt.state_dict()
++
++    #  Lightning Hook
++    def on_load_checkpoint(self, checkpoint: dict):
++        # We extract our custom optimizer state for later lazy loading
++        state = checkpoint.get("schedulefree_optimizer_state_dict")
++        if state is not None:
++            logger.info(
++                "Storing Schedule-Free optimizer state from checkpoint for lazy loading."
++            )
++            self._schedulefree_state_dict = state
++
++    #  NequIP-Specific Override for Packaging
++    @property
++    def evaluation_model(self) -> torch.nn.Module:
++        # This is used during packaging to get the smoothed evaluation weights.
++        logger.info("Loading Schedule-Free optimizer weights for evaluation.")
++
++        prev_state_dict = getattr(self, "_schedulefree_state_dict", None)
++        opt = self.configure_optimizers()
++
++        if prev_state_dict:
++            opt.load_state_dict(prev_state_dict)
++
++        # Set optimizer to evaluation mode for smoothed weights
++        opt.eval()
++
++        return self.model
++
++    #  Lightning Hook
++    def on_train_epoch_start(self) -> None:
++        # Ensures fast weights are used during training
++        self.optimizers().train()
++
++    #  Lightning Hook
++    def on_validation_epoch_start(self) -> None:
++        # Ensures smoothed weights are used for validation
++        self.optimizers().eval()
++
++    #  Lightning Hook
++    def on_test_epoch_start(self) -> None:
++        # Ensures smoothed weights are used during testing
++        self.optimizers().eval()
++
++    #  Lightning Hook
++    def on_predict_epoch_start(self) -> None:
++        # Ensures smoothed weights are used during prediction/inference
++        self.optimizers().eval()
+diff --git a/nequip/utils/unittests/utils.py b/nequip/utils/unittests/utils.py
+index 9d8ebeae0..68061b409 100644
+--- a/nequip/utils/unittests/utils.py
++++ b/nequip/utils/unittests/utils.py
+@@ -26,7 +26,7 @@ def _training_session(
+     model_dtype,
+     extra_train_from_save=None,
+     model_config=None,
+-    training_module=None,
++    training_module_override_dict=None,
+ ):
+     """
+     Create a training session using config files with optional model injection.
+@@ -38,8 +38,7 @@ def _training_session(
+         model_dtype: Model dtype string (e.g., "float32", "float64")
+         extra_train_from_save: Optional, None/"checkpoint"/"package" for additional training
+         model_config: Optional model config dict to inject (for unit tests)
+-        training_module: Optional training module target (for integration tests)
+-
++        training_module_override_dict: Optional dict with training_module override, including optimizer (e.g. for ScheduleFreeLightningModule)
+     Yields:
+         tuple: (config, tmpdir, env) - training config, temp directory, and env vars
+     """
+@@ -58,9 +57,11 @@ def _training_session(
+                 config.data.data_source_dir = data_tmpdir
+ 
+             # configure training module and model
+-            if training_module is not None:
++            if training_module_override_dict is not None:
+                 # integration test case: use provided training module
+-                config.training_module._target_ = training_module
++                if training_module_override_dict:
++                    with open_dict(config):
++                        config.training_module.update(training_module_override_dict)
+                 config.training_module.model.model_dtype = model_dtype
+             else:
+                 # unit test case: default training module
+diff --git a/tests/integration/conftest.py b/tests/integration/conftest.py
+index c3897dba0..67ae7037e 100644
+--- a/tests/integration/conftest.py
++++ b/tests/integration/conftest.py
+@@ -9,6 +9,14 @@
+ from nequip.utils.unittests.utils import _training_session, _check_and_print
+ 
+ 
++try:
++    import schedulefree  # noqa: F401
++
++    _SCHEDULEFREE_INSTALLED = True
++except ImportError:
++    _SCHEDULEFREE_INSTALLED = False
++
++
+ # available training modules for integration tests
+ # to save time, we only check the EMA ones for now
+ _ALL_TRAINING_MODULES = [
+@@ -17,6 +25,8 @@
+     # "nequip.train.ConFIGLightningModule",
+     "nequip.train.EMAConFIGLightningModule",
+ ]
++if _SCHEDULEFREE_INSTALLED:
++    _ALL_TRAINING_MODULES.append("nequip.train.ScheduleFreeLightningModule")
+ 
+ 
+ @pytest.fixture(
+@@ -29,9 +39,27 @@ def conffile(request):
+ 
+ @pytest.fixture(
+     scope="session",
+-    params=_ALL_TRAINING_MODULES,
++    params=[
++        *(
++            [
++                {
++                    "_target_": "nequip.train.ScheduleFreeLightningModule",
++                    "optimizer": {
++                        "_target_": "schedulefree.AdamWScheduleFree",
++                        "lr": 0.01,
++                        "weight_decay": 0.0,
++                        "warmup_steps": 10,
++                    },
++                }
++            ]
++            if _SCHEDULEFREE_INSTALLED
++            else []
++        ),
++        {"_target_": "nequip.train.EMALightningModule"},
++        {"_target_": "nequip.train.EMAConFIGLightningModule"},
++    ],
+ )
+-def training_module(request):
++def training_module_override_dict(request):
+     return request.param
+ 
+ 
+@@ -45,13 +73,13 @@ def extra_train_from_save(request):
+ 
+ @pytest.fixture(scope="session")
+ def fake_model_training_session(
+-    conffile, training_module, model_dtype, extra_train_from_save
++    conffile, training_module_override_dict, model_dtype, extra_train_from_save
+ ):
+     session = _training_session(
+         conffile,
+         model_dtype,
+         extra_train_from_save=extra_train_from_save,
+-        training_module=training_module,
++        training_module_override_dict=training_module_override_dict,
+     )
+     config, tmpdir, env = next(session)
+     yield config, tmpdir, env, model_dtype

@@ -1,0 +1,349 @@
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator_tools.py b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+index be00c6242..efe3800ba 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator_tools.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+@@ -265,6 +265,36 @@ def _is_glob(data_path) -> bool:
+     return any(c in data_path for c in _GLOB_MAGIC)
+ 
+ 
++def _analysis_output_dir_summary(path: Path) -> Optional[dict]:
++    """``examine_data`` keys for a prior analysis output directory (#591):
++    the manifest, the saved scripts under ``scripts/`` (a series keeps one
++    copy of its locked script per unit) and the reuse route. None when the
++    directory is not an analysis output."""
++    manifest = path / "analysis_results.json"
++    scripts_dir = path / "scripts"
++    scripts = sorted(f"scripts/{c.name}" for c in scripts_dir.iterdir()
++                     if c.suffix == ".py") if scripts_dir.is_dir() else []
++    if not manifest.is_file() and not scripts:
++        return None
++    out: dict = {"analysis_output_dir": True}
++    if manifest.is_file():
++        out["analysis_results"] = manifest.name
++    if scripts:
++        out["saved_scripts"] = scripts
++    out["prior_run_hint"] = (
++        "This is a prior analysis OUTPUT directory, not raw data. "
++        + (f"Its saved script(s): {', '.join(scripts[:6])}"
++           + (" …" if len(scripts) > 6 else "")
++           + " (a series saves the same locked script once per unit; any one is the "
++             "reusable fit script — read_file it to inspect). "
++           if scripts else "")
++        + "To re-run the locked model on data, pass this directory as "
++          "prior_analysis_paths with reuse_locked_script=true (script_edits for a "
++          "surgical change); read_file analysis_results.json for the results."
++    )
++    return out
++
++
+ def _resolve_glob_files(pattern: str) -> tuple[list[Path], list[Path]]:
+     """Expand a glob into (data_files, all_files).
+ 
+@@ -1303,6 +1333,14 @@ def examine_data(data_path: str) -> str:
+                     result["is_directory"] = True
+                     result["file_count"] = len(files)
+ 
++                    # An analysis OUTPUT directory (#591): say so, and name the
++                    # saved scripts — the artifact a re-fit looks for and used
++                    # to miss because only the data files were surfaced.
++                    if not is_glob_input:
++                        _prior = _analysis_output_dir_summary(path)
++                        if _prior:
++                            result.update(_prior)
++
+                     if not files:
+                         result["status"] = "error"
+                         result["message"] = "Directory is empty"
+diff --git a/scilink/agents/exp_agents/curve_fitting_agent.py b/scilink/agents/exp_agents/curve_fitting_agent.py
+index 21fd01c88..f74352999 100644
+--- a/scilink/agents/exp_agents/curve_fitting_agent.py
++++ b/scilink/agents/exp_agents/curve_fitting_agent.py
+@@ -1021,8 +1021,12 @@ def _edits_error(err: str, details: str, **extra):
+         # Compile results
+         final_results = self._compile_results(state)
+ 
+-        # Save fitting scripts for reproducibility
+-        self._save_fitting_scripts(state)
++        # Save fitting scripts for reproducibility, and advertise them in the
++        # manifest (#591): a re-fit that wants the locked model must be able
++        # to find scripts/ from analysis_results.json, not only trend_analysis.
++        saved_scripts = self._save_fitting_scripts(state)
++        if saved_scripts:
++            final_results["fitting_scripts"] = self._fitting_scripts_record(saved_scripts, state)
+ 
+         # Bank every approved working script as episodic memory (script bank,
+         # #346) — deterministic, no LLM, failure-isolated. Runs BEFORE T=2
+@@ -1310,8 +1314,31 @@ def _load_auxiliary_data(
+ 
+         return result
+ 
+-    def _save_fitting_scripts(self, state: dict) -> None:
+-        """Save LLM-generated fitting scripts to disk for reproducibility."""
++    def _fitting_scripts_record(self, saved: List[str], state: dict) -> dict:
++        """The manifest entry for the saved scripts (#591). A series saves one
++        copy per fitted spectrum, all the SAME locked model, so any one is the
++        reusable fit script; the record names a representative and the route
++        to reuse it (prior_analysis_paths + reuse_locked_script, script_edits
++        for a surgical change)."""
++        names = [Path(p).name for p in saved]
++        is_single = state.get("is_single_spectrum", True)
++        return {
++            "dir": str(self.output_dir / "scripts"),
++            "files": names,
++            "representative": names[0],
++            "note": (
++                ("The fitting script that produced this result." if is_single else
++                 f"The locked series model, saved once per fitted spectrum ({len(names)} "
++                 "copies of the same script); any one is the reusable fit script.")
++                + " To re-fit with this exact model, pass this output directory as "
++                  "prior_analysis_paths with reuse_locked_script=true; use script_edits "
++                  "for a surgical change (a bound, a window) instead of re-deriving."
++            ),
++        }
++
++    def _save_fitting_scripts(self, state: dict) -> List[str]:
++        """Save LLM-generated fitting scripts to disk for reproducibility.
++        Returns the saved paths."""
+         scripts_dir = self.output_dir / "scripts"
+         saved = []
+ 
+@@ -1338,6 +1365,7 @@ def _save_fitting_scripts(self, state: dict) -> None:
+ 
+         if saved:
+             self.logger.info(f"   Scripts: {scripts_dir} ({len(saved)} file(s))")
++        return saved
+ 
+     def _maybe_stage_t2_solutions(self, state: dict) -> List[str]:
+         """Stage novel T=2 (hot-annealing) successes for later distillation.
+diff --git a/scilink/agents/exp_agents/image_analysis_agent.py b/scilink/agents/exp_agents/image_analysis_agent.py
+index d18f6bbda..63994bafb 100644
+--- a/scilink/agents/exp_agents/image_analysis_agent.py
++++ b/scilink/agents/exp_agents/image_analysis_agent.py
+@@ -676,8 +676,20 @@ def _edits_error(err: str, details: str, **extra):
+         tier1_results = self._compile_results(state)
+         tier1_state = state
+ 
+-        # Save Tier 1 results
+-        self._save_analysis_scripts(state)
++        # Save the scripts and advertise them in the manifest (#591).
++        saved_scripts = self._save_analysis_scripts(state)
++        if saved_scripts:
++            names = [Path(p).name for p in saved_scripts]
++            tier1_results["analysis_scripts"] = {
++                "dir": str(self.output_dir / "scripts"), "files": names,
++                "representative": names[0],
++                "note": ("The analysis script(s) that produced this result"
++                         + ("" if state.get("is_single_image", True) else
++                            f" (the locked pipeline, saved once per image: {len(names)} copies)")
++                         + ". To re-run this exact pipeline, pass this output directory as "
++                           "prior_analysis_paths with reuse_locked_script=true; use "
++                           "script_edits for a surgical change."),
++            }
+ 
+         # ================================================================
+         # TIER 2: Evaluate and optionally run
+@@ -907,8 +919,9 @@ def _load_auxiliary_data(
+ 
+         return result
+ 
+-    def _save_analysis_scripts(self, state: dict) -> None:
+-        """Save LLM-generated analysis scripts to disk for reproducibility."""
++    def _save_analysis_scripts(self, state: dict) -> List[str]:
++        """Save LLM-generated analysis scripts to disk for reproducibility.
++        Returns the saved paths."""
+         scripts_dir = self.output_dir / "scripts"
+         saved = []
+ 
+@@ -935,6 +948,7 @@ def _save_analysis_scripts(self, state: dict) -> None:
+ 
+         if saved:
+             self.logger.info(f"   📝 Scripts: {scripts_dir} ({len(saved)} file(s))")
++        return saved
+ 
+     def _maybe_stage_t2_solutions(self, state: dict) -> List[str]:
+         """Stage novel T=2 (hot-annealing) image-analysis successes for later distillation.
+diff --git a/scilink/utils/file_io.py b/scilink/utils/file_io.py
+index 8add41a67..3aefc7fe5 100644
+--- a/scilink/utils/file_io.py
++++ b/scilink/utils/file_io.py
+@@ -169,6 +169,58 @@ def window_lines(lines: List[str], *, max_lines: int = 200,
+             "content": content}
+ 
+ 
++DIRECTORY_LISTING_MAX_ENTRIES = 300
++
++
++def list_directory(path: Path, *, display_path: Optional[str] = None,
++                   max_entries: int = DIRECTORY_LISTING_MAX_ENTRIES) -> Dict[str, Any]:
++    """What ``read_file`` returns for a directory (#591): its contents, so an
++    agent holding a folder path can reach the file inside instead of
++    concluding the file is elsewhere. Sub-directories come first (with their
++    file counts), then files with sizes; ``scripts/*.py`` and other saved
++    scripts are called out because they are the artifact most often looked
++    for in an analysis output directory.
++    """
++    path = Path(path)
++    try:
++        children = sorted(path.iterdir(), key=lambda c: (c.is_file(), c.name.lower()))
++    except OSError as e:
++        return {"status": "error", "message": f"Cannot list {display_path or path}: {e}"}
++    entries: List[Dict[str, Any]] = []
++    for child in children:
++        if child.name.startswith("."):
++            continue
++        if child.is_dir():
++            try:
++                n = sum(1 for c in child.iterdir() if not c.name.startswith("."))
++            except OSError:
++                n = None
++            entries.append({"name": child.name + "/", "type": "directory", "entries": n})
++        else:
++            try:
++                size = child.stat().st_size
++            except OSError:
++                size = None
++            entries.append({"name": child.name, "type": "file", "size_bytes": size})
++    truncated = len(entries) > max_entries
++    entries = entries[:max_entries]
++    scripts = [e["name"] for e in entries if e["name"].endswith(".py")]
++    scripts_dir = path / "scripts"
++    if scripts_dir.is_dir():
++        scripts += sorted(f"scripts/{c.name}" for c in scripts_dir.iterdir() if c.suffix == ".py")
++    out: Dict[str, Any] = {
++        "status": "success", "file_path": str(path), "is_directory": True,
++        "entries": entries, "truncated": truncated,
++        "hint": (f"'{display_path or path}' is a directory, not a file. Call read_file on one "
++                 "of the entries above (a file's path is this directory joined with its name)."),
++    }
++    if scripts:
++        out["scripts"] = scripts
++        out["hint"] += (" Saved scripts: " + ", ".join(scripts[:8])
++                        + (" …" if len(scripts) > 8 else "") + ".")
++    return out
++
++
+ def read_file_content(path: Path, *, max_lines: int = 200,
+                       tail: bool = False, search: Optional[str] = None,
+                       offset: Optional[int] = None,
+@@ -189,6 +241,8 @@ def read_file_content(path: Path, *, max_lines: int = 200,
+     the name) that are returned whole up to ``full_read_max_chars``.
+     """
+     path = Path(path)
++    if path.is_dir():
++        return list_directory(path, display_path=display_path)
+     if not path.is_file():
+         return {"status": "error",
+                 "message": f"Not a file: {display_path or path}"}
+diff --git a/tests/qc_golden/goldens/curve_realtime_reuse.json b/tests/qc_golden/goldens/curve_realtime_reuse.json
+index c32181562..b12e87daa 100644
+--- a/tests/qc_golden/goldens/curve_realtime_reuse.json
++++ b/tests/qc_golden/goldens/curve_realtime_reuse.json
+@@ -11,6 +11,14 @@
+       "center": 4.0,
+       "sigma": 0.8
+     },
++    "fitting_scripts": {
++      "dir": "<OUTDIR>/scripts",
++      "files": [
++        "fitting_script.py"
++      ],
++      "note": "The fitting script that produced this result. To re-fit with this exact model, pass this output directory as prior_analysis_paths with reuse_locked_script=true; use script_edits for a surgical change (a bound, a window) instead of re-deriving.",
++      "representative": "fitting_script.py"
++    },
+     "literature_files": null,
+     "model_type": "Gaussian + linear background",
+     "output_directory": "<OUTDIR>",
+diff --git a/tests/test_prior_run_script_discovery.py b/tests/test_prior_run_script_discovery.py
+new file mode 100644
+index 000000000..e9b7efbe1
+--- /dev/null
++++ b/tests/test_prior_run_script_discovery.py
+@@ -0,0 +1,88 @@
++"""#591 — a prior run's locked fitting scripts are discoverable: read_file
++on a directory lists it, examine_data names an analysis output directory
++and its scripts, and the curve / image manifests advertise the scripts."""
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++from scilink.utils.file_io import read_file_content, list_directory
++
++
++def _prior_run(tmp_path, n=3):
++    run = tmp_path / "curve_fit_20260908"
++    (run / "scripts").mkdir(parents=True)
++    for i in range(n):
++        (run / "scripts" / f"spectrum_{i:04d}.py").write_text("print('fit')\n")
++    (run / "trend_analysis.py").write_text("print('trend')\n")
++    (run / "analysis_results.json").write_text(json.dumps({"status": "success"}))
++    (run / "features.csv").write_text("a,b\n1,2\n")
++    (run / "spectrum_0000").mkdir()
++    return run
++
++
++def test_read_file_on_a_directory_lists_it_and_names_the_scripts(tmp_path):
++    run = _prior_run(tmp_path)
++    out = read_file_content(run / "scripts", display_path="curve_fit_20260908/scripts")
++    assert out["status"] == "success" and out["is_directory"] is True
++    assert [e["name"] for e in out["entries"]] == ["spectrum_0000.py", "spectrum_0001.py", "spectrum_0002.py"]
++    assert out["scripts"] == ["spectrum_0000.py", "spectrum_0001.py", "spectrum_0002.py"]
++    assert "is a directory, not a file" in out["hint"] and "spectrum_0000.py" in out["hint"]
++    # the run dir itself: sub-directories first, scripts/ contents surfaced
++    top = read_file_content(run)
++    names = [e["name"] for e in top["entries"]]
++    assert names[:2] == ["scripts/", "spectrum_0000/"] and "analysis_results.json" in names
++    assert top["scripts"] == ["trend_analysis.py", "scripts/spectrum_0000.py", "scripts/spectrum_0001.py", "scripts/spectrum_0002.py"]
++    assert next(e for e in top["entries"] if e["name"] == "scripts/")["entries"] == 3
++    # a real file still reads as before
++    assert read_file_content(run / "features.csv")["status"] == "success"
++
++
++def test_directory_listing_is_capped(tmp_path):
++    d = tmp_path / "many"; d.mkdir()
++    for i in range(20):
++        (d / f"f{i:03d}.txt").write_text("x")
++    out = list_directory(d, max_entries=5)
++    assert len(out["entries"]) == 5 and out["truncated"] is True
++
++
++def _examine(tmp_path):
++    from scilink.agents.exp_agents.analysis_orchestrator_tools import AnalysisOrchestratorTools
++    t = AnalysisOrchestratorTools.__new__(AnalysisOrchestratorTools)
++    t.orch = SimpleNamespace(base_dir=Path(tmp_path), model=None, analysis_results=[],
++                             futurehouse_api_key=None, current_metadata=None)
++    t.functions_map, t.openai_schemas = {}, []
++    t._register_all_tools()
++    return t.functions_map["examine_data"]
++
++
++def test_examine_data_names_an_analysis_output_dir_and_its_scripts(tmp_path):
++    run = _prior_run(tmp_path)
++    out = json.loads(_examine(tmp_path)(str(run)))
++    assert out["analysis_output_dir"] is True and out["analysis_results"] == "analysis_results.json"
++    assert out["saved_scripts"] == ["scripts/spectrum_0000.py", "scripts/spectrum_0001.py", "scripts/spectrum_0002.py"]
++    assert "prior analysis OUTPUT directory" in out["prior_run_hint"]
++    assert "reuse_locked_script=true" in out["prior_run_hint"] and "any one is the reusable fit script" in out["prior_run_hint"]
++
++
++def test_examine_data_leaves_a_plain_data_dir_alone(tmp_path):
++    d = tmp_path / "series"; d.mkdir()
++    for i in range(3):
++        (d / f"s{i}.csv").write_text("x,y\n1,2\n3,4\n")
++    out = json.loads(_examine(tmp_path)(str(d)))
++    assert "analysis_output_dir" not in out and "prior_run_hint" not in out
++
++
++def test_curve_manifest_advertises_the_locked_scripts(tmp_path):
++    from scilink.agents.exp_agents.curve_fitting_agent import CurveFittingAgent
++    a = CurveFittingAgent.__new__(CurveFittingAgent)
++    a.output_dir = tmp_path; a.logger = __import__("logging").getLogger("t")
++    state = {"is_single_spectrum": False,
++             "series_results": [{"index": i, "name": f"T={300 + 10 * i}K", "script": "print(1)\n", "success": True}
++                                for i in range(3)]}
++    saved = a._save_fitting_scripts(state)
++    rec = a._fitting_scripts_record(saved, state)
++    assert rec["files"] == ["T_300K.py", "T_310K.py", "T_320K.py"] and rec["representative"] == "T_300K.py"
++    assert rec["dir"] == str(tmp_path / "scripts")
++    assert "3 copies of the same script" in rec["note"] and "reuse_locked_script=true" in rec["note"]
++    single = a._fitting_scripts_record(["/x/scripts/fitting_script.py"], {"is_single_spectrum": True})
++    assert single["note"].startswith("The fitting script that produced this result.")

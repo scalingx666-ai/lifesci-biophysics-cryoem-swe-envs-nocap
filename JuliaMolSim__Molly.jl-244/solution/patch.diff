@@ -1,0 +1,430 @@
+diff --git a/src/Molly.jl b/src/Molly.jl
+index b9ac2796e..1332175e0 100644
+--- a/src/Molly.jl
++++ b/src/Molly.jl
+@@ -63,6 +63,7 @@ include("interactions/rb_torsion.jl")
+ include("interactions/ewald.jl")
+ include("interactions/implicit_solvent.jl")
+ include("interactions/muller_brown.jl")
++include("interactions/dpd.jl")
+ include("constraints/constraints.jl")
+ include("constraints/shake.jl")
+ include("simulators.jl")
+diff --git a/src/interactions/dpd.jl b/src/interactions/dpd.jl
+new file mode 100644
+index 000000000..d914ac4b8
+--- /dev/null
++++ b/src/interactions/dpd.jl
+@@ -0,0 +1,139 @@
++export DPDInteraction
++
++@doc raw"""
++    DPDInteraction(; a, γ, σ, r_c, dt, use_neighbors)
++
++The dissipative particle dynamics (DPD) interaction between two particles.
++
++Combines conservative, dissipative, and random pairwise forces as described in
++[Groot and Warren 1997](https://doi.org/10.1063/1.474784).
++
++The total pairwise force is
++```math
++\vec{F}_{ij} = \vec{F}_{ij}^C + \vec{F}_{ij}^D + \vec{F}_{ij}^R
++```
++where the conservative force is
++```math
++\vec{F}_{ij}^C = a \left(1 - \frac{r_{ij}}{r_c}\right) \hat{r}_{ij}
++```
++the dissipative force is
++```math
++\vec{F}_{ij}^D = -\gamma \left(1 - \frac{r_{ij}}{r_c}\right)^2
++    (\hat{r}_{ij} \cdot \vec{v}_{ij}) \hat{r}_{ij}
++```
++and the random force is
++```math
++\vec{F}_{ij}^R = \sigma \left(1 - \frac{r_{ij}}{r_c}\right)
++    \xi_{ij} \Delta t^{-1/2} \hat{r}_{ij}
++```
++
++All forces are zero for ``r_{ij} \geq r_c``.
++The weight functions satisfy ``w^D(r) = [w^R(r)]^2`` with ``w^R(r) = 1 - r/r_c``.
++
++The fluctuation-dissipation relation ``\sigma^2 = 2 \gamma k_B T`` must be
++satisfied by the user's choice of parameters to correctly thermostat at
++temperature ``T``.
++
++The conservative potential energy is
++```math
++V(r_{ij}) = \frac{a}{2} r_c \left(1 - \frac{r_{ij}}{r_c}\right)^2
++```
++
++Deterministic pairwise random numbers are generated from a hash of the particle
++indices and the step number, ensuring momentum conservation and reproducibility.
++
++When using a neighbor list, set `dist_cutoff` to at least `1.5 * r_c` to provide a
++skin distance that accounts for particle movement between neighbor list rebuilds.
++
++# Arguments
++- `a`: the conservative force strength parameter.
++- `γ`: the dissipative force strength parameter.
++- `σ`: the random force strength parameter (must satisfy σ² = 2γkBT).
++- `r_c`: the cutoff distance beyond which all forces are zero.
++- `dt`: the simulation timestep (needed for random force scaling as Δt⁻¹ᐟ²).
++- `use_neighbors::Bool=true`: whether to use the neighbor list.
++"""
++@kwdef struct DPDInteraction{A, G, S, R, D} <: PairwiseInteraction
++    a::A = 25.0
++    γ::G = 4.5
++    σ::S = 3.0
++    r_c::R = 1.0
++    dt::D = 0.01
++    use_neighbors::Bool = false
++end
++
++use_neighbors(inter::DPDInteraction) = inter.use_neighbors
++
++function Base.zero(d::DPDInteraction)
++    return DPDInteraction(d.a, d.γ, d.σ, d.r_c, d.dt, d.use_neighbors)
++end
++
++function Base.:+(d1::DPDInteraction, ::DPDInteraction)
++    return DPDInteraction(d1.a, d1.γ, d1.σ, d1.r_c, d1.dt, d1.use_neighbors)
++end
++
++# Deterministic per-pair Gaussian noise via hash-based Box-Muller transform.
++# Symmetric in (i, j) to ensure momentum conservation.
++@inline function dpd_gaussian(idx_i::Integer, idx_j::Integer, step_n::Integer)
++    a, b = minmax(idx_i, idx_j)
++    h = hash((a, b, step_n))
++    u1 = (h & 0xFFFFFFFF) / 4294967296.0
++    u2 = ((h >> 32) & 0xFFFFFFFF) / 4294967296.0
++    return sqrt(-2 * log(u1 + 1e-30)) * cos(2π * u2)
++end
++
++@inline function force(inter::DPDInteraction,
++                       dr,
++                       atom_i,
++                       atom_j,
++                       force_units,
++                       special,
++                       coord_i,
++                       coord_j,
++                       boundary,
++                       velocity_i,
++                       velocity_j,
++                       step_n)
++    r = norm(dr)
++    r_c = inter.r_c
++
++    if r >= r_c || iszero(r)
++        return ustrip.(zero(dr)) * force_units
++    end
++
++    w_R = 1 - r / r_c
++    w_D = w_R * w_R
++    inv_r = inv(r)
++
++    # Conservative: repulsive soft potential
++    f_C = inter.a * w_R * inv_r
++
++    # Dissipative: velocity-dependent drag along line of centers
++    v_rel = velocity_i - velocity_j
++    rdotv = dot(dr, v_rel) * inv_r * inv_r
++    f_D = inter.γ * w_D * rdotv
++
++    # Random: pairwise-correlated stochastic force
++    ξ = dpd_gaussian(atom_i.index, atom_j.index, step_n)
++    f_R = inter.σ * w_R * ξ * inv(sqrt(inter.dt)) * inv_r
++
++    return (f_C + f_D + f_R) * dr
++end
++
++@inline function potential_energy(inter::DPDInteraction,
++                                  dr,
++                                  atom_i,
++                                  atom_j,
++                                  energy_units=u"kJ * mol^-1",
++                                  args...)
++    r = norm(dr)
++    r_c = inter.r_c
++
++    if r >= r_c || iszero(r)
++        return ustrip(zero(dr[1])) * energy_units
++    end
++
++    # Only the conservative part has a well-defined potential energy
++    w = 1 - r / r_c
++    return (inter.a / 2) * r_c * w * w
++end
+diff --git a/src/simulators.jl b/src/simulators.jl
+index 4cac3a0b5..7b7c23ebf 100644
+--- a/src/simulators.jl
++++ b/src/simulators.jl
+@@ -4,6 +4,7 @@ export
+     SteepestDescentMinimizer,
+     simulate!,
+     VelocityVerlet,
++    DPDVelocityVerlet,
+     Verlet,
+     StormerVerlet,
+     Langevin,
+@@ -278,6 +279,115 @@ end
+     return sys
+ end
+ 
++"""
++    DPDVelocityVerlet(; <keyword arguments>)
++
++The modified velocity Verlet integrator for dissipative particle dynamics.
++
++Implements the Groot-Warren modified velocity-Verlet (MVV) algorithm from
++[Groot and Warren 1997](https://doi.org/10.1063/1.474784).
++
++Because DPD dissipative forces depend on particle velocities, a velocity
++prediction step is used before recomputing forces at the new positions.
++The `λ` parameter controls this prediction: `v_predicted = v(t) + λ * dt * a(t)`.
++A value of 0.65 is commonly used.
++
++Should be used with [`DPDInteraction`](@ref) as the pairwise interaction.
++
++# Arguments
++- `dt::T`: the time step of the simulation.
++- `λ::L=0.65`: the velocity prediction parameter (typically 0.5–0.65).
++- `coupling::C=nothing`: the coupling which applies during the simulation.
++- `remove_CM_motion=1`: remove the center of mass motion every this number of steps,
++    set to `false` or `0` to not remove center of mass motion.
++"""
++struct DPDVelocityVerlet{T, L, C}
++    dt::T
++    λ::L
++    coupling::C
++    remove_CM_motion::Int
++end
++
++function DPDVelocityVerlet(; dt, λ=0.65, coupling=nothing, remove_CM_motion=1)
++    return DPDVelocityVerlet(dt, λ, coupling, Int(remove_CM_motion))
++end
++
++@inline function simulate!(sys,
++                           sim::DPDVelocityVerlet,
++                           n_steps::Integer;
++                           n_threads::Integer=Threads.nthreads(),
++                           run_loggers=true,
++                           rng=Random.default_rng())
++    needs_vir, needs_vir_steps = needs_virial_schedule(sim.coupling)
++    sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
++    place_virtual_sites!(sys)
++    !iszero(sim.remove_CM_motion) && remove_CM_motion!(sys)
++    neighbors = find_neighbors(sys, sys.neighbor_finder; n_threads=n_threads)
++    forces_t, forces_t_dt = zero_forces(sys), zero_forces(sys)
++    buffers = init_buffers!(sys, n_threads)
++    forces!(forces_t, sys, neighbors, buffers, Val(needs_vir), 0; n_threads=n_threads)
++    accels_t = calc_accels.(forces_t, masses(sys))
++    accels_t_dt = zero(accels_t)
++    apply_loggers!(sys, buffers, neighbors, 0, run_loggers; n_threads=n_threads, current_forces=forces_t)
++    using_constraints = (length(sys.constraints) > 0)
++    if using_constraints
++        cons_coord_storage = zero(sys.coords)
++        cons_vel_storage = zero(sys.velocities)
++    end
++    velocities_t = zero(sys.velocities)
++    dt_div2 = sim.dt / 2
++    dt_sq_div2 = sim.dt^2 / 2
++    λ_dt = sim.λ * sim.dt
++
++    for step_n in 1:n_steps
++        if using_constraints
++            cons_coord_storage .= sys.coords
++        end
++        needs_vir = (step_n % needs_vir_steps == 0)
++
++        velocities_t .= sys.velocities
++
++        # Position update: r(t+dt) = r(t) + v(t)*dt + a(t)*dt²/2
++        sys.coords .+= sys.velocities .* sim.dt .+ accels_t .* dt_sq_div2
++        using_constraints && apply_position_constraints!(sys, cons_coord_storage, cons_vel_storage,
++                                                         sim.dt; n_threads=n_threads)
++        sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
++        place_virtual_sites!(sys)
++
++        # Velocity prediction for dissipative force evaluation
++        sys.velocities .= velocities_t .+ accels_t .* λ_dt
++
++        # Compute forces at new positions with predicted velocities
++        forces!(forces_t_dt, sys, neighbors, buffers, Val(needs_vir), step_n; n_threads=n_threads)
++        accels_t_dt .= calc_accels.(forces_t_dt, masses(sys))
++
++        # Final velocity: v(t+dt) = v(t) + (dt/2)*(a(t) + a(t+dt))
++        sys.velocities .= velocities_t .+ (accels_t .+ accels_t_dt) .* dt_div2
++        using_constraints && apply_velocity_constraints!(sys; n_threads=n_threads)
++
++        if !iszero(sim.remove_CM_motion) && step_n % sim.remove_CM_motion == 0
++            remove_CM_motion!(sys)
++        end
++        recompute_forces = apply_coupling!(sys, buffers, sim.coupling, sim, neighbors, step_n;
++                                           n_threads=n_threads, rng=rng)
++
++        neighbors = find_neighbors(sys, sys.neighbor_finder, neighbors, step_n, recompute_forces;
++                                   n_threads=n_threads)
++        if recompute_forces
++            forces!(forces_t_dt, sys, neighbors, buffers, Val(needs_vir), step_n; n_threads=n_threads)
++            forces_t .= forces_t_dt
++            accels_t .= calc_accels.(forces_t, masses(sys))
++        else
++            forces_t .= forces_t_dt
++            accels_t .= accels_t_dt
++        end
++
++        apply_loggers!(sys, buffers, neighbors, step_n, run_loggers; n_threads=n_threads,
++                       current_forces=forces_t)
++    end
++    return sys
++end
++
+ """
+     Verlet(; <keyword arguments>)
+ 
+diff --git a/test/interactions.jl b/test/interactions.jl
+index 6ab655d17..8daef99f2 100644
+--- a/test/interactions.jl
++++ b/test/interactions.jl
+@@ -992,3 +992,80 @@ end
+         end
+     end
+ end
++
++@testset "DPD interaction" begin
++    r_c = 1.0
++    a_param = 25.0
++    γ_param = 4.5
++    dt = 0.01
++    σ_param = 3.0
++    boundary = CubicBoundary(5.0)
++
++    inter = DPDInteraction(a=a_param, γ=γ_param, σ=σ_param, r_c=r_c, dt=dt)
++
++    @test !use_neighbors(inter)
++    @test use_neighbors(DPDInteraction(use_neighbors=true))
++
++    a1 = Atom(index=1, mass=1.0, charge=0.0, σ=0.0, ϵ=0.0)
++    a2 = Atom(index=2, mass=1.0, charge=0.0, σ=0.0, ϵ=0.0)
++    c1 = SVector(1.0, 1.0, 1.0)
++    c2 = SVector(1.5, 1.0, 1.0)
++    v1 = SVector(0.0, 0.0, 0.0)
++    v2 = SVector(0.0, 0.0, 0.0)
++    dr = vector(c1, c2, boundary)
++    r = norm(dr)
++
++    # Conservative force only (zero velocities, deterministic random from hash)
++    f = force(inter, dr, a1, a2, NoUnits, false, c1, c2, boundary, v1, v2, 0)
++    w_R = 1 - r / r_c
++    f_C_expected = a_param * w_R / r
++    # The force should be in the +x direction (repulsive, pushing j away from i)
++    @test f[1] > 0.0
++    @test isapprox(f[2], 0.0; atol=1e-10)
++    @test isapprox(f[3], 0.0; atol=1e-10)
++
++    # Conservative potential energy
++    pe = potential_energy(inter, dr, a1, a2, NoUnits)
++    pe_expected = (a_param / 2) * r_c * w_R^2
++    @test isapprox(pe, pe_expected; atol=1e-10)
++
++    # Force is zero at and beyond cutoff
++    c3 = SVector(2.0, 1.0, 1.0)
++    dr_cutoff = vector(c1, c3, boundary)
++    f_cutoff = force(inter, dr_cutoff, a1, a2, NoUnits, false, c1, c3, boundary, v1, v2, 0)
++    @test all(isapprox.(f_cutoff, 0.0; atol=1e-10))
++    @test isapprox(potential_energy(inter, dr_cutoff, a1, a2, NoUnits), 0.0; atol=1e-10)
++
++    c4 = SVector(2.5, 1.0, 1.0)
++    dr_beyond = vector(c1, c4, boundary)
++    f_beyond = force(inter, dr_beyond, a1, a2, NoUnits, false, c1, c4, boundary, v1, v2, 0)
++    @test all(isapprox.(f_beyond, 0.0; atol=1e-10))
++
++    # Dissipative force: approaching particles should experience damping
++    v1_approach = SVector(1.0, 0.0, 0.0)
++    v2_still = SVector(0.0, 0.0, 0.0)
++    inter_nodiss = DPDInteraction(a=0.0, γ=γ_param, σ=0.0, r_c=r_c, dt=dt)
++    f_diss = force(inter_nodiss, dr, a1, a2, NoUnits, false, c1, c2, boundary,
++                   v1_approach, v2_still, 0)
++    # Dissipative force on j should push j away from i (same direction as approach)
++    @test f_diss[1] > 0.0
++    # Force should be purely along x axis
++    @test isapprox(f_diss[2], 0.0; atol=1e-10)
++    @test isapprox(f_diss[3], 0.0; atol=1e-10)
++
++    # Receding particles: dissipative force should pull them back
++    v1_recede = SVector(-1.0, 0.0, 0.0)
++    f_diss_recede = force(inter_nodiss, dr, a1, a2, NoUnits, false, c1, c2, boundary,
++                          v1_recede, v2_still, 0)
++    @test f_diss_recede[1] < 0.0
++
++    # Random noise symmetry: dpd_gaussian is symmetric in particle indices
++    for step in 1:10
++        @test Molly.dpd_gaussian(1, 2, step) == Molly.dpd_gaussian(2, 1, step)
++        @test Molly.dpd_gaussian(5, 13, step) == Molly.dpd_gaussian(13, 5, step)
++    end
++
++    # Random noise varies with step number
++    vals = [Molly.dpd_gaussian(1, 2, s) for s in 1:100]
++    @test std(vals) > 0.5
++end
+diff --git a/test/simulation.jl b/test/simulation.jl
+index 0f1cb62a9..4bd07b076 100644
+--- a/test/simulation.jl
++++ b/test/simulation.jl
+@@ -1202,6 +1202,55 @@ end
+     end
+ end
+ 
++@testset "DPD simulation" begin
++    n_atoms = 100
++    n_steps = 10_000
++    dt = 0.01
++    r_c = 1.0
++    box_size = 5.0
++    density = n_atoms / box_size^3
++    γ = 4.5
++    kBT = 1.0
++    σ = sqrt(2 * γ * kBT)
++    a = 25.0
++
++    boundary = CubicBoundary(box_size)
++    rng = Xoshiro(12345)
++    coords = [SVector{3}(rand(rng, 3) .* box_size) for _ in 1:n_atoms]
++    velocities = [SVector{3}(randn(rng, 3)) for _ in 1:n_atoms]
++    atoms = [Atom(index=i, mass=1.0, charge=0.0, σ=0.0, ϵ=0.0) for i in 1:n_atoms]
++
++    sys = System(
++        atoms=atoms,
++        coords=coords,
++        boundary=boundary,
++        velocities=velocities,
++        pairwise_inters=(DPDInteraction(a=a, γ=γ, σ=σ, r_c=r_c, dt=dt, use_neighbors=true),),
++        neighbor_finder=DistanceNeighborFinder(
++            eligible=trues(n_atoms, n_atoms),
++            n_steps=10,
++            dist_cutoff=1.5 * r_c,
++        ),
++        loggers=(
++            temp=TemperatureLogger(Float64, 100),
++        ),
++        force_units=NoUnits,
++        energy_units=NoUnits,
++        k=1.0, # DPD uses reduced units where kB = 1; default_k(NoUnits) ≈ 0.008314
++    )
++
++    simulator = DPDVelocityVerlet(dt=dt, λ=0.65)
++    @time simulate!(sys, simulator, n_steps; n_threads=1)
++
++    temps = values(sys.loggers.temp)
++    mean_temp = mean(temps[length(temps) ÷ 2 + 1:end])
++    @info "DPD mean temperature (second half): $mean_temp, target kBT: $kBT"
++    @test 0.5 < mean_temp < 1.5
++
++    total_momentum = sum(sys.velocities .* mass.(atoms))
++    @test all(abs.(total_momentum) .< 1.0)
++end
++
+ @testset "Accelerated Weight Histogram (AWH)" begin
+     n_atoms = 50
+     n_steps = 2_000

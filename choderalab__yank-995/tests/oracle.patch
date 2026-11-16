@@ -1,0 +1,1030 @@
+diff --git a/Yank/experiment.py b/Yank/experiment.py
+index 06eb7a41..2a12f90f 100644
+--- a/Yank/experiment.py
++++ b/Yank/experiment.py
+@@ -236,7 +236,7 @@ class AlchemicalPhaseFactory(object):
+         'randomize_ligand_close_cutoff': 1.5 * unit.angstrom,
+         'number_of_equilibration_iterations': 0,
+         'equilibration_timestep': 1.0 * unit.femtosecond,
+-        'checkpoint_interval': 10,
++        'checkpoint_interval': 200,
+         'store_solute_trajectory': True
+     }
+ 
+@@ -1948,6 +1948,16 @@ def _validate_samplers(self, yaml_content):
+         """.format(MCMC_MOVE_IDS=list(self._mcmc_moves.keys()))
+         sampler_schema = yaml.load(sampler_schema)
+ 
++        # Special case for "checkpoint" in online analysis
++        # Handle 1-case where its set by user to something other than checkpoint and exclude it, then process if not it
++        options_description = yaml_content.get('options', {})
++        for sampler_description in sampler_descriptions:
++            if not ("online_analysis_interval" in sampler_descriptions[sampler_description] and
++                    sampler_descriptions[sampler_description]["online_analysis_interval"] != "checkpoint"):
++                sampler_descriptions[sampler_description]["online_analysis_interval"] = \
++                    options_description.get('checkpoint_interval',
++                                            AlchemicalPhaseFactory.DEFAULT_OPTIONS['checkpoint_interval'])
++
+         sampler_validator = schema.YANKCerberusValidator(sampler_schema)
+         if sampler_validator.validate({'samplers': sampler_descriptions}):
+             validated_samplers = sampler_validator.document
+@@ -2829,11 +2839,18 @@ def _get_experiment_sampler_constructor(self, experiment_description):
+             constructor_description = copy.deepcopy(self._samplers[sampler_id])
+ 
+         # Overwrite default number of iterations if not specified.
++        experiment_options, phase_options, _, _ = self._determine_experiment_options(experiment_description)
+         if 'number_of_iterations' not in constructor_description:
+-            experiment_options = self._determine_experiment_options(experiment_description)[0]
+             default_number_of_iterations = experiment_options['default_number_of_iterations']
+             constructor_description['number_of_iterations'] = default_number_of_iterations
+ 
++        # Overwrite the online analysis interval if not specified
++        if not ("online_analysis_interval" in constructor_description and
++                constructor_description["online_analysis_interval"] != "checkpoint"):
++            constructor_description["online_analysis_interval"] = \
++                phase_options.get('checkpoint_interval',
++                                  AlchemicalPhaseFactory.DEFAULT_OPTIONS['checkpoint_interval'])
++
+         return constructor_description
+ 
+     def _get_experiment_number_of_iterations(self, experiment_description):
+diff --git a/Yank/multistate/multistateanalyzer.py b/Yank/multistate/multistateanalyzer.py
+index aa3aa4ff..95d272c9 100644
+--- a/Yank/multistate/multistateanalyzer.py
++++ b/Yank/multistate/multistateanalyzer.py
+@@ -480,11 +480,21 @@ class PhaseAnalyzer(ABC):
+         For instance, the initial guess of relative free energies to give to MBAR would be something like:
+         ``{'initial_f_k':[0,1,2,3]}``
+ 
++    use_online_data : bool, optional, Default: True
++        Attempt to read online analysis data as a way to hot-start the analysis computation. This will attempt to
++        read the data stored by the MultiStateAnalyzer.
++
++        If this is set to ``False``, the online analysis data is not read.
++
++        If this is set to ``False`` after being initialized, the :class:`CachedProperty` dependencies are all
++        invalidated and properties will be computed from scratch on next observables
++
++        If no online data is found, this setting has no effect
++
+     registry : ObservablesRegistry instance
+         Instanced ObservablesRegistry with all observables implemented through a ``get_X`` function classified and
+         registered. Any cross-phase analysis must use the same instance of an ObservablesRegistry
+ 
+-
+     Attributes
+     ----------
+     name
+@@ -497,6 +507,7 @@ class PhaseAnalyzer(ABC):
+     kT
+     reporter
+     registry
++    use_online_data
+ 
+     See Also
+     --------
+@@ -505,7 +516,8 @@ class PhaseAnalyzer(ABC):
+     """
+     def __init__(self, reporter, name=None, reference_states=(0, -1),
+                  max_n_iterations=None, analysis_kwargs=None,
+-                 registry=default_observables_registry):
++                 registry=default_observables_registry,
++                 use_online_data=True):
+         """
+         The reporter provides the hook into how to read the data, all other options control where differences are
+         measured from and how each phase interfaces with other phases.
+@@ -534,13 +546,18 @@ def __init__(self, reporter, name=None, reference_states=(0, -1),
+         self._sign = '+'
+         self._reference_states = None  # Initialize the cache object.
+         self.reference_states = reference_states
+-        self._extra_analysis_kwargs = analysis_kwargs
++        self._user_extra_analysis_kwargs = analysis_kwargs  # Store the user-specified (higher priority) keywords
+ 
+         # Initialize cached values that are read or derived from the Reporter.
+         self._cache = {}  # This cache should be always set with _update_cache().
+         self.clear()
+         self.max_n_iterations = max_n_iterations
+ 
++        # Check the onlie data
++        self._online_data = None  # Init the object
++        self._use_online_data = use_online_data
++        self._read_online_data_if_present()
++
+     def clear(self):
+         """Reset all cached objects.
+ 
+@@ -649,6 +666,26 @@ def reporter(self, value):
+         """Make sure users cannot overwrite the reporter."""
+         raise ValueError("You cannot re-assign the reporter for this analyzer!")
+ 
++    @property
++    def use_online_data(self):
++        """Get the online data flag"""
++        return self._use_online_data
++
++    @use_online_data.setter
++    def use_online_data(self, value):
++        """Set the online data boolean"""
++        if type(value) != bool:
++            raise ValueError("use_online_data must be a boolean!")
++        if self._use_online_data is False and value is True:
++            # Re-read the online data
++            self._read_online_data_if_present()
++        elif self._use_online_data is True and value is False:
++            # Invalidate online data
++            self._online_data = None
++            # Re-form dict to prevent variables from referencing the same object
++            self._extra_analysis_kwargs = {**self._user_extra_analysis_kwargs}
++        self._use_online_data = value
++
+     # -------------------------------------------------------------------------
+     # Cached properties functions/classes.
+     # -------------------------------------------------------------------------
+@@ -692,7 +729,7 @@ def _update_cache(self, key, new_value, check_changes=False):
+         except KeyError:
+             invalidate_cache = False
+         else:
+-            if check_changes and old_value == new_value:
++            if check_changes and self._check_equal(old_value, new_value):
+                 invalidate_cache = False
+         # Update value and invalidate the cache.
+         self._cache[key] = new_value
+@@ -720,6 +757,15 @@ def _invalidate_cache_values(self, key):
+                 # Remove k.
+                 self._cache.pop(k, None)
+ 
++    @staticmethod
++    def _check_equal(old_value, new_value):
++        """Broader equality check"""
++        try:
++            np.testing.assert_equal(old_value, new_value)
++        except AssertionError:
++            return False
++        return True
++
+     # -------------------------------------------------------------------------
+     # Cached properties.
+     # -------------------------------------------------------------------------
+@@ -733,6 +779,8 @@ def max_n_iterations(self, instance, new_value):
+             new_value = instance.n_iterations
+         return new_value
+ 
++    _extra_analysis_kwargs = CachedProperty('_extra_analysis_kwargs', check_changes=True)
++
+     # -------------------------------------------------------------------------
+     # Abstract methods.
+     # -------------------------------------------------------------------------
+@@ -948,6 +996,16 @@ def _create_mbar(self, energy_matrix, samples_per_state):
+         logger.info('Done.')
+         return self.mbar
+ 
++    def _read_online_data_if_present(self):
++        """
++        Attempt to read the online analysis data needed to hot-start the output
++        """
++        try:
++            online_f_k = self.reporter.read_online_analysis_data(None, 'f_k')['f_k']
++            self._online_data = {'initial_f_k': online_f_k}
++        except ValueError:
++            self._online_data = None
++
+     # -------------------------------------------------------------------------
+     # Analysis combination.
+     # -------------------------------------------------------------------------
+@@ -1382,6 +1440,18 @@ def _compute_mbar_decorrelated_energies(self):
+             energy_matrix[[0, -1], :] = self.reformat_energies_for_mbar(unsampled_energy_matrix)
+             logger.info("Found expanded cutoff states in the energies!")
+             logger.info("Free energies will be reported relative to them instead!")
++        if self.use_online_data and self._online_data is not None:
++            # Do online data only if present and already exists as stored in self._online_data
++            temp_online = copy.deepcopy(self._online_data)
++            f_k_i = np.zeros(n_sampled_states + n_unsampled_states)
++            online_f_k = temp_online['initial_f_k']
++            f_k_i[first_sampled_state:last_sampled_state] = online_f_k
++            temp_online['initial_f_k'] = f_k_i
++            # Re-set the extra analysis_
++            self._extra_analysis_kwargs = {**temp_online, **self._user_extra_analysis_kwargs}
++        else:
++            # Possible reset of the final key if online was true then false to invalidate any online data.
++            self._extra_analysis_kwargs = {**self._user_extra_analysis_kwargs}
+ 
+         # These cached values speed up considerably the computation of the
+         # free energy profile along the restraint distance/energy cutoff.
+@@ -1958,7 +2028,8 @@ def _unbiased_decorrelated_N_l(self, instance):
+ 
+     mbar = CachedProperty(
+         name='mbar',
+-        dependencies=['unbiased_decorrelated_u_ln', 'unbiased_decorrelated_N_l'],
++        dependencies=['unbiased_decorrelated_u_ln', 'unbiased_decorrelated_N_l',
++                      '_extra_analysis_kwargs'],
+     )
+ 
+     @mbar.default
+diff --git a/Yank/multistate/multistatereporter.py b/Yank/multistate/multistatereporter.py
+index 37bea4e7..7fb5bc16 100644
+--- a/Yank/multistate/multistatereporter.py
++++ b/Yank/multistate/multistatereporter.py
+@@ -75,7 +75,7 @@ class MultiStateReporter(object):
+ 
+         If None, the storage file won't be open on construction, and a call to
+         :func:`Reporter.open` will be needed before attempting read/write operations.
+-    checkpoint_interval : int >= 1, Default: 10
++    checkpoint_interval : int >= 1, Default: 200
+         The frequency at which checkpointing information is written relative to analysis information.
+ 
+         This is a multiple
+@@ -99,10 +99,15 @@ class MultiStateReporter(object):
+     Attributes
+     ----------
+     filepath
++    checkpoint_interval
++    is_periodic
++    n_states
++    n_replicas
++    analysis_particle_indices
+ 
+     """
+     def __init__(self, storage, open_mode=None,
+-                 checkpoint_interval=10, checkpoint_storage=None,
++                 checkpoint_interval=200, checkpoint_storage=None,
+                  analysis_particle_indices=()):
+         # Handle checkpointing
+         if type(checkpoint_interval) != int:
+@@ -180,6 +185,11 @@ def analysis_particle_indices(self):
+         """Return the tuple of indices of the particles which additional information is stored on for analysis"""
+         return self._analysis_particle_indices
+ 
++    @property
++    def checkpoint_interval(self):
++        """Returns the checkpoint interval"""
++        return self._checkpoint_interval
++
+     def storage_exists(self, skip_size=False):
+         """
+         Check if the storage files exist on disk.
+@@ -1137,7 +1147,8 @@ def read_online_analysis_data(self, iteration, *keys: str):
+         Parameters
+         ----------
+         iteration : int or None
+-            Iteration to fetch data at
++            Iteration to fetch data at. If ``None``, then assumes static data and will attempt to get the entry with the
++            name written assuming no iteration-specific data.
+         keys : str
+             Variables to fetch data from
+ 
+diff --git a/Yank/multistate/multistatesampler.py b/Yank/multistate/multistatesampler.py
+index 76815901..1daf5a3c 100644
+--- a/Yank/multistate/multistatesampler.py
++++ b/Yank/multistate/multistatesampler.py
+@@ -82,7 +82,7 @@ class MultiStateSampler(object):
+         The number of iterations to perform. Both ``float('inf')`` and
+         ``numpy.inf`` are accepted for infinity. If you set this to infinity,
+         be sure to set also ``online_analysis_interval``.
+-    online_analysis_interval : None or Int >= 1, optional, default None
++    online_analysis_interval : None or Int >= 1, optional, default: 200
+         Choose the interval at which to perform online analysis of the free energy.
+ 
+         After every interval, the simulation will be stopped and the free energy estimated.
+@@ -90,14 +90,20 @@ class MultiStateSampler(object):
+         If the error in the free energy estimate is at or below ``online_analysis_target_error``, then the simulation
+         will be considered completed.
+ 
+-    online_analysis_target_error : float >= 0, optional, default 0.2
++        If set to ``None``, then no online analysis is performed
++
++    online_analysis_target_error : float >= 0, optional, default 0.0
+         The target error for the online analysis measured in kT per phase.
+ 
+         Once the free energy is at or below this value, the phase will be considered complete.
+ 
+         If ``online_analysis_interval`` is None, this option does nothing.
+ 
+-    online_analysis_minimum_iterations : int >= 0, optional, default 50
++        Default is set to 0.0 since online analysis runs by default, but a finite ``number_of_iterations`` should also
++        be set to ensure there is some stop condition. If target error is 0 and an infinite number of iterations is set,
++        then the sampler will run until the user stop it manually.
++
++    online_analysis_minimum_iterations : int >= 0, optional, default 200
+         Set the minimum number of iterations which must pass before online analysis is carried out.
+ 
+         Since the initial samples likely not to yield a good estimate of free energy, save time and just skip them
+@@ -132,8 +138,8 @@ class MultiStateSampler(object):
+     # -------------------------------------------------------------------------
+ 
+     def __init__(self, mcmc_moves=None, number_of_iterations=1,
+-                 online_analysis_interval=None, online_analysis_target_error=0.2,
+-                 online_analysis_minimum_iterations=50,
++                 online_analysis_interval=200, online_analysis_target_error=0.0,
++                 online_analysis_minimum_iterations=200,
+                  locality=None):
+         # These will be set on initialization. See function
+         # create() for explanation of single variables.
+@@ -253,12 +259,15 @@ def read_status(cls, storage):
+         options = reporter.read_dict('options')
+         iteration = reporter.read_last_iteration(last_checkpoint=False)
+         # Search for last cached free energies only if online analysis is activated.
++        target_error = None
++        last_err_free_energy = None
+         if options['online_analysis_interval'] is not None:
+             target_error = options['online_analysis_target_error']
+-            last_err_free_energy = cls._read_last_free_energy(reporter, iteration)[1][1]
+-        else:
+-            target_error = None
+-            last_err_free_energy = None
++            try:
++                last_err_free_energy = cls._read_last_free_energy(reporter, iteration)[1][1]
++            except TypeError:
++                # Trap for undefined free energy (has not been run yet)
++                last_err_free_energy = np.inf
+         reporter.close()
+ 
+         # Check if the calculation is done.
+@@ -381,7 +390,7 @@ def __set__(self, instance, new_value):
+         # ----------------------------------
+ 
+         @staticmethod
+-        def _number_of_iterations_validator(instance, number_of_iterations):
++        def _number_of_iterations_validator(_, number_of_iterations):
+             # Support infinite number of iterations.
+             if not (0 <= number_of_iterations <= float('inf')):
+                 raise ValueError('Accepted values for number_of_iterations are'
+@@ -389,11 +398,11 @@ def _number_of_iterations_validator(instance, number_of_iterations):
+             return number_of_iterations
+ 
+         @staticmethod
+-        def _oa_interval_validator(instance, online_analysis_interval):
++        def _oa_interval_validator(_, online_analysis_interval):
+             """Check the online_analysis_interval value for consistency"""
+             if online_analysis_interval is not None and (
+                             type(online_analysis_interval) != int or online_analysis_interval < 1):
+-                raise ValueError("online_analysis_interval must be an integer 1 or greater, or None")
++                raise ValueError('online_analysis_interval must be an integer >=1 or None')
+             return online_analysis_interval
+ 
+         @staticmethod
+@@ -401,8 +410,9 @@ def _oa_target_error_validator(instance, online_analysis_target_error):
+             if instance.online_analysis_interval is not None:
+                 if online_analysis_target_error < 0:
+                     raise ValueError("online_analysis_target_error must be a float >= 0")
+-                elif online_analysis_target_error == 0:
+-                    logger.warning("online_analysis_target_error of 0 may never converge.")
++                elif online_analysis_target_error == 0 and instance.number_of_iterations is None:
++                    logger.warning("online_analysis_target_error of 0 and number of iterations undefined "
++                                   "will never converge!")
+             return online_analysis_target_error
+ 
+         @staticmethod
+@@ -414,13 +424,12 @@ def _oa_min_iter_validator(instance, online_analysis_minimum_iterations):
+             return online_analysis_minimum_iterations
+ 
+         @staticmethod
+-        def _locality_validator(instance, locality):
++        def _locality_validator(_, locality):
+             if locality is not None:
+                 if (type(locality) != int) or (locality <= 0):
+                     raise ValueError("locality must be an int > 0")
+             return locality
+ 
+-
+     number_of_iterations = _StoredProperty('number_of_iterations',
+                                            validate_function=_StoredProperty._number_of_iterations_validator)
+     online_analysis_interval = _StoredProperty('online_analysis_interval',
+@@ -521,98 +530,6 @@ def create(self, thermodynamic_states: list, sampler_states, storage,
+ 
+         self._initialize_reporter()
+ 
+-    def _pre_write_create(self,
+-                          thermodynamic_states,
+-                          sampler_states,
+-                          storage,
+-                          initial_thermodynamic_states=None,
+-                          unsampled_thermodynamic_states=None,
+-                          metadata=None):
+-        """
+-        Internal function which allocates and sets up ALL variables prior to actually using them.
+-        This is helpful to ensure subclasses have all variables created prior to writing them out with
+-        :func:`_report_iteration`.
+-        All calls to this function should be *identical* to :func:`create` itself
+-        """
+-        # Check all systems are either periodic or not.
+-        is_periodic = thermodynamic_states[0].is_periodic
+-        for thermodynamic_state in thermodynamic_states:
+-            if thermodynamic_state.is_periodic != is_periodic:
+-                raise Exception('Thermodynamic states contain a mixture of '
+-                                'systems with and without periodic boundary conditions.')
+-
+-        # Check that sampler states specify box vectors if the system is periodic
+-        if is_periodic:
+-            for sampler_state in sampler_states:
+-                if sampler_state.box_vectors is None:
+-                    raise Exception('All sampler states must have box_vectors defined if the system is periodic.')
+-
+-        # Make sure all states have same number of particles. We don't
+-        # currently support writing storage with different n_particles
+-        n_particles = thermodynamic_states[0].n_particles
+-        for states in [thermodynamic_states, sampler_states]:
+-            for state in states:
+-                if state.n_particles != n_particles:
+-                    raise ValueError('All ThermodynamicStates and SamplerStates must '
+-                                     'have the same number of particles')
+-
+-        # Handle default argument for metadata and add default simulation title.
+-        default_title = (self._TITLE_TEMPLATE.format(time.asctime(time.localtime())))
+-        if metadata is None:
+-            metadata = dict(title=default_title)
+-        elif 'title' not in metadata:
+-            metadata['title'] = default_title
+-        self._metadata = metadata
+-
+-        # Save thermodynamic states. This sets n_replicas.
+-        self._thermodynamic_states = copy.deepcopy(thermodynamic_states)
+-
+-        # Handle default unsampled thermodynamic states.
+-        if unsampled_thermodynamic_states is None:
+-            self._unsampled_states = []
+-        else:
+-            self._unsampled_states = copy.deepcopy(unsampled_thermodynamic_states)
+-
+-        # Deep copy sampler states.
+-        self._sampler_states = [copy.deepcopy(sampler_state) for sampler_state in sampler_states]
+-
+-        # Set initial thermodynamic state indices if not specified
+-        if initial_thermodynamic_states is None:
+-            initial_thermodynamic_states = self._default_initial_thermodynamic_states(thermodynamic_states,
+-                                                                                      sampler_states)
+-        self._replica_thermodynamic_states = np.array(initial_thermodynamic_states, np.int64)
+-
+-        # Assign default system box vectors if None has been specified.
+-        for replica_id, thermodynamic_state_id in enumerate(self._replica_thermodynamic_states):
+-            sampler_state = self._sampler_states[replica_id]
+-            if sampler_state.box_vectors is not None:
+-                continue
+-            thermodynamic_state = self._thermodynamic_states[thermodynamic_state_id]
+-            sampler_state.box_vectors = thermodynamic_state.system.getDefaultPeriodicBoxVectors()
+-
+-        # Ensure there is an MCMCMove for each thermodynamic state.
+-        if isinstance(self._mcmc_moves, mmtools.mcmc.MCMCMove):
+-            self._mcmc_moves = [copy.deepcopy(self._mcmc_moves) for _ in range(self.n_states)]
+-        elif len(self._mcmc_moves) != self.n_states:
+-            raise RuntimeError('The number of MCMCMoves ({}) and ThermodynamicStates ({}) must '
+-                               'be the same.'.format(len(self._mcmc_moves), self.n_states))
+-
+-        # Reset iteration counter.
+-        self._iteration = 0
+-
+-        # Reset statistics.
+-        # _n_accepted_matrix[i][j] is the number of swaps proposed between thermodynamic states i and j.
+-        # _n_proposed_matrix[i][j] is the number of swaps proposed between thermodynamic states i and j.
+-        self._n_accepted_matrix = np.zeros([self.n_states, self.n_states], np.int64)
+-        self._n_proposed_matrix = np.zeros([self.n_states, self.n_states], np.int64)
+-
+-        # Allocate memory for energy matrix. energy_thermodynamic/unsampled_states[k][l]
+-        # is the reduced potential computed at the positions of SamplerState sampler_states[k]
+-        # and ThermodynamicState thermodynamic/unsampled_states[l].
+-        self._energy_thermodynamic_states = np.zeros([self.n_replicas, self.n_states], np.float64)
+-        self._neighborhoods = np.zeros([self.n_replicas, self.n_states], 'i1')
+-        self._energy_unsampled_states = np.zeros([self.n_replicas, len(self._unsampled_states)], np.float64)
+-
+     @mmtools.utils.with_timer('Minimizing all replicas')
+     def minimize(self, tolerance=1.0 * unit.kilojoules_per_mole / unit.nanometers,
+                  max_iterations=0):
+@@ -809,6 +726,98 @@ def __del__(self):
+     # Internal-usage.
+     # -------------------------------------------------------------------------
+ 
++    def _pre_write_create(self,
++                          thermodynamic_states,
++                          sampler_states,
++                          storage,
++                          initial_thermodynamic_states=None,
++                          unsampled_thermodynamic_states=None,
++                          metadata=None):
++        """
++        Internal function which allocates and sets up ALL variables prior to actually using them.
++        This is helpful to ensure subclasses have all variables created prior to writing them out with
++        :func:`_report_iteration`.
++        All calls to this function should be *identical* to :func:`create` itself
++        """
++        # Check all systems are either periodic or not.
++        is_periodic = thermodynamic_states[0].is_periodic
++        for thermodynamic_state in thermodynamic_states:
++            if thermodynamic_state.is_periodic != is_periodic:
++                raise Exception('Thermodynamic states contain a mixture of '
++                                'systems with and without periodic boundary conditions.')
++
++        # Check that sampler states specify box vectors if the system is periodic
++        if is_periodic:
++            for sampler_state in sampler_states:
++                if sampler_state.box_vectors is None:
++                    raise Exception('All sampler states must have box_vectors defined if the system is periodic.')
++
++        # Make sure all states have same number of particles. We don't
++        # currently support writing storage with different n_particles
++        n_particles = thermodynamic_states[0].n_particles
++        for states in [thermodynamic_states, sampler_states]:
++            for state in states:
++                if state.n_particles != n_particles:
++                    raise ValueError('All ThermodynamicStates and SamplerStates must '
++                                     'have the same number of particles')
++
++        # Handle default argument for metadata and add default simulation title.
++        default_title = (self._TITLE_TEMPLATE.format(time.asctime(time.localtime())))
++        if metadata is None:
++            metadata = dict(title=default_title)
++        elif 'title' not in metadata:
++            metadata['title'] = default_title
++        self._metadata = metadata
++
++        # Save thermodynamic states. This sets n_replicas.
++        self._thermodynamic_states = copy.deepcopy(thermodynamic_states)
++
++        # Handle default unsampled thermodynamic states.
++        if unsampled_thermodynamic_states is None:
++            self._unsampled_states = []
++        else:
++            self._unsampled_states = copy.deepcopy(unsampled_thermodynamic_states)
++
++        # Deep copy sampler states.
++        self._sampler_states = [copy.deepcopy(sampler_state) for sampler_state in sampler_states]
++
++        # Set initial thermodynamic state indices if not specified
++        if initial_thermodynamic_states is None:
++            initial_thermodynamic_states = self._default_initial_thermodynamic_states(thermodynamic_states,
++                                                                                      sampler_states)
++        self._replica_thermodynamic_states = np.array(initial_thermodynamic_states, np.int64)
++
++        # Assign default system box vectors if None has been specified.
++        for replica_id, thermodynamic_state_id in enumerate(self._replica_thermodynamic_states):
++            sampler_state = self._sampler_states[replica_id]
++            if sampler_state.box_vectors is not None:
++                continue
++            thermodynamic_state = self._thermodynamic_states[thermodynamic_state_id]
++            sampler_state.box_vectors = thermodynamic_state.system.getDefaultPeriodicBoxVectors()
++
++        # Ensure there is an MCMCMove for each thermodynamic state.
++        if isinstance(self._mcmc_moves, mmtools.mcmc.MCMCMove):
++            self._mcmc_moves = [copy.deepcopy(self._mcmc_moves) for _ in range(self.n_states)]
++        elif len(self._mcmc_moves) != self.n_states:
++            raise RuntimeError('The number of MCMCMoves ({}) and ThermodynamicStates ({}) must '
++                               'be the same.'.format(len(self._mcmc_moves), self.n_states))
++
++        # Reset iteration counter.
++        self._iteration = 0
++
++        # Reset statistics.
++        # _n_accepted_matrix[i][j] is the number of swaps proposed between thermodynamic states i and j.
++        # _n_proposed_matrix[i][j] is the number of swaps proposed between thermodynamic states i and j.
++        self._n_accepted_matrix = np.zeros([self.n_states, self.n_states], np.int64)
++        self._n_proposed_matrix = np.zeros([self.n_states, self.n_states], np.int64)
++
++        # Allocate memory for energy matrix. energy_thermodynamic/unsampled_states[k][l]
++        # is the reduced potential computed at the positions of SamplerState sampler_states[k]
++        # and ThermodynamicState thermodynamic/unsampled_states[l].
++        self._energy_thermodynamic_states = np.zeros([self.n_replicas, self.n_states], np.float64)
++        self._neighborhoods = np.zeros([self.n_replicas, self.n_states], 'i1')
++        self._energy_unsampled_states = np.zeros([self.n_replicas, len(self._unsampled_states)], np.float64)
++
+     @classmethod
+     def _instantiate_sampler_from_storage(cls, storage):
+         """
+@@ -888,11 +897,14 @@ def _read_options(check_iteration):
+                 reporter.read_mixing_statistics(iteration=check_iteration)
+ 
+             # Search for last cached free energies only if online analysis is activated.
++            internal_last_mbar_f_k, internal_last_err_free_energy = None, None
+             if self.online_analysis_interval is not None:
+                 online_analysis_info = self._read_last_free_energy(reporter, check_iteration)
+-                internal_last_mbar_f_k, (_, internal_last_err_free_energy) = online_analysis_info
+-            else:
+-                internal_last_mbar_f_k, internal_last_err_free_energy = None, None
++                try:
++                    internal_last_mbar_f_k, (_, internal_last_err_free_energy) = online_analysis_info
++                except TypeError:
++                    # Trap case where online analysis is set but not run yet and (_, ...) = None is not iterable
++                    pass
+             return (internal_sampler_states, internal_state_indices, internal_energy_thermodynamic_states,
+                     internal_neighborhoods, internal_energy_unsampled_states, internal_n_accepted_matrix,
+                     internal_n_proposed_matrix, internal_last_mbar_f_k, internal_last_err_free_energy)
+@@ -909,7 +921,7 @@ def _read_options(check_iteration):
+             except StopIteration:
+                 raise self._throw_restoration_error("Attempting to restore from any checkpoint failed. "
+                                                     "Either your data is fully corrupted or something has gone very "
+-                                                    "wrong to see this message.\n"
++                                                    "wrong to see this message. "
+                                                     "Please open an issue on the GitHub issue tracker if you see this!")
+             except:
+                 # Trap all other errors caught by the load process
+@@ -1389,7 +1401,7 @@ def _offline_analysis(self):
+         # TODO: Currently, this just uses MBAR, which only works for global neighborhoods.
+         # TODO: Add Local WHAM support.
+ 
+-        if (self.locality != None):
++        if self.locality is not None:
+             raise Exception('Cannot use MBAR with non-global locality.')
+ 
+         # This relative import is down here because having it at the top causes an ImportError.
+@@ -1401,7 +1413,12 @@ def _offline_analysis(self):
+ 
+         # Start the analysis
+         bump_error_counter = False
+-        analysis = MultiStateSamplerAnalyzer(self._reporter, analysis_kwargs={'initial_f_k': self._last_mbar_f_k})
++        # Set up analyzer
++        # Unbias restraints is False because this will quickly accumulate large time to re-read the trajectories
++        # and unbias the restraints every online-analysis. Current model is to use the last_mbar_f_k as a
++        # hot-start to the analysis. Once we store unbias info as part of a CustomCVForce, we can revisit this choice.
++        analysis = MultiStateSamplerAnalyzer(self._reporter, analysis_kwargs={'initial_f_k': self._last_mbar_f_k},
++                                             unbias_restraint=False)
+ 
+         # Indices for online analysis, "i'th index, j'th index"
+         idx, jdx = 0, -1
+@@ -1501,13 +1518,13 @@ def _update_analysis(self):
+         # TODO: Refactor this to always compute fast online analysis, updating with offline analysis infrequently.
+ 
+         # TODO: Simplify this
+-        if (self.online_analysis_interval is None):
++        if self.online_analysis_interval is None:
+             analysis_to_perform = None
+-        elif (self._iteration <= self.online_analysis_minimum_iterations):
++        elif self._iteration <= self.online_analysis_minimum_iterations:
+             analysis_to_perform = 'online'
+-        elif (self._iteration % self.online_analysis_interval != 0):
++        elif self._iteration % self.online_analysis_interval != 0:
+             analysis_to_perform = 'online'
+-        elif (self.locality != None):
++        elif self.locality is not None:
+             analysis_to_perform = 'online'
+         else:
+             # All conditions are met for offline analysis
+diff --git a/Yank/schema/validator.py b/Yank/schema/validator.py
+index ff936cfd..954e10a0 100644
+--- a/Yank/schema/validator.py
++++ b/Yank/schema/validator.py
+@@ -153,6 +153,14 @@ def to_integer_or_infinity_coercer(value):
+     return value
+ 
+ 
++def to_none_int_or_checkpoint(value):
++    """Coerce-ish a value that is None, int, or "checkpoint" """
++    if value is None or value == "checkpoint":
++        return value
++    else:
++        return int(value)
++
++
+ # ==============================================================================
+ # OBJECT CONSTRUCTORS PARSING
+ # ==============================================================================
+@@ -272,7 +280,8 @@ def call_mcmc_move_constructor(constructor_description):
+ 
+ 
+ def call_sampler_constructor(constructor_description):
+-    special_conversions = {'number_of_iterations': to_integer_or_infinity_coercer}
++    special_conversions = {'number_of_iterations': to_integer_or_infinity_coercer,
++                           'online_analysis_interval': to_none_int_or_checkpoint}
+     return call_constructor(multistate.MultiStateSampler, constructor_description,
+                             special_conversions=special_conversions)
+ 
+diff --git a/Yank/tests/test_analyze.py b/Yank/tests/test_analyze.py
+index 60fc5e27..a799a7ea 100644
+--- a/Yank/tests/test_analyze.py
++++ b/Yank/tests/test_analyze.py
+@@ -131,6 +131,7 @@ class TestMultiPhaseAnalyzer(object):
+     N_STATES = 5
+     SAMPLER = MultiStateSampler
+     ANALYZER = analyze.YankMultiStateSamplerAnalyzer
++    ONLINE_ANALYSIS = False
+ 
+     # --------------------------------------
+     # Optional helper function to overwrite.
+@@ -195,6 +196,7 @@ def setup_class(cls):
+             )
+ 
+         # Unsampled states.
++        cls.n_unsampled_states = 2
+         nonalchemical_system = copy.deepcopy(hostguest_test.system)
+         nonalchemical_system.addForce(copy.deepcopy(restraint_force))
+         nonalchemical_state = mmtools.states.ThermodynamicState(nonalchemical_system, 300*unit.kelvin)
+@@ -202,7 +204,8 @@ def setup_class(cls):
+             thermodynamic_state=nonalchemical_state,
+             composable_states=[RestraintState(lambda_restraints=1.0)]
+         )
+-        hostguest_unsampled_states = [copy.deepcopy(nonalchemical_compound_state) for _ in range(2)]
++        hostguest_unsampled_states = [copy.deepcopy(nonalchemical_compound_state) for _ in
++                                      range(cls.n_unsampled_states)]
+ 
+         cls.hostguest_test = (hostguest_compound_states, hostguest_sampler_states, hostguest_unsampled_states)
+ 
+@@ -224,7 +227,13 @@ def setup_class(cls):
+         cls.tmp_dir = tempfile.mkdtemp()
+         storage_path = os.path.join(cls.tmp_dir, 'test_analyze.nc')
+         move = mmtools.mcmc.LangevinDynamicsMove(n_steps=1)
+-        cls.sampler = cls.SAMPLER(mcmc_moves=move, number_of_iterations=cls.n_steps)
++        if cls.ONLINE_ANALYSIS:
++            online_analysis_interval = cls.n_steps - 1
++        else:
++            online_analysis_interval = None
++        cls.sampler = cls.SAMPLER(mcmc_moves=move, number_of_iterations=cls.n_steps,
++                                  online_analysis_interval=online_analysis_interval,
++                                  online_analysis_minimum_iterations=0)
+         cls.reporter = MultiStateReporter(storage_path, checkpoint_interval=cls.checkpoint_interval,
+                                           analysis_particle_indices=analysis_atoms)
+         cls.call_sampler_create(cls.sampler, cls.reporter, thermodynamic_states, sampler_states, unsampled_states,
+@@ -238,8 +247,11 @@ def setup_class(cls):
+         cls.repex_name = "RepexAnalyzer"  # kind of an unused test
+ 
+         # Debugging Messages to sent to Nose with --nocapture enabled
+-        output_descr = "Testing Analyzer: {}  -- States: {}  -- Samplers: {}".format(
+-            cls.SAMPLER.__name__, cls.N_STATES, cls.N_SAMPLERS)
++        online_flag = " "
++        if cls.ONLINE_ANALYSIS:
++            online_flag += "Online "
++        output_descr = "Testing{}Analyzer: {}  -- States: {}  -- Samplers: {}".format(
++            online_flag, cls.SAMPLER.__name__, cls.N_STATES, cls.N_SAMPLERS)
+         len_output = len(output_descr)
+         print("#" * len_output)
+         print(output_descr)
+@@ -560,6 +572,46 @@ def test_extract_trajectory(self):
+         # Extracting the trajectory of a state does not incur into errors.
+         analyze.extract_trajectory(self.reporter.filepath, state_index=0, keep_solvent=False)
+ 
++    def test_online_data_read(self):
++        """Test that online data is read from file when available and correctly invalidates when flag is toggled"""
++        if not self.ONLINE_ANALYSIS:
++            return
++        analyzer = self.ANALYZER(self.reporter, name=self.repex_name, use_online_data=True, unbias_restraint=False)
++        # Ensure online data was read
++        assert analyzer.use_online_data is True
++        assert analyzer._online_data is not None
++        # Spin up mbar
++        _ = analyzer.mbar
++        # Ensure the online data was used
++        assert analyzer._extra_analysis_kwargs != {}
++        # Clear and reset data
++        analyzer.use_online_data = False
++        assert analyzer._extra_analysis_kwargs == {}
++        assert 'mbar' not in analyzer._cache
++
++    def test_online_data_ignored(self):
++        """Test that online data is ignored when set from start or when user overrides"""
++        if not self.ONLINE_ANALYSIS:
++            return
++        analyzer = self.ANALYZER(self.reporter, name=self.repex_name, use_online_data=False, unbias_restraint=False)
++        # Ensure online data is present, but unread
++        assert analyzer.use_online_data is False
++        assert analyzer._online_data is not None
++        _ = analyzer.mbar
++        assert analyzer._extra_analysis_kwargs == {}
++        # Start over
++        del analyzer
++        initial_f_k = [0]*(self.N_STATES + self.n_unsampled_states)
++        analyzer = self.ANALYZER(self.reporter, name=self.repex_name,
++                                 use_online_data=True, analysis_kwargs={'initial_f_k': initial_f_k},
++                                 unbias_restraint=False)
++        assert analyzer.use_online_data is True
++        assert analyzer._online_data is not None
++        _ = analyzer.mbar
++        assert np.all(analyzer._extra_analysis_kwargs['initial_f_k'] == initial_f_k)
++        # Ensure mbar was not invalidated
++        assert 'mbar' in analyzer._cache
++
+ 
+ class TestRepexAnalyzer(TestMultiPhaseAnalyzer):
+     """Test suite for YankPhaseAnalyzer class."""
+@@ -585,6 +637,10 @@ class TestMultiPhaseAnalyzerReverse(TestMultiPhaseAnalyzer):
+     SAMPLER = MultiStateSampler
+ 
+ 
++class TestMultiPhaseAnalyzerOnline(TestMultiPhaseAnalyzerReverse):
++    ONLINE_ANALYSIS = True
++
++
+ class TestSAMSAnalyzerSingle(TestMultiPhaseAnalyzer):
+     """Test suite for YankPhaseAnalyzer class."""
+ 
+@@ -597,6 +653,14 @@ class TestSAMSAnalyzerSingle(TestMultiPhaseAnalyzer):
+     SAMPLER = SAMSSampler
+ 
+ 
++class TestSAMSAnalyzerSingleOnline(TestSAMSAnalyzerSingle):
++
++    # ------------------------------------
++    # VARIABLES TO SET FOR EACH TEST CLASS
++    # ------------------------------------
++    ONLINE_ANALYSIS = True
++
++
+ class TestSAMSAnalyzerMulti(TestSAMSAnalyzerSingle):
+     """Test suite for YankPhaseAnalyzer class."""
+ 
+diff --git a/Yank/tests/test_experiment.py b/Yank/tests/test_experiment.py
+index 8c9cb582..a3e418d9 100644
+--- a/Yank/tests/test_experiment.py
++++ b/Yank/tests/test_experiment.py
+@@ -407,6 +407,99 @@ def test_paths_properties():
+     assert exp_builder._db.setup_dir == os.path.join('output2', 'setup2')
+ 
+ 
++def test_online_reads_checkpoint():
++    """Test that online analysis reads the checkpoint correctly in all cases"""
++    current_log_level = logger.level
++    logger.setLevel(logging.ERROR)  # Temporarily suppress some of the logging output
++    raw_template_script = get_template_script()
++    # Pair down the processing
++    popables = []
++    for system in raw_template_script['systems'].keys():
++        if system != 'explicit-system':
++            popables.append(system)
++    for popable in popables:
++        raw_template_script['systems'].pop(popable)
++    allowed_molecules = [raw_template_script['systems']['explicit-system']['receptor'],
++                         raw_template_script['systems']['explicit-system']['ligand']]
++    popables = []
++    for molecule in raw_template_script['molecules'].keys():
++        if molecule not in allowed_molecules:
++            popables.append(molecule)
++    for popable in popables:
++        raw_template_script['molecules'].pop(popable)
++    raw_template_script.pop('samplers')
++    sampler_entry = {'type': 'SAMSSampler'}
++    sampler = {'samplers': {'sams': sampler_entry}}
++    base_template_script = {**raw_template_script, **sampler}
++    base_template_script['experiments']['sampler'] = 'sams'
++
++    def spinup_sampler(script):
++        with mmtools.utils.temporary_directory() as tmp_dir:
++            template_script['options']['output_dir'] = tmp_dir
++            exp_builder = ExperimentBuilder(script)
++            experiment = [ex for ex in exp_builder.build_experiments()][0]
++            sampler = experiment.phases[0].sampler
++        return sampler
++
++    # Test that setting "checkpoint" for online analysis gets the checkpoint interval default
++    template_script = copy.deepcopy(base_template_script)
++    template_script['options'].pop("checkpoint_interval", None)
++    template_script['samplers']['sams']['online_analysis_interval'] = "checkpoint"
++    sampler = spinup_sampler(template_script)
++    assert sampler.online_analysis_interval == AlchemicalPhaseFactory.DEFAULT_OPTIONS['checkpoint_interval']
++
++    # Test that setting "checkpoint" for online analysis gets the checkpoint interval that is set
++    template_script['options']["checkpoint_interval"] = 50
++    sampler = spinup_sampler(template_script)
++    assert sampler.online_analysis_interval == 50
++
++    # Test that not setting online analysis gets the checkpoint interval default
++    template_script = copy.deepcopy(base_template_script)
++    template_script['options'].pop("checkpoint_interval", None)
++    template_script['samplers']['sams'].pop('online_analysis_interval', None)
++    sampler = spinup_sampler(template_script)
++    assert sampler.online_analysis_interval == AlchemicalPhaseFactory.DEFAULT_OPTIONS['checkpoint_interval']
++
++    # Test that not setting online analysis gets the checkpoint interval that is set
++    template_script['options']["checkpoint_interval"] = 100
++    sampler = spinup_sampler(template_script)
++    assert sampler.online_analysis_interval == 100
++
++    # Test that setting online analysis still returns the set value
++    template_script = copy.deepcopy(base_template_script)
++    template_script['options']["checkpoint_interval"] = 70
++    template_script['samplers']['sams']['online_analysis_interval'] = 13
++    sampler = spinup_sampler(template_script)
++    assert sampler.online_analysis_interval == 13
++
++    # Test that setting online analysis to None keeps online analysis None
++    template_script = copy.deepcopy(base_template_script)
++    template_script['options']["checkpoint_interval"] = 80
++    template_script['samplers']['sams']['online_analysis_interval'] = None
++    sampler = spinup_sampler(template_script)
++    assert sampler.online_analysis_interval is None
++
++    # Test that not setting a sampler gets a the checkpoint interval for online analysis
++    template_script = copy.deepcopy(base_template_script)
++    template_script['options']["checkpoint_interval"] = 90
++    template_script.pop('samplers', None)
++    template_script['experiments'].pop('sampler', None)
++    sampler = spinup_sampler(template_script)
++    assert sampler.online_analysis_interval == 90
++
++    # Test that setting the checkpoint_interval in *experiments:options* block correctly sets the checkpoint interval
++    template_script = copy.deepcopy(base_template_script)
++    template_script['options']["checkpoint_interval"] = 110
++    template_script.pop('samplers', None)
++    opts = {'checkpoint_interval': 120}
++    template_script['experiments'].pop('sampler', None)
++    template_script['experiments']['options'] = opts
++    sampler = spinup_sampler(template_script)
++    assert sampler.online_analysis_interval == 120
++
++    logger.setLevel(current_log_level)  # Reset logging to normal
++
++
+ def test_processes_per_experiment():
+     """Test the determination of processes_per_experiment option."""
+     # Create a script with 4 experiments.
+diff --git a/docs/whatsnew.rst b/docs/whatsnew.rst
+index b0d8c534..88e9dab4 100644
+--- a/docs/whatsnew.rst
++++ b/docs/whatsnew.rst
+@@ -6,6 +6,13 @@ This section features and improvements of note in each release.
+ 
+ The full release history can be viewed `at the GitHub yank releases page <https://github.com/choderalab/yank/releases>`_.
+ 
++0.22.1 Online Analysis Default
++------------------------------
++- Online analysis will always run by default now, with no target error, run every checkpoint interval, and with at least 200 iterations
++- Online analysis can now be a set to the checkpoint interval by setting ``online_analysis_interval: "checkpoint"`` in the YAML files (application layer, not API)
++- Checkpoint interval increased from default of 10 to 200
++- Analysis now uses the online-analysis data if available by default
++
+ 0.22.0 RMSD the Casbah
+ ----------------------
+ 
+diff --git a/docs/yamlpages/experiments.rst b/docs/yamlpages/experiments.rst
+index 9d8b2695..92bde025 100644
+--- a/docs/yamlpages/experiments.rst
++++ b/docs/yamlpages/experiments.rst
+@@ -21,6 +21,7 @@ Experiments Syntax
+    experiments:
+      system: {UserDefinedSystem}
+      protocol: {UserDefinedProtocol}
++     sampler: {UserDefinedSampler}
+      restraint:
+        type: FlatBottom
+        {Restraint Parameter}
+@@ -33,7 +34,8 @@ Experiments Syntax
+ This is the structure of an ``experiment``.
+ 
+ It takes a ``{UserDefinedSystem}`` (see :doc:`systems <systems>`) and a ``{UserDefinedProtocol}`` (see :doc:`protocols <protocols>`)
+-to create the experiment and are the only required arguments.
++to create the experiment and are the only required arguments. You can also specify any ``{UserDefinedSampler}`` (see
++:doc:`samplers <samplers>`), however this is optional and will fill in with a default sampler.
+ 
+ The ``restraint`` is an **optional** keyword that applies a restraint to the ligand to keep it close to the receptor.
+ The only required keyword is ``type``. Valid types are: ``FlatBottom``/``Harmonic``/``Boresch``/``RMSD``/``PeriodicTorsionBoresch``/``null``. If not
+diff --git a/docs/yamlpages/options.rst b/docs/yamlpages/options.rst
+index 12a1dd26..dc7cd630 100644
+--- a/docs/yamlpages/options.rst
++++ b/docs/yamlpages/options.rst
+@@ -633,7 +633,7 @@ Valid Options (2.0 * femtosecond): <Quantity Time> [1]_
+ .. code-block:: yaml
+ 
+    options:
+-     checkpoint_interval: 10
++     checkpoint_interval: 200
+ 
+ Specify how frequently checkpoint information should be saved to file relative to iterations. YANK simulations can be
+ resumed only from checkpoints, so if something crashes, up to ``checkpoint_interval`` worth of iterations will be lost
+@@ -645,7 +645,7 @@ you will get. If you want to write a checkpoint every iteration, set this to ``1
+ Checkpoint information includes things like full coordinates and box vectors, as well as more static information such
+ as metadata, simulation options, and serialized thermodynamic states.
+ 
+-Valid Options (10): <Integer ``>= 1``>
++Valid Options (200): <Integer ``>= 1``>
+ 
+ 
+ 
+diff --git a/docs/yamlpages/samplers.rst b/docs/yamlpages/samplers.rst
+index 89222c7a..a71cb7f3 100644
+--- a/docs/yamlpages/samplers.rst
++++ b/docs/yamlpages/samplers.rst
+@@ -136,9 +136,11 @@ Ratio estimate for the free energy is calculated and the error is computed. Some
+ speed up future calculations, but this operation will still slow down as more iterations are added. We recommend
+ choosing an interval of *at least* 100, if not more.
+ 
+-If set to ``null`` (default), then online analysis is not run.
++If set to ``checkpoint``, then the online analysis is run every :ref:`yaml_options_checkpoint_interval`
+ 
+-Valid Options (``null``): ``null`` or <Int >= 1>
++If set to ``null``, then online analysis is not run.
++
++Valid Options (``checkpoint``): ``checkpoint``, ``null``, or <Int >= 1>
+ 
+ 
+ .. rst-class:: html-toggle
+@@ -163,7 +165,7 @@ is never zero except in very rare cases, so your simulation may never converge i
+ 
+ If :ref:`yaml_samplers_online_analysis_interval` is ``null``, this option does nothing.
+ 
+-Valid Options (0.2): <Float >= 0>
++Valid Options (0.0): <Float >= 0>
+ 
+ 
+ 
+@@ -186,13 +188,14 @@ Number of iterations that are skipped at the beginning of the simulation before
+ a speed option since most of the initial iterations will be either equilibration or under sampled. We recommend choosing
+ an initial number that is *at least* one or two :ref:`yaml_samplers_online_analysis_interval`'s for speed's sake.
+ 
+-The first iteration at which online analysis is performed is not affected by this number and always tracked as the
+-modulo of the current iteration. E.g. if you have ``online_analysis_interval: 100`` and
+-``online_analysis_minimum_iterations: 150``, online analysis would happen at iteration 200 first, not iteration 250.
++This number is only the threshold above when online analysis is run, and the iteration at which first analysis is
++performed is tracked as the modulo of the current iteration.
++E.g. if you have ``online_analysis_interval: 100`` and
++``online_analysis_minimum_iterations: 150``, online analysis would happen at iteration 200, not iteration 250.
+ 
+ If :ref:`yaml_samplers_online_analysis_interval` is ``null``, this option does nothing.
+ 
+-Valid Options (50): <Int >=1>
++Valid Options (200): <Int >=1>
+ 
+ 
+ 

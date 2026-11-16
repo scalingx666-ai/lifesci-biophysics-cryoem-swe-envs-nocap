@@ -1,0 +1,356 @@
+diff --git a/tests/test_minimizer.py b/tests/test_minimizer.py
+index c9c59b554a..eeb8455c93 100644
+--- a/tests/test_minimizer.py
++++ b/tests/test_minimizer.py
+@@ -6,8 +6,10 @@
+ from rdkit import Chem
+ from rdkit.Chem import AllChem
+ 
+-from timemachine.fe.free_energy import HostConfig
++from timemachine.constants import MAX_FORCE_NORM
++from timemachine.fe.free_energy import AbsoluteFreeEnergy, HostConfig
+ from timemachine.fe.model_utils import get_vacuum_val_and_grad_fn
++from timemachine.fe.topology import BaseTopology
+ from timemachine.fe.utils import get_romol_conf, read_sdf, read_sdf_mols_by_name
+ from timemachine.ff import Forcefield
+ from timemachine.ff.handlers import openmm_deserializer
+@@ -15,7 +17,7 @@
+ from timemachine.md.barostat.utils import compute_box_volume
+ from timemachine.md.minimizer import equilibrate_host_barker, make_host_du_dx_fxn
+ from timemachine.potentials import NonbondedPairList
+-from timemachine.potentials.jax_utils import distance_on_pairs
++from timemachine.potentials.jax_utils import distance_on_pairs, idxs_within_cutoff
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -217,6 +219,121 @@ def test_local_minimize_water_box(minimizer_config):
+     np.testing.assert_array_equal(g_init, g_init_test)
+ 
+ 
++@pytest.mark.parametrize("seed", [2024])
++@pytest.mark.parametrize(
++    "minimizer_config",
++    [
++        minimizer.FireMinimizationConfig(100),
++        minimizer.ScipyMinimizationConfig("BFGS"),
++        minimizer.ScipyMinimizationConfig("L-BFGS-B"),
++    ],
++)
++def test_local_minimize_restrained_subset(seed, minimizer_config):
++    """
++    Test that we can minimize systems and only restrain subsets of the atoms.
++    """
++    rng = np.random.default_rng(seed)
++    ff = Forcefield.load_default()
++
++    system, x0, box0, top = builders.build_water_system(4.0, ff.water_ff)
++    host_fns, _ = openmm_deserializer.deserialize_system(system, cutoff=1.2)
++    box0 += np.diag([0.1, 0.1, 0.1])  # remove any possible clashes at the boundary
++
++    val_and_grad_fn = minimizer.get_val_and_grad_fn(host_fns, box0)
++
++    free_idxs = rng.choice(np.arange(len(x0), dtype=np.int32), size=128, replace=False)
++    frozen_idxs = set(range(len(x0))).difference(set(free_idxs))
++    frozen_idxs = list(frozen_idxs)
++
++    u_init, g_init = val_and_grad_fn(x0)
++
++    with pytest.raises(AssertionError, match="Restraint k be greater than 0.0 if restrained indices provided"):
++        minimizer.local_minimize(x0, box0, val_and_grad_fn, free_idxs, minimizer_config, restrained_idxs=frozen_idxs)
++
++    # Set a large k, to ensure movement of restrained idxs is minimal
++    k = 500_000.0
++
++    with pytest.raises(AssertionError, match="Restrained indices must be a subset of local indices"):
++        minimizer.local_minimize(
++            x0, box0, val_and_grad_fn, free_idxs, minimizer_config, restraint_k=k, restrained_idxs=frozen_idxs
++        )
++
++    restrained_idxs = rng.choice(free_idxs, replace=False, size=len(free_idxs) // 2)
++    unrestrained_idxs = np.array(list(set(free_idxs).difference(restrained_idxs)))
++
++    x_opt = minimizer.local_minimize(
++        x0, box0, val_and_grad_fn, free_idxs, minimizer_config, restraint_k=k, restrained_idxs=restrained_idxs
++    )
++
++    np.testing.assert_array_equal(x0[frozen_idxs], x_opt[frozen_idxs])
++    # All free atoms should have moved
++    assert np.linalg.norm(x0[free_idxs] - x_opt[free_idxs]) > 0.0
++    # Restrained atoms should have moved very slightly
++    assert np.linalg.norm(x0[restrained_idxs] - x_opt[restrained_idxs]) < 0.011
++    # Unrestrained atoms should have moved more
++    assert np.linalg.norm(x0[unrestrained_idxs] - x_opt[unrestrained_idxs]) > 0.011
++
++
++@pytest.mark.parametrize("seed", [2024])
++@pytest.mark.parametrize(
++    "minimizer_config",
++    [
++        minimizer.FireMinimizationConfig(100),
++        minimizer.ScipyMinimizationConfig("BFGS"),
++        minimizer.ScipyMinimizationConfig("L-BFGS-B"),
++    ],
++)
++def test_local_minimize_restrained_waters_trigger_failure(seed, minimizer_config):
++    """Construct a water box and attempt to minimize a benzene mol into it without removing clashy waters. Verify
++    that if the water atoms are restrained that minimization fails and without restraints the minimization succeeds.
++    """
++    benzene = Chem.AddHs(Chem.MolFromSmiles("c1ccccc1"))
++    AllChem.EmbedMolecule(benzene, randomSeed=seed)
++
++    ff = Forcefield.load_default()
++
++    # Use non-zero lambda to ensure forces are large to start
++    lamb = 0.1
++
++    # Setup a water box without a void for the mol
++    host_system, host_coords, box, host_top = builders.build_water_system(4.0, ff.water_ff)
++    box += np.diag([0.1, 0.1, 0.1])  # remove any possible clashes at the boundary
++
++    bt = BaseTopology(benzene, ff)
++    afe = AbsoluteFreeEnergy(benzene, bt)
++    host_config = HostConfig(host_system, host_coords, box, host_coords.shape[0], host_top)
++    unbound_potentials, sys_params, masses = afe.prepare_host_edge(ff, host_config, lamb)
++    coords = afe.prepare_combined_coords(host_coords=host_coords)
++
++    bps = [pot.bind(p) for pot, p in zip(unbound_potentials, sys_params)]
++    val_and_grad_fn = minimizer.get_val_and_grad_fn(bps, box)
++    # Forces should be beyond the max force norm to start
++    _, g_init = val_and_grad_fn(coords)
++    assert np.max(np.linalg.norm(g_init, axis=-1)) > MAX_FORCE_NORM
++
++    ligand_idxs = np.arange(benzene.GetNumAtoms()) + len(host_coords)
++
++    free_idxs = idxs_within_cutoff(coords, coords[ligand_idxs], box, cutoff=0.5).tolist()
++
++    # Set a large k, making it difficult to move waters out of the way if restrained
++    k = 500_000.0
++
++    # Restraining all atoms should trigger a failure
++    with pytest.raises(minimizer.MinimizationError):
++        minimizer.local_minimize(coords, box, val_and_grad_fn, free_idxs, minimizer_config, restraint_k=k)
++
++    unrestrained_idxs = np.array(list(set(free_idxs).difference(ligand_idxs)))
++
++    # Only restraining the ligand should work, since water is free to move
++    minimized_coords = minimizer.local_minimize(
++        coords, box, val_and_grad_fn, free_idxs, minimizer_config, restraint_k=k, restrained_idxs=ligand_idxs
++    )
++    np.testing.assert_allclose(minimized_coords[ligand_idxs], coords[ligand_idxs], atol=0.005)
++
++    # At least one water atom will need to have moved an angstrom to allow the ligand to be in the water
++    assert np.any(np.linalg.norm(minimized_coords[unrestrained_idxs] - coords[unrestrained_idxs], axis=-1) > 0.1)
++
++
+ def test_local_minimize_water_box_with_bounds():
+     """
+     Test that we can locally relax a box of water using L-BFGS-B with bounds
+@@ -267,7 +384,7 @@ def test_local_minimize_water_box_with_bounds():
+         minimizer.ScipyMinimizationConfig("L-BFGS-B"),
+     ],
+ )
+-@pytest.mark.parametrize("restraint_k", [None, 3_000.0])
++@pytest.mark.parametrize("restraint_k", [0.0, 3_000.0])
+ def test_local_minimize_strained_ligand(minimizer_config, restraint_k):
+     """
+     Test that we can minimize a ligand in vacuum using local_minimize when the ligand is strained.
+diff --git a/tests/test_single_topology_confgen.py b/tests/test_single_topology_confgen.py
+index 9b781d4c7e..aa9b42788b 100644
+--- a/tests/test_single_topology_confgen.py
++++ b/tests/test_single_topology_confgen.py
+@@ -269,7 +269,7 @@ def test_optimize_coords_with_positional_restraint():
+         state = setup_initial_state(st, lamb, None, DEFAULT_TEMP, 2024)
+ 
+         free_idxs = get_free_idxs(state)
+-        x_opt_unrestrained = optimize_coords_state(state.potentials, state.x0, state.box0, free_idxs, False, k=None)
++        x_opt_unrestrained = optimize_coords_state(state.potentials, state.x0, state.box0, free_idxs, False, k=0.0)
+         x_opt_restrained = optimize_coords_state(state.potentials, state.x0, state.box0, free_idxs, False, k=2000.0)
+         interacting_atoms = state.interacting_atoms
+         displacement_distances_unrestrained = distance_on_pairs(
+diff --git a/timemachine/fe/rbfe.py b/timemachine/fe/rbfe.py
+index 3a2da69975..a021495576 100644
+--- a/timemachine/fe/rbfe.py
++++ b/timemachine/fe/rbfe.py
+@@ -281,7 +281,7 @@ def setup_optimized_initial_state(
+     optimized_initial_states: Sequence[InitialState],
+     temperature: float,
+     seed: int,
+-    k: Optional[float] = DEFAULT_POSITIONAL_RESTRAINT_K,
++    k: float = DEFAULT_POSITIONAL_RESTRAINT_K,
+ ) -> InitialState:
+     """Setup an InitialState for the specified lambda and optimize the coordinates given a list of pre-optimized IntialStates.
+     If the specified lambda exists within the list of optimized_initial_states list, return the existing InitialState.
+@@ -316,6 +316,7 @@ def setup_optimized_initial_state(
+             free_idxs,
+             # assertion can lead to spurious errors when new state is close to an existing one
+             assert_energy_decreased=False,
++            restrained_idxs=initial_state.interacting_atoms,
+             k=k,
+         )
+         return initial_state
+@@ -327,7 +328,8 @@ def optimize_coords_state(
+     box: NDArray,
+     free_idxs: List[int],
+     assert_energy_decreased: bool,
+-    k: Optional[float],
++    k: float,
++    restrained_idxs: Optional[NDArray] = None,
+     minimization_config: Optional[minimizer.MinimizationConfig] = None,
+ ) -> NDArray:
+     val_and_grad_fn = minimizer.get_val_and_grad_fn(potentials, box)
+@@ -343,6 +345,7 @@ def optimize_coords_state(
+         free_idxs,
+         minimization_config,
+         assert_energy_decreased=assert_energy_decreased,
++        restrained_idxs=restrained_idxs,
+         restraint_k=k,
+     )
+     assert np.all(np.isfinite(x_opt)), "Minimization resulted in a nan"
+@@ -359,7 +362,7 @@ def get_free_idxs(initial_state: InitialState, cutoff: float = 0.5) -> List[int]
+ 
+ 
+ def _optimize_coords_along_states(
+-    initial_states: List[InitialState], k: Optional[float], minimization_config: minimizer.MinimizationConfig
++    initial_states: List[InitialState], k: float, minimization_config: minimizer.MinimizationConfig
+ ) -> List[NDArray]:
+     # use the end-state to define the optimization settings
+     end_state = initial_states[0]
+@@ -378,6 +381,7 @@ def _optimize_coords_along_states(
+                 free_idxs,
+                 minimization_config=minimization_config,
+                 assert_energy_decreased=idx == 0,
++                restrained_idxs=initial_state.interacting_atoms,
+                 k=k,
+             )
+         except (AssertionError, minimizer.MinimizationError) as e:
+@@ -390,7 +394,7 @@ def _optimize_coords_along_states(
+ def optimize_coordinates(
+     initial_states: List[InitialState],
+     min_cutoff: Optional[float] = 0.7,
+-    k: Optional[float] = DEFAULT_POSITIONAL_RESTRAINT_K,
++    k: float = DEFAULT_POSITIONAL_RESTRAINT_K,
+     minimization_config: Optional[minimizer.MinimizationConfig] = None,
+ ) -> List[NDArray]:
+     """
+@@ -403,10 +407,9 @@ def optimize_coordinates(
+     min_cutoff: float, optional
+         Throw error if any atom moves more than this distance (nm) after minimization
+ 
+-    k: float, optional
++    k: float
+         force constant for a positional harmonic restraint potential to apply to the initial positions.
+-        If None, minimize with no positional restraint. Refer to `timemachine.potentials.bonded.harmonic_positional_restraint`
+-        for implementation.
++        Refer to `timemachine.potentials.bonded.harmonic_positional_restraint` for implementation.
+ 
+     minimization_config: minimizer.MinimizationConfig, optional
+         Options to define the type of minimization for the states
+diff --git a/timemachine/fe/single_topology.py b/timemachine/fe/single_topology.py
+index 4f2fbb4e8a..d0098eedfd 100644
+--- a/timemachine/fe/single_topology.py
++++ b/timemachine/fe/single_topology.py
+@@ -1041,7 +1041,7 @@ class AtomMapMixin:
+     self.c_flags
+     """
+ 
+-    def __init__(self, mol_a, mol_b, core):
++    def __init__(self, mol_a, mol_b, core: NDArray):
+         assert core.shape[1] == 2
+         assert mol_a is not None
+         assert mol_b is not None
+@@ -1082,16 +1082,16 @@ def __init__(self, mol_a, mol_b, core):
+         self.c_to_a = {v: k for k, v in enumerate(self.a_to_c)}
+         self.c_to_b = {v: k for k, v in enumerate(self.b_to_c)}
+ 
+-    def get_dummy_atoms_a(self):
++    def get_dummy_atoms_a(self) -> set[int]:
+         return {idx for idx, flag in enumerate(self.c_flags) if flag == AtomMapFlags.MOL_A}
+ 
+-    def get_dummy_atoms_b(self):
++    def get_dummy_atoms_b(self) -> set[int]:
+         return {idx for idx, flag in enumerate(self.c_flags) if flag == AtomMapFlags.MOL_B}
+ 
+-    def get_core_atoms(self):
++    def get_core_atoms(self) -> set[int]:
+         return {idx for idx, flag in enumerate(self.c_flags) if flag == AtomMapFlags.CORE}
+ 
+-    def get_num_atoms(self):
++    def get_num_atoms(self) -> int:
+         """
+         Get the total number of atoms in the alchemical hybrid.
+ 
+@@ -1102,7 +1102,7 @@ def get_num_atoms(self):
+         """
+         return self.mol_a.GetNumAtoms() + self.mol_b.GetNumAtoms() - len(self.core)
+ 
+-    def get_num_dummy_atoms(self):
++    def get_num_dummy_atoms(self) -> int:
+         """
+         Get the total number of dummy atoms in the alchemical hybrid.
+ 
+diff --git a/timemachine/md/minimizer.py b/timemachine/md/minimizer.py
+index 1e64565965..9f670fc6a0 100644
+--- a/timemachine/md/minimizer.py
++++ b/timemachine/md/minimizer.py
+@@ -481,6 +481,8 @@ def get_val_and_grad_fn(bps: Sequence[BoundPotential], box: NDArray, precision=n
+ 
+     box: np.array (3,3)
+ 
++    precision: np.float64 or np.float32
++
+     Returns
+     -------
+     Energy function with gradient
+@@ -550,7 +552,8 @@ def local_minimize(
+     minimizer_config: MinimizationConfig,
+     verbose: bool = True,
+     assert_energy_decreased: bool = True,
+-    restraint_k: Optional[float] = None,
++    restraint_k: float = 0.0,
++    restrained_idxs: Optional[NDArray] = None,
+ ):
+     """
+     Minimize a local region given selected idxs.
+@@ -578,10 +581,13 @@ def local_minimize(
+     assert_energy_decreased: bool
+         Throw an assertion if the energy does not decrease
+ 
+-    restraint_k float, optional
++    restraint_k: float
+         Restraint k to wrap val_and_grad_fn in a positional harmonic restraint to the input positions of the local_idxs.
+-        If None, minimize with no positional restraint. Refer to `timemachine.potentials.bonded.harmonic_positional_restraint`
+-        for implementation.
++        Refer to `timemachine.potentials.bonded.harmonic_positional_restraint` for implementation.
++
++    restrained_idxs: np.ndarray, optional
++        A subset of idxs to restrain, must be a subset of local_idxs. If restrained_idxs is None, all local_idxs are restrained.
++
+ 
+     Returns
+     -------
+@@ -596,6 +602,10 @@ def local_minimize(
+ 
+     if not isinstance(minimizer_config, (FireMinimizationConfig, ScipyMinimizationConfig)):
+         raise ValueError(f"Invalid minimizer config: {type(minimizer_config)}")
++    assert restraint_k >= 0.0, "Restraint k must be greater than or equal to 0.0"
++    if restrained_idxs is not None:
++        assert restraint_k > 0.0, "Restraint k be greater than 0.0 if restrained indices provided"
++        assert set(restrained_idxs).issubset(set(local_idxs)), "Restrained indices must be a subset of local indices"
+ 
+     method = "FIRE"
+     if isinstance(minimizer_config, ScipyMinimizationConfig):
+@@ -610,10 +620,11 @@ def local_minimize(
+ 
+     # Only use the restrained function when minimizing, don't otherwise use to compute energy/forces
+     minimizer_val_and_grad = val_and_grad_fn
+-    if restraint_k is not None:
+-        assert restraint_k > 0.0
++    if restraint_k > 0.0:
++        if restrained_idxs is None:
++            restrained_idxs = free_idxs
+         minimizer_val_and_grad = wrap_val_and_grad_with_positional_restraint(
+-            minimizer_val_and_grad, x0, box0, free_idxs, restraint_k
++            minimizer_val_and_grad, x0, box0, restrained_idxs, restraint_k
+         )
+ 
+     def val_and_grad_fn_local(x_local):

@@ -1,0 +1,2153 @@
+diff --git a/scilink/agents/sim_agents/critics.py b/scilink/agents/sim_agents/critics.py
+index 91933f98..aa83b9bb 100644
+--- a/scilink/agents/sim_agents/critics.py
++++ b/scilink/agents/sim_agents/critics.py
+@@ -810,6 +810,7 @@ def assess(
+         check_observables: bool = False,
+         required_observables: Optional[list] = None,
+         deterministic_findings: Optional[list] = None,
++        physical_findings: Optional[list] = None,
+     ) -> Dict[str, Any]:
+         """Assess a finished run and return a verdict report.
+ 
+@@ -1000,6 +1001,26 @@ def assess(
+                 + "\n- ".join(str(f) for f in deterministic_findings)
+             )
+ 
++        # Post-run physical-sanity evidence. Framed as a completed-but-wrong
++        # result — distinct from the pre-run coverage channel above — so the
++        # fixer diagnoses the deck setting that produced a non-physical value
++        # rather than being steered to add missing outputs.
++        if physical_findings:
++            observable_coverage += (
++                "\n\n=== Physical-sanity check (POST-run) ===\n"
++                "The run COMPLETED CLEANLY (the engine exited normally), but a "
++                "deterministic check measured a physical observable OUTSIDE its "
++                "plausible range. The result is NON-PHYSICAL, not under-provided "
++                "with outputs: the data IS present and it is wrong. Do NOT "
++                "propose adding thermo columns, dumps, or other logging. "
++                "Diagnose the deck setting that produced the non-physical state "
++                "(e.g. an unstable barostat/thermostat, a wrong `units` system, "
++                "too large a timestep, a bad initial box) and return the "
++                "COMPLETE corrected deck(s) in `suggested_fixes`, keyed by the "
++                "exact input filename. Treat each as BLOCKING:\n- "
++                + "\n- ".join(str(f) for f in physical_findings)
++            )
++
+         prompt = self.BASELINE_PROMPT_TEMPLATE.format(
+             skill_context=skill_context or "(no engine skill loaded)",
+             output_dir=str(out_path),
+diff --git a/scilink/agents/sim_agents/health.py b/scilink/agents/sim_agents/health.py
+new file mode 100644
+index 00000000..f927df26
+--- /dev/null
++++ b/scilink/agents/sim_agents/health.py
+@@ -0,0 +1,162 @@
++"""Engine-neutral physical-sanity gate for a finished run.
++
++A completed process is not the same as a physically valid run: a barostat can
++drive a simulation box to a near-vacuum, an SCF can settle on a nonsensical
++energy, a relaxation can explode — and the engine still exits 0. Nothing
++downstream catches that, because the autonomy's self-correction (method
++escalation, reparameterization) only fires on a *converged observable compared
++to a reference*, which a pathological run never reaches.
++
++This module is the tripwire ahead of that path. It is pure: given the
++observables a run produced and the plausible bands a skill declares, it returns
++the bands that were violated. It knows no engine and does no I/O — the per-engine
++hook that *reads* an observable from a run directory, and the ``health:`` block
++that *declares* the bands, live in the skill bundle and are resolved by name
++through the registry (mirroring the ``convergence:`` machinery in
++:mod:`scilink.agents.sim_agents.convergence`).
++
++The bands are **gross physical-sanity bounds, not accuracy checks**: a liquid
++whose density came out near zero is broken; whether its density is 1.00 vs 1.05
++g/cm³ is an accuracy question answered downstream against a reference, never
++here. Keep the declared bands loose enough that only a genuinely non-physical
++run trips them.
++"""
++
++from __future__ import annotations
++
++import logging
++import math
++from dataclasses import dataclass
++from typing import Dict, List, Optional
++
++logger = logging.getLogger(__name__)
++
++
++def _as_number(value) -> Optional[float]:
++    """Coerce a frontmatter bound to a float, or ``None`` if it isn't one.
++
++    Accepts ints/floats and numeric strings (``"0.02"``); rejects booleans
++    (``True`` is an ``int`` subclass but never a valid bound) and anything
++    unparseable.
++    """
++    if isinstance(value, bool) or value is None:
++        return None
++    if isinstance(value, (int, float)):
++        return float(value)
++    if isinstance(value, str):
++        try:
++            return float(value.strip())
++        except ValueError:
++            return None
++    return None
++
++
++@dataclass(frozen=True)
++class HealthBand:
++    """A plausible range for one observable.
++
++    Either bound may be ``None`` (one-sided). ``observable`` is the name the
++    per-engine reader hook understands (e.g. ``"density"``).
++    """
++
++    observable: str
++    minimum: Optional[float] = None
++    maximum: Optional[float] = None
++
++
++@dataclass(frozen=True)
++class HealthViolation:
++    """A reading that fell outside its band (or was non-finite)."""
++
++    observable: str
++    value: float
++    minimum: Optional[float]
++    maximum: Optional[float]
++
++    @property
++    def reason(self) -> str:
++        if not math.isfinite(self.value):
++            return f"{self.observable}={self.value} (non-finite)"
++        if self.minimum is not None and self.value < self.minimum:
++            return f"{self.observable}={self.value:g} < min {self.minimum:g}"
++        if self.maximum is not None and self.value > self.maximum:
++            return f"{self.observable}={self.value:g} > max {self.maximum:g}"
++        return f"{self.observable}={self.value:g} out of band"
++
++
++def parse_health_specs(specs) -> List[HealthBand]:
++    """Coerce raw frontmatter specs (a list of dicts) into :class:`HealthBand`.
++
++    Tolerant by design: a spec missing an ``observable`` name, or with no bound
++    at all, is skipped rather than raising, so a malformed ``health:`` block
++    never breaks a run. Accepts ``min``/``minimum`` and ``max``/``maximum``.
++    """
++    bands: List[HealthBand] = []
++    if not isinstance(specs, list):
++        return bands
++    for spec in specs:
++        if not isinstance(spec, dict):
++            continue
++        name = spec.get("observable")
++        if not name:
++            continue
++        lo = _as_number(spec.get("min", spec.get("minimum")))
++        hi = _as_number(spec.get("max", spec.get("maximum")))
++        if lo is None and hi is None:
++            continue
++        if lo is not None and hi is not None and lo > hi:
++            # An inverted band would fail every finite value — almost certainly
++            # a typo. Skip it (and say so) rather than reject every run.
++            logger.warning(
++                "health band for %r has min %g > max %g; skipping it", name, lo, hi)
++            continue
++        bands.append(HealthBand(observable=str(name), minimum=lo, maximum=hi))
++    return bands
++
++
++def evaluate_health(
++    observations: Dict[str, Optional[float]],
++    specs,
++) -> List[HealthViolation]:
++    """Return the bands a run violated.
++
++    ``observations`` maps observable name -> value (or ``None`` when the reader
++    could not extract it). A ``None`` value is *skipped*, not treated as a
++    violation: the gate judges only what it can actually read, and an engine
++    that declares no bands (empty ``specs``) is simply ungated. A non-finite
++    value (NaN/inf) is always a violation — it is never a valid physical state.
++
++    No side effects, no I/O, no engine knowledge: pure and unit-testable.
++    """
++    bands = parse_health_specs(specs)
++    violations: List[HealthViolation] = []
++    for band in bands:
++        value = observations.get(band.observable)
++        if value is None:
++            continue
++        try:
++            value = float(value)
++        except (TypeError, ValueError):
++            # A reader hook that returned a non-numeric value can't be judged —
++            # skip it rather than raise (the gate never breaks a run).
++            continue
++        if not math.isfinite(value):
++            violations.append(HealthViolation(
++                band.observable, value, band.minimum, band.maximum))
++            continue
++        if band.minimum is not None and value < band.minimum:
++            violations.append(HealthViolation(
++                band.observable, value, band.minimum, band.maximum))
++        elif band.maximum is not None and value > band.maximum:
++            violations.append(HealthViolation(
++                band.observable, value, band.minimum, band.maximum))
++    return violations
++
++
++def observable_names(specs) -> List[str]:
++    """The distinct observable names a ``health:`` block declares."""
++    seen: List[str] = []
++    for band in parse_health_specs(specs):
++        if band.observable not in seen:
++            seen.append(band.observable)
++    return seen
+diff --git a/scilink/agents/sim_agents/mlip_agent.py b/scilink/agents/sim_agents/mlip_agent.py
+index 7230ff6a..10bce1c1 100644
+--- a/scilink/agents/sim_agents/mlip_agent.py
++++ b/scilink/agents/sim_agents/mlip_agent.py
+@@ -874,42 +874,25 @@ def _check_observables(
+         return report
+ 
+     def _parse_lammps_thermo(self, log_file: str) -> Dict[str, List[float]]:
+-        """Extract thermo columns from a LAMMPS log file."""
+-        import numpy as np
+-
+-        data: Dict[str, List[float]] = {}
+-        headers: List[str] = []
+-
+-        try:
+-            with open(log_file) as f:
+-                in_thermo = False
+-                for line in f:
+-                    stripped = line.strip()
+-
+-                    # Detect thermo header
+-                    if stripped.startswith("Step "):
+-                        headers = stripped.split()
+-                        for h in headers:
+-                            data.setdefault(h, [])
+-                        in_thermo = True
+-                        continue
+-
+-                    if in_thermo:
+-                        if stripped.startswith("Loop time") or not stripped:
+-                            in_thermo = False
+-                            continue
+-                        parts = stripped.split()
+-                        if len(parts) == len(headers):
+-                            try:
+-                                values = [float(x) for x in parts]
+-                                for h, v in zip(headers, values):
+-                                    data[h].append(v)
+-                            except ValueError:
+-                                in_thermo = False
+-        except Exception as e:
+-            self.logger.warning(f"Error parsing LAMMPS log: {e}")
+-
+-        return data
++        """Extract thermo columns from a LAMMPS log file (all blocks merged).
++
++        Delegates to the LAMMPS skill's canonical thermo parser so the MLIP
++        agent and the health gate read the same log by the same rules (a stray
++        ``fix print`` / ``WARNING:`` line is skipped, not treated as the end of
++        the block). Keys preserve the header's original case (e.g. ``Density``).
++
++        Note: the canonical parser also parses ``Time``-headed blocks, so if a
++        log mixes ``Step``- and ``Time``-headed blocks the merged columns can be
++        ragged (different lengths). Current consumers index single columns
++        (``Density[-100:]``, ``Temp``, ``TotEng``) and are unaffected; a future
++        consumer that zips columns together must not assume equal length.
++        """
++        from ...skills.molecular_dynamics.lammps.lammps import parse_thermo_log
++        merged: Dict[str, List[float]] = {}
++        for block in parse_thermo_log(log_file):
++            for key, values in block.items():
++                merged.setdefault(key, []).extend(values)
++        return merged
+ 
+     # ================================================================
+     # PRIVATE — LLM HELPERS
+diff --git a/scilink/agents/sim_agents/refinement.py b/scilink/agents/sim_agents/refinement.py
+index 3c3c350d..5b2dfde9 100644
+--- a/scilink/agents/sim_agents/refinement.py
++++ b/scilink/agents/sim_agents/refinement.py
+@@ -35,6 +35,7 @@
+ import os
+ import shutil
+ import subprocess
++import time
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass, field, replace
+ from enum import Enum
+@@ -310,6 +311,10 @@ class RefinementContext:
+             ``"autonomous"``).
+         max_cycles: Maximum refine cycles per phase.
+         cycle: Refine cycles spent on the current phase (loop-managed).
++        max_health_retries: How many times a phase that completes in a
++            non-physical state (an out-of-band ``health:`` observable) may be
++            re-run — optionally with perturbed initial conditions — before it is
++            marked failed. 0 disables the retry (gate still fails a bad run).
+         coverage_votes: Independent coverage checks to majority-vote in the
+             pre-run gate (1 = single check; >1 damps the stochastic decision).
+         required_observables: Optional engine-neutral ``Requirement`` list the
+@@ -327,6 +332,7 @@ class RefinementContext:
+     autonomy: str = "autonomous"
+     max_cycles: int = 3
+     cycle: int = 0
++    max_health_retries: int = 2
+     coverage_votes: int = 1
+     required_observables: Optional[List] = None
+     history: List[Dict[str, Any]] = field(default_factory=list)
+@@ -551,9 +557,13 @@ def _refine_phase(
+     ctx.cycle = 0
+     last_verdict: Dict[str, Any] = {}
+     phase_status = "failed"
++    violations = None          # the final cycle's health violations (if any)
++    gate_unchecked = False     # gated but no observable could be read
+ 
+     while ctx.cycle < ctx.max_cycles:
+-        result = executor.run(inputs, phase.run_command, phase.run_dir)
++        result, violations, inputs, checked = _run_phase_health_gated(
++            inputs, phase, executor, ctx, allow_retry=True)
++        gate_unchecked = checked is False
+ 
+         if result.get("status") == "error":
+             # Could not launch — still assess (the critic reads the persisted
+@@ -563,13 +573,34 @@ def _refine_phase(
+                 phase.name, result.get("error"),
+             )
+ 
++        # The health gate informs the critic rather than replacing it: a physical
++        # violation is handed over as POST-run physical-sanity evidence (the run
++        # finished cleanly but is non-physical — fix the deck, do not add
++        # outputs), and the run is deterministically held below "acceptable" so a
++        # fail-open verdict cannot wave a measured-non-physical run through. The
++        # normal repair loop then drives the fix + re-run; only on exhaustion
++        # does the phase fail.
++        # Pass physical evidence only when there is a violation, so a critic that
++        # predates the `physical_findings` argument is unaffected on clean runs.
++        extra = {"physical_findings": [v.reason for v in violations]} if violations else {}
+         verdict = run_critic.assess(
+             output_dir=result.get("output_dir", phase.run_dir),
+             research_goal=ctx.research_goal,
+             skill=ctx.skill,
+             domain=ctx.domain,
+             input_files=inputs,
++            **extra,
+         )
++        if violations:
++            # The measured violation is the ground truth: it overrides a
++            # fail-open verdict (held below "acceptable"). It names the cause
++            # only when the critic did not diagnose a more specific, differently
++            # routed one — a `structure` or `force_field` call made alongside the
++            # violation is kept so the campaign still routes it correctly.
++            forced = {**verdict, "verdict": "needs_fixes"}
++            if forced.get("failure_class") not in ("structure", "force_field"):
++                forced["failure_class"] = "health_gate"
++            verdict = forced
+         last_verdict = verdict
+         ctx.record(phase, result, verdict)
+ 
+@@ -593,7 +624,7 @@ def _refine_phase(
+         # Budget exhausted without an acceptable verdict.
+         phase_status = "exhausted"
+ 
+-    return {
++    rec = {
+         "phase": phase.name,
+         "status": phase_status,
+         "cycles": ctx.cycle + 1,
+@@ -601,6 +632,18 @@ def _refine_phase(
+         "run_status": last_verdict.get("run_status"),
+         "failure_class": last_verdict.get("failure_class"),
+     }
++    # A phase that ended unresolved on a measured non-physical value carries its
++    # reasons; it is labelled health_gate unless the critic named a more specific
++    # cause (structure / force_field) with its own campaign routing.
++    if phase_status != "success" and violations:
++        if rec.get("failure_class") not in ("structure", "force_field"):
++            rec["failure_class"] = "health_gate"
++        rec["health_violations"] = [v.reason for v in violations]
++    # The gate was enabled but couldn't read its observable — record that the
++    # pass was unvouched (the deck may not log it / unsupported units / no log).
++    if gate_unchecked:
++        rec["health_checked"] = False
++    return rec
+ 
+ 
+ def _run_once_phase(
+@@ -609,13 +652,22 @@ def _run_once_phase(
+     run_critic: _RunCriticLike,
+     ctx: RefinementContext,
+ ) -> Dict[str, Any]:
+-    """Run a phase exactly once and assess it, with no refine loop.
++    """Run a combine phase exactly once and assess it, with no refine loop.
+ 
+-    Used for a combine stage: it consumes a prior fan-out's outputs (e.g.
+-    assembling a free-energy profile from umbrella windows), so re-running it
+-    with a fix is not the right recovery — it is judged once, not iterated.
++    The combine stage post-processes a prior fan-out's outputs (e.g. assembling
++    a free-energy profile from umbrella windows), so re-running it with a fix is
++    not the right recovery — it is judged once, not iterated. The health gate
++    still applies (a cleanly-finished but non-physical aggregation is caught),
++    but without a retry, since re-running an aggregation cannot change its input.
+     """
+-    result = executor.run(phase.input_files, phase.run_command, phase.run_dir)
++    result, violations, _, checked = _run_phase_health_gated(
++        phase.input_files, phase, executor, ctx, allow_retry=False)
++    if violations:
++        ctx.record(phase, result, {
++            "run_status": "failed", "verdict": "needs_fixes",
++            "failure_class": "health_gate",
++        })
++        return _health_failure_record(phase, 1, violations)
+     if result.get("status") == "error":
+         logger.warning(
+             "Executor could not launch combine phase %s: %s",
+@@ -629,13 +681,16 @@ def _run_once_phase(
+         input_files=phase.input_files,
+     )
+     ctx.record(phase, result, verdict)
+-    return {
++    rec = {
+         "phase": phase.name,
+         "status": "success" if _is_acceptable(verdict) else "stopped",
+         "cycles": 1,
+         "verdict": verdict.get("verdict"),
+         "run_status": verdict.get("run_status"),
+     }
++    if checked is False:
++        rec["health_checked"] = False
++    return rec
+ 
+ 
+ _MAX_DRYRUN_CYCLES = 5
+@@ -661,6 +716,174 @@ def _resolve_skill_callable(skill: Optional[str], domain: Optional[str],
+     return fn if callable(fn) else None
+ 
+ 
++# ──────────────────────────────────────────────────────────────────────────
++# Health gate — catch a run that completes in a non-physical state
++# ──────────────────────────────────────────────────────────────────────────
++
++def _health_specs(skill: Optional[str], domain: Optional[str]) -> List[Dict[str, Any]]:
++    """Return the active skill's ``health:`` frontmatter bands, or ``[]``.
++
++    Engine-neutral and best-effort: an engine whose skill declares no ``health:``
++    block (or that cannot be loaded) yields an empty list, which leaves the gate
++    disabled for that engine — exactly like the convergence / dry-run hooks.
++    """
++    if not (skill and domain):
++        return []
++    try:
++        from ...skills.loader import load_skill
++        meta = load_skill(skill, domain=domain).get("meta") or {}
++        specs = meta.get("health") or []
++        return specs if isinstance(specs, list) else []
++    except Exception as e:  # best-effort: a bad frontmatter never breaks a run
++        logger.debug("could not load health specs for %s/%s: %s", domain, skill, e)
++        return []
++
++
++def _read_health_observations(output_dir: str, specs, reader, since=None) -> Dict[str, Any]:
++    """Call the per-engine reader hook once per declared observable.
++
++    ``since`` is the wall-clock time just before the run; a reader that accepts
++    it should ignore output older than it (a stale log from an earlier phase in
++    a shared run directory). Never raises: a reader that fails on one observable
++    contributes ``None``, which the pure comparator skips."""
++    from .health import observable_names
++    obs: Dict[str, Any] = {}
++    for name in observable_names(specs):
++        try:
++            try:
++                obs[name] = reader(output_dir=output_dir, observable=name, since=since)
++            except TypeError:
++                # reader predates the `since` argument — call the old way
++                obs[name] = reader(output_dir=output_dir, observable=name)
++        except Exception as e:
++            logger.debug("health reader failed for %s in %s: %s",
++                         name, output_dir, e)
++            obs[name] = None
++    return obs
++
++
++def _resolve_health(ctx: RefinementContext):
++    """Resolve ``(specs, reader, perturb)`` for the active skill, once per context.
++
++    Skill and domain are fixed for the life of a ``RefinementContext``, so the
++    skill markdown is loaded and the hooks resolved a single time and cached on
++    the context — not re-parsed per phase × cycle × health-retry × member.
++    """
++    cached = getattr(ctx, "_health_cache", None)
++    if cached is not None:
++        return cached
++    specs = _health_specs(ctx.skill, ctx.domain)
++    reader = (_resolve_skill_callable(ctx.skill, ctx.domain, "read_health_observable")
++              if specs else None)
++    perturb = (_resolve_skill_callable(ctx.skill, ctx.domain, "perturb_for_retry")
++               if specs else None)
++    resolved = (specs, reader, perturb)
++    try:
++        ctx._health_cache = resolved
++    except Exception:
++        pass
++    return resolved
++
++
++def _run_phase_health_gated(
++    inputs: Dict[str, str],
++    phase: Phase,
++    executor: Executor,
++    ctx: RefinementContext,
++    allow_retry: bool = True,
++):
++    """Execute a phase and gate a *cleanly finished* run on physical sanity.
++
++    Runs the executor. The gate judges only a run that actually completed with
++    ``returncode == 0``: a non-zero exit (or a launch error) is a crash, not a
++    non-physical result, so it is handed to the critic to diagnose rather than
++    mislabeled. On a clean run whose declared ``health:`` observable is out of
++    band, the inputs are re-run — first perturbed through the engine's optional
++    ``perturb_for_retry`` hook (e.g. a fresh velocity seed) — up to
++    ``ctx.max_health_retries`` times, then the violation is returned. Without a
++    perturb hook, re-running the identical deck cannot help, so the gate does
++    not retry (the violation goes to the critic, which may propose a deck fix).
++
++    Returns ``(result, violations, run_inputs, checked)`` where ``violations`` is:
++
++    * ``None`` — not gated (no ``health:`` block / no reader hook, a launch
++      error, or a non-zero return code);
++    * ``[]`` — the run passed the gate (or the gate could not read a value);
++    * a non-empty list of :class:`~scilink.agents.sim_agents.health.HealthViolation`
++      — a clean run that is physically out of band and retries could not rescue.
++
++    ``checked`` is a tri-state: ``None`` when the gate did not apply, ``True``
++    when it read at least one declared observable and actually judged the run,
++    and ``False`` when it was gated but every declared observable read ``None``
++    (the deck did not log it, an unsupported unit system, a stale log) — a pass
++    that the gate could not actually vouch for, so the caller can record it.
++
++    ``run_inputs`` is the deck that actually produced ``result`` (it differs from
++    the argument only when a perturb retry changed it), so the caller hands the
++    critic the inputs the run was really made from.
++    """
++    from .health import evaluate_health
++    specs, reader, perturb_hook = _resolve_health(ctx)
++    gate_on = bool(specs) and reader is not None
++    perturb = perturb_hook if (gate_on and allow_retry) else None
++    retries = (max(0, ctx.max_health_retries)
++               if (allow_retry and perturb is not None) else 0)
++
++    attempt = 0
++    while True:
++        since = time.time()
++        result = executor.run(inputs, phase.run_command, phase.run_dir)
++        # Only a clean completion is a candidate for the physical-sanity gate.
++        rc = result.get("returncode")
++        if (not gate_on or result.get("status") == "error"
++                or (rc is not None and rc != 0)):
++            return result, None, inputs, None
++
++        out_dir = result.get("output_dir", phase.run_dir)
++        obs = _read_health_observations(out_dir, specs, reader, since=since)
++        checked = any(v is not None for v in obs.values())
++        violations = evaluate_health(obs, specs)
++        if not violations:
++            if not checked:
++                logger.info(
++                    "health gate skipped on phase %s: no declared observable "
++                    "could be read (not logged, unsupported units, or no log)",
++                    phase.name)
++            return result, [], inputs, checked
++
++        reasons = "; ".join(v.reason for v in violations)
++        if attempt >= retries:
++            logger.warning(
++                "health gate tripped on phase %s after %d attempt(s): %s",
++                phase.name, attempt + 1, reasons)
++            return result, violations, inputs, True
++
++        attempt += 1
++        logger.warning(
++            "health gate tripped on phase %s (%s); retry %d/%d",
++            phase.name, reasons, attempt, retries)
++        if perturb is not None:
++            try:
++                new_inputs = perturb(input_files=inputs, attempt=attempt)
++                if isinstance(new_inputs, dict) and new_inputs:
++                    inputs = new_inputs
++            except Exception as e:
++                logger.debug("perturb_for_retry failed on %s: %s", phase.name, e)
++
++
++def _health_failure_record(phase: Phase, cycles: int, violations) -> Dict[str, Any]:
++    """The phase record for a run that failed the health gate."""
++    return {
++        "phase": phase.name,
++        "status": "failed",
++        "cycles": cycles,
++        "verdict": "needs_fixes",
++        "run_status": "failed",
++        "failure_class": "health_gate",
++        "health_violations": [v.reason for v in violations],
++    }
++
++
+ def _stage_dry_dir(run_dir: str, dry_dir: str, entry: str) -> None:
+     """Recreate ``dry_dir`` with the run's dependency files linked from
+     ``run_dir`` — everything except the deck itself and subdirs.
+@@ -1027,6 +1250,21 @@ def run_campaign(
+     # the deck loop cannot fix it — it needs reparameterization upstream.
+     elif any(p.get("failure_class") == "force_field" for p in flat):
+         result["failure_class"] = "force_field"
++    # A health-gate failure is a run that finished cleanly but non-physical (e.g.
++    # a barostat-blown box) which the repair loop could not rescue. Surface it —
++    # with the measured reasons — so the orchestrator can tell it apart from an
++    # ordinary refinement failure and act on it.
++    elif any(p.get("failure_class") == "health_gate" for p in flat):
++        result["failure_class"] = "health_gate"
++        result["health_violations"] = [
++            r for p in flat if p.get("failure_class") == "health_gate"
++            for r in p.get("health_violations", [])
++        ]
++    # A phase whose health gate could not read its observable passed WITHOUT a
++    # physical-sanity check; surface that on the campaign result so the pipeline
++    # (and the user) know the pass was unvouched — even when the run succeeded.
++    if any(p.get("health_checked") is False for p in flat):
++        result["health_checked"] = False
+     if dry_run_record is not None:
+         result["dry_run"] = dry_run_record
+     return result
+diff --git a/scilink/agents/sim_agents/simulation_pipeline.py b/scilink/agents/sim_agents/simulation_pipeline.py
+index 236c3232..c0a62ee8 100644
+--- a/scilink/agents/sim_agents/simulation_pipeline.py
++++ b/scilink/agents/sim_agents/simulation_pipeline.py
+@@ -957,6 +957,36 @@ def _run_ladder(param, members, _entry=entry):
+             "Run flagged force-field-limited (failure_class='force_field'); "
+             "reparameterization needed — not yet automated."
+         )
++    # A health-gate failure is a run that finished cleanly but non-physical (a
++    # measured observable out of its plausible band) which the repair loop could
++    # not rescue. Surface it to the user with the measured reasons, like the
++    # force-field case, rather than leaving it as a bare refinement failure.
++    elif refinement.get("failure_class") == "health_gate":
++        reasons = refinement.get("health_violations") or []
++        result["health_gate_flagged"] = True
++        result.setdefault("warnings", []).append(
++            "A run completed cleanly but a measured physical observable is "
++            "outside its plausible range (a non-physical result): "
++            + ("; ".join(reasons) if reasons else "see refinement details")
++            + ". The automatic repair loop could not resolve it; treat this "
++            "result as unreliable."
++        )
++        logger.warning(
++            "Run flagged health-gate (non-physical result): %s",
++            "; ".join(reasons) if reasons else "(no reasons recorded)",
++        )
++    # Independent of pass/fail: the health gate could not read its declared
++    # observable for at least one run, so that run was not physically checked.
++    # Surface it so a clean-looking result is not mistaken for a vouched one.
++    if refinement.get("health_checked") is False:
++        result.setdefault("warnings", []).append(
++            "The physical-sanity (health) gate could not read its declared "
++            "observable for at least one run — the deck may not log it, the unit "
++            "system is not covered, or no log was written. That run passed "
++            "WITHOUT a physical-sanity check."
++        )
++        logger.warning("Health gate could not read its observable; a run passed "
++                       "without a physical-sanity check.")
+     result["final_status"] = (
+         "success" if refinement.get("status") == "success"
+         else f"refinement_{refinement.get('status', 'failed')}"
+diff --git a/scilink/skills/molecular_dynamics/lammps/lammps.md b/scilink/skills/molecular_dynamics/lammps/lammps.md
+index c2220e31..efd164d5 100644
+--- a/scilink/skills/molecular_dynamics/lammps/lammps.md
++++ b/scilink/skills/molecular_dynamics/lammps/lammps.md
+@@ -16,6 +16,15 @@ detect:
+     Python module (PYTHON package binding) is also a valid runtime
+     surface — if importable, the engine is usable even without a
+     standalone binary on $PATH.
++health:
++  # Gross physical-sanity bands for a finished condensed-phase run — a tripwire
++  # for a non-physical result (e.g. a barostat that drove the box to a near-
++  # vacuum), NOT an accuracy check. Keep the bounds loose: only a genuinely
++  # broken run should trip them. Accuracy is judged downstream against a
++  # reference, never here. Read by the `read_health_observable` hook.
++  - observable: density       # g/cm^3
++    min: 0.02                 # below any real liquid/solid; a blown-up box -> ~0
++    max: 30.0                 # above the densest solids; catches an implosion
+ ---
+ 
+ ## Overview
+@@ -260,7 +269,7 @@ pair_coeff * * {potential_file} {element_list}
+ neighbor 2.0 bin
+ neigh_modify every 1 delay 0 check yes
+ thermo 100
+-thermo_style custom step temp press pe ke etotal vol lx ly lz
++thermo_style custom step temp press pe ke etotal vol density lx ly lz
+ minimize 1.0e-6 1.0e-8 10000 100000
+ velocity all create {temperature} {seed} dist gaussian
+ fix 1 all npt temp {temperature} {temperature} 0.1 aniso {pressure} {pressure} 1.0
+diff --git a/scilink/skills/molecular_dynamics/lammps/lammps.py b/scilink/skills/molecular_dynamics/lammps/lammps.py
+index 4e7632b7..29c1a4b3 100644
+--- a/scilink/skills/molecular_dynamics/lammps/lammps.py
++++ b/scilink/skills/molecular_dynamics/lammps/lammps.py
+@@ -1681,7 +1681,278 @@ def detect_signal_logging(deck_text: str, signal: str) -> Dict[str, Any]:
+     return {"present": False, "interval_steps": None}
+ 
+ 
++# ──────────────────────────────────────────────────────────────────────────
++# Health-gate reader — a gross physical-sanity value from a finished run
++# ──────────────────────────────────────────────────────────────────────────
++
++# health observable name -> LAMMPS thermo column header tokens (lowercased)
++# that carry it, most-preferred first.
++_HEALTH_COLUMNS: Dict[str, Tuple[str, ...]] = {
++    "density": ("density",),
++    "temperature": ("temp", "temperature"),
++    "pressure": ("press", "pressure"),
++    "volume": ("volume", "vol"),
++    "potential_energy": ("poteng", "pe"),
++    "total_energy": ("toteng", "etotal"),
++}
++
++_THERMO_LOG_NAMES = ("log.lammps", "thermo.log")
++
++# LAMMPS reports `density` in the deck's `units` system. Factor to convert that
++# raw value to g/cm^3 (the unit the health band is declared in). Unit systems
++# not listed (lj reduced, nano, electron, micro, …) are not convertible to a
++# g/cm^3 band, so the reader returns None for them and the gate skips.
++_DENSITY_UNIT_TO_GCC = {
++    "real": 1.0,     # g/cm^3 already
++    "metal": 1.0,    # g/cm^3 already
++    "cgs": 1.0,      # g/cm^3 already
++    "si": 1.0e-3,    # kg/m^3 -> g/cm^3
++}
++
++
++def _find_thermo_log(output_dir: str) -> Optional[Path]:
++    """Return the thermo log at the TOP LEVEL of ``output_dir``, or None.
++
++    Deliberately not recursive: a phase owns its run directory, and recursing
++    could pick up an unrelated nested log (a ``_dryrun/`` log, or — for a
++    combine stage whose dir is the parent of a fan-out — an arbitrary member's
++    log). An engine that nests its log elsewhere should say so explicitly rather
++    than have the gate guess.
++    """
++    d = Path(output_dir)
++    if not d.is_dir():
++        return None
++    for name in _THERMO_LOG_NAMES:
++        hit = d / name
++        if hit.is_file():
++            return hit
++    return None
++
++
++def _is_number(tok: str) -> bool:
++    try:
++        float(tok)
++        return True
++    except ValueError:
++        return False
++
++
++def parse_thermo_log(log_file, columns=None) -> List[Dict[str, List[float]]]:
++    """Parse a LAMMPS thermo log into one column-dict per thermo block.
++
++    The single place the LAMMPS thermo-format rules live in the skill (used by
++    the health reader here and by the MLIP agent), so the two can never read a
++    different density from the same log. Keys preserve the header's original
++    case. Robust to real-world noise:
++
++    * a header line (starts with ``Step``/``Time``, >=2 non-numeric tokens) is
++      only ACCEPTED once a numeric data row with the same column count actually
++      follows it — so an all-words ``fix print "Step done now"`` line is not
++      mistaken for a header and does not steal the rows after it;
++    * a stray mid-block line — a ``fix print`` message, a ``WARNING:``, a blank,
++      a truncated final row — is skipped, NOT treated as the end of the block;
++    * a block ends only at ``Loop time``, end of file, or the next real header.
++
++    ``columns`` optionally restricts which columns are materialized (lowercased
++    names); the health reader passes just the one it needs so a long, densely
++    logged run isn't held in memory column-for-column. ``None`` keeps all.
++
++    Never raises; a malformed log yields whatever parsed cleanly.
++    """
++    blocks: List[Dict[str, List[float]]] = []
++    header: Optional[List[str]] = None       # confirmed current-block header
++    keep: Optional[List[str]] = None         # columns being accumulated
++    cur: Optional[Dict[str, List[float]]] = None
++    pending: Optional[List[str]] = None      # candidate header, not yet confirmed
++
++    def _looks_like_header(tokens):
++        return (tokens and tokens[0] in ("Step", "Time") and len(tokens) >= 2
++                and not any(_is_number(t) for t in tokens))
++
++    try:
++        with open(log_file, "r", errors="ignore") as f:
++            for line in f:
++                toks = line.split()
++                numeric = bool(toks) and all(_is_number(t) for t in toks)
++
++                if line.strip().startswith("Loop time"):
++                    cur, header, keep, pending = None, None, None, None
++                    continue
++
++                if cur is not None:
++                    # Inside an open block, a numeric row of the right width is
++                    # data; EVERYTHING else — including a `Step`/`Time` line from
++                    # a `fix print` — is a stray line that is skipped, never a new
++                    # header. A new block only begins after `Loop time` closes
++                    # this one.
++                    if numeric and len(toks) == len(header):
++                        row = dict(zip(header, toks))
++                        for h in keep:
++                            cur[h].append(float(row[h]))
++                    continue
++
++                # No block open. A candidate header is HELD (across intervening
++                # stray lines) until a numeric row of matching width confirms it;
++                # a later candidate replaces an unconfirmed one.
++                if _looks_like_header(toks):
++                    pending = toks
++                    continue
++                if pending is not None and numeric and len(toks) == len(pending):
++                    header = pending
++                    keep = [h for h in header
++                            if columns is None or h.lower() in columns]
++                    cur = {h: [] for h in keep}
++                    blocks.append(cur)
++                    pending = None
++                    row = dict(zip(header, toks))
++                    for h in keep:
++                        cur[h].append(float(row[h]))
++                # else: no block, unconfirmed — skip, keep holding `pending`
++    except Exception as e:
++        logger.debug("could not parse LAMMPS thermo log %s: %s", log_file, e)
++    return [b for b in blocks if any(b.values())]
++
++
++def _match_column(block: Dict[str, List[float]], candidates: Tuple[str, ...]):
++    """First block column (case-insensitive) matching ``candidates``, or None."""
++    lowered = {k.lower(): k for k in block}
++    for cand in candidates:
++        if cand in lowered and block[lowered[cand]]:
++            return lowered[cand]
++    return None
++
++
++def _equilibrated_mean(values: List[float]) -> Optional[float]:
++    """Mean of the back half of a thermo series (drops startup transients)."""
++    if not values:
++        return None
++    tail = values[len(values) // 2:] or values
++    return sum(tail) / len(tail)
++
++
++# Deck filename globs the skill declares (lammps.md `inputs.deck`). The units
++# scan is restricted to these so the fallback never reads a trajectory dump or
++# data file (which can be multi-GB) into memory.
++_DECK_GLOBS = ("run.lammps", "run_*.lammps", "in.*", "*.in")
++_UNITS_SCAN_BYTES = 65536
++
++
++def _units_in(path: Path, rx) -> Optional[str]:
++    """First ``units`` style in the head of ``path``, or None. Reads a capped
++    prefix only — ``units`` is echoed at the very top of a LAMMPS script/log."""
++    try:
++        with open(path, "r", errors="ignore") as fh:
++            m = rx.search(fh.read(_UNITS_SCAN_BYTES))
++        return m.group(1).lower() if m else None
++    except Exception:
++        return None
++
++
++def _deck_units(log_file: Path, output_dir: str) -> Optional[str]:
++    """The ``units`` style this run used, or None if it can't be determined.
++
++    LAMMPS echoes the input script into the log, and ``units`` is a mandatory
++    command, so the style is almost always recoverable from the log's head;
++    falls back to the declared deck files (never arbitrary run-dir files).
++    """
++    rx = re.compile(r'^\s*units\s+(\w+)', re.MULTILINE)
++    units = _units_in(Path(log_file), rx)
++    if units:
++        return units
++    seen = set()
++    for pat in _DECK_GLOBS:
++        for f in sorted(Path(output_dir).glob(pat)):
++            if f.name in _THERMO_LOG_NAMES or f in seen or not f.is_file():
++                continue
++            seen.add(f)
++            units = _units_in(f, rx)
++            if units:
++                return units
++    return None
++
++
++def read_health_observable(output_dir: str, observable: str,
++                           since: Optional[float] = None) -> Optional[float]:
++    """Read one gross physical-sanity observable from a finished LAMMPS run.
++
++    Engine hook for the engine-neutral health gate (mirrors VASP's
++    ``read_convergence_observable``). Reads the matching thermo column from the
++    run's final block and returns its back-half (equilibrated) mean — robust
++    enough to tell a physical run from a blown-up one (e.g. density near zero
++    after a barostat instability). Which observables and plausible bands to
++    check live in lammps.md's ``health:`` frontmatter, not here.
++
++    ``since`` is the wall-clock time just before the run; the log is treated as
++    stale (``None`` returned) if it is not newer than that, so a phase that
++    produced no log of its own in a shared run directory is not judged on the
++    previous phase's log.
++
++    For ``density`` the raw thermo value is in the deck's ``units`` system, so
++    it is converted to the g/cm^3 the band is declared in; a unit system with no
++    g/cm^3 equivalent (lj reduced, nano, …) yields None so the gate skips rather
++    than compare raw numbers against a g/cm^3 band.
++
++    Returns the value as a float, or ``None`` if it cannot be read (no log,
++    stale log, unknown observable, column absent, uncovered unit system). Never
++    raises.
++    """
++    cols = _HEALTH_COLUMNS.get(observable.lower())
++    if not cols:
++        logger.debug("unknown health observable %r for LAMMPS", observable)
++        return None
++    log = _find_thermo_log(output_dir)
++    if log is None:
++        return None
++    # A rc==0 exit does not prove THIS run wrote the log (a tee/wrapper that
++    # swallows the exit code, an mpirun that returns 0 on a pre-launch failure);
++    # a log older than the run start is a leftover from an earlier phase.
++    if since is not None:
++        try:
++            if log.stat().st_mtime + 1.0 < since:
++                logger.debug("thermo log %s predates the run; treating as absent", log)
++                return None
++        except OSError:
++            return None
++    # the LAST block that logs the column (final run segment, not the ramp)
++    values: List[float] = []
++    for block in reversed(parse_thermo_log(log, columns={c.lower() for c in cols})):
++        key = _match_column(block, cols)
++        if key is not None:
++            values = block[key]
++            break
++    value = _equilibrated_mean(values)
++    if value is None:
++        return None
++    if observable.lower() == "density":
++        units = _deck_units(log, output_dir)
++        factor = _DENSITY_UNIT_TO_GCC.get(units) if units else None
++        if factor is None:
++            logger.debug("density health check skipped: units %r not convertible "
++                         "to g/cm^3 in %s", units, output_dir)
++            return None
++        value *= factor
++    return value
++
++
+ TOOL_SPECS = [
++    ToolSpec(
++        name="read_health_observable",
++        description=(
++            "Read a gross physical-sanity observable (density, temperature, "
++            "pressure, volume, energy) from a finished LAMMPS run directory by "
++            "parsing its thermo log. Engine hook for the health gate; returns "
++            "None if unreadable. Plausible bands live in lammps.md's `health:` "
++            "frontmatter."
++        ),
++        parameters={
++            "output_dir": "Finished LAMMPS run directory (string).",
++            "observable": (
++                "Observable name: density | temperature | pressure | volume | "
++                "potential_energy | total_energy."
++            ),
++        },
++        agents=["simulation"],
++    ),
+     ToolSpec(
+         name="detect_signal_logging",
+         description=(
+diff --git a/tests/fixtures/lammps/log_exploded.lammps b/tests/fixtures/lammps/log_exploded.lammps
+new file mode 100644
+index 00000000..7f35fc83
+--- /dev/null
++++ b/tests/fixtures/lammps/log_exploded.lammps
+@@ -0,0 +1,124 @@
++units           real
++       0 = # of size 3 clusters
++       0 = # of size 4 clusters
++    4100 = # of frozen angles
++  find clusters CPU = 0.001 seconds
++
++thermo          1000
++thermo_style    custom step temp press pe ke etotal vol density lx
++
++# ======================================================================
++# STAGE A : minimize
++# ======================================================================
++minimize        1.0e-4 1.0e-6 5000 50000
++
++CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
++
++Your simulation uses code contributions which should be cited:
++
++- Type Label Framework: https://doi.org/10.1021/acs.jpcb.3c08419
++
++@Article{Gissinger24,
++ author = {Jacob R. Gissinger, Ilia Nikiforov, Yaser Afshar, Brendon Waters, Moon-ki Choi, Daniel S. Karls, Alexander Stukowski, Wonpil Im, Hendrik Heinz, Axel Kohlmeyer, and Ellad B. Tadmor},
++ title = {Type Label Framework for Bonded Force Fields in LAMMPS},
++ journal = {J. Phys. Chem. B},
++ year =    2024,
++ volume =  128,
++ number =  13,
++ pages =   {3282–-3297}
++}
++
++CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
++
++PPPM initialization ...
++  extracting TIP4P info from pair style
++WARNING: System is not charge neutral, net charge = 4.598e-05 (src/kspace.cpp:327)
++  using 12-bit tables for long-range coulomb (src/kspace.cpp:342)
++  G vector (1/distance) = 0.217683
++  grid = 24 24 24
++  stencil order = 5
++  estimated absolute RMS force accuracy = 0.028957998
++  estimated relative force accuracy = 8.7206151e-05
++  using double precision FFTW3
++  3d grid and FFT values/proc = 1331 216
++WARNING: Communication cutoff 0 is shorter than a bond length based estimate of 6.078796924121749. This may lead to errors. (src/comm.cpp:730)
++WARNING: Increasing communication cutoff to 15.12983 for TIP4P pair style (src/KSPACE/pair_lj_cut_tip4p_long.cpp:497)
++Generated 36 of 36 mixed pair_coeff terms from geometric mixing rule
++WARNING: Using fix shake with minimization.
++  Substituting constraints with harmonic restraint forces using kbond=1987 (src/RIGID/fix_shake.cpp:386)
++Neighbor list info ...
++  update: every = 1 steps, delay = 0 steps, check = yes
++  max neighbors/atom: 2000, page size: 100000
++  master list distance cutoff = 14.3092
++  ghost atom cutoff = 15.12983
++  binsize = 7.1546, bins = 9 9 9
++  1 neighbor lists, perpetual/occasional/extra = 1 0 0
++  (1) pair lj/cut/tip4p/long, perpetual
++      attributes: half, newton on
++      pair build: half/bin/newton
++      stencil: half/bin/3d
++      bin: standard
++Per MPI rank memory allocation (min/avg/max) = 18.04 | 18.59 | 19.2 Mbytes
++   Step          Temp          Press          PotEng         KinEng         TotEng         Volume        Density           Lx      
++    200000   296.04161      0.68342457    -49197.061      11592.664     -37604.397      87712600       0.0025697636   444.31127    
++    220000   297.03038      1.0765057     -49155.35       11631.384     -37523.966      87712600       0.0025697636   444.31127    
++    240000   297.41537      0.89244962    -49105.695      11646.459     -37459.236      87712600       0.0025697636   444.31127    
++    260000   301.36701      0.43978452    -49187.362      11801.201     -37386.16       87712600       0.0025697636   444.31127    
++    280000   303.23862      1.8595716     -49188.127      11874.491     -37313.636      87712600       0.0025697636   444.31127    
++    300000   300.34165      0.45330557    -49233.211      11761.049     -37472.162      87712600       0.0025697636   444.31127    
++    320000   295.98789      0.46379669    -49341.02       11590.561     -37750.46       87712600       0.0025697636   444.31127    
++    340000   302.13885      1.216712      -49302.22       11831.426     -37470.794      87712600       0.0025697636   444.31127    
++    360000   300.4671       2.708511      -49254.582      11765.962     -37488.62       87712600       0.0025697636   444.31127    
++    380000   296.46037      1.7490427     -49429.282      11609.062     -37820.22       87712600       0.0025697636   444.31127    
++    400000   300.55207      0.50152781    -49420.512      11769.289     -37651.223      87712600       0.0025697636   444.31127    
++    420000   298.05695      1.2685978     -49374.73       11671.583     -37703.147      87712600       0.0025697636   444.31127    
++    440000   296.64459      0.99752992    -49342.959      11616.276     -37726.683      87712600       0.0025697636   444.31127    
++    460000   295.89265      1.6210653     -49326.942      11586.831     -37740.111      87712600       0.0025697636   444.31127    
++    480000   299.47341      2.1391101     -49405.164      11727.05      -37678.114      87712600       0.0025697636   444.31127    
++    500000   295.81367      1.5791125     -49448.095      11583.738     -37864.357      87712600       0.0025697636   444.31127    
++    520000   296.20381      0.98318351    -49366.781      11599.016     -37767.766      87712600       0.0025697636   444.31127    
++    540000   295.59346      1.2526531     -49482.227      11575.115     -37907.112      87712600       0.0025697636   444.31127    
++    560000   299.21846      0.029415514   -49309.257      11717.066     -37592.191      87712600       0.0025697636   444.31127    
++    580000   295.65616      0.71298842    -49518.756      11577.57      -37941.186      87712600       0.0025697636   444.31127    
++    600000   298.65721      1.4293444     -49557.119      11695.088     -37862.031      87712600       0.0025697636   444.31127    
++    620000   298.38917      1.0563143     -49481.375      11684.592     -37796.783      87712600       0.0025697636   444.31127    
++    640000   301.10386      0.83686549    -49509.834      11790.896     -37718.937      87712600       0.0025697636   444.31127    
++    660000   298.87457      1.6236563     -49527.111      11703.6       -37823.511      87712600       0.0025697636   444.31127    
++    680000   298.60749      2.349147      -49540.017      11693.141     -37846.876      87712600       0.0025697636   444.31127    
++    700000   298.83956      1.389574      -49458.542      11702.229     -37756.313      87712600       0.0025697636   444.31127    
++    720000   298.96581      2.7650961     -49536.557      11707.173     -37829.385      87712600       0.0025697636   444.31127    
++    740000   299.4566       2.1825863     -49469.508      11726.392     -37743.116      87712600       0.0025697636   444.31127    
++    760000   302.02449      1.6751255     -49518.922      11826.947     -37691.975      87712600       0.0025697636   444.31127    
++    780000   296.57644      0.50348675    -49461.991      11613.608     -37848.384      87712600       0.0025697636   444.31127    
++    800000   296.08843      1.9147825     -49540.314      11594.498     -37945.817      87712600       0.0025697636   444.31127    
++    820000   297.48889      1.3660789     -49540.335      11649.338     -37890.997      87712600       0.0025697636   444.31127    
++    840000   296.64058      2.3879667     -49455.944      11616.119     -37839.825      87712600       0.0025697636   444.31127    
++    860000   298.38494      1.3509841     -49616.302      11684.426     -37931.876      87712600       0.0025697636   444.31127    
++    880000   298.99327      1.710474      -49677.253      11708.248     -37969.004      87712600       0.0025697636   444.31127    
++    900000   296.76764      0.9553785     -49722.129      11621.095     -38101.034      87712600       0.0025697636   444.31127    
++    920000   299.50077      1.1669182     -49743.16       11728.121     -38015.039      87712600       0.0025697636   444.31127    
++    940000   300.58132      0.67562078    -49656.458      11770.434     -37886.024      87712600       0.0025697636   444.31127    
++    960000   299.27239      1.7828947     -49626.628      11719.178     -37907.45       87712600       0.0025697636   444.31127    
++    980000   297.81675      2.1815883     -49689.385      11662.177     -38027.208      87712600       0.0025697636   444.31127    
++   1000000   301.52714      1.8944044     -49629.107      11807.472     -37821.635      87712600       0.0025697636   444.31127    
++   1020000   299.69594      1.9058662     -49668.272      11735.764     -37932.508      87712600       0.0025697636   444.31127    
++   1040000   295.836        2.0109396     -49718.946      11584.613     -38134.334      87712600       0.0025697636   444.31127    
++   1060000   300.16624      1.4630986     -49637.764      11754.18      -37883.583      87712600       0.0025697636   444.31127    
++   1080000   299.84449      1.1660032     -49699.222      11741.581     -37957.641      87712600       0.0025697636   444.31127    
++   1100000   299.17413      0.69915904    -49795.8        11715.33      -38080.47       87712600       0.0025697636   444.31127    
++   1120000   300.60447      0.88140126    -49721.396      11771.341     -37950.055      87712600       0.0025697636   444.31127    
++   1140000   293.1135       1.5234181     -49552.783      11478.003     -38074.78       87712600       0.0025697636   444.31127    
++   1160000   299.54511      1.332456      -49714.44       11729.857     -37984.582      87712600       0.0025697636   444.31127    
++   1180000   302.24937      1.8343269     -49660.581      11835.753     -37824.827      87712600       0.0025697636   444.31127    
++   1200000   294.71542      1.3621335     -49775.981      11540.732     -38235.249      87712600       0.0025697636   444.31127    
++   1220000   298.76753      1.9244387     -49797.365      11699.408     -38097.957      87712600       0.0025697636   444.31127    
++   1240000   297.32972      1.4577086     -49763.704      11643.105     -38120.599      87712600       0.0025697636   444.31127    
++
++   1242000   298.58903      0.88824468    -49764.23       11692.418     -38071.811      87712600       0.0025697636   444.31127    
++   1243000   299.62916      1.8228117     -49777.374      11733.149     -38044.225      87712600       0.0025697636   444.31127    
++   1244000   296.98321      3.2019386     -49766.776      11629.536     -38137.239      87712600       0.0025697636   444.31127    
++   1245000   297.60578      1.9552385     -49832.365      11653.915     -38178.449      87712600       0.0025697636   444.31127    
++   1246000   297.61975      1.2292913     -49695.228      11654.463     -38040.765      87712600       0.0025697636   444.31127    
++   1247000   300.44354      1.1806725     -49688.414      11765.039     -37923.375      87712600       0.0025697636   444.31127    
++   1248000   299.06923      2.1768859     -49786.263      11711.222     -38075.041      87712600       0.0025697636   444.31127    
++   1249000   2
+\ No newline at end of file
+diff --git a/tests/fixtures/lammps/log_healthy.lammps b/tests/fixtures/lammps/log_healthy.lammps
+new file mode 100644
+index 00000000..e8ec1a63
+--- /dev/null
++++ b/tests/fixtures/lammps/log_healthy.lammps
+@@ -0,0 +1,164 @@
++units           real
++       0 = # of size 3 clusters
++       0 = # of size 4 clusters
++    4100 = # of frozen angles
++  find clusters CPU = 0.001 seconds
++
++thermo          1000
++thermo_style    custom step temp press pe ke etotal vol density lx
++
++# ======================================================================
++# STAGE A : minimize
++# ======================================================================
++minimize        1.0e-4 1.0e-6 5000 50000
++
++CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
++
++Your simulation uses code contributions which should be cited:
++
++- Type Label Framework: https://doi.org/10.1021/acs.jpcb.3c08419
++
++@Article{Gissinger24,
++ author = {Jacob R. Gissinger, Ilia Nikiforov, Yaser Afshar, Brendon Waters, Moon-ki Choi, Daniel S. Karls, Alexander Stukowski, Wonpil Im, Hendrik Heinz, Axel Kohlmeyer, and Ellad B. Tadmor},
++ title = {Type Label Framework for Bonded Force Fields in LAMMPS},
++ journal = {J. Phys. Chem. B},
++ year =    2024,
++ volume =  128,
++ number =  13,
++ pages =   {3282–-3297}
++}
++
++CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
++
++PPPM initialization ...
++  extracting TIP4P info from pair style
++WARNING: System is not charge neutral, net charge = 4.598e-05 (src/kspace.cpp:327)
++  using 12-bit tables for long-range coulomb (src/kspace.cpp:342)
++  G vector (1/distance) = 0.217683
++  grid = 24 24 24
++  stencil order = 5
++  estimated absolute RMS force accuracy = 0.028957998
++  estimated relative force accuracy = 8.7206151e-05
++  using double precision FFTW3
++  3d grid and FFT values/proc = 1331 216
++WARNING: Communication cutoff 0 is shorter than a bond length based estimate of 6.078796924121749. This may lead to errors. (src/comm.cpp:730)
++WARNING: Increasing communication cutoff to 15.12983 for TIP4P pair style (src/KSPACE/pair_lj_cut_tip4p_long.cpp:497)
++Generated 36 of 36 mixed pair_coeff terms from geometric mixing rule
++WARNING: Using fix shake with minimization.
++  Substituting constraints with harmonic restraint forces using kbond=1987 (src/RIGID/fix_shake.cpp:386)
++Neighbor list info ...
++  update: every = 1 steps, delay = 0 steps, check = yes
++  max neighbors/atom: 2000, page size: 100000
++  master list distance cutoff = 14.3092
++  ghost atom cutoff = 15.12983
++  binsize = 7.1546, bins = 9 9 9
++  1 neighbor lists, perpetual/occasional/extra = 1 0 0
++  (1) pair lj/cut/tip4p/long, perpetual
++      attributes: half, newton on
++      pair build: half/bin/newton
++      stencil: half/bin/3d
++      bin: standard
++Per MPI rank memory allocation (min/avg/max) = 18.04 | 18.59 | 19.2 Mbytes
++   Step          Temp          Press          PotEng         KinEng         TotEng         Volume        Density           Lx      
++    200000   294.54439      196.47928     -60965.13       11534.035     -49431.095      271179.04      0.83118755     64.726984    
++    220000   296.93126      129.45948     -61128.656      11627.502     -49501.154      271179.04      0.83118755     64.726984    
++    240000   299.77838     -355.60598     -61218.853      11738.992     -49479.861      271179.04      0.83118755     64.726984    
++    260000   300.77291     -29.797124     -61282.784      11777.937     -49504.847      271179.04      0.83118755     64.726984    
++    280000   295.81413     -305.21312     -61129.386      11583.756     -49545.629      271179.04      0.83118755     64.726984    
++    300000   297.21861      3.8621273     -60992.433      11638.754     -49353.678      271179.04      0.83118755     64.726984    
++    320000   297.70236      100.27133     -61245.885      11657.698     -49588.187      271179.04      0.83118755     64.726984    
++    340000   299.7978      -340.88996     -61301.752      11739.753     -49561.999      271179.04      0.83118755     64.726984    
++    360000   301.46733      118.8089      -61277.681      11805.129     -49472.551      271179.04      0.83118755     64.726984    
++    380000   300.2803      -130.72131     -61307.31       11758.647     -49548.663      271179.04      0.83118755     64.726984    
++    400000   296.78442     -48.425253     -61191.771      11621.752     -49570.019      271179.04      0.83118755     64.726984    
++    420000   297.65163      283.04943     -61256.293      11655.711     -49600.582      271179.04      0.83118755     64.726984    
++    440000   299.38788      81.789877     -61279.193      11723.7       -49555.492      271179.04      0.83118755     64.726984    
++    460000   300.27742     -120.73716     -61262.32       11758.534     -49503.785      271179.04      0.83118755     64.726984    
++    480000   299.6093       105.67615     -61297.862      11732.371     -49565.491      271179.04      0.83118755     64.726984    
++    500000   301.52612      245.44934     -61331.786      11807.432     -49524.354      271179.04      0.83118755     64.726984    
++    520000   294.32765     -109.17039     -61261.162      11525.547     -49735.614      271179.04      0.83118755     64.726984    
++    540000   300.96299      3.6406386     -61370.142      11785.38      -49584.762      271179.04      0.83118755     64.726984    
++    560000   296.70511     -287.68953     -61452.127      11618.646     -49833.481      271179.04      0.83118755     64.726984    
++    580000   300.0493      -167.45895     -61317.073      11749.601     -49567.472      271179.04      0.83118755     64.726984    
++    600000   301.55384      74.428791     -61339.359      11808.517     -49530.842      271179.04      0.83118755     64.726984    
++    620000   299.01969      43.37303      -61388.644      11709.283     -49679.361      271179.04      0.83118755     64.726984    
++    640000   296.89035     -217.4479      -61307.222      11625.9       -49681.322      271179.04      0.83118755     64.726984    
++    660000   299.25033     -527.13302     -61173.653      11718.314     -49455.338      271179.04      0.83118755     64.726984    
++    680000   299.37215      340.43374     -61373.12       11723.084     -49650.036      271179.04      0.83118755     64.726984    
++    700000   295.9453       107.04494     -61482.635      11588.893     -49893.742      271179.04      0.83118755     64.726984    
++    720000   297.2894       216.19051     -61385.324      11641.526     -49743.798      271179.04      0.83118755     64.726984    
++    740000   296.78996     -210.52511     -61464.321      11621.969     -49842.352      271179.04      0.83118755     64.726984    
++    760000   298.83386      413.96131     -61577.639      11702.006     -49875.633      271179.04      0.83118755     64.726984    
++    780000   299.9483      -164.49368     -61634.811      11745.646     -49889.165      271179.04      0.83118755     64.726984    
++    800000   298.67381     -127.92622     -61626.893      11695.738     -49931.155      271179.04      0.83118755     64.726984    
++    820000   300.23974      126.0811      -61366.996      11757.059     -49609.937      271179.04      0.83118755     64.726984    
++    840000   296.75237      115.58043     -61324.884      11620.497     -49704.387      271179.04      0.83118755     64.726984    
++    860000   298.10271      186.05017     -61450.598      11673.375     -49777.223      271179.04      0.83118755     64.726984    
++    880000   299.10861     -5.0404519     -61525.18       11712.765     -49812.416      271179.04      0.83118755     64.726984    
++    900000   300.11009     -39.241707     -61396.676      11751.981     -49644.694      271179.04      0.83118755     64.726984    
++    920000   300.37583     -423.75333     -61608.981      11762.387     -49846.593      271179.04      0.83118755     64.726984    
++    940000   295.79061     -22.346194     -61462.2        11582.835     -49879.364      271179.04      0.83118755     64.726984    
++    960000   290.88672      13.315146     -61497.348      11390.804     -50106.543      271179.04      0.83118755     64.726984    
++    980000   298.88716     -100.14632     -61553.847      11704.093     -49849.754      271179.04      0.83118755     64.726984    
++   1000000   299.35844      194.60003     -61550.214      11722.548     -49827.666      271179.04      0.83118755     64.726984    
++   1020000   300.97101     -71.387092     -61532.946      11785.694     -49747.252      271179.04      0.83118755     64.726984    
++   1040000   299.6651       307.58844     -61612.381      11734.556     -49877.825      271179.04      0.83118755     64.726984    
++   1060000   298.60647     -241.42912     -61454.741      11693.101     -49761.639      271179.04      0.83118755     64.726984    
++   1080000   297.15364      67.204822     -61608.421      11636.21      -49972.21       271179.04      0.83118755     64.726984    
++   1100000   293.86623     -116.9057      -61600.495      11507.479     -50093.016      271179.04      0.83118755     64.726984    
++   1120000   301.14507     -349.23226     -61787.161      11792.51      -49994.651      271179.04      0.83118755     64.726984    
++   1140000   295.35791      372.48019     -61863.489      11565.891     -50297.598      271179.04      0.83118755     64.726984    
++   1160000   298.30122     -46.005993     -61945.468      11681.148     -50264.319      271179.04      0.83118755     64.726984    
++   1180000   301.12089     -87.791445     -61770.468      11791.563     -49978.905      271179.04      0.83118755     64.726984    
++   1200000   298.75176      197.05941     -61764.891      11698.791     -50066.101      271179.04      0.83118755     64.726984    
++   1220000   304.60305      209.74515     -61836.06       11927.921     -49908.139      271179.04      0.83118755     64.726984    
++   1240000   296.13206     -76.412634     -61832.759      11596.206     -50236.553      271179.04      0.83118755     64.726984    
++   1260000   297.64944      139.39198     -61768.99       11655.625     -50113.365      271179.04      0.83118755     64.726984    
++   1280000   298.1794      -281.24034     -61879.927      11676.378     -50203.549      271179.04      0.83118755     64.726984    
++   1300000   298.99062     -195.88389     -61775.626      11708.144     -50067.481      271179.04      0.83118755     64.726984    
++   1320000   298.3042      -171.10979     -61971.584      11681.265     -50290.32       271179.04      0.83118755     64.726984    
++   1340000   299.44707      75.47105      -61929.356      11726.018     -50203.338      271179.04      0.83118755     64.726984    
++   1360000   299.93244      133.83746     -61712.862      11745.025     -49967.837      271179.04      0.83118755     64.726984    
++   1380000   296.5439       234.87689     -61735.375      11612.333     -50123.041      271179.04      0.83118755     64.726984    
++   1400000   301.1113       0.73508022    -61738.337      11791.188     -49947.149      271179.04      0.83118755     64.726984    
++   1420000   296.1818      -146.66267     -61792.204      11598.154     -50194.05       271179.04      0.83118755     64.726984    
++   1440000   294.92425     -138.2903      -61854.763      11548.91      -50305.853      271179.04      0.83118755     64.726984    
++   1460000   298.87129      37.451027     -61776.578      11703.472     -50073.106      271179.04      0.83118755     64.726984    
++   1480000   302.68746      71.838815     -61832.905      11852.908     -49979.996      271179.04      0.83118755     64.726984    
++   1500000   300.18076      12.789436     -61918.831      11754.749     -50164.082      271179.04      0.83118755     64.726984    
++   1520000   297.66812      71.642483     -61930.246      11656.357     -50273.889      271179.04      0.83118755     64.726984    
++   1540000   301.86678      260.34129     -61932.929      11820.771     -50112.158      271179.04      0.83118755     64.726984    
++   1560000   297.80044      156.76641     -61796.806      11661.538     -50135.268      271179.04      0.83118755     64.726984    
++   1580000   297.10941      298.08279     -61832.025      11634.478     -50197.547      271179.04      0.83118755     64.726984    
++   1600000   297.05367     -68.744028     -62048.18       11632.295     -50415.884      271179.04      0.83118755     64.726984    
++   1620000   299.5725       348.25079     -61800.818      11730.93      -50069.888      271179.04      0.83118755     64.726984    
++   1640000   298.24982      25.050347     -62053.198      11679.135     -50374.063      271179.04      0.83118755     64.726984    
++   1660000   295.08711      203.48959     -61974.323      11555.287     -50419.036      271179.04      0.83118755     64.726984    
++   1680000   294.59546      92.540239     -61906.529      11536.035     -50370.495      271179.04      0.83118755     64.726984    
++   1700000   298.04132     -29.824051     -61912.802      11670.971     -50241.831      271179.04      0.83118755     64.726984    
++   1720000   299.76892     -9.1711232     -61957.893      11738.621     -50219.271      271179.04      0.83118755     64.726984    
++   1740000   300.56073     -261.69916     -61815.907      11769.628     -50046.279      271179.04      0.83118755     64.726984    
++   1760000   299.44857      152.83416     -62178.812      11726.077     -50452.735      271179.04      0.83118755     64.726984    
++   1780000   296.75451     -38.399942     -61994.756      11620.581     -50374.176      271179.04      0.83118755     64.726984    
++   1800000   297.07466      136.28685     -61947.202      11633.117     -50314.085      271179.04      0.83118755     64.726984    
++   1820000   297.37599      112.41409     -61931.875      11644.917     -50286.958      271179.04      0.83118755     64.726984    
++   1840000   298.49668     -311.85857     -62129.092      11688.802     -50440.29       271179.04      0.83118755     64.726984    
++   1860000   296.90619     -2.3041207     -61966.511      11626.52      -50339.99       271179.04      0.83118755     64.726984    
++   1880000   297.35692      339.49359     -61950.334      11644.17      -50306.164      271179.04      0.83118755     64.726984    
++   1900000   300.79646     -28.356839     -61982.336      11778.859     -50203.477      271179.04      0.83118755     64.726984    
++   1920000   297.09194      108.74623     -62050.268      11633.794     -50416.474      271179.04      0.83118755     64.726984    
++   1940000   294.47008      243.97223     -62183.122      11531.125     -50651.997      271179.04      0.83118755     64.726984    
++   1960000   299.89601     -265.72015     -62074.378      11743.599     -50330.78       271179.04      0.83118755     64.726984    
++   1980000   298.68128     -231.87422     -62251.477      11696.031     -50555.447      271179.04      0.83118755     64.726984    
++   2000000   300.13414      153.96501     -62104.562      11752.923     -50351.639      271179.04      0.83118755     64.726984    
++Nghost:        6126.56 ave        6819 max        5385 min
++  estimated absolute RMS force accuracy = 0.034431073
++
++  grid = 25 25 25
++  stencil order = 5
++  estimated absolute RMS force accuracy = 0.034431073
++  estimated relative force accuracy = 0.00010368815
++  using double precision FFTW3
++  3d grid and FFT values/proc = 1728 400
++Generated 36 of 36 mixed pair_coeff terms from geometric mixing rule
++Total wall time: 5:48:03
+diff --git a/tests/fixtures/lammps/log_no_density.lammps b/tests/fixtures/lammps/log_no_density.lammps
+new file mode 100644
+index 00000000..63f636aa
+--- /dev/null
++++ b/tests/fixtures/lammps/log_no_density.lammps
+@@ -0,0 +1,67 @@
++units           real
++    4100 = # of frozen angles
++  find clusters CPU = 0.001 seconds
++
++# ============================================================
++# STAGE 1 : 100 ps NVT re-thermalization  (fresh velocities, seed 101)
++# ============================================================
++velocity        all create 298.15 101 dist gaussian mom yes rot yes
++
++fix             NVT all nvt temp 298.15 298.15 100.0
++
++thermo          1000
++thermo_style    custom step temp press pe ke etotal vol pxy pxz pyz
++thermo_modify   flush yes
++timestep        1.0
++
++restart         50000 thermalize.restart1 thermalize.restart2
++run             100000     # 100 ps
++
++CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
++
++Your simulation uses code contributions which should be cited:
++
++- Type Label Framework: https://doi.org/10.1021/acs.jpcb.3c08419
++
++@Article{Gissinger24,
++ author = {Jacob R. Gissinger, Ilia Nikiforov, Yaser Afshar, Brendon Waters, Moon-ki Choi, Daniel S. Karls, Alexander Stukowski, Wonpil Im, Hendrik Heinz, Axel Kohlmeyer, and Ellad B. Tadmor},
++ title = {Type Label Framework for Bonded Force Fields in LAMMPS},
++ journal = {J. Phys. Chem. B},
++ year =    2024,
++ volume =  128,
++ number =  13,
++ pages =   {3282–-3297}
++}
++
++CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE-CITE
++
++PPPM initialization ...
++WARNING: System is not charge neutral, net charge = 4.598e-05 (src/kspace.cpp:327)
++  using 12-bit tables for long-range coulomb (src/kspace.cpp:342)
++  G vector (1/distance) = 0.21466932
++  grid = 24 24 24
++  stencil order = 5
++  estimated absolute RMS force accuracy = 0.032801388
++  estimated relative force accuracy = 9.8780404e-05
++  using double precision FFTW3
++  3d grid and FFT values/proc = 2197 216
++Generated 36 of 36 mixed pair_coeff terms from geometric mixing rule
++Neighbor list info ...
++  update: every = 1 steps, delay = 0 steps, check = yes
++  max neighbors/atom: 2000, page size: 100000
++  master list distance cutoff = 14.5
++  ghost atom cutoff = 14.5
++  binsize = 7.25, bins = 9 9 9
++  1 neighbor lists, perpetual/occasional/extra = 1 0 0
++  (1) pair lj/cut/coul/long, perpetual
++      attributes: half, newton on
++      pair build: half/bin/newton
++      stencil: half/bin/3d
++      bin: standard
++Per MPI rank memory allocation (min/avg/max) = 16.65 | 17.07 | 17.71 Mbytes
++   Step          Temp          Press          PotEng         KinEng         TotEng         Volume          Pxy            Pxz            Pyz      
++         0   302.58904     -652.56917     -82486.615      11849.054     -70637.561      214656         345.85429      351.83907     -5.4821179    
++
++         0   302.58904     -652.56917     -82486.615      11849.054     -70637.561      214656         345.85429      351.83907     -5.4821179    
++ERROR: Fix in variable not computed at compatible time (src/variable.cpp:4463)
++Last command: run             200000     # 200 ps
+diff --git a/tests/test_health.py b/tests/test_health.py
+new file mode 100644
+index 00000000..6ad3ea78
+--- /dev/null
++++ b/tests/test_health.py
+@@ -0,0 +1,130 @@
++"""Unit tests for the engine-neutral physical-sanity (health) comparator.
++
++Pure: no engine, no I/O, no LLM. Verifies :func:`evaluate_health` and the
++frontmatter coercion in :func:`parse_health_specs`.
++"""
++
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++from scilink.agents.sim_agents.health import (  # noqa: E402
++    HealthBand,
++    evaluate_health,
++    observable_names,
++    parse_health_specs,
++)
++
++# A loose density band like lammps.md declares.
++DENSITY_SPEC = [{"observable": "density", "min": 0.02, "max": 30.0}]
++
++
++def test_within_band_is_healthy():
++    assert evaluate_health({"density": 0.83}, DENSITY_SPEC) == []
++
++
++def test_below_min_is_a_violation():
++    # The box-explosion case: density collapsed to a near-vacuum.
++    violations = evaluate_health({"density": 0.003}, DENSITY_SPEC)
++    assert len(violations) == 1
++    assert violations[0].observable == "density"
++    assert "min" in violations[0].reason
++
++
++def test_above_max_is_a_violation():
++    violations = evaluate_health({"density": 500.0}, DENSITY_SPEC)
++    assert len(violations) == 1
++    assert "max" in violations[0].reason
++
++
++def test_none_value_is_skipped_not_failed():
++    # An unreadable observable can't be judged — the gate skips it, it is not
++    # treated as a violation (no fabricated failures).
++    assert evaluate_health({"density": None}, DENSITY_SPEC) == []
++
++
++def test_missing_observable_is_skipped():
++    assert evaluate_health({}, DENSITY_SPEC) == []
++
++
++def test_non_numeric_value_is_skipped_not_raised():
++    # A (third-party) reader hook that returns a non-numeric value must not
++    # break the run — the gate judges only what it can coerce.
++    assert evaluate_health({"density": "N/A"}, DENSITY_SPEC) == []
++    assert evaluate_health({"density": object()}, DENSITY_SPEC) == []
++
++
++def test_non_finite_is_always_a_violation():
++    for bad in (float("nan"), float("inf"), float("-inf")):
++        violations = evaluate_health({"density": bad}, DENSITY_SPEC)
++        assert len(violations) == 1
++        assert "non-finite" in violations[0].reason
++
++
++def test_empty_specs_gate_disabled():
++    assert evaluate_health({"density": 0.003}, []) == []
++
++
++def test_one_sided_band():
++    spec = [{"observable": "density", "min": 0.02}]  # no max
++    assert evaluate_health({"density": 1e6}, spec) == []
++    assert len(evaluate_health({"density": 0.0}, spec)) == 1
++
++
++def test_multiple_observables():
++    spec = [
++        {"observable": "density", "min": 0.02, "max": 30.0},
++        {"observable": "temperature", "min": 1.0, "max": 1e5},
++    ]
++    violations = evaluate_health({"density": 0.001, "temperature": 300.0}, spec)
++    assert [v.observable for v in violations] == ["density"]
++
++
++# ── frontmatter coercion ────────────────────────────────────────────────────
++
++def test_parse_accepts_min_max_aliases():
++    bands = parse_health_specs([{"observable": "d", "minimum": 1, "maximum": 2}])
++    assert bands == [HealthBand("d", 1.0, 2.0)]
++
++
++def test_parse_skips_malformed():
++    specs = [
++        {"observable": "density", "min": 0.02, "max": 30.0},  # ok
++        {"min": 1, "max": 2},                                  # no observable
++        {"observable": "nobounds"},                            # no bounds
++        "not-a-dict",                                          # wrong type
++    ]
++    bands = parse_health_specs(specs)
++    assert [b.observable for b in bands] == ["density"]
++
++
++def test_parse_non_list_is_empty():
++    assert parse_health_specs(None) == []
++    assert parse_health_specs({"observable": "x"}) == []
++
++
++def test_parse_coerces_string_bounds():
++    # Quoted YAML bounds ("0.02") should still gate, not be silently dropped.
++    bands = parse_health_specs([{"observable": "density", "min": "0.02", "max": "30"}])
++    assert bands == [HealthBand("density", 0.02, 30.0)]
++
++
++def test_parse_rejects_bool_bounds():
++    # bool is an int subclass but never a valid bound.
++    assert parse_health_specs([{"observable": "d", "min": True, "max": False}]) == []
++
++
++def test_parse_skips_inverted_band():
++    # min > max would fail every finite value — treat as a typo and skip.
++    assert parse_health_specs([{"observable": "d", "min": 30, "max": 0.02}]) == []
++
++
++def test_observable_names_dedup_preserves_order():
++    specs = [
++        {"observable": "density", "min": 0},
++        {"observable": "temperature", "max": 1e5},
++        {"observable": "density", "max": 30},
++    ]
++    assert observable_names(specs) == ["density", "temperature"]
+diff --git a/tests/test_health_gate.py b/tests/test_health_gate.py
+new file mode 100644
+index 00000000..0437eecb
+--- /dev/null
++++ b/tests/test_health_gate.py
+@@ -0,0 +1,311 @@
++"""Integration tests for the health gate inside the refinement phase runners.
++
++The gate is engine-neutral; these drive the real control flow with a fake
++executor and fake per-engine hooks (no real skill, no engine). They cover the
++hybrid design: the gate judges only a cleanly-finished run (returncode 0),
++hands a physical violation to the critic as POST-run physical-sanity evidence
++(``physical_findings``), and deterministically holds the run below "acceptable"
++so a fail-open verdict can't wave it through — while the normal repair loop
++still drives the fix + re-run. A crash (returncode != 0) skips the gate and
++reaches the critic. `_run_once_phase` is the combine path: gated, never retried.
++"""
++
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++from scilink.agents.sim_agents import refinement  # noqa: E402
++from scilink.agents.sim_agents.refinement import (  # noqa: E402
++    Executor,
++    Phase,
++    RefinementContext,
++    Stage,
++    _refine_phase,
++    _run_once_phase,
++    _run_phase_health_gated,
++    policy_for,
++    run_campaign,
++)
++
++DENSITY_SPEC = [{"observable": "density", "min": 0.02, "max": 30.0}]
++
++
++class FakeExecutor(Executor):
++    """Reports completion with a fixed return code, running nothing."""
++
++    def __init__(self, returncode=0):
++        self.returncode = returncode
++        self.calls = 0
++
++    def run(self, input_files, run_command, run_dir):
++        self.calls += 1
++        return {"status": "completed", "output_dir": run_dir,
++                "returncode": self.returncode}
++
++
++class RecordingCritic:
++    """Returns scripted verdicts and records how each assess() was called."""
++
++    def __init__(self, verdicts):
++        self._verdicts = list(verdicts)
++        self.calls = []
++
++    def assess(self, output_dir, research_goal, skill=None, domain=None,
++               input_files=None, check_observables=False,
++               deterministic_findings=None, physical_findings=None, **kw):
++        self.calls.append({
++            "input_files": input_files,
++            "check_observables": check_observables,
++            "deterministic_findings": deterministic_findings,
++            "physical_findings": physical_findings,
++        })
++        idx = min(len(self.calls) - 1, len(self._verdicts) - 1)
++        return dict(self._verdicts[idx])
++
++
++def _good():
++    return {"verdict": "good", "run_status": "succeeded", "suggested_fixes": None}
++
++
++def _needs_fix(files=None, failure_class=None):
++    v = {"verdict": "needs_fixes", "run_status": "failed",
++         "suggested_fixes": files or {"in.lmp": "patched deck"}}
++    if failure_class:
++        v["failure_class"] = failure_class
++    return v
++
++
++def _ctx(**kw):
++    return RefinementContext(research_goal="g", skill="lammps",
++                             domain="molecular_dynamics", **kw)
++
++
++def _phase():
++    return Phase(name="production",
++                 input_files={"in.lmp": "velocity all create 300 12345"},
++                 run_command="lmp -in in.lmp", run_dir="/tmp/run")
++
++
++def _patch(monkeypatch, *, density, specs=DENSITY_SPEC, perturb=None):
++    """Wire health specs + a density reader (and optional perturb) into refinement.
++
++    ``density`` may be a scalar, None (reader can't read it), or a
++    callable(call_index)->value for a reader whose answer changes across cycles.
++    """
++    monkeypatch.setattr(refinement, "_health_specs", lambda skill, domain: specs)
++    state = {"n": 0}
++
++    def _reader(output_dir, observable, since=None):
++        if observable != "density":
++            return None
++        state["n"] += 1
++        return density(state["n"] - 1) if callable(density) else density
++
++    def _resolve(skill, domain, fn_name):
++        if fn_name == "read_health_observable":
++            return _reader
++        if fn_name == "perturb_for_retry":
++            return perturb
++        return None
++
++    monkeypatch.setattr(refinement, "_resolve_skill_callable", _resolve)
++
++
++# ── _run_phase_health_gated: the gate/retry primitive (4-tuple) ──────────────
++
++def test_gate_healthy_passes(monkeypatch):
++    _patch(monkeypatch, density=0.83)
++    ex = FakeExecutor()
++    result, violations, inputs, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), ex, _ctx())
++    assert violations == [] and checked is True and ex.calls == 1
++
++
++def test_gate_nonzero_returncode_is_not_gated(monkeypatch):
++    # A crash (rc != 0) is not a non-physical result — hand it to the critic.
++    _patch(monkeypatch, density=0.003)
++    ex = FakeExecutor(returncode=127)
++    result, violations, inputs, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), ex, _ctx())
++    assert violations is None and checked is None and ex.calls == 1
++
++
++def test_gate_disabled_without_specs(monkeypatch):
++    _patch(monkeypatch, density=0.003, specs=[])
++    result, violations, _, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), FakeExecutor(), _ctx())
++    assert violations is None and checked is None
++
++
++def test_gate_unreadable_is_checked_false_not_a_pass(monkeypatch):
++    # Reader returns None (deck doesn't log it / unsupported units): the gate
++    # could not judge — violations empty, but checked is False, not True.
++    _patch(monkeypatch, density=None)
++    result, violations, _, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), FakeExecutor(), _ctx())
++    assert violations == [] and checked is False
++
++
++def test_gate_violation_no_perturb_fails_fast(monkeypatch):
++    _patch(monkeypatch, density=0.003, perturb=None)
++    ex = FakeExecutor()
++    result, violations, _, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), ex, _ctx(max_health_retries=2))
++    assert violations and "density" in violations[0].reason
++    assert checked is True and ex.calls == 1       # no pointless re-runs
++
++
++def test_gate_retries_with_perturb_then_fails(monkeypatch):
++    seeds = []
++
++    def perturb(input_files, attempt):
++        seeds.append(attempt)
++        return {"in.lmp": f"velocity all create 300 {1000 + attempt}"}
++
++    _patch(monkeypatch, density=0.003, perturb=perturb)
++    ex = FakeExecutor()
++    result, violations, inputs, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), ex, _ctx(max_health_retries=2))
++    assert violations and ex.calls == 3 and seeds == [1, 2]
++    assert inputs == {"in.lmp": "velocity all create 300 1002"}  # last deck run
++
++
++def test_gate_retry_recovers_and_returns_run_inputs(monkeypatch):
++    # bad, bad, good -> succeeds on the 3rd attempt; returns the deck that ran.
++    _patch(monkeypatch, density=lambda n: 0.84 if n >= 2 else 0.003,
++           perturb=lambda input_files, attempt: {"in.lmp": f"reseed {attempt}"})
++    ex = FakeExecutor()
++    result, violations, inputs, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), ex, _ctx(max_health_retries=3))
++    assert violations == [] and ex.calls == 3
++    assert inputs == {"in.lmp": "reseed 2"}
++
++
++# ── _refine_phase: hybrid ③ ───────────────────────────────────────────────────
++
++def test_refine_healthy_run_succeeds(monkeypatch):
++    _patch(monkeypatch, density=0.83)
++    critic = RecordingCritic([_good()])
++    rec = _refine_phase(_phase(), FakeExecutor(), critic, policy_for("autonomous"),
++                        _ctx())
++    assert rec["status"] == "success"
++    assert critic.calls[0]["physical_findings"] is None   # nothing to flag
++    assert "health_checked" not in rec
++
++
++def test_refine_violation_goes_through_postrun_channel_and_recovers(monkeypatch):
++    # cycle 0: density bad -> fed to critic as POST-run physical evidence (NOT
++    # the pre-run coverage channel), critic proposes a deck fix; cycle 1: good.
++    _patch(monkeypatch, density=lambda n: 0.83 if n >= 1 else 0.003)
++    critic = RecordingCritic([_needs_fix({"in.lmp": "fixed barostat"}), _good()])
++    rec = _refine_phase(_phase(), FakeExecutor(), critic, policy_for("autonomous"),
++                        _ctx(max_cycles=3))
++    assert rec["status"] == "success"
++    # physical evidence routed through physical_findings, not coverage flags
++    assert critic.calls[0]["physical_findings"]
++    assert critic.calls[0]["check_observables"] is False
++    assert critic.calls[0]["deterministic_findings"] is None
++    # the critic reasoned about the deck that actually ran
++    assert critic.calls[1]["input_files"] == {"in.lmp": "fixed barostat"}
++
++
++def test_refine_violation_vetoes_fail_open_good_verdict(monkeypatch):
++    # The critic fails open ("good", no fix), but a measured violation must not
++    # be accepted — the phase fails as health_gate with the reasons.
++    _patch(monkeypatch, density=0.003)
++    critic = RecordingCritic([_good()])
++    rec = _refine_phase(_phase(), FakeExecutor(), critic, policy_for("autonomous"),
++                        _ctx(max_cycles=2))
++    assert rec["status"] != "success"
++    assert rec["failure_class"] == "health_gate"
++    assert any("density" in r for r in rec["health_violations"])
++
++
++def test_refine_reasons_kept_even_when_critic_names_its_own_class(monkeypatch):
++    # Critic labels the violating run "deck"; the measured violation still wins
++    # the terminal class and the reasons are not dropped.
++    _patch(monkeypatch, density=0.003)
++    critic = RecordingCritic([_needs_fix(failure_class="deck")])
++    rec = _refine_phase(_phase(), FakeExecutor(), critic, policy_for("autonomous"),
++                        _ctx(max_cycles=1))
++    assert rec["failure_class"] == "health_gate"
++    assert rec["health_violations"]
++
++
++def test_refine_records_health_checked_false_when_unreadable(monkeypatch):
++    # Gate on, but the reader can't read density -> pass is unvouched; the
++    # record says so, and (stub critic accepts) the phase still succeeds.
++    _patch(monkeypatch, density=None)
++    rec = _refine_phase(_phase(), FakeExecutor(), RecordingCritic([_good()]),
++                        policy_for("autonomous"), _ctx())
++    assert rec["status"] == "success"
++    assert rec["health_checked"] is False
++
++
++def test_refine_keeps_structure_class_beside_a_violation(monkeypatch):
++    # A violating run the critic diagnoses as a bad structure keeps the
++    # structure class (its own campaign routing) — not overwritten to
++    # health_gate — while the measured reasons are still carried.
++    _patch(monkeypatch, density=0.003)
++    critic = RecordingCritic([_needs_fix(failure_class="structure")])
++    rec = _refine_phase(_phase(), FakeExecutor(), critic, policy_for("autonomous"),
++                        _ctx(max_cycles=1))
++    assert rec["failure_class"] == "structure"
++    assert rec["health_violations"]
++
++
++def test_refine_crash_reaches_critic_not_health_gate(monkeypatch):
++    # rc != 0 with an out-of-band reading: the gate steps aside, the critic owns it.
++    _patch(monkeypatch, density=0.003)
++    critic = RecordingCritic([_needs_fix(), _good()])
++    rec = _refine_phase(_phase(), FakeExecutor(returncode=1), critic,
++                        policy_for("autonomous"), _ctx(max_cycles=3))
++    assert rec.get("failure_class") != "health_gate"
++    assert critic.calls[0]["physical_findings"] is None
++
++
++# ── _run_once_phase: the combine path ────────────────────────────────────────
++
++def test_combine_healthy_passes(monkeypatch):
++    _patch(monkeypatch, density=0.83)
++    rec = _run_once_phase(_phase(), FakeExecutor(), RecordingCritic([_good()]), _ctx())
++    assert rec["status"] == "success"
++
++
++def test_combine_nonphysical_fails_health_gate_without_retry(monkeypatch):
++    _patch(monkeypatch, density=0.003,
++           perturb=lambda input_files, attempt: {"in.lmp": "x"})
++    ex = FakeExecutor()
++    rec = _run_once_phase(_phase(), ex, RecordingCritic([_good()]),
++                          _ctx(max_health_retries=2))
++    assert rec["status"] == "failed" and rec["failure_class"] == "health_gate"
++    assert ex.calls == 1                      # combine never retries
++
++
++# ── campaign surfacing ───────────────────────────────────────────────────────
++
++def test_campaign_surfaces_health_gate(monkeypatch):
++    _patch(monkeypatch, density=0.003)       # every run is non-physical
++    critic = RecordingCritic([_good()])       # critic fails open
++    stage = Stage(name="prod", phases=[_phase()])
++    out = run_campaign([stage], FakeExecutor(), critic, policy_for("autonomous"),
++                       _ctx(max_cycles=1), pre_run_verdict={"verdict": "good"})
++    assert out["status"] != "success"
++    assert out["failure_class"] == "health_gate"
++    assert out["health_violations"]
++
++
++def test_campaign_surfaces_health_checked_false(monkeypatch):
++    # The gate couldn't read its observable: the run passes, but the campaign
++    # result flags that the pass was unvouched.
++    _patch(monkeypatch, density=None)
++    stage = Stage(name="prod", phases=[_phase()])
++    out = run_campaign([stage], FakeExecutor(), RecordingCritic([_good()]),
++                       policy_for("autonomous"), _ctx(max_cycles=1),
++                       pre_run_verdict={"verdict": "good"})
++    assert out["status"] == "success"
++    assert out["health_checked"] is False
+diff --git a/tests/test_lammps_health_reader.py b/tests/test_lammps_health_reader.py
+new file mode 100644
+index 00000000..9bf344af
+--- /dev/null
++++ b/tests/test_lammps_health_reader.py
+@@ -0,0 +1,299 @@
++"""Ground the LAMMPS health reader in REAL engine output.
++
++Runs the actual ``read_health_observable`` + health gate against trimmed-but-
++real ``log.lammps`` fixtures captured from production runs (tests/fixtures/
++lammps/). This guards against writing a parser and its test from the same
++unchecked mental model of the log format: the fixtures are real LAMMPS bytes
++(real header, real multi-column thermo, and real end-of-file noise — a
++truncated final row, a `3d grid and FFT values/proc = ...` line, a LAMMPS
++ERROR line), not a reconstruction.
++
++Fixtures:
++  log_healthy.lammps    a completed run, density ~0.83 g/cm^3   -> PASS
++  log_exploded.lammps   a barostat-blown box, density ~0.003    -> FAIL
++  log_no_density.lammps a deck that logs the stress tensor, not
++                        density (viscosity run)                 -> SKIP (None)
++"""
++
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++from scilink.agents.sim_agents.health import evaluate_health  # noqa: E402
++from scilink.skills.molecular_dynamics.lammps.lammps import (  # noqa: E402
++    parse_thermo_log,
++    read_health_observable,
++)
++
++FIXTURES = REPO_ROOT / "tests" / "fixtures" / "lammps"
++# the loose density band lammps.md declares
++DENSITY_SPEC = [{"observable": "density", "min": 0.02, "max": 30.0}]
++
++
++def _run_dir(fixture_name):
++    """A temp dir containing the fixture renamed to log.lammps."""
++    td = Path(tempfile.mkdtemp())
++    shutil.copy(FIXTURES / fixture_name, td / "log.lammps")
++    return str(td)
++
++
++def test_healthy_real_log_reads_physical_density():
++    rho = read_health_observable(_run_dir("log_healthy.lammps"), "density")
++    assert rho == pytest.approx(0.83, abs=0.05)
++    assert evaluate_health({"density": rho}, DENSITY_SPEC) == []  # PASS
++
++
++def test_exploded_real_log_is_caught():
++    rho = read_health_observable(_run_dir("log_exploded.lammps"), "density")
++    assert rho < 0.02                       # a near-vacuum
++    violations = evaluate_health({"density": rho}, DENSITY_SPEC)
++    assert len(violations) == 1             # the gate FAILS it
++    assert "density" in violations[0].reason
++
++
++def test_stress_only_deck_returns_none_and_gate_skips():
++    # This real deck logs Pxy/Pxz/Pyz (for viscosity), not density, so the
++    # density gate cannot judge it — it must skip, not fabricate a failure.
++    rho = read_health_observable(_run_dir("log_no_density.lammps"), "density")
++    assert rho is None
++    assert evaluate_health({"density": rho}, DENSITY_SPEC) == []
++
++
++def test_reader_handles_real_eof_noise_without_raising():
++    # The real logs end in a truncated row / FFT-grid line / ERROR line; none
++    # should fool the parser or raise.
++    for fx in ("log_healthy.lammps", "log_exploded.lammps", "log_no_density.lammps"):
++        for obs in ("density", "temperature", "volume", "pressure"):
++            read_health_observable(_run_dir(fx), obs)  # no exception
++
++
++def test_temperature_and_volume_also_readable():
++    d = _run_dir("log_healthy.lammps")
++    assert read_health_observable(d, "temperature") == pytest.approx(298, abs=20)
++    assert read_health_observable(d, "volume") > 0
++
++
++def test_uses_last_block_not_earlier_ramp():
++    # Two thermo blocks: an equilibration ramp (density ~0.1) then production
++    # (density ~0.83). The reader must report the FINAL block only, so the
++    # equilibration transient can't bleed into the mean.
++    log = (
++        "units real\n"
++        "LAMMPS\n"
++        "   Step          Temp          Density   \n"
++        "         0   300.0         0.10\n"
++        "       100   300.0         0.20\n"
++        "Loop time of 1 on 1 procs\n"
++        "   Step          Temp          Density   \n"
++        "         0   298.0         0.830\n"
++        "       100   298.0         0.832\n"
++        "       200   298.0         0.831\n"
++        "Loop time of 2 on 1 procs\n"
++    )
++    td = Path(tempfile.mkdtemp())
++    (td / "log.lammps").write_text(log)
++    assert read_health_observable(str(td), "density") == pytest.approx(0.831, abs=0.01)
++
++
++def test_stray_line_mid_block_does_not_truncate(tmp_path):
++    # A `fix print` / WARNING line mid-block must be skipped, not end the block —
++    # otherwise the mean becomes the startup rows and a healthy run FAILS.
++    log = (
++        "units real\n"
++        "   Step   Temp   Density\n"
++        "      0   300.0   0.010\n"
++        "    100   300.0   0.015\n"
++        "Water box: 0.5 ns elapsed\n"          # stray fix print
++        "WARNING: bond atoms missing (src/ntopo.cpp:1)\n"   # stray warning
++        "    200   298.0   0.820\n"
++        "    300   298.0   0.830\n"
++        "    400   298.0   0.840\n"
++        "Loop time of 2 on 1 procs\n"
++    )
++    (tmp_path / "log.lammps").write_text(log)
++    rho = read_health_observable(str(tmp_path), "density")
++    assert rho == pytest.approx(0.835, abs=0.02)   # the settled rows, not 0.015
++
++
++def test_time_first_header_is_detected(tmp_path):
++    # `thermo_style custom time temp density` -> header starts with Time, not Step.
++    log = ("units real\n"
++           "   Time   Temp   Density\n"
++           "    0.0   298.0   0.83\n"
++           "    1.0   298.0   0.84\n"
++           "Loop time of 1 on 1 procs\n")
++    (tmp_path / "log.lammps").write_text(log)
++    assert read_health_observable(str(tmp_path), "density") == pytest.approx(0.835, abs=0.02)
++
++
++def test_density_unit_conversion(tmp_path):
++    # si logs density in kg/m^3; must convert to g/cm^3 before the band check.
++    si = ("units si\n   Step Temp Density\n   0 298 1000.0\n   100 298 1000.0\n"
++          "Loop time of 1 on 1 procs\n")
++    (tmp_path / "log.lammps").write_text(si)
++    assert read_health_observable(str(tmp_path), "density") == pytest.approx(1.0, abs=0.01)
++
++
++def test_unsupported_units_return_none(tmp_path):
++    # lj reduced density has no g/cm^3 equivalent -> skip rather than misjudge.
++    lj = ("units lj\n   Step Temp Density\n   0 1.0 0.80\n   100 1.0 0.80\n"
++          "Loop time of 1 on 1 procs\n")
++    (tmp_path / "log.lammps").write_text(lj)
++    assert read_health_observable(str(tmp_path), "density") is None
++
++
++def test_fix_print_step_line_is_not_a_header(tmp_path):
++    # A `fix print "Step $s ..."` line begins with "Step" but contains numbers;
++    # it must not be taken as a thermo header (which would drop the rows after
++    # it and return the mean of only the first rows).
++    log = (
++        "units real\n"
++        "   Step   Temp   Density\n"
++        "      0   300.0   0.010\n"
++        "    100   300.0   0.015\n"
++        "Step 200 reached Temp 300 rho 0.02\n"   # fix print idiom, not a header
++        "    200   298.0   0.820\n"
++        "    300   298.0   0.830\n"
++        "    400   298.0   0.840\n"
++        "Loop time of 2 on 1 procs\n"
++    )
++    (tmp_path / "log.lammps").write_text(log)
++    rho = read_health_observable(str(tmp_path), "density")
++    assert rho == pytest.approx(0.835, abs=0.02)   # settled rows, not 0.0125
++
++
++def test_all_words_fix_print_step_line_is_not_a_header(tmp_path):
++    # An all-WORDS line beginning with "Step" (no numbers) must not be taken as
++    # a header: it would otherwise steal the rows after it and leave the mean on
++    # the startup rows, failing a healthy run.
++    log = (
++        "units real\n"
++        "   Step   Temp   Density\n"
++        "      0   300.0   0.010\n"
++        "    100   300.0   0.015\n"
++        "Step reseed complete; continuing production\n"   # all words, starts "Step"
++        "    200   298.0   0.820\n"
++        "    300   298.0   0.830\n"
++        "    400   298.0   0.840\n"
++        "Loop time of 2 on 1 procs\n"
++    )
++    (tmp_path / "log.lammps").write_text(log)
++    rho = read_health_observable(str(tmp_path), "density")
++    assert rho == pytest.approx(0.835, abs=0.02)   # settled rows, not 0.0125
++
++
++def test_header_confirmed_only_by_following_numeric_row(tmp_path):
++    # Two real blocks separated by an all-words stray "Step" line; the parser
++    # must keep exactly the two real blocks, not spawn a phantom one.
++    log = (
++        "   Step Temp Density\n   0 300 0.10\n   100 300 0.20\n"
++        "Loop time of 1 on 1 procs\n"
++        "Step change: switching ensemble\n"              # not a header
++        "   Step Temp Density\n   0 298 0.83\n   100 298 0.84\n"
++        "Loop time of 2 on 1 procs\n"
++    )
++    (tmp_path / "log.lammps").write_text(log)
++    blocks = parse_thermo_log(tmp_path / "log.lammps")
++    assert len(blocks) == 2
++    assert blocks[-1]["Density"] == [0.83, 0.84]
++
++
++def test_header_held_across_a_stray_line_before_first_row(tmp_path):
++    # Regression guard: a WARNING between the header and the first data row must
++    # not drop the whole block (the candidate header is held until a numeric row
++    # confirms it).
++    log = (
++        "units real\n"
++        "   Step   Temp   Density\n"
++        "WARNING: bond atoms missing (src/ntopo.cpp:1)\n"   # stray BEFORE data
++        "      0   298.0   0.830\n"
++        "    100   298.0   0.840\n"
++        "Loop time of 1 on 1 procs\n"
++    )
++    (tmp_path / "log.lammps").write_text(log)
++    assert read_health_observable(str(tmp_path), "density") == pytest.approx(0.835, abs=0.01)
++
++
++def test_mid_block_step_line_matching_width_is_stray(tmp_path):
++    # An all-words `Step` line INSIDE an open block is a stray line even when its
++    # token count matches the columns — it must not split the block.
++    log = (
++        "units real\n"
++        "   Step   Temp   Density\n"           # 3 columns
++        "      0   300.0   0.010\n"
++        "    100   300.0   0.015\n"
++        "Step is steady\n"                      # 3 tokens, all words — still stray
++        "    200   298.0   0.820\n"
++        "    300   298.0   0.830\n"
++        "    400   298.0   0.840\n"
++        "Loop time of 2 on 1 procs\n"
++    )
++    (tmp_path / "log.lammps").write_text(log)
++    assert read_health_observable(str(tmp_path), "density") == pytest.approx(0.835, abs=0.02)
++
++
++def test_stale_log_from_earlier_phase_is_ignored(tmp_path):
++    # A log older than the run start (shared run_dir, this phase wrote no log)
++    # must be treated as absent, not judged.
++    import os
++    import time
++    log = ("units real\n   Step Temp Density\n   0 298 0.83\n   100 298 0.83\n"
++           "Loop time of 1 on 1 procs\n")
++    (tmp_path / "log.lammps").write_text(log)
++    old = time.time() - 3600
++    os.utime(tmp_path / "log.lammps", (old, old))
++    # since = now: the hour-old log predates the run -> None
++    assert read_health_observable(str(tmp_path), "density", since=time.time()) is None
++    # without a since, the log is read normally
++    assert read_health_observable(str(tmp_path), "density") == pytest.approx(0.83, abs=0.01)
++
++
++def test_parse_thermo_log_column_filter_and_last_block():
++    log = (
++        "   Step   Temp   Density\n   0 300 0.10\n   100 300 0.20\n"
++        "Loop time of 1 on 1 procs\n"
++        "   Step   Temp   Density\n   0 298 0.83\n   100 298 0.84\n"
++        "Loop time of 2 on 1 procs\n"
++    )
++    import tempfile as _t
++    p = Path(_t.mkdtemp()) / "log.lammps"
++    p.write_text(log)
++    # column filter keeps only Density; two blocks returned
++    blocks = parse_thermo_log(p, columns={"density"})
++    assert len(blocks) == 2
++    assert set(blocks[0]) == {"Density"}
++    assert blocks[-1]["Density"] == [0.83, 0.84]
++
++
++def test_parse_thermo_log_parity_on_real_fixture():
++    # The canonical parser (shared with the MLIP agent) reads the real fixture's
++    # final-block Density; preserves original-case keys.
++    blocks = parse_thermo_log(FIXTURES / "log_healthy.lammps")
++    assert blocks, "expected at least one thermo block"
++    assert "Density" in blocks[-1]
++    tail = blocks[-1]["Density"]
++    assert sum(tail[len(tail) // 2:]) / (len(tail) - len(tail) // 2) == pytest.approx(0.83, abs=0.05)
++
++
++def test_mlip_wrapper_merges_blocks_on_real_fixture():
++    # Exercise the MLIP agent's _parse_lammps_thermo wrapper itself (not just
++    # parse_thermo_log) so the merge-and-original-case behaviour it relies on is
++    # covered. The wrapper uses no instance state, so a bare instance is fine.
++    from scilink.agents.sim_agents.mlip_agent import MLIPAgent
++    agent = MLIPAgent.__new__(MLIPAgent)
++    merged = agent._parse_lammps_thermo(str(FIXTURES / "log_healthy.lammps"))
++    assert "Density" in merged and "Temp" in merged     # original-case keys
++    tail = merged["Density"][-100:]
++    assert sum(tail) / len(tail) == pytest.approx(0.83, abs=0.05)
++
++
++def test_missing_dir_and_empty_dir_return_none():
++    assert read_health_observable("/no/such/dir", "density") is None
++    empty = tempfile.mkdtemp()
++    assert read_health_observable(empty, "density") is None
+diff --git a/tests/test_lammps_prose_critic.py b/tests/test_lammps_prose_critic.py
+index 13b311c3..8486e7c6 100644
+--- a/tests/test_lammps_prose_critic.py
++++ b/tests/test_lammps_prose_critic.py
+@@ -159,3 +159,38 @@ def test_drop_vacuous_fix_noop_when_no_fixes(self):
+         report = {"suggested_fixes": None}
+         _drop_vacuous_fix(report)
+         assert report["suggested_fixes"] is None
++
++
++class TestPhysicalFindingsFraming:
++    """A health violation reaches the critic as POST-run non-physical evidence,
++    NOT through the pre-run observable-coverage channel (which would steer the
++    fixer toward adding logged outputs rather than fixing the deck)."""
++
++    def test_physical_findings_use_postrun_block_not_coverage(self, tmp_path):
++        rc, captured = _stub_critic(
++            RunCritic,
++            json.dumps({"run_status": "succeeded", "verdict": "needs_fixes",
++                        "suggested_fixes": {"in.lmp": "fixed"}}),
++        )
++        rc.assess(
++            output_dir=str(tmp_path),
++            research_goal="1 mol/L aqueous electrolyte density",
++            skill="lammps", domain="molecular_dynamics",
++            physical_findings=["density=0.0026 g/cm^3 < min 0.02"],
++        )
++        prompt = captured["prompt"]
++        # framed as a completed-but-non-physical result, with the measured value
++        assert "Physical-sanity check (POST-run)" in prompt
++        assert "NON-PHYSICAL" in prompt
++        assert "density=0.0026 g/cm^3 < min 0.02" in prompt
++        # and NOT through the pre-run observable-coverage / missing-output framing
++        assert "Observable-coverage check (pre-run)" not in prompt
++
++    def test_no_physical_findings_adds_no_block(self, tmp_path):
++        rc, captured = _stub_critic(
++            RunCritic,
++            json.dumps({"run_status": "succeeded", "verdict": "good"}),
++        )
++        rc.assess(output_dir=str(tmp_path), research_goal="x",
++                  skill="lammps", domain="molecular_dynamics")
++        assert "Physical-sanity check (POST-run)" not in captured["prompt"]

@@ -1,0 +1,2431 @@
+diff --git a/mbuild/path/build.py b/mbuild/path/build.py
+index 4cdfb850a..c3cec1140 100644
+--- a/mbuild/path/build.py
++++ b/mbuild/path/build.py
+@@ -3,17 +3,17 @@
+ import logging
+ import math
+ import time
++from itertools import combinations_with_replacement
+ 
+ import networkx as nx
+ import numpy as np
+ from scipy.interpolate import interp1d
+ 
+-from mbuild import Compound
++from mbuild import Box, Compound
+ from mbuild.exceptions import PathConvergenceError
+ from mbuild.path.constraints import CuboidConstraint, CylinderConstraint
+ from mbuild.path.namers import BEAD_NAME_DTYPE, BeadNamer
+ from mbuild.path.path_utils import (
+-    calculate_sq_distances,
+     check_path,
+     random_coordinate,
+ )
+@@ -24,6 +24,7 @@
+     get_second_point,
+ )
+ from mbuild.path.termination import NumSites, Termination, Terminator
++from mbuild.utils.io import import_
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -97,6 +98,8 @@ def __init__(self, coordinates=None, bond_graph=None, bead_name="_A"):
+             # Passed array of bead names, cast to the bead name dtype
+             elif isinstance(bead_name, np.ndarray):
+                 self.beads = bead_name.astype(BEAD_NAME_DTYPE)
++            elif isinstance(bead_name, list):
++                self.beads = np.array(bead_name, dtype=BEAD_NAME_DTYPE)
+             for idx in range(len((self.coordinates))):
+                 self.bond_graph.add_node(idx)
+         # Nothing is defined, create empty place holders for coords, bond graph and bead names
+@@ -115,17 +118,33 @@ def __eq__(self, other):
+     def __add__(self, other):
+         coordinates = np.concat((self.coordinates, other.coordinates))
+         beads = np.concat((self.beads, other.beads))
+-        bond_graph = nx.compose(
+-            self.bond_graph, other.bond_graph
+-        )  # TODO: Don't overwrite nodes in bg
++        offset = len(self)
++        mapping = {node: node + offset for node in range(len(other))}
++        shifted_graph = nx.relabel_nodes(other.bond_graph, mapping)
++        bond_graph = nx.compose(self.bond_graph, shifted_graph)
+         return Path(coordinates, bond_graph, beads)
+ 
++    def __len__(self):
++        if hasattr(self, "coordinates"):
++            return len(self.coordinates)
++        return 0
++
++    def add_path(self, otherPath, other_coordinates=None):
++        """Add one path to current path."""
++        if other_coordinates is None:
++            other_coordinates = otherPath.coordinates
++        initial_n_nodes = len(self)
++        self.append_coordinates(other_coordinates, otherPath.beads)
++        for site1, site2 in otherPath.bond_graph.edges():
++            self.bond_graph.add_edge(site1 + initial_n_nodes, site2 + initial_n_nodes)
++
+     @classmethod
+     def from_compound(cls, compound):
+         coordinates = compound.xyz
++        names = [particle.name for particle in compound.particles()]
+ 
+         # Create the path with coordinates and bond graph
+-        path = cls(coordinates=coordinates, bead_name=compound.name)
++        path = cls(coordinates=coordinates, bead_name=names)
+         path.bond_graph = nx.Graph()
+ 
+         # Ensure all nodes have xyz and name attributes
+@@ -297,6 +316,7 @@ def to_compound(self):
+         compound = Compound()
+         compounds = []
+         # TODO: Should we have a mass parameter? Could be useful for density termination
++        # TODO: Could also add an is_atomistic flag and validate the bead names here before sending to Compound.
+         for node_id in self.bond_graph.nodes:
+             compounds.append(
+                 Compound(
+@@ -475,6 +495,146 @@ def relax(
+         sim.cap_displacement(n_steps=500, dt=1, max_displacement=0.01 * bond_eff)
+         sim.fire(n_steps=steps)
+ 
++    def print_bond_lengths(self, box=None):
++        """Compute and return info about path bonds.
++
++        Parameters
++        ----------
++        box : list, optional
++            list of [Lx, Ly, Lz] to use for checking for periodic bonds. Assume centered at (0,0,0)
++
++        Returns
++        -------
++        bonds : dict
++            Dictionary mapping (i, center, k) tuples to their angles in nm.
++        bonds_typesDict : dict
++            Dictionary mapping sorted bead-type tuples to lists of bonds.
++        """
++        positions = self.coordinates
++        bond_lengths = {}
++        beads = set(self.beads)
++        bond_types = list(combinations_with_replacement(beads, 2))
++        bond_typesDict = {
++            tuple(sorted((str(b1), str(b2)))): [] for b1, b2 in bond_types
++        }
++
++        for i, j in self.bond_graph.edges():
++            delta = positions[j] - positions[i]
++            if isinstance(box, CuboidConstraint):
++                box_arr = box.box_lengths
++                delta -= np.round(delta / box_arr) * box_arr
++            elif isinstance(box, Box):
++                box_arr = box.lengths
++                delta -= np.round(delta / box_arr) * box_arr
++            elif isinstance(box, list):
++                box_arr = np.array(box)
++                delta -= np.round(delta / box_arr) * box_arr
++            bl = np.linalg.norm(delta)
++            bond_lengths[(i, j)] = bl
++            bond_name = tuple(sorted((str(self.beads[i]), str(self.beads[j]))))
++            bond_typesDict[bond_name].append(bl)
++
++        # Summary stats
++        print(f"Min bond length: {min(bond_lengths.values()):.4f}")
++        print(f"Max bond length: {max(bond_lengths.values()):.4f}")
++        print(f"Mean bond length: {np.mean(list(bond_lengths.values())):.4f}")
++        for key in bond_typesDict:
++            if not len(bond_typesDict[key]):
++                continue
++            print(
++                f"{key}: Max={max(bond_typesDict[key]):.2f}, Min={min(bond_typesDict[key]):.2f}"
++            )
++
++        return bond_lengths, bond_typesDict
++
++    def print_angle_lengths(self, box=None):
++        """Compute and return info about path angles.
++
++        Parameters
++        ----------
++        box : array-like of shape (3,), optional
++            Box dimensions [Lx, Ly, Lz]. If None, no periodic wrapping is applied.
++
++        Returns
++        -------
++        angles : dict
++            Dictionary mapping (i, center, k) tuples to their angles in degrees.
++        angle_typesDict : dict
++            Dictionary mapping sorted bead-type tuples to lists of angles.
++        """
++        from itertools import combinations, combinations_with_replacement
++
++        positions = self.coordinates
++        angles = {}
++        beads = set(self.beads)
++
++        # Build angle type keys: (outer, center, outer) with outer pair sorted
++        angle_types = set()
++        for center_bead in beads:
++            for b1, b2 in combinations_with_replacement(beads, 2):
++                angle_types.add((str(b1), str(center_bead), str(b2)))
++        angle_typesDict = {key: [] for key in angle_types}
++
++        for center_node in self.bond_graph.nodes():
++            neighbors = list(self.bond_graph.neighbors(center_node))
++            if len(neighbors) < 2:
++                continue
++
++            for i_node, k_node in combinations(neighbors, 2):
++                # Vector from center to i
++                delta_i = positions[i_node] - positions[center_node]
++                if box is not None:
++                    box_arr = np.array(box)
++                    delta_i -= np.round(delta_i / box_arr) * box_arr
++
++                # Vector from center to k
++                delta_k = positions[k_node] - positions[center_node]
++                if box is not None:
++                    delta_k -= np.round(delta_k / box_arr) * box_arr
++
++                # Compute angle via dot product
++                cos_angle = np.dot(delta_i, delta_k) / (
++                    np.linalg.norm(delta_i) * np.linalg.norm(delta_k)
++                )
++                cos_angle = np.clip(cos_angle, -1.0, 1.0)
++                angle_deg = np.degrees(np.arccos(cos_angle))
++
++                angles[(i_node, center_node, k_node)] = angle_deg
++
++                # Categorize by type (sort outer beads for consistency)
++                outer_beads = tuple(
++                    sorted((str(self.beads[i_node]), str(self.beads[k_node])))
++                )
++                center_bead = str(self.beads[center_node])
++                angle_key = (outer_beads[0], center_bead, outer_beads[1])
++                angle_typesDict[angle_key].append(angle_deg)
++
++        # Summary stats
++        print(f"Min angle: {min(angles.values()):.2f}°")
++        print(f"Max angle: {max(angles.values()):.2f}°")
++        print(f"Mean angle: {np.mean(list(angles.values())):.2f}°")
++        for key in angle_typesDict:
++            if not len(angle_typesDict[key]):
++                continue
++            print(
++                f"{key}: Max={max(angle_typesDict[key]):.2f}°, Min={min(angle_typesDict[key]):.2f}°, Mean={np.mean(angle_typesDict[key]):.2f}°"
++            )
++
++        return angles, angle_typesDict
++
++    def freud_rdf(self, box=None, bins=50, r_max=1):
++        freud = import_("freud")
++        if box is None:
++            box = np.array([np.inf, np.inf, np.inf, 0, 0, 0])  # infinite box
++        elif isinstance(box, Box):
++            box = np.array([*box.lengths, 0, 0, 0])
++        elif len(box) == 3:
++            box = np.array([*box, 0, 0, 0])  # assume orthorhombic
++
++        rdf = freud.density.RDF(bins=bins, r_max=r_max)
++        rdf.compute(system=(box, self.coordinates))
++        return rdf
++
+ 
+ def lamellar(
+     path=None,
+@@ -1233,10 +1393,9 @@ def hard_sphere_random_walk(
+             thetas=batch_angles,
+             r_vectors=batch_vectors,
+         )
+-        # Create mask for particles inside volume constraint, allows for PBC
+         if state.volume_constraint:
+             is_inside_mask = volume_constraint.is_inside(
+-                points=candidates, buffer=radius
++                points=candidates, buffer=tolerance
+             )
+             candidates = candidates[is_inside_mask]
+         # If there is a bias, sort candidates according to the bias
+@@ -1525,200 +1684,17 @@ def check_termination(self, path, coordinates, beads):
+         return False
+ 
+ 
+-def crosslink(
+-    path,
+-    bead_name="_R",
+-    backbone_name="_A",
+-    radius=0.1,
+-    excluded_bond_depth=2,
+-    n_connection_sites=2,
+-    volume_constraint=None,
+-    initial_point=None,
+-    seed=42,
+-    chunk_size=512,
+-):
+-    """
+-    Create a crosslink node that bonds to n_connection_sites backbone beads.
+-
+-    Adds a new node with bead_name to path.bond_graph, positioned near
+-    and bonded to n_connection_sites backbone beads within the specified radius.
+-
+-    Parameters
+-    ----------
+-    path : Path
+-        The Path object containing coordinates and bond_graph
+-    bead_name : str, default "_R"
+-        Name for the crosslink bead
+-    backbone_name : str, default "_A"
+-        Name for backbone beads to search for
+-    radius : float, default 0.1
+-        Search radius for finding nearby backbone beads
+-    n_connection_sites : int, default 2
+-        Number of backbone beads to bond to
+-    initial_point : int or array-like, optional
+-        Starting point (node index or xyz coordinate) to search around
+-    seed : int, default 42
+-        Random seed for reproducibility
+-    chunk_size : int, default 512
+-        Chunk size for batch processing (used if extending coordinates)
+-
+-    Returns
+-    -------
+-    Path
+-        The modified path object with the new crosslink node
+-    """
+-    rng = np.random.default_rng(seed + len(path.coordinates))
+-
+-    # Find all backbone beads
+-    backbone_nodes = [
+-        node
+-        for node in path.bond_graph.nodes()
+-        if (
+-            path.beads[node] == backbone_name
+-            # and path.bond_graph.degree[node] <= 2
+-        )  # TODO: Multiple crosslink sites on one backbone too
+-    ]  # value references global node index
+-    backbone_subgraph = path.bond_graph.subgraph(
+-        backbone_nodes
+-    )  # TODO: make a path function?
+-
+-    if len(backbone_nodes) == 0:
+-        raise ValueError(f"No backbone beads with name '{backbone_name}' found in path")
+-
+-    if len(backbone_nodes) < n_connection_sites:
+-        raise ValueError(
+-            f"Not enough backbone beads ({len(backbone_nodes)}) for "
+-            f"{n_connection_sites} connection sites"
+-        )
++_CUDA_AVAILABLE = None
+ 
+-        # Set up PBC info from volume constraints
+-    if isinstance(volume_constraint, CuboidConstraint):
+-        pbc = volume_constraint.pbc
+-        box_lengths = volume_constraint.box_lengths.astype(np.float32)
+-    elif isinstance(volume_constraint, CylinderConstraint):
+-        pbc = (False, False, volume_constraint.periodic_height)
+-        box_lengths = np.array(
+-            [
+-                volume_constraint.radius * 2,
+-                volume_constraint.radius * 2,
+-                volume_constraint.height,
+-            ]
+-        ).astype(np.float32)
+-    else:
+-        pbc = np.array([False, False, False], dtype=bool)
+-        box_lengths = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
+-
+-    # Get coordinates of all backbone nodes
+-    candidate_nodes = [
+-        node for node in backbone_nodes if path.bond_graph.degree[node] <= 2
+-    ]
+-    candidate_coords = np.array(path.coordinates[candidate_nodes], dtype=np.float32)
+-
+-    # get reference points
+-    def get_reference_points(path, initial_point):
+-        """Create reference points for finding candidates.
+-
+-        Returns
+-        -------
+-        nodesArray: np.array
+-            index of global bond_graph nodes that are viable starting points -> [0,2,10...]
+-        coordsArray: np.array
+-            each value matches path.coordinates[nodesList]
+-        """
+-        initial_point, starting_from_site = _normalize_initial_point(initial_point)
+-        if initial_point is not None:
+-            if starting_from_site:
+-                # Use coordinate of specified node
+-                if initial_point not in path.bond_graph.nodes:
+-                    raise ValueError(f"Node {initial_point} not found in bond_graph")
+-                nodesArray = np.array([initial_point])
+-                coordsArray = np.array([path.coordinates[initial_point]])
+-            else:
+-                # Use provided coordinate
+-                initial_point32 = np.asarray(initial_point, dtype=np.float32)
+-                sq_distances = calculate_sq_distances(
+-                    initial_point32, candidate_coords, pbc=pbc, box_lengths=box_lengths
+-                )
+-                nodesArray = np.argsort(sq_distances)
+-                coordsArray = path.coordinates[nodesArray]
+-        else:
+-            # Randomly select a backbone node as reference
+-            nodesArray = rng.choice(
+-                candidate_nodes, size=len(candidate_nodes), replace=False
+-            )
+-            coordsArray = path.coordinates[nodesArray]
+-
+-        return nodesArray, coordsArray
+-
+-    ref_nodes, ref_coords = get_reference_points(path, initial_point)
+-
+-    found_ref = False  # flag to check all ref_nodes
+-    for ref_node, ref_coord in zip(ref_nodes, ref_coords):
+-        selected_nodes = [ref_node]  # first choice is ref
+-        sq_distances = calculate_sq_distances(
+-            ref_coord, candidate_coords, pbc=pbc, box_lengths=box_lengths
+-        )
+-        distances = np.sqrt(sq_distances)
+-
+-        # Find candidates within radius
+-        within_radius_mask = distances <= (radius) * 2  # twice radiu
+-        possible_pairs = np.where(within_radius_mask)[0]
+-        # Verify starting point or return early
+-        if len(possible_pairs) < n_connection_sites - 1:
+-            continue
+-
+-        closest_paired_nodes = possible_pairs[np.argsort(distances[possible_pairs])]
+-        excluded_nodes = set(
+-            nx.single_source_shortest_path_length(
+-                backbone_subgraph, ref_node, cutoff=excluded_bond_depth
+-            ).keys()
+-        )
+-        # import pdb; pdb.set_trace()
+-        for idx in closest_paired_nodes:
+-            node = candidate_nodes[idx]  # temp replace
+-            # node = possible_pairs[idx] # is index == value ??
+-            if node in excluded_nodes:
+-                continue
+-
+-            selected_nodes.append(int(node))
+-
+-            # Stop if we have enough connection sites
+-            if len(selected_nodes) >= n_connection_sites:
+-                found_ref = True
+-                break  # break twice
+-        if found_ref:
+-            break
+-
+-    # Verify enough final viable crosslink
+-    if not found_ref:
+-        n_clinks = sum([bead == bead_name for bead in path.beads])
+-        raise PathConvergenceError(
+-            f"Only found {len(selected_nodes)} non-neighboring backbone beads "
+-            f"within radius {radius}, need {n_connection_sites}."
+-            f"\nMaximum crossinks found are {n_clinks}. "
+-            "Ways to increase crosslinking:\nIncrease radius"
+-            "\nPack at higher density\nRelax structure."
+-        )
+-
+-    # Calculate position for new crosslink node (centroid of selected beads)
+-    selected_coords = np.array(path.coordinates[selected_nodes])
+-    crosslink_position = np.mean(selected_coords, axis=0)
+-
+-    # Add new node to path
+-    path.append_coordinates(crosslink_position, bead_name)
+-    new_node_idx = len(path.coordinates) - 1  # add as last index
+-
+-    # Add edges from crosslink node to selected backbone nodes
+-    for backbone_node in selected_nodes:
+-        path.bond_graph.add_edge(
+-            int(new_node_idx),
+-            int(backbone_node),
+-            bond_type=(bead_name, backbone_name),
+-        )
+-
+-    return path
+ 
++def _get_cuda_available():
++    """Check if numba can access CUDA runtime."""
++    global _CUDA_AVAILABLE
++    if _CUDA_AVAILABLE is None:
++        try:
++            from numba import cuda
+ 
+-class CrosslinkWalkState:
+-    # TODO
+-    pass
++            _CUDA_AVAILABLE = cuda.is_available()
++        except Exception:
++            _CUDA_AVAILABLE = False
++    return _CUDA_AVAILABLE
+diff --git a/mbuild/path/constraints.py b/mbuild/path/constraints.py
+index b9d01a340..724e28a15 100644
+--- a/mbuild/path/constraints.py
++++ b/mbuild/path/constraints.py
+@@ -144,6 +144,29 @@ def sample_candidates(self, points, n_candidates, buffer, k=10, rng=None):
+         sorted_order = np.argsort(-density_metric)  # negative = biggest first
+         return candidates[sorted_order]
+ 
++    def wrap(self, points):
++        """Wrap an array of points into the box using periodic boundary conditions.
++
++        Parameters
++        ----------
++        points : array-like, shape (N, 3)
++            The points to wrap.
++
++        Returns
++        -------
++        np.ndarray, shape (N, 3)
++            The wrapped points.
++        """
++        points = np.asarray(points, dtype=np.float64)
++        wrapped = points.copy()
++        pbc = self.pbc  # shape (3,) use as a bool mask
++        if pbc.any():
++            # Shift to box-local coordinates, apply modulo, shift back
++            wrapped[:, pbc] = (
++                (wrapped[:, pbc] - self.mins[pbc]) % self.box_lengths[pbc]
++            ) + self.mins[pbc]
++        return wrapped
++
+ 
+ class SphereConstraint(Constraint):
+     """Creates a spherical constraint.
+diff --git a/mbuild/path/crosslink.py b/mbuild/path/crosslink.py
+new file mode 100644
+index 000000000..38d1f32ad
+--- /dev/null
++++ b/mbuild/path/crosslink.py
+@@ -0,0 +1,1201 @@
++"""Crosslinking module for polymer path structures.
++
++Handles placement of crosslinker geometries between backbone beads,
++with proper overlap avoidance and bond length enforcement under PBC.
++"""
++
++import itertools
++
++import networkx as nx
++import numpy as np
++from scipy.spatial import cKDTree
++from scipy.spatial.transform import Rotation
++
++from mbuild.exceptions import PathConvergenceError
++from mbuild.path.constraints import CuboidConstraint
++from mbuild.path.path_utils import check_path
++
++
++class CrosslinkerGeometry:
++    """Rigid crosslinker geometry with connection site metadata.
++
++    Parameters
++    ----------
++    coordinates : array-like, shape (N, 3)
++        Positions of beads in the crosslinker geometry.
++    bond_graph : networkx.Graph, optional
++        Internal bond topology. If None, creates a graph with no edges.
++    bead_name : str or array-like of str
++        Name(s) for each bead. Strings are prefixed with '_' if not already.
++    connection_sites : list of int, or numpy array with dtype int
++        Node indices that bond to external backbone beads. May contain
++        duplicates to indicate multiple connections from the same physical node.
++    isrigid : bool
++        If the crosslinker should be held rigid
++    """
++
++    def __init__(
++        self,
++        coordinates,
++        bond_graph=None,
++        bead_name="_R",
++        connection_sites=None,
++        isrigid=False,
++    ):
++        coordinates = np.asarray(coordinates, dtype=np.float32)
++        self.coordinates = coordinates - coordinates.mean(axis=0)
++        self.isrigid = isrigid
++
++        if bond_graph is None:
++            bond_graph = nx.Graph()
++            bond_graph.add_nodes_from(range(self.n_sites))
++        self.bond_graph = bond_graph
++
++        if isinstance(bead_name, str):
++            self.beads = np.full(self.n_sites, bead_name, dtype="U10")
++        else:
++            self.beads = np.asarray(bead_name, dtype="U10")
++
++        if connection_sites is None:
++            self.connection_sites = list(range(self.n_sites))
++        elif isinstance(connection_sites, int):
++            self.connection_sites = [connection_sites, connection_sites]
++        elif isinstance(connection_sites, np.ndarray):
++            self.connection_sites = connection_sites.tolist()
++        else:
++            self.connection_sites = list(connection_sites)
++
++        self.validate_connection_sites()
++
++    @property
++    def n_sites(self):
++        """Number of beads in the crosslinker."""
++        return len(self.coordinates)
++
++    @property
++    def n_connections(self):
++        """Total number of connections (including duplicates)."""
++        return len(self.connection_sites)
++
++    @property
++    def unique_connection_sites(self):
++        """Unique physical node indices used as connection sites."""
++        return list(dict.fromkeys(self.connection_sites))
++
++    @property
++    def internal_bonds(self):
++        """List of (u, v) edges within the crosslinker."""
++        return list(self.bond_graph.edges())
++
++    def validate_connection_sites(self):
++        """Raise if any connection site index exceeds the number of sites."""
++        largest_index = max(self.connection_sites)
++        if largest_index >= self.n_sites:
++            raise PathConvergenceError(
++                f"connection site {largest_index} is too large for {self.n_sites}"
++            )
++
++    def copy(self):
++        """Return a deep copy of this crosslinker geometry."""
++        return CrosslinkerGeometry(
++            coordinates=self.coordinates.copy(),
++            bond_graph=self.bond_graph.copy(),
++            bead_name=self.beads.copy(),
++            connection_sites=list(self.connection_sites),
++            isrigid=self.isrigid,
++        )
++
++    def recenter(self):
++        """Shift coordinates so the centroid is at the origin."""
++        if len(self.coordinates) > 0:
++            self.coordinates -= self.coordinates.mean(axis=0)
++
++    @classmethod
++    def from_path(cls, path, connection_sites):
++        """Create a CrosslinkerGeometry from an existing Path object.
++
++        Parameters
++        ----------
++        path : Path
++            Source path providing coordinates, bond_graph, and bead names.
++        connection_sites : list of int
++            Which nodes serve as external connection points.
++        """
++        return cls(
++            coordinates=path.coordinates.copy(),
++            bond_graph=path.bond_graph.copy(),
++            bead_name=path.beads.copy(),
++            connection_sites=connection_sites,
++        )
++
++    @classmethod
++    def single_site(cls, bead_name="_R", n_connections=2):
++        """A single bead that bonds to n_connections backbone beads.
++
++        Parameters
++        ----------
++        bead_name : str
++            Name for the crosslinker bead.
++        n_connections : int
++            Number of backbone beads this single site connects to.
++        """
++        return cls(
++            coordinates=np.zeros((1, 3), dtype=np.float32),
++            bead_name=bead_name,
++            connection_sites=[0] * n_connections,
++        )
++
++    @classmethod
++    def equilateral_triangle(
++        cls, bond_length=0.27, bead_name="_R", connection_sites=None
++    ):
++        """Three beads arranged in an equilateral triangle.
++
++        Parameters
++        ----------
++        bond_length : float
++            Edge length of the triangle.
++        bead_name : str
++            Name for each bead.
++        connection_sites : list of int, optional
++            Defaults to [0, 1, 2].
++        """
++        R = bond_length / np.sqrt(3)
++        angles = np.array([0, 2 * np.pi / 3, 4 * np.pi / 3])
++        positions = np.column_stack(
++            [R * np.cos(angles), R * np.sin(angles), np.zeros(3)]
++        ).astype(np.float32)
++        G = nx.cycle_graph(3)
++        if connection_sites is None:
++            connection_sites = [0, 1, 2]
++        return cls(
++            coordinates=positions,
++            bond_graph=G,
++            bead_name=bead_name,
++            connection_sites=connection_sites,
++        )
++
++    @classmethod
++    def linear(cls, n_sites=2, bond_length=0.27, bead_name="_R", connection_sites=None):
++        """A linear chain of beads along the x-axis.
++
++        Parameters
++        ----------
++        n_sites : int
++            Number of beads in the chain.
++        bond_length : float
++            Spacing between adjacent beads.
++        bead_name : str
++            Name for each bead.
++        connection_sites : list of int, optional
++            Defaults to the two endpoints [0, n_sites - 1].
++        """
++        positions = np.zeros((n_sites, 3), dtype=np.float32)
++        positions[:, 0] = np.arange(n_sites) * bond_length
++        G = nx.path_graph(n_sites)
++        if connection_sites is None:
++            connection_sites = [0, n_sites - 1]
++        return cls(
++            coordinates=positions,
++            bond_graph=G,
++            bead_name=bead_name,
++            connection_sites=connection_sites,
++        )
++
++    @classmethod
++    def square(cls, bond_length=0.27, bead_name="_R", connection_sites=None):
++        """Four beads at the corners of a square.
++
++        Parameters
++        ----------
++        bond_length : float
++            Edge length of the square.
++        bead_name : str
++            Name for each bead.
++        connection_sites : list of int, optional
++            Defaults to [0, 1, 2, 3].
++        """
++        half = bond_length / 2.0
++        positions = np.array(
++            [[half, half, 0], [-half, half, 0], [-half, -half, 0], [half, -half, 0]],
++            dtype=np.float32,
++        )
++        G = nx.cycle_graph(4)
++        if connection_sites is None:
++            connection_sites = [0, 1, 2, 3]
++        return cls(
++            coordinates=positions,
++            bond_graph=G,
++            bead_name=bead_name,
++            connection_sites=connection_sites,
++        )
++
++    @classmethod
++    def tetrahedral(cls, bond_length=0.27, bead_name="_R", connection_sites=None):
++        """Four beads at the vertices of a regular tetrahedron.
++
++        Parameters
++        ----------
++        bond_length : float
++            Edge length of the tetrahedron.
++        bead_name : str
++            Name for each bead.
++        connection_sites : list of int, optional
++            Defaults to [0, 1, 2, 3].
++        """
++        positions = np.array(
++            [[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]], dtype=np.float32
++        )
++        positions *= bond_length / np.linalg.norm(positions[0] - positions[1])
++        G = nx.complete_graph(4)
++        if connection_sites is None:
++            connection_sites = [0, 1, 2, 3]
++        return cls(
++            coordinates=positions,
++            bond_graph=G,
++            bead_name=bead_name,
++            connection_sites=connection_sites,
++        )
++
++    @classmethod
++    def trigonal_bipyramidal(
++        cls, bond_length=0.27, bead_name="_R", connection_sites=None
++    ):
++        """Five beads in a trigonal bipyramidal arrangement.
++
++        Three equatorial beads plus two axial beads. All equatorial-equatorial
++        and equatorial-axial edges are present.
++
++        Parameters
++        ----------
++        bond_length : float
++            Equatorial edge length.
++        bead_name : str
++            Name for each bead.
++        connection_sites : list of int, optional
++            Defaults to [0, 1, 2, 3, 4].
++        """
++        R_eq = bond_length / np.sqrt(3)
++        eq_angles = np.array([0, 2 * np.pi / 3, 4 * np.pi / 3])
++        equatorial = np.column_stack(
++            [R_eq * np.cos(eq_angles), R_eq * np.sin(eq_angles), np.zeros(3)]
++        )
++        axial_dist = bond_length * np.sqrt(2.0 / 3.0)
++        axial = np.array([[0, 0, axial_dist], [0, 0, -axial_dist]])
++        positions = np.vstack([equatorial, axial]).astype(np.float32)
++
++        G = nx.Graph()
++        G.add_nodes_from(range(5))
++        G.add_edges_from([(0, 1), (1, 2), (0, 2)])
++        for eq in range(3):
++            G.add_edges_from([(eq, 3), (eq, 4)])
++        if connection_sites is None:
++            connection_sites = [0, 1, 2, 3, 4]
++        return cls(
++            coordinates=positions,
++            bond_graph=G,
++            bead_name=bead_name,
++            connection_sites=connection_sites,
++        )
++
++    @classmethod
++    def pentagon(cls, bond_length=0.27, bead_name="_R", connection_sites=None):
++        """Five beads arranged in a regular pentagon.
++
++        Parameters
++        ----------
++        bond_length : float
++            Edge length of the pentagon.
++        bead_name : str
++            Name for each bead.
++        connection_sites : list of int, optional
++            Defaults to [0, 1, 2, 3, 4].
++        """
++        R = bond_length / (2 * np.sin(np.pi / 5))
++        angles = np.linspace(0, 2 * np.pi, 5, endpoint=False)
++        positions = np.column_stack(
++            [R * np.cos(angles), R * np.sin(angles), np.zeros(5)]
++        ).astype(np.float32)
++        G = nx.cycle_graph(5)
++        if connection_sites is None:
++            connection_sites = [0, 1, 2, 3, 4]
++        return cls(
++            coordinates=positions,
++            bond_graph=G,
++            bead_name=bead_name,
++            connection_sites=connection_sites,
++        )
++
++    @classmethod
++    def from_graph_edges(
++        cls, coordinates, edges, bead_name="_R", connection_sites=None
++    ):
++        """Create a crosslinker from explicit coordinates and edge list, use for constructing from other graphs.
++
++        Parameters
++        ----------
++        coordinates : array-like, shape (N, 3)
++            Bead positions.
++        edges : list of (int, int)
++            Pairs of node indices defining internal bonds. Can be nx.Graph.edges().
++        bead_name : str
++            Name for each bead.
++        connection_sites : list of int, optional
++            Defaults to all nodes.
++        """
++        coordinates = np.asarray(coordinates, dtype=np.float32)
++        n = len(coordinates)
++        G = nx.Graph()
++        G.add_nodes_from(range(n))
++        # edges map from 0 to n-1
++        sorted_edges = sorted(itertools.chain(*edges))
++        edges_map = {edge: i for i, edge in enumerate(sorted_edges)}
++        ordered_edges = [(edges_map[e1], edges_map[e2]) for e1, e2 in edges]
++        G.add_edges_from(ordered_edges)
++        if connection_sites is None:
++            connection_sites = list(range(n))
++        return cls(
++            coordinates=coordinates,
++            bond_graph=G,
++            bead_name=bead_name,
++            connection_sites=connection_sites,
++        )
++
++
++def crosslink(
++    path,
++    crosslinker=None,
++    n_crosslinks=1,
++    crosslink_bond_length=0.2,
++    backbone_degree=(0, 2),
++    tolerance=0.1,
++    minimum_intrachain_depth=2,
++    volume_constraint=None,
++    minimum_separation=0.1,
++    n_rotation_samples=12,
++    backbone_bead_name=None,
++    seed=None,
++    verbose=False,
++):
++    """Add crosslinks between backbone beads in a path structure.
++
++    Finds eligible backbone bead groups, places crosslinker geometries
++    between them at the specified bond length, and modifies the path in-place.
++
++    Parameters
++    ----------
++    path : Path
++        The polymer path to crosslink.
++    crosslinker : CrosslinkerGeometry, optional
++        The crosslinker geometry to place. Defaults to a single-site
++        2-connection crosslinker.
++    n_crosslinks : int
++        Number of crosslinks to place.
++    crosslink_bond_length : float, default 0.2
++        Target distance from each crosslinker connection node to its
++        backbone bead(s).
++    backbone_degree : int, or tuple size 2 of int, default (0,4)
++        (minimum_backbone_degee, maximum_backbone_degree) to use when selecting
++        from available backbones. See _filter_initial_backbones for more info.
++        Values are inclusive. If only a single integer value is provided, the
++        minimum_backbone_degree is assumed to be 0 and the
++        maximum_backbone_degree is set from that integer. Note that the resultant
++        path will end with crosslinked sites with > than the maximum_backbone_degree,
++        since the backbone site will only be excluded once it falls outside of this
++        specified range, i.e. once it forms an edge that pushes it past the maximum
++        criteria.
++    tolerance : float, default 0.1
++        Fractional tolerance on bond lengths (0.1 = ±10%).
++    minimum_intrachain_depth : int, default 2
++        Backbone beads within this many bonds of a selected bead are
++        excluded from being selected as additional connection points.
++    volume_constraint : optional, default None
++        Provides PBC information from CuboidConstraint. Will by default assume
++        infinite aperiodic box if `None` is passed.
++    minimum_separation : float, default 0.1
++        Minimum distance between placed crosslinker beads and existing beads.
++    n_rotation_samples : int, default 12
++        Number of rotations to try for overlap avoidance.
++    backbone_bead_name : str or list, optional
++        Filter eligible backbone beads by name. If a list, must have one
++        entry per connection site.
++    seed : int, optional
++        Random seed for reproducibility.
++    verbose : bool, default False
++        Print progress information.
++
++    Returns
++    -------
++    path : Path
++        The same path object, modified in-place with crosslinks inserted.
++
++    Raises
++    ------
++    PathConvergenceError
++        If the requested number of crosslinks cannot be placed.
++    """
++    if volume_constraint is None:
++        box = CuboidConstraint(np.inf, np.inf, np.inf)  # aperiodic inf box is default
++    elif isinstance(volume_constraint, CuboidConstraint):
++        box = volume_constraint
++    else:
++        raise NotImplementedError(
++            f"{type(volume_constraint).__name__} is not yet supported for crosslinking; "
++            "only CuboidConstraint (or None) is implemented."
++        )
++
++    # normalize backbone_degree once, so we can enforce max_backbone_degree
++    # ourselves as sites get consumed during the loop below
++    _, max_backbone_degree = _normalize_degree_range(backbone_degree)
++
++    # filter down to valid backbone sites here; keys are eligible node
++    # indices, values are their current degree in path.bond_graph.
++    # This is computed once upfront and updated in-place as crosslinks
++    # are placed (see bottom of loop), rather than being recomputed from
++    # path.bond_graph every iteration.
++    backbone_sitesDict = _filter_initial_backbones(
++        path, backbone_bead_name, backbone_degree
++    )
++    if minimum_intrachain_depth:
++        backbone_graph = _get_backbone_graph(path, backbone_bead_name)
++    else:
++        backbone_graph = None  # no checks necessary
++
++    # key to access supported crosslink geometry functions
++    if crosslinker is None:
++        crosslinkKey = 0
++    else:
++        # use a set to account for duplicates
++        crosslinkKey = len(
++            set(crosslinker.connection_sites)
++        )  # i.e. [0,0] means only one unique bonding site
++    if crosslinkKey not in (0, 1):
++        raise NotImplementedError(
++            "Have not implemented crosslinking for CrosslinkerGeometry with > 1 connection points. "
++            "In the future, more candidatesGenerator functions will be used to handle placement "
++            "on a case by case basis."
++        )
++    if isinstance(crosslink_bond_length, (float, int)) and crosslinker is not None:
++        crosslink_bond_lengthList = [crosslink_bond_length] * len(
++            crosslinker.connection_sites
++        )
++    elif isinstance(crosslink_bond_length, (float, int)):
++        crosslink_bond_lengthList = [crosslink_bond_length]
++    elif isinstance(crosslink_bond_length, np.ndarray):
++        crosslink_bond_lengthList = crosslink_bond_length.tolist()
++    elif isinstance(crosslink_bond_length, (list, tuple)):
++        crosslink_bond_lengthList = list(crosslink_bond_length)
++        if not len(crosslink_bond_lengthList) == len(crosslinker.connection_sites):
++            raise PathConvergenceError(
++                f"backbone_bond_lengths list doesn't match crosslinker.connection_sites"
++                f"{crosslink_bond_length}"
++                f"and {crosslinker.connection_sites}"
++            )
++    else:
++        raise TypeError(
++            f"Unsupported crosslink_bond_length type {type(crosslink_bond_length).__name__}"
++        )
++
++    rng = np.random.default_rng(seed)
++    n_placed = 0
++    max_attempts = n_crosslinks * 100
++    attempt = 0
++
++    while n_placed < n_crosslinks and attempt < max_attempts:
++        attempt += 1
++
++        backbone_sitesArray = np.array(list(backbone_sitesDict.keys()))
++        if backbone_sitesArray.size == 0:
++            raise PathConvergenceError(
++                f"No backbone sites remain eligible under backbone_degree={backbone_degree} "
++                f"after placing {n_placed}/{n_crosslinks} crosslinks."
++            )
++
++        if crosslinkKey == 0:
++            candidatesGenerator = direct_crosslink
++            generator_kwargs = {
++                "coords": path.coordinates,
++                "backbone_sites": backbone_sitesArray,
++                "crosslink_bond_lengthList": crosslink_bond_lengthList,
++                "bond_tolerance": tolerance,
++                "rng": rng,
++                "bond_graph": backbone_graph,
++                "minimum_intrachain_depth": minimum_intrachain_depth,
++                "box": box,
++            }
++        elif crosslinkKey == 1:
++            candidatesGenerator = one_site_crosslink
++            generator_kwargs = {
++                "coords": path.coordinates,
++                "backbone_sites": backbone_sitesArray,
++                "crosslink_bond_lengthList": crosslink_bond_lengthList,
++                "bond_tolerance": tolerance,
++                "rng": rng,
++                "bond_graph": backbone_graph,
++                "minimum_intrachain_depth": minimum_intrachain_depth,
++                "box": box,
++            }
++        elif crosslinkKey == 2:
++            raise ValueError(f"Unsupported for {crosslinker} as of now.")
++        else:
++            candidatesGenerator = None  # 3 sites and more.
++
++        # validate generated sites
++        crosslinker_pos = None  # stays None if we never generate viable candidates
++        for candidate in candidatesGenerator(**generator_kwargs):
++            if crosslinkKey == 0:
++                crosslinker_pos = _verify_direct_bond(
++                    candidate,
++                    path.coordinates,
++                    crosslink_bond_lengthList[0],
++                    tolerance,
++                    box,
++                )
++            elif crosslinkKey == 1:
++                crosslinker_pos = _verify_one_site_bond(
++                    candidate,
++                    crosslinker,
++                    path.coordinates,
++                    minimum_separation,
++                    crosslink_bond_lengthList,
++                    box=box,
++                    tolerance=tolerance,
++                    rng=rng,
++                    n_rotation_samples=n_rotation_samples,
++                    n_position_samples=8,  # TODO: expose to top level api
++                )
++            if crosslinker_pos is not False:
++                break
++        if crosslinker_pos is False:  # found a valid site, but couldn't fit overlaps
++            raise PathConvergenceError(
++                f"Could not find crosslinker placement with "
++                f"bond_length={crosslink_bond_length} (tolerance=±{tolerance * 100:.0f}%).\n"
++                f"minimum_separation={minimum_separation}.\n"
++                f"minimum_intrachain_depth={minimum_intrachain_depth}.\n"
++                f"Ended after {n_placed} crosslinks placed.\n"
++                "Ways to increase crosslinking:\n"
++                " - Modify crosslink_bond_length or tolerance\n"
++                " - Increase backbone_degree range\n"
++                " - Decrease minimum_intrachain_depth\n"
++                " - Pack at different density"
++                " - Run relaxation after this error and try again/"
++            )
++        elif crosslinker_pos is None:  # never found a viable candidate after loop
++            raise PathConvergenceError(
++                f"Found no valid candidate sites in backbone for crosslinking after creating {n_placed}/{n_crosslinks} crosslinks."
++            )
++
++        if crosslinkKey == 0:
++            if path.bond_graph.has_edge(*candidate):
++                # direct_crosslink has no built-in duplicate-pair
++                # exclusion; treat re-proposals of an existing bond as a
++                # failed attempt so they don't silently consume a
++                # placement slot.
++                continue
++            path.bond_graph.add_edge(*candidate, crosslink=True)
++            consumed_sites = tuple(int(c) for c in candidate)
++        else:  # any other number of connection sites
++            _insert_crosslinker(path, crosslinker, candidate, crosslinker_pos, box)
++            consumed_sites = tuple(int(c) for c in candidate)
++
++        # increment degree for every backbone site consumed by this
++        # placement, and drop any that have now exceeded max_backbone_degree
++        for site in consumed_sites:
++            if site not in backbone_sitesDict:
++                continue  # defensive; e.g. non-backbone crosslinker-inserted node
++            backbone_sitesDict[site] += 1
++            if backbone_sitesDict[site] > max_backbone_degree:
++                del backbone_sitesDict[site]
++
++        n_placed += 1
++        if verbose and n_placed % 10 == 0:
++            print(f"Placed {n_placed}/{n_crosslinks} crosslinks")
++
++    if n_placed < n_crosslinks:
++        raise PathConvergenceError(
++            f"Could only place {n_placed}/{n_crosslinks} crosslinks after "
++            f"{attempt} attempts.\n"
++            f"Consider increasing tolerance, n_rotation_samples, or "
++            f"decreasing minimum_separation."
++        )
++
++    return path
++
++
++# =============================================================================
++# General crosslink functions
++# =============================================================================
++
++
++def _filter_initial_backbones(path, backbone_name, backbone_degree):
++    """Return a dict of valid backbone sites in path, mapped to their current degree.
++
++    Parameters
++    ----------
++    path : mbuild.path.build.Path object
++        Path to use for searching backbones
++    backbone_name : str or list or set
++        names filter to get indices of valid backbone sites
++    backbone_degree : int or tuple or list
++        Specification of site backbone degree.
++        If is an integer, this argument is used for the maximum allowed degree.
++        The minimum value is set to 0.
++        If an iterable is passed, assume the first value is the minumimum
++        and the second is the maximum value, inclusive.
++
++    Returns
++    -------
++    backbone_sitesDict : dict[int, int]
++        Mapping of valid backbone node index -> its current degree in
++        path.bond_graph. Only includes sites whose name matches
++        backbone_name (if provided) and whose degree falls within
++        [min_backbone_degree, max_backbone_degree] at call time.
++
++    Notes
++    -----
++    Handles a single bead name, and the maximum_degree. In the future might more specifically filter
++    out other features of backbones.
++    """
++    if isinstance(backbone_name, str):
++        backbone_namesSet = set(
++            (backbone_name,)
++        )  # every connection bond to same crosslink
++    elif backbone_name is None:
++        pass  # skip nonetype formatting
++    else:
++        backbone_namesSet = set(backbone_name)  # assume it's some iterable
++    if isinstance(backbone_degree, int):
++        min_backbone_degree = 0
++        max_backbone_degree = backbone_degree
++    elif isinstance(backbone_degree, (tuple, list, np.ndarray)):
++        assert len(backbone_degree) == 2, (
++            f"Provided {backbone_degree} must be length 2."
++        )
++        min_backbone_degree = int(backbone_degree[0])
++        max_backbone_degree = int(backbone_degree[1])
++    else:
++        raise TypeError(
++            f"Unsupported backbone_degree type {type(backbone_degree).__name__}"
++        )
++
++    n = path.bond_graph.number_of_nodes()
++    degrees = np.zeros(n, dtype=int)
++    nodes, degs = zip(*path.bond_graph.degree())
++    degrees[list(nodes)] = degs
++
++    if backbone_name is None:
++        name_ok = np.ones(n, dtype=bool)
++    else:
++        name_ok = np.isin(
++            path.beads, np.fromiter(backbone_namesSet, dtype=path.beads.dtype)
++        )
++
++    valid_sites = np.flatnonzero(
++        (degrees >= min_backbone_degree) & (degrees <= max_backbone_degree) & name_ok
++    )
++
++    backbone_sitesDict = {int(site): int(degrees[site]) for site in valid_sites}
++    return backbone_sitesDict
++
++
++def _normalize_degree_range(backbone_degree):
++    if isinstance(backbone_degree, (int, np.integer)):
++        return 0, int(backbone_degree)
++    min_deg, max_deg = backbone_degree
++    return int(min_deg), int(max_deg)
++
++
++def _get_backbone_graph(path, backbone_bead_name=None):
++    """
++    Extract the backbone-only bond graph from `path`.
++
++    Returns a graph containing only the original backbone connectivity
++    (i.e. excluding bonds added later as crosslinks between backbones).
++    Every node is tagged with an `eligible` attribute indicating whether
++    its bead name matches `backbone_bead_name`, so it can be used as a
++    connection/crosslink site.
++
++    Parameters
++    ----------
++    path : Path
++        Custom object exposing:
++            path.bond_graph : networkx.Graph
++                Nodes are integer bead indices (0..n-1). Crosslink bonds
++                added after the backbone was built should carry an edge
++                attribute `bond_graph.edges[u, v]['crosslink'] = True`.
++            path.beads : sequence
++                path.beads[i].name gives the bead name at node i.
++    backbone_bead_name : str or list of str, optional
++        Name(s) of beads eligible to act as connection sites. If a list,
++        one entry per connection site. If None, every backbone bead is
++        treated as eligible.
++
++    Returns
++    -------
++    networkx.Graph
++        Backbone-only subgraph of path.bond_graph, with nodes annotated
++        with `name` and `eligible` attributes.
++    """
++    if backbone_bead_name is None:
++        eligible_names = None
++    elif isinstance(backbone_bead_name, str):
++        eligible_names = {backbone_bead_name}
++    else:
++        eligible_names = set(backbone_bead_name)
++
++    source_graph = path.bond_graph
++    backbone_graph = nx.Graph()
++    backbone_graph.add_nodes_from(source_graph.nodes)
++
++    for u, v, data in source_graph.edges(data=True):
++        if data.get("crosslink", False):
++            continue
++        backbone_graph.add_edge(u, v)
++
++    for node in backbone_graph.nodes:
++        bead_name = path.beads[node]
++        backbone_graph.nodes[node]["name"] = bead_name
++        backbone_graph.nodes[node]["eligible"] = (
++            eligible_names is None or bead_name in eligible_names
++        )
++
++    return backbone_graph
++
++
++def _insert_crosslinker(
++    path,
++    crosslinker,
++    candidate,
++    crosslinker_pos,
++    box,
++):
++    """Modify path inplace with crosslinker positions, and update backbone info for next cycle.
++
++    Returns
++    -------
++    None
++    """
++    box_center = box.center
++
++    # Wrap final positions into the box one more time as a safety net.
++    if any(box.pbc):
++        mask = box.pbc & ~np.isinf(box.box_lengths)
++        if np.any(mask):
++            shifted = (crosslinker_pos - box_center).astype(np.float32)
++            wrapped = box.wrap(shifted)  # TODO: Add a cuboid wrap function
++            # Apply mask to dimensions (axis 1), not particles (axis 0)
++            crosslinker_pos[:, mask] = (wrapped[:, mask] + box_center[mask]).astype(
++                np.float32
++            )
++
++    previous_n_nodes = len(path)
++    path.add_path(crosslinker, crosslinker_pos)
++    for clink_site, backbone_site in zip(crosslinker.connection_sites, candidate):
++        path.bond_graph.add_edge(
++            previous_n_nodes + clink_site, backbone_site, crosslink=True
++        )
++
++
++# =============================================================================
++# Direct Crosslinking (backbone to backbone)
++# =============================================================================
++
++
++def direct_crosslink(
++    coords,
++    backbone_sites,
++    crosslink_bond_lengthList,
++    bond_tolerance,
++    rng,
++    box,
++    bond_graph=None,
++    minimum_intrachain_depth=2,
++):
++    """Yield candidate backbone site pairs for a direct crosslink bond."""
++    box_center = box.center
++    shifted_coords32 = (coords - box_center).astype(np.float32)
++
++    bond_length = crosslink_bond_lengthList[0]
++    r_max = bond_length * (1 + bond_tolerance) + 1e-4  # 1e-4 edge padding
++    r_min = bond_length * (1 - bond_tolerance) - 1e-4  # edge padding
++    n_backbones = len(backbone_sites)
++
++    # Boolean mask so we can intersect the distance window with valid sites.
++    backbone_set = set(backbone_sites.tolist())
++
++    for site in rng.choice(np.arange(n_backbones), size=n_backbones, replace=False):
++        origin = backbone_sites[site]
++
++        if bond_graph is not None:
++            excluded = set(
++                nx.single_source_shortest_path_length(
++                    bond_graph, origin, cutoff=minimum_intrachain_depth
++                ).keys()
++            )
++        else:
++            excluded = {origin}
++
++        # _find_neighbors dispatches to AABBQuery (all-periodic) or tiled
++        # cKDTree (any aperiodic axis).
++        neighbors = _find_neighbors(
++            shifted_coords32,
++            box,
++            origin,
++            r_max=r_max,
++            r_min=r_min,
++        )
++
++        for candidate_site in neighbors:
++            if candidate_site not in backbone_set or candidate_site in excluded:
++                continue
++            yield (origin, int(candidate_site))
++    return None
++
++
++def _verify_direct_bond(
++    candidate,
++    coords,
++    bond_length,
++    tolerance,
++    box,
++):
++    """Verify a candidate backbone pair is within tolerance of the target
++    direct bond length, using minimum-image distance under PBC.
++    """
++    pbc = box.pbc
++    box_lengths = box.box_lengths
++
++    p1, p2 = coords[list(candidate)]
++    d = np.linalg.norm(_minimum_image(p2 - p1, pbc, box_lengths))
++
++    if bond_length * (1 - tolerance) <= d <= bond_length * (1 + tolerance):
++        return d
++    return False
++
++
++# =============================================================================
++# One-Site Crosslinker
++# =============================================================================
++
++
++def one_site_crosslink(
++    coords,
++    backbone_sites,
++    crosslink_bond_lengthList,
++    bond_tolerance,
++    rng,
++    box,
++    bond_graph=None,
++    minimum_intrachain_depth=2,
++):
++    """Yield candidate backbone site pairs for a one-site crosslink."""
++    box_center = box.center
++    if len(crosslink_bond_lengthList) == 1:
++        r_max = 2 * crosslink_bond_lengthList[0] * (1 + bond_tolerance)
++    else:
++        r_max = sum(crosslink_bond_lengthList) * (1 + bond_tolerance)
++
++    # Shift to freud's box frame once; all neighbor queries use this array.
++    # TODO: Probably should shift all coordinates centered at 0 at beginning of
++    # crosslink function
++    shifted_coords32 = (coords - box_center).astype(np.float32)
++    backbone_set = set(backbone_sites.tolist())
++    n_backbones = len(backbone_sites)
++
++    for site in rng.choice(np.arange(n_backbones), size=n_backbones, replace=False):
++        origin = backbone_sites[site]
++
++        if bond_graph is not None:  # validate distance along backbone chains
++            excluded = set(
++                nx.single_source_shortest_path_length(
++                    bond_graph, origin, cutoff=minimum_intrachain_depth
++                ).keys()
++            )
++        else:
++            excluded = {origin}
++
++        # _find_neighbors dispatches to AABBQuery (all-periodic) or tiled
++        # cKDTree (any aperiodic axis).
++        neighbors = _find_neighbors(
++            shifted_coords32,
++            box,
++            origin,
++            r_max=r_max,
++            r_min=1e-4,  # Will account for r_min during single site placement
++        )
++
++        for candidate_site in neighbors:
++            if candidate_site not in backbone_set or candidate_site in excluded:
++                continue
++            yield (origin, int(candidate_site))
++
++
++def _verify_one_site_bond(
++    candidate,
++    crosslinker,
++    coords,
++    minimum_separation,
++    crosslink_bond_lengthsList,
++    box,
++    tolerance=0.1,
++    rng=None,
++    n_position_samples=8,
++    n_rotation_samples=12,
++):
++    """Check bond_lengths, overlaps, and connectivity of a single_site crosslink."""
++    unique_sites = crosslinker.unique_connection_sites
++    if len(unique_sites) != 1:
++        return False
++    if crosslinker.n_connections != 2:
++        return False
++
++    pbc = box.pbc
++    box_lengths = box.box_lengths  # Assume Cubic
++    box_center = box.center
++    connection_node = unique_sites[0]
++    target_bond_lengths = np.asarray(crosslink_bond_lengthsList, dtype=float)
++    if target_bond_lengths.size == 1:  # set for all connection sites
++        target_bond_lengths = np.repeat(target_bond_lengths, crosslinker.n_connections)
++    p1, p2 = coords[list(candidate)]
++    r1, r2 = target_bond_lengths
++
++    candidate_positions = _solve_two_bond_positions(
++        p1, p2, r1, r2, tolerance, pbc, box_lengths, n_samples=n_position_samples
++    )
++    if candidate_positions is None:
++        return False
++
++    if rng is None:
++        rng = np.random.default_rng()
++
++    local_coords = crosslinker.coordinates - crosslinker.coordinates[connection_node]
++
++    if crosslinker.n_sites == 1:
++        # skip rotation for beads with only a single bead site, which is the connection site.
++        n_rotation_samples = 1
++    other_bead_mask = np.ones(crosslinker.n_sites, dtype=bool)
++    other_bead_mask[connection_node] = False
++
++    mask = np.ones(len(coords), dtype=bool)
++    mask[list(candidate)] = False
++    coords_excluding_candidate = coords[mask]
++
++    # For wrapping for aperiodic axes
++    aperiodic_axes = [ax for ax in range(3) if not pbc[ax]]
++    box_lo = box_center - box_lengths / 2.0  # shape (3,)
++    box_hi = box_center + box_lengths / 2.0
++
++    checked_positions = set()
++    for position in candidate_positions:
++        positionTuple = tuple(position)  # skip duplicate sites
++        if positionTuple not in checked_positions:
++            checked_positions.add(positionTuple)
++        else:
++            continue
++        for _ in range(n_rotation_samples):
++            rotation = Rotation.random(random_state=rng)
++            transformed = rotation.apply(local_coords) + position
++            connection_pos = transformed[connection_node]
++
++            if not _connection_bond_ok(
++                connection_pos, p1, p2, r1, r2, tolerance, pbc, box_lengths
++            ):
++                continue
++            if any(pbc):
++                shifted = (transformed - box_center).astype(np.float32)
++                newly_transformed = box.wrap(shifted).astype(np.float32) + box_center
++                nan_mask = ~np.isnan(newly_transformed)
++                transformed[nan_mask] = newly_transformed[nan_mask]
++                connection_pos = transformed[connection_node]
++            if aperiodic_axes:
++                out_of_bounds = False
++                for ax in aperiodic_axes:
++                    if np.any(transformed[:, ax] < box_lo[ax] - 1e-5) or np.any(
++                        transformed[:, ax] > box_hi[ax] + 1e-5
++                    ):
++                        out_of_bounds = True
++                        break
++                if out_of_bounds:
++                    continue
++            if not check_path(
++                coords_excluding_candidate,
++                connection_pos,
++                radius=minimum_separation,
++                tolerance=0.0,
++                pbc=pbc,
++                box_lengths=box_lengths,
++            ):
++                continue
++            other_beads = transformed[other_bead_mask]
++            if other_beads.shape[0] > 0 and not _check_all_overlap(
++                other_beads, coords, minimum_separation, pbc, box_lengths
++            ):
++                continue
++
++            return transformed
++
++    return False
++
++
++def _solve_two_bond_positions(p1, p2, r1, r2, tolerance, pbc, box_lengths, n_samples=8):
++    """Analytic sphere-intersection solver, minimum-image aware. Same
++    logic as before, but the p1->p2 displacement (and everything
++    downstream of it) uses the minimum-image vector rather than the raw
++    difference, since p1 and p2 may in fact be closer across a periodic
++    face than their unwrapped coordinates suggest.
++    """
++    diff = _minimum_image(p2 - p1, pbc, box_lengths)
++    d = np.linalg.norm(diff)
++    if d < 1e-12:
++        return None
++
++    r1_lo, r1_hi = r1 * (1 - tolerance), r1 * (1 + tolerance)
++    r2_lo, r2_hi = r2 * (1 - tolerance), r2 * (1 + tolerance)
++
++    min_gap = max(0.0, r1_lo - r2_hi, r2_lo - r1_hi) - 1e-6
++    max_reach = r1_hi + r2_hi
++    if d < min_gap or d > max_reach:
++        return None
++
++    r1_eff, r2_eff = r1, r2
++    if d > r1_eff + r2_eff:
++        deficit = d - (r1_eff + r2_eff)
++        headroom1, headroom2 = r1_hi - r1_eff, r2_hi - r2_eff
++        r1_eff += deficit * (headroom1 / (headroom1 + headroom2))
++        r2_eff += deficit * (headroom2 / (headroom1 + headroom2))
++    elif d < abs(r1_eff - r2_eff):
++        excess = abs(r1_eff - r2_eff) - d
++        if r1_eff > r2_eff:
++            room_down, room_up = r1_eff - r1_lo, r2_hi - r2_eff
++            r1_eff -= excess * (room_down / (room_down + room_up))
++            r2_eff += excess * (room_up / (room_down + room_up))
++        else:
++            room_down, room_up = r2_eff - r2_lo, r1_hi - r1_eff
++            r2_eff -= excess * (room_down / (room_down + room_up))
++            r1_eff += excess * (room_up / (room_down + room_up))
++
++    u_hat = diff / d
++    a = (d**2 + r1_eff**2 - r2_eff**2) / (2 * d)
++    h_sq = r1_eff**2 - a**2
++    if h_sq < 0:
++        return None
++    h = np.sqrt(h_sq)
++    # Measured from p1 along the minimum-image direction toward p2 --
++    # NOT p1's raw unwrapped distance to p2.
++    circle_center = p1 + a * u_hat
++
++    arbitrary = np.array([1.0, 0.0, 0.0])
++    if abs(np.dot(arbitrary, u_hat)) > 0.9:
++        arbitrary = np.array([0.0, 1.0, 0.0])
++    v1 = arbitrary - np.dot(arbitrary, u_hat) * u_hat
++    v1 /= np.linalg.norm(v1)
++    v2 = np.cross(u_hat, v1)
++
++    thetas = np.linspace(0, 2 * np.pi, n_samples, endpoint=False)
++    return circle_center + h * (
++        np.outer(np.cos(thetas), v1) + np.outer(np.sin(thetas), v2)
++    )
++
++
++def _connection_bond_ok(position, p1, p2, r1, r2, tolerance, pbc, box_lengths):
++    d1 = np.linalg.norm(_minimum_image(position - p1, pbc, box_lengths))
++    d2 = np.linalg.norm(_minimum_image(position - p2, pbc, box_lengths))
++    return r1 * (1 - tolerance) <= d1 <= r1 * (1 + tolerance) and r2 * (
++        1 - tolerance
++    ) <= d2 <= r2 * (1 + tolerance)
++
++
++def _check_all_overlap(points, existing_points, radius, pbc, box_lengths):
++    for p in points:
++        if not check_path(
++            existing_points,
++            p,
++            radius=radius,
++            tolerance=0.0,
++            pbc=pbc,
++            box_lengths=box_lengths,
++        ):
++            return False
++    return True
++
++
++# =============================================================================
++# Two-Site Crosslinker
++# =============================================================================
++
++
++def two_site_crosslink():
++    """Crosslinking where backbones bond to two different crosslinker sites."""
++    pass
++
++
++# =============================================================================
++# Periodic and neighbor utilities
++# =============================================================================
++
++
++def _minimum_image(diff, pbc, box_lengths):
++    """Apply minimum-image convention to displacement vector(s) along
++    periodic axes. Same convention as `check_path`'s inline wrap, kept
++    as a shared helper so every distance calc here is consistent with it.
++
++    Parameters
++    ----------
++    diff : np.ndarray (..., 3)
++        Displacement vector(s), e.g. point - reference.
++    pbc : np.ndarray (3,) bool
++    box_lengths : np.ndarray (3,) float
++
++    Returns
++    -------
++    np.ndarray, same shape as diff
++    """
++    diff = np.array(diff, dtype=float, copy=True)
++    for axis in range(3):
++        if pbc[axis] and not np.isinf(box_lengths[axis]):
++            length = box_lengths[axis]
++            diff[..., axis] -= np.round(diff[..., axis] / length) * length
++    return diff
++
++
++def _find_neighbors(coords, box, origin_idx, r_max, r_min=0.0):
++    """Return neighbor indices of `origin_idx` within [r_min, r_max].
++
++    Uses scikit cKDTree for handling MIC
++
++    Parameters
++    ----------
++    coords    : np.ndarray (N, 3) float32, freud convention [-L/2, L/2).
++    box : mbuild.path.constraints.CuboidConstraint  (periodic flags already set).
++    origin_idx : int
++    r_max      : float
++    r_min      : float, default 0.0
++
++    Returns
++    -------
++    np.ndarray of int  –  indices into `coords`.
++    """
++
++    periodic = box.pbc
++    Ls = box.box_lengths
++    boxsize = np.where(periodic & np.isfinite(Ls) & (Ls > 0), Ls, 0.0)
++
++    pts = np.asarray(coords, dtype=np.float64).copy()
++    for ax in range(3):  # cKDTree needs periodic coords in [0, L)
++        if boxsize[ax] > 0:
++            pts[:, ax] = np.mod(pts[:, ax], boxsize[ax])
++            pts[pts[:, ax] >= boxsize[ax], ax] = 0.0  # np.mod can return exactly L
++
++    tree = cKDTree(pts, boxsize=boxsize if np.any(boxsize > 0) else None)
++    raw = np.asarray(tree.query_ball_point(pts[origin_idx], r=r_max), dtype=np.intp)
++    if raw.size == 0:
++        return np.empty(0, dtype=np.intp)
++
++    d = pts[raw] - pts[origin_idx]
++    for ax in range(3):
++        if boxsize[ax] > 0:
++            d[:, ax] -= np.round(d[:, ax] / boxsize[ax]) * boxsize[ax]
++    dists = np.linalg.norm(d, axis=1)
++
++    keep = (raw != origin_idx) & (dists >= r_min)
++    return raw[keep]
+diff --git a/mbuild/path/path_utils.py b/mbuild/path/path_utils.py
+index fa66a11d2..d52fa720f 100644
+--- a/mbuild/path/path_utils.py
++++ b/mbuild/path/path_utils.py
+@@ -95,7 +95,7 @@ def check_path(
+         for j in range(existing_points.shape[1]):
+             diff = existing_points[i, j] - new_point[j]
+             # Apply minimum-image convention on periodic axes
+-            if pbc[j]:
++            if pbc[j] and not (box_lengths[0] + 1 == box_lengths[0]):  # handles inf box
+                 diff -= np.round(diff / box_lengths[j]) * box_lengths[j]
+             dist_sq += diff * diff
+         if dist_sq < min_sq_dist:
+diff --git a/mbuild/tests/test_crosslinks.py b/mbuild/tests/test_crosslinks.py
+new file mode 100644
+index 000000000..13c85df1d
+--- /dev/null
++++ b/mbuild/tests/test_crosslinks.py
+@@ -0,0 +1,597 @@
++import copy
++
++import numpy as np
++import pytest
++
++from mbuild.exceptions import PathConvergenceError
++from mbuild.path.build import Path
++from mbuild.path.constraints import CuboidConstraint
++from mbuild.path.crosslink import CrosslinkerGeometry, crosslink
++from mbuild.tests.base_test import BaseTest
++
++
++class TestCrosslinkerGeometry(BaseTest):
++    """Tests for CrosslinkerGeometry construction and factory methods."""
++
++    def test_single_site_default(self):
++        cl = CrosslinkerGeometry.single_site()
++        assert cl.n_sites == 1
++        assert cl.n_connections == 2
++        assert cl.connection_sites == [0, 0]
++        assert len(cl.internal_bonds) == 0
++
++    def test_single_site_custom_connections(self):
++        cl = CrosslinkerGeometry.single_site(bead_name="_X", n_connections=3)
++        assert cl.n_sites == 1
++        assert cl.n_connections == 3
++        assert cl.beads[0] == "_X"
++
++    def test_equilateral_triangle_geometry(self):
++        cl = CrosslinkerGeometry.equilateral_triangle(bond_length=0.27)
++        assert cl.n_sites == 3
++        assert cl.n_connections == 3
++        assert len(cl.internal_bonds) == 3
++        # Verify equilateral: all edge lengths should be ~0.27
++        for i, j in cl.bond_graph.edges():
++            dist = np.linalg.norm(cl.coordinates[i] - cl.coordinates[j])
++            assert abs(dist - 0.27) < 1e-4
++
++    def test_equilateral_triangle_partial_connections(self):
++        cl = CrosslinkerGeometry.equilateral_triangle(
++            bond_length=0.27, connection_sites=[0, 1]
++        )
++        assert cl.n_connections == 2
++        assert cl.connection_sites == [0, 1]
++
++    def test_linear_geometry(self):
++        cl = CrosslinkerGeometry.linear(n_sites=3, bond_length=0.5)
++        assert cl.n_sites == 3
++        assert cl.n_connections == 2  # default: first and last
++        assert len(cl.internal_bonds) == 2
++        # Check bond lengths
++        for i, j in cl.bond_graph.edges():
++            dist = np.linalg.norm(cl.coordinates[i] - cl.coordinates[j])
++            assert abs(dist - 0.5) < 1e-4
++
++    def test_square_geometry(self):
++        cl = CrosslinkerGeometry.square(bond_length=0.27)
++        assert cl.n_sites == 4
++        assert cl.n_connections == 4
++        assert len(cl.internal_bonds) == 4
++        for i, j in cl.bond_graph.edges():
++            dist = np.linalg.norm(cl.coordinates[i] - cl.coordinates[j])
++            assert abs(dist - 0.27) < 1e-4
++
++    def test_tetrahedral_geometry(self):
++        cl = CrosslinkerGeometry.tetrahedral(bond_length=0.27)
++        assert cl.n_sites == 4
++        assert cl.n_connections == 4
++        assert len(cl.internal_bonds) == 6  # complete graph K4
++        for i, j in cl.bond_graph.edges():
++            dist = np.linalg.norm(cl.coordinates[i] - cl.coordinates[j])
++            assert abs(dist - 0.27) < 1e-4
++
++    def test_trigonal_bipyramidal_geometry(self):
++        cl = CrosslinkerGeometry.trigonal_bipyramidal(bond_length=0.27)
++        assert cl.n_sites == 5
++        assert cl.n_connections == 5
++        assert len(cl.internal_bonds) == 9
++
++    def test_pentagon_geometry(self):
++        cl = CrosslinkerGeometry.pentagon(bond_length=0.27)
++        assert cl.n_sites == 5
++        assert cl.n_connections == 5
++        assert len(cl.internal_bonds) == 5
++        for i, j in cl.bond_graph.edges():
++            dist = np.linalg.norm(cl.coordinates[i] - cl.coordinates[j])
++            assert abs(dist - 0.27) < 1e-4
++
++    def test_from_graph_edges(self):
++        coords = [[0, 0, 0], [1, 0, 0], [0.5, 0.866, 0]]
++        edges = [(0, 1), (1, 2)]
++        cl = CrosslinkerGeometry.from_graph_edges(
++            coords, edges, bead_name="_R", connection_sites=[0, 2]
++        )
++        assert cl.n_sites == 3
++        assert cl.n_connections == 2
++        assert len(cl.internal_bonds) == 2
++        assert cl.connection_sites == [0, 2]
++
++    def test_from_graph_edges_disordered(self):
++        coords = [[0, 0, 0], [1, 0, 0], [0.5, 0.866, 0]]
++        edges = [(0, 1), (1, 5)]
++        cl = CrosslinkerGeometry.from_graph_edges(
++            coords, edges, bead_name="_R", connection_sites=[0, 2]
++        )
++        assert cl.n_sites == 3
++        assert cl.n_connections == 2
++        assert len(cl.internal_bonds) == 2
++        assert cl.connection_sites == [0, 2]
++
++    def test_from_path(self):
++        coords = np.array([[0, 0, 0], [0.27, 0, 0]], dtype=np.float32)
++        p = Path(coords, bead_name="_R")
++        p._connect_edges("linear")
++        cl = CrosslinkerGeometry.from_path(p, connection_sites=[0, 1])
++        assert cl.n_sites == 2
++        assert cl.n_connections == 2
++        assert len(cl.internal_bonds) == 1
++
++    def test_centered_at_origin(self):
++        cl = CrosslinkerGeometry.equilateral_triangle(bond_length=0.27)
++        centroid = np.mean(cl.coordinates, axis=0)
++        assert np.allclose(centroid, [0, 0, 0], atol=1e-6)
++
++    def test_invalid_connection_site_raises(self):
++        coords = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.float32)
++        with pytest.raises(
++            PathConvergenceError, match="connection site 5 is too large"
++        ):
++            CrosslinkerGeometry(
++                coordinates=coords, bead_name="_R", connection_sites=[0, 5]
++            )
++
++    def test_unique_connection_sites(self):
++        cl = CrosslinkerGeometry.single_site(n_connections=3)
++        assert cl.unique_connection_sites == [0]
++        cl2 = CrosslinkerGeometry.equilateral_triangle(connection_sites=[0, 1, 2])
++        assert cl2.unique_connection_sites == [0, 1, 2]
++
++    def test_copy(self):
++        cl = CrosslinkerGeometry.equilateral_triangle(bond_length=0.27)
++        cl2 = cl.copy()
++        assert np.allclose(cl.coordinates, cl2.coordinates)
++        assert cl.connection_sites == cl2.connection_sites
++        # Mutate copy, original unchanged
++        cl2.coordinates[0] = [99, 99, 99]
++        assert not np.allclose(cl.coordinates, cl2.coordinates)
++
++
++class TestCrosslink(BaseTest):
++    """Tests for the crosslink function."""
++
++    @pytest.fixture
++    def parallel_chains(self):
++        # Two linear paths offset by two
++        coords = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=np.float32)
++        linear_path = Path(coords, bead_name="_A")
++        linear_path._connect_edges("linear")
++        linear_path.append_coordinates(coords + np.array([0, 2, 0]), bead_names="_A")
++        linear_path.form_linear_bond_graph(np.arange(3, 6))
++        return linear_path
++
++    @pytest.fixture
++    def periodic_path(self):
++        coords = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], dtype=np.float32)
++        linear_path = Path(coords, bead_name="_A")
++        linear_path._connect_edges("linear")
++        linear_path.append_coordinates(coords + np.array([0, 8, 0]), bead_names="_A")
++        linear_path.form_linear_bond_graph(np.arange(3, 6))
++        return linear_path
++
++    @pytest.fixture
++    def periodic_cuboid(self):
++        """10×10×10 fully periodic box centred at (1, 4, 0)."""
++        return CuboidConstraint(
++            10.0,
++            10.0,
++            10.0,
++            center=[1.0, 4.0, 0.0],
++            pbc=(True, True, True),
++        )
++
++    @pytest.fixture
++    def one_site_crosslink(self):
++        return CrosslinkerGeometry.single_site()
++
++    @pytest.fixture
++    def two_site_crosslink(self):
++        return CrosslinkerGeometry.linear(connection_sites=[0, 1])  # default 2-site
++
++    def test_single_site(self, parallel_chains, one_site_crosslink):
++        path = parallel_chains
++        clinker = one_site_crosslink
++        crosslink(
++            path, clinker, crosslink_bond_length=1, seed=3, backbone_bead_name="_A"
++        )
++        crosslink(
++            path, clinker, crosslink_bond_length=1, seed=3, backbone_bead_name="_A"
++        )
++        crosslink(
++            path, clinker, crosslink_bond_length=1, seed=3, backbone_bead_name="_A"
++        )
++        # Original 4 sites only
++        assert len(path.coordinates) == 9
++        assert len(path.bond_graph.edges()) == 10
++        for e1, e2 in path.bond_graph.edges():
++            distance = np.linalg.norm(path.coordinates[e1] - path.coordinates[e2])
++            assert np.isclose(distance, 1)
++
++    def test_single_site_extended(self, parallel_chains, one_site_crosslink):
++        path = parallel_chains
++        clinker = one_site_crosslink
++        min_sep = 1
++        crosslink(
++            path,
++            clinker,
++            crosslink_bond_length=1.1,
++            seed=3,
++            backbone_bead_name="_A",
++            backbone_degree=2,
++            minimum_separation=min_sep,
++            tolerance=0,
++        )
++        crosslink(
++            path,
++            clinker,
++            crosslink_bond_length=1.1,
++            seed=3,
++            backbone_bead_name="_A",
++            backbone_degree=2,
++            minimum_separation=min_sep,
++            tolerance=0,
++        )
++        crosslink(
++            path,
++            clinker,
++            crosslink_bond_length=1.1,
++            seed=3,
++            backbone_bead_name="_A",
++            backbone_degree=2,
++            minimum_separation=min_sep,
++            tolerance=0,
++        )
++        assert len(path.coordinates) == 9
++        assert len(path.bond_graph.edges()) == 10
++        print(path.bond_graph.edges())
++        for e1, e2 in path.bond_graph.edges():
++            distance = np.linalg.norm(path.coordinates[e1] - path.coordinates[e2])
++            assert np.isclose(distance, 1) or np.isclose(distance, 1.1)
++
++    def test_direct_crosslink_aperiodic(self, parallel_chains):
++        """clinker=None: direct bond placed between chains 2 units apart,
++        no periodic boundary conditions.  Validates that:
++        - exactly one new bond is added (no new beads),
++        - the bond length matches the target within tolerance.
++        """
++        path = parallel_chains
++        n_beads_before = len(path.coordinates)
++        n_edges_before = len(path.bond_graph.edges())
++        bond_length = 2.1
++
++        crosslink(
++            path,
++            crosslinker=None,
++            crosslink_bond_length=bond_length,
++            tolerance=0.1,
++            seed=0,
++            backbone_bead_name="_A",
++        )
++
++        assert len(path.coordinates) == n_beads_before
++        assert len(path.bond_graph.edges()) == n_edges_before + 1
++
++        # Check bond length tolerance
++        for e1, e2 in path.bond_graph.edges():
++            if abs(e1 - e2) < 3:
++                continue
++            distance = np.linalg.norm(path.coordinates[e1] - path.coordinates[e2])
++            assert bond_length * 0.9 <= distance <= bond_length * 1.1, (
++                f"Direct bond length {distance:.4f} outside tolerance of {bond_length}"
++            )
++
++    def test_direct_crosslink_periodic(self, periodic_path, periodic_cuboid):
++        """clinker=None: direct bond placed across a periodic boundary.
++
++        The two chains are 8 units apart in y inside a box of length 10,
++        so the minimum-image distance is 2.  Without PBC the pair would
++        be at distance 8 and the crosslink should *not* form.
++        """
++        path = periodic_path
++        bond_length = 2.0
++        n_beads_before = len(path.coordinates)
++        n_edges_before = len(path.bond_graph.edges())
++
++        # Fails with separation of 8, not 2 without pbc
++        with pytest.raises(PathConvergenceError):
++            crosslink(
++                copy.deepcopy(path),
++                crosslinker=None,
++                crosslink_bond_length=bond_length,
++                tolerance=0.1,
++                seed=0,
++                backbone_bead_name="_A",
++                volume_constraint=None,
++            )
++
++        # With the periodic box the minimum-image distance is 2.
++        crosslink(
++            path,
++            crosslinker=None,
++            crosslink_bond_length=bond_length,
++            tolerance=0.1,
++            seed=0,
++            backbone_bead_name="_A",
++            volume_constraint=periodic_cuboid,
++        )
++
++        assert len(path.coordinates) == n_beads_before
++        assert len(path.bond_graph.edges()) == n_edges_before + 1
++        for e1, e2 in path.bond_graph.edges():
++            test_distance = np.linalg.norm(path.coordinates[e1] - path.coordinates[e2])
++            assert test_distance in (1.0, 8.0)
++
++    def test_single_site_minimum_separation_respected(
++        self, parallel_chains, one_site_crosslink
++    ):
++        """Placed crosslinker bead must be at least minimum_separation
++        away from every pre-existing bead.
++        """
++        path = parallel_chains
++        min_sep = 0.8
++
++        crosslink(
++            path,
++            crosslinker=one_site_crosslink,
++            crosslink_bond_length=1.0,
++            seed=7,
++            backbone_bead_name="_A",
++            minimum_separation=min_sep,
++            tolerance=0.1,
++        )
++
++        # Index of last added bead.
++        new_bead_idx = len(path.coordinates) - 1
++        new_bead_pos = path.coordinates[new_bead_idx]
++        original_coords = path.coordinates[:new_bead_idx]
++
++        distances = np.linalg.norm(original_coords - new_bead_pos, axis=1)
++        assert np.all(distances >= min_sep), (
++            f"Crosslinker bead placed too close to an existing bead: "
++            f"min distance = {distances.min():.4f}, required >= {min_sep}"
++        )
++
++    def test_single_site_tolerance_enforced(self, parallel_chains, one_site_crosslink):
++        """Tolerance=0 with a bond_length that has no exact solution raises
++        PathConvergenceError; a slightly relaxed tolerance succeeds.
++
++        The chains are exactly 2 units apart in y.  A target bond_length
++        of 1.3 (each arm = 1.3) gives a total reach of 2.6 > 2, so the
++        geometry *is* solvable — but only if tolerance > 0 allows the
++        solver enough room.  With tolerance=0 the sphere-intersection
++        circle collapses and no valid position can be found.
++        """
++
++        # tolerance=0: won't find correct bond length
++        fail_path = copy.deepcopy(parallel_chains)
++        with pytest.raises(PathConvergenceError):
++            crosslink(
++                fail_path,
++                crosslinker=one_site_crosslink,
++                crosslink_bond_length=0.5,
++                tolerance=0.0,
++                seed=1,
++                backbone_bead_name="_A",
++            )
++
++        # tolerance=0.2: reaches bond lengths of one
++        bond_length = 0.9
++        crosslink(
++            parallel_chains,
++            crosslinker=one_site_crosslink,
++            crosslink_bond_length=bond_length,
++            tolerance=0.2,
++            seed=1,
++            backbone_bead_name="_A",
++        )
++
++        # Verify placed bond lengths sit within the relaxed tolerance window.
++        new_bead_idx = len(parallel_chains.coordinates) - 1
++        new_bead_pos = parallel_chains.coordinates[new_bead_idx]
++        for nb in parallel_chains.bond_graph.neighbors(new_bead_idx):
++            d = np.linalg.norm(parallel_chains.coordinates[nb] - new_bead_pos)
++            assert bond_length * 0.8 <= d <= bond_length * 1.2, (
++                f"Bond length {d:.4f} outside 20% tolerance of {bond_length}"
++            )
++
++    def test_crosslinker_wraps_into_box(self):
++        """Build a periodic box and place beads on opposite side of periodic boundary."""
++        box_len = 4.0
++        half = box_len / 2.0
++        near_face = half - 0.05  # 0.05 nm inside the +x face
++        sep = 1.0  # inter-chain separation in y
++
++        coords = np.array(
++            [
++                [near_face, 0.0, 0.0],
++                [-near_face, 0.0, 0.0],
++                [near_face, sep, 0.0],
++                [-near_face, sep, 0.0],
++            ],
++            dtype=np.float32,
++        )
++        path = Path(coords, bead_name="_A")
++        path.bond_graph.add_edge(0, 2)
++        path.bond_graph.add_edge(1, 3)
++
++        constraint = CuboidConstraint(
++            box_len,
++            box_len,
++            box_len,
++            center=[0.0, 0.0, 0.0],
++            pbc=(True, True, True),
++        )
++
++        bulky_crosslinker = CrosslinkerGeometry.linear(
++            n_sites=9,
++            bond_length=0.4,
++            bead_name="_R",
++            connection_sites=0,
++        )
++
++        # MIC distance between bead 0 and bead 1 across the periodic x-boundary
++        # is 2 * 0.05 = 0.1 nm — use that as the bond length so the
++        # sphere-intersection solver is forced to place beads near that face.
++        bond_length = 0.1
++        n_beads_before = len(path.coordinates)
++        crosslink(
++            path,
++            crosslinker=bulky_crosslinker,
++            crosslink_bond_length=bond_length,
++            tolerance=0.15,
++            seed=42,
++            backbone_bead_name="_A",
++            minimum_intrachain_depth=1,
++            volume_constraint=constraint,
++        )
++
++        assert len(path) == 13  # check crosslinker sites were added
++        coords_after = path.coordinates
++        pbc = np.array([True, True, True])
++
++        violations = []
++        for ax, (periodic, L) in enumerate(zip(pbc, [box_len, box_len, box_len])):
++            if not periodic:
++                continue
++            lo, hi = -L / 2.0, L / 2.0
++            out_lo = np.where(coords_after[:, ax] < lo - 1e-5)[0]
++            out_hi = np.where(coords_after[:, ax] > hi + 1e-5)[0]
++            for idx in np.concatenate([out_lo, out_hi]):
++                violations.append(
++                    f"  bead {idx:4d}  axis={ax}  pos={coords_after[idx, ax]:.6f}"
++                    f"  box=[{lo:.3f}, {hi:.3f}]"
++                )
++
++        assert not violations, (
++            f"{len(violations)} bead(s) found outside the periodic box after crosslinking:\n"
++            + "\n".join(violations)
++        )
++
++        # Check all bond lengths
++        new_bead_indices = np.arange(n_beads_before, len(path.coordinates))
++        for new_idx in new_bead_indices:
++            for nb in path.bond_graph.neighbors(new_idx):
++                p_new = path.coordinates[new_idx].astype(np.float64)
++                p_nb = path.coordinates[nb].astype(np.float64)
++                # minimum-image distance so PBC bonds are measured correctly
++                diff = p_new - p_nb
++                for ax in range(3):
++                    diff[ax] -= box_len * np.round(diff[ax] / box_len)
++                d = np.linalg.norm(diff)
++                # bonds to backbone anchors must respect the crosslink_bond_length
++                if nb < n_beads_before:
++                    assert d <= bond_length * (1 + 0.15) + 1e-4, (
++                        f"Crosslinker→backbone bond too long: {d:.4f} "
++                        f"(max {bond_length * 1.15:.4f})"
++                    )
++
++    def test_multiple_crosslinks(self, parallel_chains):
++        crosslink(
++            parallel_chains,
++            None,
++            crosslink_bond_length=2,
++            n_crosslinks=3,
++            minimum_intrachain_depth=2,
++        )
++        assert len(parallel_chains.bond_graph.edges()) == 7
++        edges = set(list(parallel_chains.bond_graph.edges()))
++        for edge in [(0, 1), (1, 2), (3, 4), (4, 5), (0, 3), (1, 4), (2, 5)]:
++            assert edge in edges
++
++    def test_get_backbone_degree_correct_on_n_crosslinks(self):
++        # Two linear paths offset by two
++        coords = np.array(
++            [[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]], dtype=np.float32
++        )
++        linear_path = Path(coords, bead_name="_A")
++        linear_path._connect_edges("linear")
++        linear_path.append_coordinates(coords + np.array([0, 2, 0]), bead_names="_A")
++        linear_path.form_linear_bond_graph(np.arange(4, 8))
++
++        path1 = copy.deepcopy(linear_path)
++        path2 = copy.deepcopy(linear_path)
++        path3 = copy.deepcopy(linear_path)
++        crosslink(  # check that form two middle bonds
++            path1,
++            None,
++            n_crosslinks=2,
++            crosslink_bond_length=2,
++            backbone_degree=(2, 2),  # should only be able to form two crosslinks
++            minimum_intrachain_depth=2,
++            tolerance=0,
++        )
++        assert len(path1.bond_graph.edges()) == 8
++        edges = set(list(path1.bond_graph.edges()))
++        for edge in [(0, 1), (1, 2), (2, 3), (4, 5), (5, 6), (6, 7), (1, 5), (2, 6)]:
++            assert edge in edges
++        with pytest.raises(PathConvergenceError):
++            crosslink(  # check that you can't form links on end chains
++                path2,
++                None,
++                n_crosslinks=3,
++                crosslink_bond_length=2,
++                backbone_degree=(2, 2),  # should only be able to form two crosslinks
++                minimum_intrachain_depth=3,
++                tolerance=0,
++            )
++        crosslink(  # Validate that intrachain_depth doesn't cross backbones as bond_graph
++            # forms more and more crosslinks
++            path3,
++            None,
++            n_crosslinks=2,
++            crosslink_bond_length=2,
++            backbone_degree=(2, 2),  # should only be able to form two crosslinks
++            minimum_intrachain_depth=3,
++            tolerance=0,
++        )
++        assert len(path3.bond_graph.edges()) == 8
++        edges = set(list(path3.bond_graph.edges()))
++        for edge in [(0, 1), (1, 2), (2, 3), (4, 5), (5, 6), (6, 7), (1, 5), (2, 6)]:
++            assert edge in edges
++
++
++class TestCrosslinkUtilities(BaseTest):
++    def test_find_neighbors_non_periodic(self):
++        from mbuild.path.crosslink import _find_neighbors
++
++        coords = np.array([[0, 0, 0], [1, 0, 0]])
++        box = CuboidConstraint(10, 10, 10)
++        box.pbc = (False, False, False)
++        origin = 0
++        neighbors = _find_neighbors(coords, box, origin, r_max=1, r_min=0.0)
++        assert len(neighbors) == 1, neighbors
++
++        coords = np.array([[0, 0, 0], [9, 0, 0]])
++        neighbors = _find_neighbors(coords, box, origin, r_max=1, r_min=0.0)
++        assert len(neighbors) == 0, neighbors
++
++    def test_find_neighbors_periodic(self):
++        from mbuild.path.crosslink import _find_neighbors
++
++        coords = np.array([[0, 0, 0], [9, 0, 0]])
++        box = CuboidConstraint(10, 10, 10)
++        box.pbc = (True, True, True)
++        origin = 0
++        neighbors = _find_neighbors(coords, box, origin, r_max=1, r_min=0.0)
++        assert len(neighbors) == 1, neighbors
++        coords = np.array([[0, 0, 0], [9.8, 0, 0]])
++        neighbors = _find_neighbors(coords, box, origin, r_max=1, r_min=0.5)
++        assert len(neighbors) == 0
++
++    def test_verify_direct_bond(self):
++        from mbuild.path.crosslink import _verify_direct_bond
++
++        coords = np.array([[0, 0, 0], [1, 0, 0]])
++        candidate = (0, 1)  # should thsi be integers
++        path = Path(coords)
++        box = CuboidConstraint(10, 10, 10)
++        box.pbc = (True, True, True)
++        box.center = np.array((0, 0, 0))
++        crosslinker_pos = _verify_direct_bond(
++            candidate,
++            path.coordinates,
++            1,
++            0,
++            box,
++        )
++        assert crosslinker_pos == 1
+diff --git a/mbuild/tests/test_path.py b/mbuild/tests/test_path.py
+index b61025229..a3df2cbdf 100644
+--- a/mbuild/tests/test_path.py
++++ b/mbuild/tests/test_path.py
+@@ -5,7 +5,6 @@
+ from mbuild.exceptions import PathConvergenceError
+ from mbuild.path.build import (
+     Path,
+-    crosslink,
+     cyclic,
+     hard_sphere_random_walk,
+     helix,
+@@ -254,6 +253,16 @@ def test_string_bead_name_still_works(self):
+         straight_line(path=path, spacing=0.2, N=4, bead_name="_X")
+         assert list(path.beads) == ["_X", "_X", "_X", "_X"]
+ 
++    def test_add_paths(self):
++        coords = np.random.uniform(-5, 5, size=(20, 3))
++        path1 = Path(coordinates=coords)
++        path2 = Path(coordinates=coords)
++        path3 = path1 + path2
++        assert path3 == path1 + path2
++        assert np.allclose(
++            path3.coordinates, np.concatenate((path1.coordinates, path2.coordinates))
++        )
++
+ 
+ class TestRandomWalk(BaseTest):
+     def test_extend_coordinates(self):
+@@ -540,9 +549,10 @@ def test_walk_inside_cube(self):
+                 radius=0.22,
+                 volume_constraint=cube,
+                 seed=14,
++                tolerance=0.2,
+             )
+         bounds = bounding_box(path.coordinates)
+-        assert np.all(bounds < np.array([5 - 0.44, 5 - 0.44, 5 - 0.44]))
++        assert np.all(bounds < np.array([5 - 0.4, 5 - 0.4, 5 - 0.4]))
+ 
+     def test_walk_inside_cube_with_pbc(self):
+         # First make sure this seed gives a path outside these bounds without PBC
+@@ -728,6 +738,7 @@ def test_init_positions(self):
+             initial_point=(-0.25, -0.25, -0.25),
+             termination=3,
+             seed=100,
++            tolerance=0.1,
+         )
+         assert np.allclose(path.coordinates[0], np.array([-0.25, -0.25, -0.25]))
+         assert all(constraint.is_inside(points=path.coordinates[1:], buffer=0.1))
+@@ -998,66 +1009,3 @@ def test_check_path_pbc_overlap_across_face(self, axis):
+             pbc=pbc,
+             box_lengths=box_lengths,
+         )
+-
+-
+-class TestCrossLinks(BaseTest):
+-    def test_find_links_line(self):
+-        path = Path()
+-        pos1 = np.zeros((10, 3))
+-        pos1[:, 1] = np.arange(10)
+-        path.append_coordinates(pos1, "_A")
+-        path.form_linear_bond_graph()
+-
+-        pos2 = np.zeros((10, 3))
+-        pos2[:, 0] += 1
+-        pos2[:, 1] = np.arange(10)
+-        path.append_coordinates(pos2, "_A")
+-        path.form_linear_bond_graph(indices=np.arange(10, 20))
+-
+-        for i in range(10):
+-            crosslink(
+-                path, initial_point=i, radius=1.1, excluded_bond_depth=10, seed=42
+-            )
+-
+-        clinks = sum([b == "_R" for b in path.beads])
+-        bbones = sum([b == "_A" for b in path.beads])
+-        assert clinks == 10
+-        assert bbones == 20
+-        for i in range(10):
+-            assert (i, i + 20) in path.bond_graph.edges
+-            assert (i + 10, i + 20) in path.bond_graph.edges
+-
+-    def test_deterministic_rw(self):
+-        path1 = hard_sphere_random_walk(
+-            radius=1,
+-            bond_length=2,
+-            termination=20,
+-            rw_angles=(np.pi / 2, np.pi),
+-            seed=1,
+-        )
+-        path2 = hard_sphere_random_walk(
+-            radius=1,
+-            bond_length=2,
+-            termination=20,
+-            rw_angles=(np.pi / 2, np.pi),
+-            seed=1,
+-        )
+-        assert path1 == path2
+-
+-    def test_deterministic_crosslink(self):
+-        """Test set coordinates, relax seed as well"""
+-        rng = np.random.default_rng(1)
+-
+-        points = rng.random((100, 3))
+-        path1 = Path(coordinates=points)
+-        path2 = Path(coordinates=points)
+-        assert path1 == path2
+-
+-        crosslink(path1, radius=1, excluded_bond_depth=2)
+-        crosslink(path2, radius=1, excluded_bond_depth=2)
+-        assert path1 == path2
+-
+-        path1.relax(0.2, None, steps=10)
+-        path2.relax(0.2, None, steps=10)
+-        print(path1.coordinates - path2.coordinates)
+-        assert np.allclose(path1.coordinates, path2.coordinates, atol=1e-6)

@@ -1,0 +1,1027 @@
+diff --git a/scilink/skills/_shared/atomistic_model_manager.py b/scilink/skills/_shared/atomistic_model_manager.py
+index f4fc8dc7a..582f20c22 100644
+--- a/scilink/skills/_shared/atomistic_model_manager.py
++++ b/scilink/skills/_shared/atomistic_model_manager.py
+@@ -71,20 +71,27 @@ def get_or_download_atomistic_model(settings: dict, logger: logging.Logger = Non
+     if not os.path.isabs(default_path) and not os.path.isdir(default_path):
+         default_path = _persistent_model_dir(default_path)
+ 
+-    if not os.path.isdir(default_path) or not _locate_model_files(default_path, logging.getLogger("quiet")):
+-        logger.warning(f"Default model directory '{default_path}' not found. Downloading...")
+-        
+-        # Download the model
+-        success = _download_and_extract_model(
+-            gdrive_id=DCNN_MODEL_GDRIVE_ID,
+-            output_dir=default_path,
+-            logger=logger,
+-            url=DCNN_MODEL_URL,
+-        )
+-        
+-        if not success:
+-            logger.error("Failed to download and extract the model.")
+-            return None
++    def _ready() -> bool:
++        return os.path.isdir(default_path) and bool(
++            _locate_model_files(default_path, logging.getLogger("quiet")))
++
++    if not _ready():
++        # Several analyses can reach a missing ensemble at once (fan-out
++        # branches, best-of-N candidates, spawned series replays). The lock
++        # makes one of them download; the others wait and then find it.
++        from scilink.utils.file_lock import path_lock
++        with path_lock(default_path, label="the DCNN ensemble"):
++            if not _ready():
++                logger.warning(f"Default model directory '{default_path}' not found. Downloading...")
++                success = _download_and_extract_model(
++                    gdrive_id=DCNN_MODEL_GDRIVE_ID,
++                    output_dir=default_path,
++                    logger=logger,
++                    url=DCNN_MODEL_URL,
++                )
++                if not success:
++                    logger.error("Failed to download and extract the model.")
++                    return None
+     
+     # 3. Locate model files
+     model_path = _locate_model_files(default_path, logger)
+@@ -113,23 +120,15 @@ def _persistent_model_dir(name: str) -> str:
+ 
+ def _download_url(url: str, dest: str, logger: logging.Logger) -> Optional[str]:
+     """Stream ``url`` to ``dest``; the path on success, ``None`` on any failure
+-    (a partial file is removed). Plain HTTPS, no third-party client."""
+-    import shutil
+-    import urllib.request
+-    tmp = dest + ".part"
++    (a partial file is removed, and a short transfer is a failure). Plain
++    HTTPS, no third-party client."""
++    from scilink.utils.download import fetch_to
+     try:
+-        os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
+-        with urllib.request.urlopen(url, timeout=60) as resp, open(tmp, "wb") as fh:
+-            shutil.copyfileobj(resp, fh, length=1 << 20)
+-        os.replace(tmp, dest)
++        fetch_to(url, dest)
+         logger.info(f"Downloaded {os.path.getsize(dest) / 1e6:.0f} MB from {url}")
+         return dest
+     except Exception as exc:  # noqa: BLE001 - the caller falls back
+         logger.warning(f"Download from {url} failed: {exc}")
+-        try:
+-            os.remove(tmp)
+-        except OSError:
+-            pass
+         return None
+ 
+ 
+@@ -155,35 +154,61 @@ def _download_and_extract_model(gdrive_id: str, output_dir: str, logger: logging
+     # call sites below stable.
+     from scilink.skills.image_analysis.atomic_stem import atomic_stem as atomistic_tools
+     
+-    zip_filename = f"{output_dir}.zip"
+-    
+-    # Download: the release asset first, Google Drive as the fallback
+-    downloaded_zip_path = None
+-    if url:
+-        logger.info(f"Downloading model from {url} ...")
+-        downloaded_zip_path = _download_url(url, zip_filename, logger)
+-    if not downloaded_zip_path:
+-        logger.info(f"Downloading model from Google Drive (ID: {gdrive_id})...")
+-        downloaded_zip_path = atomistic_tools.download_file_with_gdown(
+-            gdrive_id, zip_filename, logger
+-        )
+-    
+-    if not downloaded_zip_path or not os.path.exists(downloaded_zip_path):
+-        logger.error("Failed to download the model.")
+-        return False
+-    
+-    # Extract
+-    logger.info(f"Extracting model to {output_dir}...")
+-    unzip_success = atomistic_tools.unzip_file(downloaded_zip_path, output_dir, logger)
+-    
+-    # Cleanup zip file
++    import shutil
++    from scilink.utils.download import unique_sibling
++
++    # Every intermediate is uniquely named beside the destination (created
++    # with the umask applied by the kernel), and the extracted folder is
++    # published with one rename: a concurrent reader sees no ensemble or the
++    # whole ensemble, never some of its members.
++    out = os.path.abspath(output_dir)
++    parent, name = os.path.dirname(out), os.path.basename(out)
++    zip_filename = str(unique_sibling(parent, f".{name}.", ".zip"))
++    staging = str(unique_sibling(parent, f".{name}.", ".extract", directory=True))
+     try:
+-        os.remove(downloaded_zip_path)
+-        logger.info(f"Cleaned up downloaded zip file: {downloaded_zip_path}")
+-    except OSError as e:
+-        logger.warning(f"Could not remove zip file {downloaded_zip_path}: {e}")
+-    
+-    return unzip_success
++        # Download: the release asset first, Google Drive as the fallback
++        downloaded_zip_path = None
++        if url:
++            logger.info(f"Downloading model from {url} ...")
++            downloaded_zip_path = _download_url(url, zip_filename, logger)
++        if not downloaded_zip_path:
++            logger.info(f"Downloading model from Google Drive (ID: {gdrive_id})...")
++            downloaded_zip_path = atomistic_tools.download_file_with_gdown(
++                gdrive_id, zip_filename, logger
++            )
++
++        if (not downloaded_zip_path or not os.path.exists(downloaded_zip_path)
++                or os.path.getsize(downloaded_zip_path) == 0):
++            logger.error("Failed to download the model.")
++            return False
++
++        logger.info(f"Extracting model to {output_dir}...")
++        if not atomistic_tools.unzip_file(downloaded_zip_path, staging, logger):
++            return False
++
++        if os.path.exists(out):
++            if _locate_model_files(out, logging.getLogger("quiet")):
++                # Published by another process while this one downloaded
++                # (possible where locking is unavailable): keep theirs.
++                return True
++            # An incomplete folder from an earlier interrupted run is moved
++            # aside, not deleted: it may hold something the user put there.
++            aside = str(unique_sibling(parent, f".{name}.", ".stale", directory=True))
++            os.rename(out, os.path.join(aside, name))
++            logger.warning(f"Moved the incomplete '{output_dir}' aside to '{aside}'.")
++        try:
++            os.rename(staging, out)
++        except OSError:
++            if _locate_model_files(out, logging.getLogger("quiet")):
++                return True             # lost a publish race to a complete copy
++            raise
++        return True
++    finally:
++        try:
++            os.remove(zip_filename)
++        except OSError:
++            pass
++        shutil.rmtree(staging, ignore_errors=True)
+ 
+ 
+ def _locate_model_files(search_dir: str, logger: logging.Logger) -> str | None:
+diff --git a/scilink/skills/_shared/particle_analyzer.py b/scilink/skills/_shared/particle_analyzer.py
+index 4c0b62f12..ade34552b 100644
+--- a/scilink/skills/_shared/particle_analyzer.py
++++ b/scilink/skills/_shared/particle_analyzer.py
+@@ -7,7 +7,6 @@
+ """
+ 
+ import os
+-import urllib.request
+ import logging
+ from typing import Optional, Dict, Any, List
+ 
+@@ -126,9 +125,11 @@ def _ensure_checkpoint(cls, checkpoint_path: Optional[str], model_type: str) ->
+             url = cls._MODEL_URLS.get(model_type)
+             if url is None:
+                 raise ValueError(f"Unknown model type: '{model_type}'. Cannot download.")
+-            logger.info(f"Downloading SAM checkpoint for '{model_type}' ...")
+-            urllib.request.urlretrieve(url, checkpoint_path)
+-            logger.info(f"Saved to '{checkpoint_path}'.")
++            # Locked and published whole: concurrent analyses on a fresh
++            # machine download once and never load a half-written .pth.
++            from scilink.utils.download import download_once
++            logger.info(f"Fetching SAM checkpoint for '{model_type}' ...")
++            download_once(url, checkpoint_path, logger=logger)
+ 
+         return checkpoint_path
+ 
+diff --git a/scilink/skills/structure_matching/_backends/cod.py b/scilink/skills/structure_matching/_backends/cod.py
+index b03712a99..85491d6e6 100644
+--- a/scilink/skills/structure_matching/_backends/cod.py
++++ b/scilink/skills/structure_matching/_backends/cod.py
+@@ -350,7 +350,12 @@ def _locate_cif(self, cid: int) -> Optional[Path]:
+         if cached.is_file():
+             return cached
+         try:
+-            urllib.request.urlretrieve(_COD_CIF_URL.format(cid=sid), cached)
++            # Published whole: two matchers fetching one id never share a file.
++            from scilink.utils.download import download_once
++            # One lock for the whole cache: a lock file beside every 10 KB
++            # CIF would double the cache's file count.
++            download_once(_COD_CIF_URL.format(cid=sid), cached, timeout=30,
++                          lock=self._cache_dir)
+             return cached
+         except Exception as exc:
+             _logger.debug("COD %s CIF fetch failed: %s", cid, exc)
+diff --git a/scilink/utils/download.py b/scilink/utils/download.py
+new file mode 100644
+index 000000000..b601a96ce
+--- /dev/null
++++ b/scilink/utils/download.py
+@@ -0,0 +1,129 @@
++"""Downloads into a shared cache: once per machine, never half-visible.
++
++Model weights and reference files are cached per machine (``~/.scilink/models``
++and friends) and fetched on first use. Several analyses can reach the same
++missing file at the same moment — fan-out branches, best-of-N candidates,
++series replays in spawned processes — and the cache used to be written the
++simple way: straight to the final path (SAM's ``urlretrieve``) or through a
++fixed ``.part`` name (the DCNN ensemble). Two writers then share one file, and
++a reader that checks ``os.path.exists`` can load a checkpoint that is still
++arriving.
++
++``download_once`` closes both windows: the destination is locked for the whole
++download (across threads and processes), the existence check is repeated once
++the lock is held so the second caller reuses the first caller's file, the
++bytes go to a unique temp file in the destination directory, and the file is
++published with ``os.replace`` only when complete. A reader never sees a
++partial file, only no file or the whole one.
++"""
++from __future__ import annotations
++
++import contextlib
++import logging
++import os
++import secrets
++import shutil
++import urllib.request
++from pathlib import Path
++from typing import Any, Optional
++
++from scilink.utils.file_lock import path_lock
++
++_logger = logging.getLogger(__name__)
++
++
++class DownloadError(OSError):
++    """A download that did not produce a complete file."""
++
++
++def _usable(p: Path) -> bool:
++    try:
++        return p.is_file() and p.stat().st_size > 0
++    except OSError:
++        return False
++
++
++def unique_sibling(parent: Any, prefix: str, suffix: str, *, directory: bool = False) -> Path:
++    """Create a new, uniquely named file (or directory) in ``parent`` and
++    return its path.
++
++    Created with ``O_EXCL`` and mode ``0o666`` (``0o777`` for a directory),
++    so the kernel applies the umask. Reading the umask instead
++    (``os.umask(0)`` then restoring it) briefly changes it for the whole
++    process, and threads racing through that window leave files world-writable
++    or the umask at 0 for the rest of the session.
++    """
++    parent = Path(parent)
++    parent.mkdir(parents=True, exist_ok=True)
++    for _ in range(100):
++        cand = parent / f"{prefix}{secrets.token_hex(6)}{suffix}"
++        try:
++            if directory:
++                os.mkdir(cand, 0o777)
++            else:
++                os.close(os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY
++                                 | getattr(os, "O_BINARY", 0), 0o666))
++            return cand
++        except FileExistsError:
++            continue
++    raise FileExistsError(f"could not create a unique name in {parent}")
++
++
++def fetch_to(url: str, dest: Any, *, timeout: float = 60.0) -> Path:
++    """Stream ``url`` into ``dest`` through a unique same-directory temp file,
++    published with ``os.replace``. Raises ``DownloadError`` (removing the
++    temp file) when the transfer fails or ends short of its Content-Length.
++    No lock: callers that share ``dest`` use ``download_once``."""
++    p = Path(dest)
++    tmp = unique_sibling(p.parent, f".{p.name}.", ".part")
++    try:
++        with open(tmp, "wb") as fh, urllib.request.urlopen(url, timeout=timeout) as resp:
++            expected = resp.headers.get("Content-Length")
++            shutil.copyfileobj(resp, fh, length=1 << 20)
++            written = fh.tell()
++        if expected is not None and expected.isdigit() and written != int(expected):
++            raise DownloadError(f"{url}: received {written} of {expected} bytes")
++        try:
++            os.replace(tmp, p)
++        except PermissionError:
++            # Windows: another process has the destination open. If it holds
++            # a complete file, that is the one to use.
++            if not _usable(p):
++                raise
++            os.unlink(tmp)
++        return p
++    except BaseException as exc:
++        with contextlib.suppress(OSError):
++            os.unlink(tmp)
++        if isinstance(exc, DownloadError) or not isinstance(exc, Exception):
++            raise
++        raise DownloadError(f"{url}: {exc}") from exc
++
++
++def download_once(url: str, dest: Any, *, timeout: float = 60.0,
++                  logger: Optional[logging.Logger] = None,
++                  lock: Any = None) -> Path:
++    """Return ``dest``, downloading it from ``url`` first if it is missing.
++
++    Concurrent callers for the same ``dest`` download it once: the rest wait
++    on the lock and then find the file. ``lock`` names what to lock instead
++    of ``dest`` itself (one lock for a directory of small files, rather than
++    a lock file beside each). Raises ``DownloadError`` on failure, leaving no
++    file at ``dest``.
++    """
++    log = logger or _logger
++    p = Path(dest)
++    if _usable(p):
++        return p
++    with path_lock(lock if lock is not None else p, label=p.name):
++        if _usable(p):          # another worker finished it while we waited
++            return p
++        log.info(f"Downloading {url} ...")
++        try:
++            fetch_to(url, p, timeout=timeout)
++        except DownloadError:
++            if _usable(p):      # unlocked filesystem: another writer won
++                return p
++            raise
++        log.info(f"Saved {p.stat().st_size / 1e6:.0f} MB to '{p}'.")
++        return p
+diff --git a/scilink/utils/file_lock.py b/scilink/utils/file_lock.py
+new file mode 100644
+index 000000000..d5cb4681d
+--- /dev/null
++++ b/scilink/utils/file_lock.py
+@@ -0,0 +1,191 @@
++"""A cross-process, cross-thread exclusive lock on a path.
++
++Shared stores under ``~/.scilink`` (model weights, knowledge bases, the
++sessions index) are written by several analyses at once: fan-out branches and
++best-of-N candidates are threads, series replays and separate CLI sessions are
++processes. ``path_lock`` serializes a read-modify-write on one path across all
++of them. It is the same ``flock`` pattern as the script bank's domain lock,
++without the bank's re-entrancy bookkeeping.
++
++Platforms:
++
++- POSIX: ``flock`` on a freshly opened descriptor, which conflicts with every
++  other descriptor on the file, in this process or another. The kernel
++  releases it when the holder dies.
++- Windows: ``msvcrt.locking`` on byte 0 of the lock file, also per handle, so
++  it covers threads and processes alike.
++- A filesystem that does not support locking (some HPC Lustre, GPFS or NFS
++  mounts raise ``ENOTSUP`` / ``ENOLCK``): the caller runs unlocked, with one
++  warning. Callers publish atomically, so the cost is a possible duplicate of
++  the work, never a torn file.
++"""
++from __future__ import annotations
++
++import contextlib
++import errno
++import logging
++import threading
++import time
++from pathlib import Path
++from typing import Any, Iterator, Optional
++
++_logger = logging.getLogger(__name__)
++
++# Neither fcntl nor msvcrt (an exotic platform): threads still serialize,
++# processes do not.
++_local_locks: dict = {}
++_local_locks_guard = threading.Lock()
++
++_UNSUPPORTED_ERRNOS = {errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOLCK, errno.EINVAL,
++                       getattr(errno, "ENOSYS", errno.ENOTSUP)}
++_warned_unsupported: set = set()
++
++
++class _Unsupported(Exception):
++    """The filesystem holding the lock file cannot lock."""
++
++
++def lock_file_for(path: Any) -> Path:
++    """The lock file that guards ``path``: ``<path>.lock`` beside it."""
++    p = Path(path)
++    return p.parent / f"{p.name}.lock"
++
++
++def _try_acquire(fh) -> bool:
++    """One non-blocking attempt. True when held, False when someone else
++    holds it; raises ``_Unsupported`` when the filesystem cannot lock."""
++    try:
++        import fcntl
++    except ImportError:
++        fcntl = None
++    if fcntl is not None:
++        try:
++            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            return True
++        except BlockingIOError:
++            return False
++        except OSError as exc:
++            if exc.errno in (errno.EAGAIN, errno.EACCES):
++                return False
++            if exc.errno in _UNSUPPORTED_ERRNOS:
++                raise _Unsupported(exc) from exc
++            raise
++    import msvcrt                                    # Windows
++    fh.seek(0)
++    try:
++        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
++        return True
++    except OSError as exc:
++        # Only "someone holds it" means held; anything else (a share that
++        # cannot lock) falls back to running unlocked, as flock's ENOTSUP does.
++        if exc.errno in (errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK)):
++            return False
++        raise _Unsupported(exc) from exc
++
++
++def _acquire_blocking(fh) -> None:
++    try:
++        import fcntl
++    except ImportError:
++        fcntl = None
++    if fcntl is not None:
++        try:
++            fcntl.flock(fh, fcntl.LOCK_EX)
++            return
++        except OSError as exc:
++            if exc.errno in _UNSUPPORTED_ERRNOS:
++                raise _Unsupported(exc) from exc
++            raise
++    while not _try_acquire(fh):                      # Windows: no blocking call
++        time.sleep(0.2)
++
++
++def _release(fh) -> None:
++    try:
++        import fcntl
++    except ImportError:
++        fcntl = None
++    if fcntl is not None:
++        fcntl.flock(fh, fcntl.LOCK_UN)
++        return
++    import msvcrt
++    fh.seek(0)
++    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
++
++
++def _has_os_lock() -> bool:
++    for name in ("fcntl", "msvcrt"):
++        try:
++            __import__(name)
++            return True
++        except ImportError:
++            continue
++    return False
++
++
++def _warn_unsupported(lock_path: Path, exc: BaseException) -> None:
++    key = str(lock_path.parent)
++    if key not in _warned_unsupported:
++        _warned_unsupported.add(key)
++        _logger.warning(f"File locking is not supported under {lock_path.parent} ({exc}); "
++                        "continuing without a lock. Concurrent writers may duplicate work "
++                        "there, but never see a partial file.")
++
++
++@contextlib.contextmanager
++def path_lock(path: Any, *, label: Optional[str] = None) -> Iterator[None]:
++    """Exclusive lock on ``path`` held through ``<path>.lock`` beside it,
++    across threads and processes. Not reentrant.
++
++    ``label`` names what is being waited for in the log line written when
++    another holder has it (a waiting fan-out branch otherwise spends its
++    wall-clock budget without saying why).
++    """
++    lock_path = lock_file_for(path)
++    lock_path.parent.mkdir(parents=True, exist_ok=True)
++    if not _has_os_lock():                           # pragma: no cover - exotic platform
++        with _local_locks_guard:
++            lock = _local_locks.setdefault(str(lock_path), threading.Lock())
++        with lock:
++            yield
++        return
++    fh = open(lock_path, "a+b")
++    try:
++        unsupported = None
++        try:
++            if not _try_acquire(fh):
++                _logger.info(f"Waiting for another process working on {label or Path(path).name} ...")
++                _acquire_blocking(fh)
++        except _Unsupported as exc:
++            unsupported = exc
++        if unsupported is not None:
++            # Yielded outside the except block, so an error raised by the
++            # caller's body does not carry "During handling of ..." noise.
++            _warn_unsupported(lock_path, unsupported.__cause__ or unsupported)
++            yield
++            return
++        try:
++            yield
++        finally:
++            _release(fh)
++    finally:
++        fh.close()
++
++
++def is_locked(path: Any) -> bool:
++    """Whether another holder has ``path_lock(path)`` right now. Never
++    blocks; False where locking is unsupported or the lock file is absent."""
++    lock_path = lock_file_for(path)
++    if not lock_path.exists() or not _has_os_lock():
++        return False
++    try:
++        with open(lock_path, "a+b") as fh:
++            try:
++                if _try_acquire(fh):
++                    _release(fh)
++                    return False
++                return True
++            except _Unsupported:
++                return False
++    except OSError:
++        return False
+diff --git a/tests/test_download_once.py b/tests/test_download_once.py
+new file mode 100644
+index 000000000..8c6e00314
+--- /dev/null
++++ b/tests/test_download_once.py
+@@ -0,0 +1,480 @@
++"""Shared-cache downloads happen once and are never half-visible.
++
++Several analyses can reach the same missing model file at once: fan-out
++branches, best-of-N candidates, series replays in spawned processes. SAM wrote
++straight to its final path behind an ``os.path.exists`` check, so a second
++worker could load a checkpoint that was still arriving; the DCNN ensemble went
++through one fixed ``.part`` name, so two downloaders wrote into the same file.
++These tests drive the real download path against a slow local HTTP server.
++"""
++
++import io
++import logging
++import os
++import subprocess
++import sys
++import threading
++import time
++import zipfile
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++
++from scilink.utils.download import DownloadError, download_once
++
++PAYLOAD = os.urandom(256 * 1024)
++
++
++class _Server:
++    def __init__(self, payload=PAYLOAD, chunk=16 * 1024, delay=0.02, truncate=False):
++        self.payload, self.chunk, self.delay, self.truncate = payload, chunk, delay, truncate
++        self.hits = 0
++        self._lock = threading.Lock()
++        server = self
++
++        class Handler(BaseHTTPRequestHandler):
++            def do_GET(self):
++                with server._lock:
++                    server.hits += 1
++                self.send_response(200)
++                self.send_header("Content-Length", str(len(server.payload)))
++                self.end_headers()
++                body = server.payload[: len(server.payload) // 2] if server.truncate else server.payload
++                for i in range(0, len(body), server.chunk):
++                    self.wfile.write(body[i:i + server.chunk])
++                    self.wfile.flush()
++                    time.sleep(server.delay)
++
++            def log_message(self, *args):
++                pass
++
++        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/weights.bin"
++        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
++
++    def close(self):
++        self.httpd.shutdown()
++        self.httpd.server_close()
++
++
++@pytest.fixture
++def server():
++    s = _Server()
++    yield s
++    s.close()
++
++
++def _leftovers(d: Path):
++    return [p.name for p in d.iterdir() if p.name.endswith(".part")]
++
++
++def test_concurrent_threads_download_once_and_all_get_the_whole_file(server, tmp_path):
++    dest = tmp_path / "models" / "sam_vit_b.pth"
++    results, errors = [], []
++
++    def worker():
++        try:
++            results.append(download_once(server.url, dest).read_bytes())
++        except Exception as exc:  # noqa: BLE001
++            errors.append(exc)
++
++    threads = [threading.Thread(target=worker) for _ in range(8)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert errors == []
++    assert server.hits == 1
++    assert len(results) == 8 and all(r == PAYLOAD for r in results)
++    assert _leftovers(dest.parent) == []
++
++
++def test_concurrent_processes_download_once(server, tmp_path):
++    """Spawned series replays are processes, not threads: the lock must hold
++    across them too."""
++    dest = tmp_path / "models" / "w.bin"
++    code = ("import sys; from scilink.utils.download import download_once; "
++            "p = download_once(sys.argv[1], sys.argv[2]); print(p.stat().st_size)")
++    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
++        [str(Path(__file__).resolve().parents[1])] + [p for p in [os.environ.get("PYTHONPATH")] if p]))
++    procs = [subprocess.Popen([sys.executable, "-c", code, server.url, str(dest)],
++                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
++             for _ in range(3)]
++    outs = [p.communicate(timeout=120) for p in procs]
++    assert [p.returncode for p in procs] == [0, 0, 0], [o[1].decode()[-500:] for o in outs]
++    assert server.hits == 1
++    assert all(o[0].strip() == str(len(PAYLOAD)).encode() for o in outs)
++    assert dest.read_bytes() == PAYLOAD
++
++
++def test_a_reader_never_sees_a_partial_file(server, tmp_path):
++    dest = tmp_path / "w.bin"
++    seen = []
++    t = threading.Thread(target=download_once, args=(server.url, dest))
++    t.start()
++    while t.is_alive():
++        if dest.exists():
++            seen.append(dest.stat().st_size)
++        time.sleep(0.005)
++    t.join()
++    assert all(size == len(PAYLOAD) for size in seen)
++    assert dest.read_bytes() == PAYLOAD
++
++
++def test_a_short_transfer_fails_and_leaves_nothing_behind(tmp_path):
++    s = _Server(truncate=True)
++    try:
++        dest = tmp_path / "w.bin"
++        with pytest.raises(DownloadError):
++            download_once(s.url, dest)
++        assert not dest.exists()
++        assert _leftovers(tmp_path) == []
++    finally:
++        s.close()
++
++
++def test_a_failed_download_releases_the_lock_for_the_next_try(server, tmp_path):
++    dest = tmp_path / "w.bin"
++    with pytest.raises(DownloadError):
++        download_once("http://127.0.0.1:9/nothing", dest, timeout=2)
++    assert download_once(server.url, dest).read_bytes() == PAYLOAD
++
++
++def test_a_downloaded_file_gets_the_umask_mode_not_mkstemps_0600(server, tmp_path):
++    dest = tmp_path / "w.bin"
++    download_once(server.url, dest)
++    umask = os.umask(0)
++    os.umask(umask)
++    assert dest.stat().st_mode & 0o777 == 0o666 & ~umask
++
++
++def test_an_existing_file_is_not_fetched_again(server, tmp_path):
++    dest = tmp_path / "w.bin"
++    dest.write_bytes(b"cached")
++    assert download_once(server.url, dest).read_bytes() == b"cached"
++    assert server.hits == 0
++
++
++def test_sam_checkpoint_is_fetched_once_by_concurrent_analyzers(server, tmp_path, monkeypatch):
++    from scilink.skills._shared import particle_analyzer as pa
++    monkeypatch.setitem(pa.ParticleAnalyzer._MODEL_URLS, "vit_b", server.url)
++    monkeypatch.setenv("SCILINK_MODELS", str(tmp_path / "models"))
++    monkeypatch.setenv("HOME", str(tmp_path))            # no legacy cache in the way
++    paths = []
++    threads = [threading.Thread(target=lambda: paths.append(
++        pa.ParticleAnalyzer._ensure_checkpoint(None, "vit_b"))) for _ in range(4)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++    assert server.hits == 1
++    assert len(set(paths)) == 1 and Path(paths[0]).read_bytes() == PAYLOAD
++
++
++# ── the DCNN ensemble: one download, and the folder appears whole ────────────
++
++N_MEMBERS = 5
++
++
++def _ensemble_zip() -> bytes:
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w") as z:
++        for i in range(N_MEMBERS):
++            z.writestr(f"atomnet_ensemble/atomnet3_{i}.tar", os.urandom(64 * 1024))
++    return buf.getvalue()
++
++
++def test_concurrent_dcnn_requests_download_once_and_never_see_part_of_the_ensemble(tmp_path, monkeypatch):
++    from scilink.skills._shared import atomistic_model_manager as mm
++    from scilink.skills.image_analysis.atomic_stem import atomic_stem as tools
++
++    s = _Server(payload=_ensemble_zip(), chunk=8 * 1024, delay=0.01)
++
++    def slow_unzip(zip_path, out_dir, logger):
++        # Extract one member at a time, slowly, so a reader has every chance
++        # to catch a folder holding only some of them.
++        with zipfile.ZipFile(zip_path) as z:
++            for member in z.namelist():
++                z.extract(member, out_dir)
++                time.sleep(0.05)
++        return True
++
++    monkeypatch.setattr(tools, "unzip_file", slow_unzip)
++    monkeypatch.setenv("SCILINK_MODELS", str(tmp_path / "models"))
++    monkeypatch.chdir(tmp_path)
++    settings = {"dcnn_model_url": s.url}
++    target = tmp_path / "models" / "dcnn_trained"
++    partial_views, stop = [], threading.Event()
++
++    def watch():
++        while not stop.is_set():
++            members = list(target.glob("**/atomnet3_*.tar")) if target.exists() else []
++            if 0 < len(members) < N_MEMBERS:
++                partial_views.append(len(members))
++            time.sleep(0.002)
++
++    watcher = threading.Thread(target=watch)
++    watcher.start()
++    results = []
++    workers = [threading.Thread(target=lambda: results.append(
++        mm.get_or_download_atomistic_model(settings, logging.getLogger("t")))) for _ in range(4)]
++    try:
++        for t in workers:
++            t.start()
++        for t in workers:
++            t.join()
++    finally:
++        stop.set()
++        watcher.join()
++        s.close()
++    assert s.hits == 1
++    assert partial_views == []
++    assert len(set(results)) == 1 and results[0] is not None
++    assert len(list(Path(results[0]).glob("atomnet3_*.tar"))) == N_MEMBERS
++    umask = os.umask(0)
++    os.umask(umask)
++    assert target.stat().st_mode & 0o777 == 0o777 & ~umask     # not mkdtemp's 0700
++    leftovers = [p.name for p in (tmp_path / "models").iterdir() if p.name.startswith(".dcnn_trained.")
++                 and not p.name.endswith(".lock")]
++    assert leftovers == []
++
++
++def test_an_incomplete_dcnn_folder_is_moved_aside_not_deleted(tmp_path, monkeypatch):
++    from scilink.skills._shared import atomistic_model_manager as mm
++
++    s = _Server(payload=_ensemble_zip(), delay=0)
++    monkeypatch.setenv("SCILINK_MODELS", str(tmp_path / "models"))
++    monkeypatch.chdir(tmp_path)
++    target = tmp_path / "models" / "dcnn_trained"
++    target.mkdir(parents=True)
++    (target / "notes.txt").write_text("mine")          # no model files: incomplete
++    try:
++        path = mm.get_or_download_atomistic_model({"dcnn_model_url": s.url}, logging.getLogger("t"))
++    finally:
++        s.close()
++    assert len(list(Path(path).glob("atomnet3_*.tar"))) == N_MEMBERS
++    kept = list((tmp_path / "models").glob(".dcnn_trained.*.stale/dcnn_trained/notes.txt"))
++    assert len(kept) == 1 and kept[0].read_text() == "mine"
++
++
++# ── review follow-ups ─────────────────────────────────────────────────────
++
++def test_concurrent_downloads_never_touch_the_process_umask(tmp_path):
++    """Reading the umask (umask(0) then restore) changed it for the whole
++    process; threads racing through that window left files world-writable
++    or the umask at 0. Files are now created with the umask applied by the
++    kernel, so neither the downloads nor an unrelated writer can see it move."""
++    import sys
++    servers = [_Server(chunk=8 * 1024, delay=0.001) for _ in range(4)]
++    before = os.umask(0o022)
++    old_switch = sys.getswitchinterval()
++    sys.setswitchinterval(1e-6)
++    try:
++        stop = threading.Event()
++        unrelated = []
++
++        def writer():
++            i = 0
++            while not stop.is_set():
++                f = tmp_path / "results" / f"r{i}.txt"
++                f.parent.mkdir(exist_ok=True)
++                f.write_text("x")
++                unrelated.append(f)
++                i += 1
++
++        w = threading.Thread(target=writer)
++        w.start()
++        dests = [tmp_path / "cache" / f"w{i}.bin" for i in range(4)]
++        ts = [threading.Thread(target=download_once, args=(s.url, d)) for s, d in zip(servers, dests)]
++        for t in ts:
++            t.start()
++        for t in ts:
++            t.join()
++        stop.set()
++        w.join()
++        assert os.umask(0o022) == 0o022                  # untouched
++        assert all(d.stat().st_mode & 0o777 == 0o644 for d in dests)
++        assert unrelated and all(f.stat().st_mode & 0o777 == 0o644 for f in unrelated)
++    finally:
++        sys.setswitchinterval(old_switch)
++        os.umask(before)
++        for s in servers:
++            s.close()
++
++
++def test_a_filesystem_without_locking_still_downloads(server, tmp_path, monkeypatch, caplog):
++    """HPC mounts without flock raise ENOTSUP/ENOLCK: run unlocked (atomic
++    publish still holds), warn once, never fail the model."""
++    import errno
++    import fcntl
++    import logging as _logging
++    from scilink.utils import file_lock
++    real = fcntl.flock
++
++    def unsupported(fh, op):
++        if op & (fcntl.LOCK_EX | fcntl.LOCK_NB):
++            raise OSError(errno.ENOTSUP, "Operation not supported")
++        return real(fh, op)
++
++    monkeypatch.setattr(fcntl, "flock", unsupported)
++    file_lock._warned_unsupported.clear()
++    with caplog.at_level(_logging.WARNING, logger="scilink.utils.file_lock"):
++        a = download_once(server.url, tmp_path / "a.bin")
++        b = download_once(server.url, tmp_path / "b.bin")
++    assert a.read_bytes() == PAYLOAD and b.read_bytes() == PAYLOAD
++    assert sum("not supported" in r.message for r in caplog.records) == 1
++
++
++def test_the_windows_lock_serializes_across_handles(tmp_path, monkeypatch):
++    """No fcntl: path_lock uses msvcrt.locking on byte 0 of the lock file.
++    Simulated with a fake msvcrt whose locks conflict across handles."""
++    import sys
++    import types
++    held, guard = {}, threading.Lock()
++
++    def locking(fd, mode, nbytes):
++        key = os.fstat(fd).st_ino
++        with guard:
++            if mode == fake.LK_UNLCK:
++                held.pop(key, None)
++                return
++            if key in held:
++                raise OSError(13, "locked")
++            held[key] = fd
++
++    fake = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=locking)
++    monkeypatch.setitem(sys.modules, "fcntl", None)
++    monkeypatch.setitem(sys.modules, "msvcrt", fake)
++    from scilink.utils.file_lock import is_locked, path_lock
++    inside, overlap = [0], []
++
++    def work():
++        with path_lock(tmp_path / "x"):
++            inside[0] += 1
++            overlap.append(inside[0])
++            time.sleep(0.05)
++            inside[0] -= 1
++
++    ts = [threading.Thread(target=work) for _ in range(4)]
++    for t in ts:
++        t.start()
++    for t in ts:
++        t.join()
++    assert max(overlap) == 1
++    with path_lock(tmp_path / "x"):
++        assert is_locked(tmp_path / "x")
++    assert not is_locked(tmp_path / "x")
++
++
++def test_is_locked_sees_a_holder_in_another_process(tmp_path):
++    from scilink.utils.file_lock import is_locked
++    target = tmp_path / "kb"
++    code = ("import sys, time; from scilink.utils.file_lock import path_lock\n"
++            "with path_lock(sys.argv[1]):\n    print('held', flush=True); time.sleep(5)")
++    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
++    p = subprocess.Popen([sys.executable, "-c", code, str(target)], env=env, stdout=subprocess.PIPE, text=True)
++    try:
++        assert p.stdout.readline().strip() == "held"
++        assert is_locked(target)
++    finally:
++        p.kill()
++        p.wait()
++    assert not is_locked(target)                      # the kernel released it
++
++
++def test_a_waiter_says_what_it_is_waiting_for(server, tmp_path, caplog):
++    import logging as _logging
++    from scilink.utils.file_lock import path_lock
++    dest = tmp_path / "big.pth"
++    release = threading.Event()
++
++    def holder():
++        with path_lock(dest):
++            release.wait(5)
++
++    h = threading.Thread(target=holder)
++    h.start()
++    time.sleep(0.1)
++    with caplog.at_level(_logging.INFO, logger="scilink.utils.file_lock"):
++        t = threading.Thread(target=download_once, args=(server.url, dest))
++        t.start()
++        time.sleep(0.3)
++        release.set()
++        t.join()
++        h.join()
++    assert any("Waiting for another process working on big.pth" in r.message for r in caplog.records)
++
++
++def test_a_complete_ensemble_published_meanwhile_is_kept(tmp_path, monkeypatch):
++    """Where locking is unavailable a second publisher used to move a
++    complete ensemble aside (and leave a 770 MB .stale copy): it now keeps
++    the one already there."""
++    from scilink.skills._shared import atomistic_model_manager as mm
++    from scilink.skills.image_analysis.atomic_stem import atomic_stem as tools
++    out = tmp_path / "dcnn_trained"
++
++    def fake_url(url, dest, logger):
++        Path(dest).write_bytes(_ensemble_zip())
++        # meanwhile another process publishes a complete ensemble
++        (out / "atomnet_ensemble").mkdir(parents=True)
++        for i in range(N_MEMBERS):
++            (out / "atomnet_ensemble" / f"atomnet3_{i}.tar").write_bytes(b"theirs")
++        return dest
++
++    monkeypatch.setattr(mm, "_download_url", fake_url)
++    assert mm._download_and_extract_model("gid", str(out), logging.getLogger("t"), url="https://x/y.zip")
++    assert (out / "atomnet_ensemble" / "atomnet3_0.tar").read_bytes() == b"theirs"
++    assert sorted(p.name for p in tmp_path.iterdir()) == ["dcnn_trained"]    # no .stale, no staging
++
++
++def test_no_download_or_publish_path_touches_the_umask(server, tmp_path, monkeypatch):
++    """The race above is two syscalls wide and rarely shows in a test; this
++    pins the property itself: nothing on these paths calls os.umask."""
++    from scilink.skills._shared import atomistic_model_manager as mm
++    calls = []
++    real = os.umask
++    monkeypatch.setattr(os, "umask", lambda m: calls.append(m) or real(m))
++    download_once(server.url, tmp_path / "a.bin")
++    s = _Server(payload=_ensemble_zip(), delay=0)
++    try:
++        mm._download_and_extract_model("gid", str(tmp_path / "dcnn_trained"), logging.getLogger("t"), url=s.url)
++    finally:
++        s.close()
++    assert calls == []
++
++
++def test_a_windows_share_that_cannot_lock_runs_unlocked(tmp_path, monkeypatch):
++    """Only EACCES/EDEADLOCK from msvcrt.locking means 'held'; any other
++    error (a share without locking) must not poll forever."""
++    import sys
++    import types
++    import errno as _errno
++    from scilink.utils import file_lock
++
++    def locking(fd, mode, nbytes):
++        raise OSError(_errno.EINVAL, "locking not supported on this share")
++
++    monkeypatch.setitem(sys.modules, "fcntl", None)
++    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=locking))
++    file_lock._warned_unsupported.clear()
++    ran = []
++    with file_lock.path_lock(tmp_path / "x"):
++        ran.append(True)
++    assert ran == [True]
++
++
++def test_an_error_in_an_unlocked_body_carries_no_lock_context(tmp_path, monkeypatch):
++    import errno as _errno
++    import fcntl
++    from scilink.utils import file_lock
++
++    def unsupported(fh, op):
++        raise OSError(_errno.ENOTSUP, "Operation not supported")
++
++    monkeypatch.setattr(fcntl, "flock", unsupported)
++    file_lock._warned_unsupported.clear()
++    with pytest.raises(ValueError) as info:
++        with file_lock.path_lock(tmp_path / "x"):
++            raise ValueError("body")
++    assert info.value.__context__ is None

@@ -1,0 +1,191 @@
+diff --git a/platforms/common/include/openmm/common/CommonKernels.h b/platforms/common/include/openmm/common/CommonKernels.h
+index bc49b20aad..c8432e7386 100644
+--- a/platforms/common/include/openmm/common/CommonKernels.h
++++ b/platforms/common/include/openmm/common/CommonKernels.h
+@@ -1384,7 +1384,7 @@ class CommonApplyMonteCarloBarostatKernel : public ApplyMonteCarloBarostatKernel
+ private:
+     ComputeContext& cc;
+     bool hasInitializedKernels, rigidMolecules, atomsWereReordered;
+-    int numMolecules, components;
++    int numMolecules, numLargeMolecules, components;
+     ComputeArray savedPositions, savedFloatForces, savedLongForces, savedVelocities;
+     ComputeArray moleculeAtoms, moleculeStartIndex;
+     std::vector<ComputeArray> energyBuffers;
+diff --git a/platforms/common/src/CommonKernels.cpp b/platforms/common/src/CommonKernels.cpp
+index 252c8d59a4..8e7b1a206c 100644
+--- a/platforms/common/src/CommonKernels.cpp
++++ b/platforms/common/src/CommonKernels.cpp
+@@ -4286,6 +4286,10 @@ void CommonApplyMonteCarloBarostatKernel::saveCoordinates(ContextImpl& context)
+                 molecules[i].push_back(i);
+         }
+         numMolecules = molecules.size();
++
++        // Molecules with many atoms are placed first, since the kernel processes them differently.
++
++        numLargeMolecules = stable_partition(molecules.begin(), molecules.end(), [] (const vector<int>& m) { return m.size() > 32; })-molecules.begin();
+         moleculeAtoms.initialize<int>(cc, cc.getNumAtoms(), "moleculeAtoms");
+         moleculeStartIndex.initialize<int>(cc, numMolecules+1, "moleculeStartIndex");
+         vector<int> atoms(moleculeAtoms.getSize());
+@@ -4302,12 +4306,9 @@ void CommonApplyMonteCarloBarostatKernel::saveCoordinates(ContextImpl& context)
+ 
+         // Initialize the kernel arguments.
+ 
+-        kernel->addArg();
+-        kernel->addArg();
+-        kernel->addArg();
+-        kernel->addArg();
+-        kernel->addArg();
+-        kernel->addArg();
++        for (int i = 0; i < 6; i++)
++            kernel->addArg();
++        kernel->addArg(numLargeMolecules);
+         kernel->addArg(numMolecules);
+         for (int i = 0; i < 5; i++)
+             kernel->addArg();
+@@ -4343,8 +4344,8 @@ void CommonApplyMonteCarloBarostatKernel::scaleCoordinates(ContextImpl& context,
+     kernel->setArg(3, (float) scaleXY);
+     kernel->setArg(4, (float) scaleXZ);
+     kernel->setArg(5, (float) scaleYZ);
+-    setPeriodicBoxArgs(cc, kernel, 7);
+-    kernel->execute(numMolecules);
++    setPeriodicBoxArgs(cc, kernel, 8);
++    kernel->execute(numMolecules, cc.ThreadBlockSize);
+ }
+ 
+ void CommonApplyMonteCarloBarostatKernel::restoreCoordinates(ContextImpl& context) {
+diff --git a/platforms/common/src/kernels/monteCarloBarostat.cc b/platforms/common/src/kernels/monteCarloBarostat.cc
+index 2947b04b2f..3678467d30 100644
+--- a/platforms/common/src/kernels/monteCarloBarostat.cc
++++ b/platforms/common/src/kernels/monteCarloBarostat.cc
+@@ -1,13 +1,51 @@
+ /**
+  * Apply an upper triangular deformation to the molecule centers.  When the shear factors
+  * (scaleXY, scaleXZ, scaleYZ) are zero this reduces to scaling each axis independently.
++ * Molecules with many atoms come first in the list, and each of those is processed by
++ * a whole work group so that its atoms are handled in parallel.  The remaining molecules
++ * are processed one per thread.
+  */
+ 
+ KERNEL void scalePositions(float scaleX, float scaleY, float scaleZ, float scaleXY, float scaleXZ, float scaleYZ,
+-        int numMolecules, real4 periodicBoxSize,
++        int numLargeMolecules, int numMolecules, real4 periodicBoxSize,
+         real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, GLOBAL real4* RESTRICT posq,
+         GLOBAL const int* RESTRICT moleculeAtoms, GLOBAL const int* RESTRICT moleculeStartIndex) {
+-    for (int index = GLOBAL_ID; index < numMolecules; index += GLOBAL_SIZE) {
++    LOCAL real3 tempBuffer[WORK_GROUP_SIZE];
++    for (int index = GROUP_ID; index < numLargeMolecules; index += NUM_GROUPS) {
++        int first = moleculeStartIndex[index];
++        int last = moleculeStartIndex[index+1];
++        int numAtoms = last-first;
++
++        // Find the center of the molecule.
++
++        real3 sum = make_real3(0, 0, 0);
++        for (int atom = first+LOCAL_ID; atom < last; atom += LOCAL_SIZE)
++            sum += trimTo3(posq[moleculeAtoms[atom]]);
++        tempBuffer[LOCAL_ID] = sum;
++        for (int i = 1; i < WORK_GROUP_SIZE; i *= 2) {
++            SYNC_THREADS;
++            if (LOCAL_ID%(i*2) == 0 && LOCAL_ID+i < WORK_GROUP_SIZE)
++                tempBuffer[LOCAL_ID] += tempBuffer[LOCAL_ID+i];
++        }
++        SYNC_THREADS;
++        real3 center = tempBuffer[0]*RECIP((real) numAtoms);
++
++        // Now apply the deformation to the position of the molecule center.
++
++        real3 delta;
++        delta.x = center.x*(scaleX-1) + center.y*scaleXY + center.z*scaleXZ;
++        delta.y = center.y*(scaleY-1) + center.z*scaleYZ;
++        delta.z = center.z*(scaleZ-1);
++        for (int atom = first+LOCAL_ID; atom < last; atom += LOCAL_SIZE) {
++            real4 pos = posq[moleculeAtoms[atom]];
++            pos.x += delta.x;
++            pos.y += delta.y;
++            pos.z += delta.z;
++            posq[moleculeAtoms[atom]] = pos;
++        }
++        SYNC_THREADS;
++    }
++    for (int index = numLargeMolecules+GLOBAL_ID; index < numMolecules; index += GLOBAL_SIZE) {
+         int first = moleculeStartIndex[index];
+         int last = moleculeStartIndex[index+1];
+         int numAtoms = last-first;
+diff --git a/tests/TestMonteCarloBarostat.h b/tests/TestMonteCarloBarostat.h
+index 827846fa77..76c2e6a7db 100644
+--- a/tests/TestMonteCarloBarostat.h
++++ b/tests/TestMonteCarloBarostat.h
+@@ -315,6 +315,65 @@ void testMoleculeScaling(bool rigid) {
+     }
+ }
+ 
++void testLargeMoleculeScaling() {
++    // Molecules with many atoms are scaled differently from small ones, so check a
++    // mixture of sizes: each molecule's center should scale with the box and its
++    // internal geometry should not change.
++
++    const vector<int> sizes = {2, 40, 3, 100, 33, 5, 1, 300, 32};
++    const int numMolecules = sizes.size();
++    double initialWidth = 4.0;
++    System system;
++    Vec3 initialBox[] = {Vec3(initialWidth, 0, 0), Vec3(0, initialWidth, 0), Vec3(0, 0, initialWidth)};
++    system.setDefaultPeriodicBoxVectors(initialBox[0], initialBox[1], initialBox[2]);
++    HarmonicBondForce* bonds = new HarmonicBondForce();
++    system.addForce(bonds);
++    NonbondedForce* nonbonded = new NonbondedForce();
++    nonbonded->setNonbondedMethod(NonbondedForce::CutoffPeriodic);
++    system.addForce(nonbonded);
++    system.addForce(new MonteCarloBarostat(1.0, 300.0, 1, true));
++    vector<Vec3> positions;
++    vector<int> firstAtom;
++    OpenMM_SFMT::SFMT sfmt;
++    init_gen_rand(0, sfmt);
++    for (int i = 0; i < numMolecules; i++) {
++        firstAtom.push_back(positions.size());
++        Vec3 pos(initialWidth*genrand_real2(sfmt), initialWidth*genrand_real2(sfmt), initialWidth*genrand_real2(sfmt));
++        for (int j = 0; j < sizes[i]; j++) {
++            int atom = system.addParticle(1.0);
++            nonbonded->addParticle(0.0, 0.1, 1.0);
++            if (j > 0) {
++                bonds->addBond(atom-1, atom, 0.1, 1000.0);
++                pos += Vec3(genrand_real2(sfmt)-0.5, genrand_real2(sfmt)-0.5, genrand_real2(sfmt)-0.5)*0.1;
++            }
++            positions.push_back(pos);
++        }
++    }
++    firstAtom.push_back(positions.size());
++    CustomIntegrator integrator(1.0);
++    integrator.addUpdateContextState();
++    Context context(system, integrator, platform);
++    context.setPositions(positions);
++    integrator.step(100);
++    State state = context.getState(State::Positions);
++    Vec3 finalBox[3];
++    state.getPeriodicBoxVectors(finalBox[0], finalBox[1], finalBox[2]);
++    ASSERT(finalBox[0][0] != initialBox[0][0]);
++    Vec3 boxScale(finalBox[0][0]/initialBox[0][0], finalBox[1][1]/initialBox[1][1], finalBox[2][2]/initialBox[2][2]);
++    for (int i = 0; i < numMolecules; i++) {
++        Vec3 center1, center2;
++        for (int atom = firstAtom[i]; atom < firstAtom[i+1]; atom++) {
++            center1 += positions[atom];
++            center2 += state.getPositions()[atom];
++        }
++        center1 /= sizes[i];
++        center2 /= sizes[i];
++        ASSERT_EQUAL_VEC(Vec3(center1[0]*boxScale[0], center1[1]*boxScale[1], center1[2]*boxScale[2]), center2, 1e-5);
++        for (int atom = firstAtom[i]+1; atom < firstAtom[i+1]; atom++)
++            ASSERT_EQUAL_VEC(positions[atom]-positions[atom-1], state.getPositions()[atom]-state.getPositions()[atom-1], 1e-5);
++    }
++}
++
+ void testMolecularGas(bool rigid) {
+     const int numMolecules = 256;
+     const int frequency = 5;
+@@ -558,6 +617,7 @@ int main(int argc, char* argv[]) {
+         testContinuity();
+         testMoleculeScaling(true);
+         testMoleculeScaling(false);
++        testLargeMoleculeScaling();
+         testMolecularGas(true);
+         testMolecularGas(false);
+         testRandomSeed();

@@ -1,0 +1,233 @@
+diff --git a/scilink/server/tools_api.py b/scilink/server/tools_api.py
+index 5a2041ec..4aca3a8e 100644
+--- a/scilink/server/tools_api.py
++++ b/scilink/server/tools_api.py
+@@ -16,6 +16,7 @@
+ from typing import Any, Dict, List, Optional
+ 
+ _DESC_MAX = 600
++_DETAIL_MAX = 8000  # a tool's own description, shown when its chip is opened
+ 
+ 
+ def _clip(text: Any) -> str:
+@@ -23,6 +24,30 @@ def _clip(text: Any) -> str:
+     return s if len(s) <= _DESC_MAX else s[:_DESC_MAX - 1] + "…"
+ 
+ 
++def _tool_detail(fn: Dict[str, Any]) -> Dict[str, Any]:
++    """A tool's description as its server wrote it (line breaks kept) and
++    its parameters read from the input schema."""
++    desc = str(fn.get("description") or "").strip()
++    if len(desc) > _DETAIL_MAX:
++        desc = desc[:_DETAIL_MAX - 1] + "…"
++    schema = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
++    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
++    required = set(schema.get("required") or [])
++    params = []
++    for pname, spec in props.items():
++        spec = spec if isinstance(spec, dict) else {}
++        ptype = spec.get("type")
++        if isinstance(ptype, list):
++            ptype = " | ".join(str(t) for t in ptype)
++        elif not ptype and isinstance(spec.get("anyOf"), list):
++            ptype = " | ".join(str(o.get("type")) for o in spec["anyOf"]
++                               if isinstance(o, dict) and o.get("type"))
++        params.append({"name": str(pname), "type": str(ptype or ""),
++                       "required": pname in required,
++                       "description": _clip(spec.get("description"))})
++    return {"name": str(fn.get("name", "")), "description": desc, "parameters": params}
++
++
+ def tool_inventory(agent: Any) -> Dict[str, Any]:
+     """``{external, mcp_servers, mcp_supported}`` for one agent."""
+     external = [{"name": str(t.get("name", "")), "description": _clip(t.get("description"))}
+@@ -32,15 +57,16 @@ def tool_inventory(agent: Any) -> Dict[str, Any]:
+     servers: List[Dict[str, Any]] = []
+     for name, conn in (getattr(agent, "_mcp_connections", None) or {}).items():
+         schemas = getattr(conn, "tool_schemas", None) or []
+-        tool_names = []
++        tool_names, details = [], []
+         for s in schemas:
+             fn = s.get("function", {}) if isinstance(s, dict) else {}
+             if fn.get("name"):
+                 tool_names.append(fn["name"])
++                details.append(_tool_detail(fn))
+         transport = ("stdio" if getattr(conn, "command", None)
+                      else getattr(conn, "transport", None) or "sse")
+         servers.append({"name": str(name), "transport": transport,
+-                        "tools": tool_names})
++                        "tools": tool_names, "tool_details": details})
+     return {
+         "external": external,
+         "mcp_servers": servers,
+diff --git a/tests/test_web_server.py b/tests/test_web_server.py
+index 51f75fd5..20dd2ef2 100644
+--- a/tests/test_web_server.py
++++ b/tests/test_web_server.py
+@@ -1202,7 +1202,11 @@ def connect_mcp_server(self, name, command=None, url=None, env=None,
+         self.calls.append((name, command, url, transport, headers))
+         if url == "http://bad":
+             raise RuntimeError("connection refused")
+-        schemas = [{"type": "function", "function": {"name": f"{name}_add", "description": "Add."}}]
++        schemas = [{"type": "function", "function": {
++            "name": f"{name}_add", "description": "Add.\n\nTwo numbers.",
++            "parameters": {"type": "object", "required": ["a"], "properties": {
++                "a": {"type": "number", "description": "First."},
++                "b": {"anyOf": [{"type": "number"}, {"type": "null"}]}}}}}]
+         self._mcp_connections[name] = SimpleNamespace(
+             tool_schemas=schemas, command=command, transport=transport or "sse")
+         self._external_tools.append({"name": f"{name}_add", "description": "Add."})
+@@ -1227,7 +1231,15 @@ def test_tools_inventory_and_mcp_lifecycle(client, tmp_path):
+     assert r.status_code == 200 and r.json()["registered"] == 1
+     assert session.agent.calls[-1][1] == ["python", "-m", "calc_server", "--x", "1"]
+     inv = r.json()["inventory"]
+-    assert inv["mcp_servers"] == [{"name": "calc", "transport": "stdio", "tools": ["calc_add"]}]
++    (server,) = inv["mcp_servers"]
++    assert {k: server[k] for k in ("name", "transport", "tools")} == {
++        "name": "calc", "transport": "stdio", "tools": ["calc_add"]}
++    # the server's own description (line breaks kept) and parameters, for the chip
++    assert server["tool_details"] == [{
++        "name": "calc_add", "description": "Add.\n\nTwo numbers.",
++        "parameters": [
++            {"name": "a", "type": "number", "required": True, "description": "First."},
++            {"name": "b", "type": "number | null", "required": False, "description": ""}]}]
+     assert inv["external"] == [{"name": "calc_add", "description": "Add."}]
+     # duplicate name → 409; http transport with headers; failure → 400
+     assert client.post(f"{base}/mcp", json={"name": "calc", "transport": "stdio", "command": "x"}).status_code == 409
+diff --git a/webui/src/api.ts b/webui/src/api.ts
+index 5f159f34..845a464c 100644
+--- a/webui/src/api.ts
++++ b/webui/src/api.ts
+@@ -430,9 +430,15 @@ export interface SkillCatalog {
+   skills_supported: boolean;
+ }
+ 
++export interface ToolDetail {
++  name: string;
++  description: string;
++  parameters: { name: string; type: string; required: boolean; description: string }[];
++}
++
+ export interface ToolInventory {
+   external: { name: string; description: string }[];
+-  mcp_servers: { name: string; transport: string; tools: string[] }[];
++  mcp_servers: { name: string; transport: string; tools: string[]; tool_details?: ToolDetail[] }[];
+   mcp_supported: boolean;
+ }
+ 
+diff --git a/webui/src/app.css b/webui/src/app.css
+index a4f9700d..68bc9acc 100644
+--- a/webui/src/app.css
++++ b/webui/src/app.css
+@@ -974,6 +974,12 @@ details.card iframe { width: 100%; height: 600px; border: none; background: #fff
+ .mcp-server-head { display: flex; align-items: center; gap: 4px; }
+ .mcp-server-head .icon-btn { margin-left: auto; }
+ .tool-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
++.tool-chip { cursor: pointer; font: inherit; font-size: 12px; }
++.tool-chip:hover, .tool-chip.open { color: var(--accent); border-color: var(--accent); }
++.tool-detail { margin-top: 8px; padding: 8px 10px; border-left: 2px solid var(--accent); font-size: 13px; }
++.tool-detail-desc { margin: 0 0 6px; white-space: pre-wrap; }
++.tool-params { border-collapse: collapse; font-size: 12px; }
++.tool-params td { padding: 3px 12px 3px 0; vertical-align: top; }
+ .tool-list { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
+ .tool-list li { margin: 3px 0; }
+ 
+diff --git a/webui/src/components/ToolsPanel.tsx b/webui/src/components/ToolsPanel.tsx
+index 6c091fcf..189bf115 100644
+--- a/webui/src/components/ToolsPanel.tsx
++++ b/webui/src/components/ToolsPanel.tsx
+@@ -1,8 +1,9 @@
+ import { useCallback, useEffect, useState } from "react";
+-import { api, type ToolInventory } from "../api";
++import { api, type ToolDetail, type ToolInventory } from "../api";
+ 
+ /** MCP tab — connect MCP servers to the session's agent and disconnect
+- * them; each server card lists the tools it registered. Nothing else: the
++ * them; each server card lists the tools it registered, and a tool's chip
++ * opens its description and parameters. Nothing else: the
+  * agent's own built-in tools are not listed (in a meta session that would
+  * be only the meta's routing tools, not what the specialists can do), and
+  * there is deliberately no tool-file uploader — users hand code to the
+@@ -27,6 +28,8 @@ export function ToolsPanel({
+   const [name, setName] = useState("");
+   const [addr, setAddr] = useState("");
+   const [headers, setHeaders] = useState("");
++  // The open tool, keyed "<server>/<tool>"; one at a time.
++  const [openTool, setOpenTool] = useState<string | null>(null);
+ 
+   const refresh = useCallback(() => {
+     api.tools(sessionId).then(setInv).catch((e) => setError(String(e)));
+@@ -191,12 +194,30 @@ export function ToolsPanel({
+               </button>
+             </div>
+             <div className="tool-chips">
+-              {s.tools.map((t) => (
+-                <span key={t} className="file-chip" title={inv.external.find((e) => e.name === t)?.description}>
+-                  {t}
+-                </span>
+-              ))}
++              {s.tools.map((t) => {
++                const key = `${s.name}/${t}`;
++                return (
++                  <button
++                    key={t}
++                    type="button"
++                    className={`file-chip tool-chip${openTool === key ? " open" : ""}`}
++                    aria-expanded={openTool === key}
++                    onClick={() => setOpenTool(openTool === key ? null : key)}
++                  >
++                    {t}
++                  </button>
++                );
++              })}
+             </div>
++            {s.tools.map((t) =>
++              openTool === `${s.name}/${t}` ? (
++                <ToolDetailCard
++                  key={t}
++                  detail={s.tool_details?.find((d) => d.name === t)}
++                  fallback={inv.external.find((e) => e.name === t)?.description}
++                />
++              ) : null,
++            )}
+           </div>
+         ))}
+       </section>
+@@ -218,3 +239,37 @@ export function ToolsPanel({
+     </div>
+   );
+ }
++
++/** What an MCP tool says about itself: the server's description, line
++ * breaks kept, and the parameters from its input schema. `fallback` is the
++ * agent's registered (one-line) description, for a server that predates
++ * `tool_details`. */
++function ToolDetailCard({ detail, fallback }: { detail?: ToolDetail; fallback?: string }) {
++  const description = detail?.description || fallback || "";
++  const params = detail?.parameters ?? [];
++  return (
++    <div className="tool-detail">
++      {description ? (
++        <p className="tool-detail-desc">{description}</p>
++      ) : (
++        <p className="caption">The server gives no description for this tool.</p>
++      )}
++      {params.length > 0 && (
++        <table className="tool-params">
++          <tbody>
++            {params.map((p) => (
++              <tr key={p.name}>
++                <td>
++                  <code>{p.name}</code>
++                  {p.required && <span className="caption"> required</span>}
++                </td>
++                <td className="caption">{p.type}</td>
++                <td>{p.description}</td>
++              </tr>
++            ))}
++          </tbody>
++        </table>
++      )}
++    </div>
++  );
++}

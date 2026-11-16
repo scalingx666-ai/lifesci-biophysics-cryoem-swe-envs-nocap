@@ -1,0 +1,362 @@
+diff --git a/src/python/espressomd/particle_data.py b/src/python/espressomd/particle_data.py
+index 9e37b9314ac..98d23a16df2 100644
+--- a/src/python/espressomd/particle_data.py
++++ b/src/python/espressomd/particle_data.py
+@@ -25,7 +25,7 @@
+ from .utils import nesting_level, array_locked, is_valid_type
+ from .utils import check_type_or_throw_except
+ from .code_features import assert_features, has_features
+-from .script_interface import script_interface_register, ScriptInterfaceHelper
++from .script_interface import script_interface_register, ScriptInterfaceHelper, fast_tiling
+ from .propagation import Propagation
+ 
+ 
+@@ -1320,7 +1320,8 @@ def select(self, *args, **kwargs):
+ 
+ 
+ def set_slice_one_for_all(p_slice, attribute, value):
+-    set_slice_one_for_each(p_slice, attribute, [value] * len(p_slice))
++    set_slice_one_for_each(
++        p_slice, attribute, fast_tiling(value, len(p_slice)))
+ 
+ 
+ def set_slice_one_for_each(p_slice, attribute, values):
+@@ -1450,16 +1451,14 @@ def get_attribute(particle_slice, attribute):
+             values = []
+             for part in particle_slice._id_gen():
+                 values.append(getattr(part, attribute))
+-        else:
+-            values = particle_slice.call_method(
+-                "get_param_parallel", name=attribute)
+-            if attribute == "propagation":
+-                values = np.array([Propagation(value)
+-                                  for value in values], dtype=object)
+-            else:
+-                values = np.stack(values)
+-
+-        return values
++            return values
++        values = particle_slice.call_method(
++            "get_param_parallel", name=attribute)
++        if attribute == "propagation":
++            return np.array([Propagation(v) for v in values], dtype=object)
++        if isinstance(values, np.ndarray):
++            return values
++        return np.stack(values)
+ 
+     for attribute_name in sorted(particle_attributes):
+         if attribute_name in dir(ParticleSlice):
+diff --git a/src/python/espressomd/script_interface.pyx b/src/python/espressomd/script_interface.pyx
+index 8becc7c25c8..bc5ebcb6606 100644
+--- a/src/python/espressomd/script_interface.pyx
++++ b/src/python/espressomd/script_interface.pyx
+@@ -20,11 +20,13 @@ from libcpp.utility cimport pair
+ from libcpp.vector cimport vector
+ from libcpp.memory cimport shared_ptr, make_shared
+ import numpy as np
++cimport numpy as cnp
+ import pathlib
+ from . import utils
+ from .utils cimport Vector3b, Vector3i, Vector2d, Vector3d, Vector4d
+ from .utils cimport path
+ cimport cpython.object
++cnp.import_array()
+ 
+ 
+ cdef shared_ptr[ContextManager] _om
+@@ -226,6 +228,25 @@ class array_variant(np.ndarray):
+         return obj
+ 
+ 
++def fast_tiling(value, n):
++    """
++    Repeat a value (scalar or vector) multiple times.
++    Based on the value type, either a NumPy n-dimensional array is returned,
++    or a list of references to the original object (if mutable),
++    or a list of copies of the original object (if immutable).
++    """
++    if isinstance(value, np.ndarray) and value.ndim == 1 and len(value) != 0 and \
++            any(np.issubdtype(value.dtype, x) for x in (np.floating, np.signedinteger)) or \
++            isinstance(value, (list, tuple)) and len(value) != 0 and \
++            all(map(lambda x: isinstance(x, (int, np.signedinteger, float, np.floating))
++                    and not isinstance(x, type(True)), value)):
++        return np.tile(value, (n, 1))
++    if isinstance(value, (int, np.signedinteger, float, np.floating)) and \
++            not isinstance(value, type(True)):
++        return array_variant(np.repeat(value, n))
++    return n * [value]
++
++
+ cdef Variant python_object_to_variant(value) except *:
+     """Convert Python objects to C++ Variant objects."""
+ 
+@@ -236,10 +257,17 @@ cdef Variant python_object_to_variant(value) except *:
+     cdef unordered_map[string, Variant] map_str2var
+     cdef PObjectRef oref
+     cdef int[::1] view_int
++    cdef int[:, ::1] view_int_2d
+     cdef int * data_int
+     cdef double[::1] view_double
++    cdef double[:, ::1] view_double_2d
+     cdef double * data_double
+     cdef path fs_path
++    cdef size_t index
++    cdef size_t nrows
++    cdef size_t bufsize
++    cdef Vector3d vector3d
++    cdef Vector3i vector3i
+ 
+     if value is None:
+         return Variant()
+@@ -276,40 +304,80 @@ cdef Variant python_object_to_variant(value) except *:
+     if isinstance(value, pathlib.Path):
+         fs_path.assign(utils.to_bytes(str(value)))
+         return make_variant[path](fs_path)
+-    if isinstance(value, array_variant):
+-        if np.issubdtype(value.dtype, np.signedinteger):
+-            view_int = np.ascontiguousarray(value, dtype=np.int32)
+-            data_int = &view_int[0]
+-            vec_int.assign(data_int, data_int + len(view_int))
+-            return make_variant[vector[int]](vec_int)
+-        if np.issubdtype(value.dtype, np.floating):
+-            view_double = np.ascontiguousarray(value, dtype=np.float64)
+-            data_double = &view_double[0]
+-            vec_double.assign(data_double, data_double + len(view_double))
+-            return make_variant[vector[double]](vec_double)
+-    if hasattr(value, "__iter__"):
+-        if len(value) == 0:
+-            return make_variant[vector[Variant]](vec_variant)
+-        if isinstance(value, np.ndarray) and value.ndim == 1:
++    if isinstance(value, np.ndarray):
++        if isinstance(value, array_variant):
++            if np.issubdtype(value.dtype, np.signedinteger):
++                view_int = np.ascontiguousarray(value, dtype=np.int32)
++                data_int = &view_int[0]
++                vec_int.assign(data_int, data_int + len(view_int))
++                return make_variant[vector[int]](vec_int)
+             if np.issubdtype(value.dtype, np.floating):
++                view_double = np.ascontiguousarray(value, dtype=np.float64)
++                data_double = &view_double[0]
++                vec_double.assign(data_double, data_double + len(view_double))
++                return make_variant[vector[double]](vec_double)
++        if value.ndim == 1:
++            if np.issubdtype(value.dtype, np.floating):
++                vec_double.reserve(len(value))
+                 for e in value:
+                     vec_double.push_back(e)
+                 return make_variant[vector[double]](vec_double)
+             if np.issubdtype(value.dtype, np.signedinteger):
++                vec_int.reserve(len(value))
+                 for e in value:
+                     vec_int.push_back(e)
+                 return make_variant[vector[int]](vec_int)
++        if value.ndim == 2:
++            if np.issubdtype(value.dtype, np.signedinteger):
++                nrows = value.shape[0]
++                bufsize = value.shape[1]
++                vec_variant.reserve(nrows)
++                vec_int.reserve(bufsize)
++                view_int_2d = np.ascontiguousarray(value, dtype=np.int32)
++                for index in range(nrows):
++                    data_int = &view_int_2d[index, 0]
++                    vec_int.assign(data_int, data_int + bufsize)
++                    vec_variant.emplace_back(
++                        make_variant[vector[int]](vec_int))
++                return make_variant[vector[Variant]](vec_variant)
++            if np.issubdtype(value.dtype, np.floating):
++                nrows = value.shape[0]
++                bufsize = value.shape[1]
++                vec_variant.reserve(nrows)
++                vec_double.reserve(bufsize)
++                view_double_2d = np.ascontiguousarray(value, dtype=np.float64)
++                for index in range(nrows):
++                    data_double = &view_double_2d[index, 0]
++                    vec_double.assign(data_double, data_double + bufsize)
++                    vec_variant.emplace_back(
++                        make_variant[vector[double]](vec_double))
++                return make_variant[vector[Variant]](vec_variant)
++    if hasattr(value, "__iter__"):
++        bufsize = len(value)
++        if bufsize == 0:
++            return make_variant[vector[Variant]](vec_variant)
+         if all(map(lambda x: isinstance(x, (float, np.floating)), value)):
++            if bufsize == 3:
++                for index in range(bufsize):
++                    vector3d[index] = value[index]
++                return make_variant[Vector3d](vector3d)
++            vec_double.reserve(bufsize)
+             for e in value:
+                 vec_double.push_back(e)
+             return make_variant[vector[double]](vec_double)
+         if all(map(lambda x: isinstance(x, (int, np.integer))
+                    and not isinstance(x, type(True)), value)):
++            if bufsize == 3:
++                for index in range(bufsize):
++                    vector3i[index] = value[index]
++                return make_variant[Vector3i](vector3i)
++            vec_int.reserve(bufsize)
+             for e in value:
+                 vec_int.push_back(e)
+             return make_variant[vector[int]](vec_int)
++        vec_variant.reserve(bufsize)
+         for e in value:
+-            vec_variant.push_back(python_object_to_variant(e))
++            vec_variant.emplace_back(python_object_to_variant(e))
+         return make_variant[vector[Variant]](vec_variant)
+     if isinstance(value, (type(True), np.bool_)):
+         return make_variant[cbool](value)
+@@ -320,6 +388,7 @@ cdef Variant python_object_to_variant(value) except *:
+     raise TypeError(
+         f"No conversion from type '{type(value).__name__}' to 'Variant'")
+ 
++
+ cdef variant_to_python_object(const Variant & value):
+     """Convert C++ Variant objects to Python objects."""
+ 
+@@ -334,6 +403,9 @@ cdef variant_to_python_object(const Variant & value):
+     cdef Vector2d vec2d
+     cdef Vector3d vec3d
+     cdef Vector4d vec4d
++    cdef cnp.ndarray[cnp.float64_t, ndim = 2] arrayNvec3d
++    cdef size_t index
++    cdef size_t nrows
+     if is_none(value):
+         return None
+     if is_type[cbool](value):
+@@ -392,11 +464,25 @@ cdef variant_to_python_object(const Variant & value):
+             return None
+     if is_type[vector[Variant]](value):
+         vec = get_value[vector[Variant]](value)
+-        res = []
+-
+-        for i in vec:
+-            res.append(variant_to_python_object(i))
++        nrows = vec.size()
++
++        if (nrows > 0) and is_type[Vector3d](vec[0]):
++            arrayNvec3d = np.empty((nrows, 3), dtype=np.float64)
++            mixed_types = False
++            for index in range(nrows):
++                if not is_type[Vector3d](vec[index]):
++                    mixed_types = True
++                    break
++                vec3d = get_value[Vector3d](vec[index])
++                arrayNvec3d[index, 0] = vec3d[0]
++                arrayNvec3d[index, 1] = vec3d[1]
++                arrayNvec3d[index, 2] = vec3d[2]
++            if not mixed_types:
++                return arrayNvec3d
+ 
++        res = []
++        for index in range(nrows):
++            res.append(variant_to_python_object(vec[index]))
+         return res
+ 
+     if is_type[unordered_map[int, Variant]](value):
+diff --git a/src/script_interface/get_value.hpp b/src/script_interface/get_value.hpp
+index f6779938ce4..fe5eca8d990 100644
+--- a/src/script_interface/get_value.hpp
++++ b/src/script_interface/get_value.hpp
+@@ -257,6 +257,12 @@ template <typename T> struct VisitorVector {
+ 
+     return ret;
+   }
++
++  template <typename U, std::size_t N>
++    requires allow_conversion<T, U>::value
++  std::vector<T> operator()(Utils::Vector<U, N> const &vv) const {
++    return {vv.begin(), vv.end()};
++  }
+ };
+ 
+ /* std::vector cases */
+diff --git a/src/script_interface/scafacos/scafacos.cpp b/src/script_interface/scafacos/scafacos.cpp
+index f81c0211997..c36a7764e80 100644
+--- a/src/script_interface/scafacos/scafacos.cpp
++++ b/src/script_interface/scafacos/scafacos.cpp
+@@ -35,9 +35,11 @@
+ #include <iomanip>
+ #include <iterator>
+ #include <optional>
++#include <span>
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
++#include <type_traits>
+ #include <utility>
+ #include <variant>
+ #include <vector>
+@@ -63,10 +65,11 @@ struct ConvertToStringVector {
+ 
+   auto operator()(result_type const &values) const { return values; }
+ 
+-  template <typename T> auto operator()(std::vector<T> const &values) const {
++  template <typename T, std::size_t N>
++  auto operator()(std::span<T, N> const values) const {
+     result_type values_str;
+     for (auto const &v : values) {
+-      if constexpr (std::is_same_v<T, Variant>) {
++      if constexpr (std::is_same_v<std::remove_cvref_t<T>, Variant>) {
+         values_str.emplace_back(std::visit(*this, v).front());
+       } else {
+         values_str.emplace_back(to_str(v));
+@@ -75,6 +78,15 @@ struct ConvertToStringVector {
+     return values_str;
+   }
+ 
++  template <typename T> auto operator()(std::vector<T> const &values) const {
++    return (*this)(std::span(values.begin(), values.size()));
++  }
++
++  template <typename T, std::size_t N>
++  auto operator()(Utils::Vector<T, N> const &values) const {
++    return (*this)(std::span(values.begin(), N));
++  }
++
+ private:
+   template <typename T>
+     requires std::is_arithmetic_v<T>
+diff --git a/src/script_interface/tests/get_value_test.cpp b/src/script_interface/tests/get_value_test.cpp
+index 20c09fdf01d..746f3a54756 100644
+--- a/src/script_interface/tests/get_value_test.cpp
++++ b/src/script_interface/tests/get_value_test.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2017-2022 The ESPResSo project
++ * Copyright (C) 2017-2025 The ESPResSo project
+  *
+  * This file is part of ESPResSo.
+  *
+@@ -17,7 +17,7 @@
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+-#define BOOST_TEST_MODULE ScriptInterface::get_value test
++#define BOOST_TEST_MODULE "ScriptInterface::get_value test"
+ #define BOOST_TEST_DYN_LINK
+ #include <boost/test/unit_test.hpp>
+ 
+@@ -127,6 +127,11 @@ BOOST_AUTO_TEST_CASE(heap_vector) {
+     auto const expected = std::vector<double>{1., 2., 3.};
+     BOOST_CHECK(get_value<std::vector<double>>(Variant{vec_var}) == expected);
+   }
++  {
++    auto const vec3d = Utils::Vector3d{{1., 2., 3.}};
++    auto const expected = std::vector<double>{1., 2., 3.};
++    BOOST_CHECK(get_value<std::vector<double>>(Variant{vec3d}) == expected);
++  }
+ 
+   /* Conversion applied */
+   {
+@@ -134,6 +139,11 @@ BOOST_AUTO_TEST_CASE(heap_vector) {
+     auto const expected = std::vector<double>{1, 2, 3};
+     BOOST_CHECK(get_value<std::vector<double>>(v) == expected);
+   }
++  {
++    auto const vec3i = Utils::Vector3i{{1, 2, 3}};
++    auto const expected = std::vector<double>{1., 2., 3.};
++    BOOST_CHECK(get_value<std::vector<double>>(Variant{vec3i}) == expected);
++  }
+ }
+ 
+ BOOST_AUTO_TEST_CASE(get_value_from_map) {

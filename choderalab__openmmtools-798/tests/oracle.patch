@@ -1,0 +1,211 @@
+diff --git a/openmmtools/multistate/multistatesampler.py b/openmmtools/multistate/multistatesampler.py
+index 8656972f..378e53c4 100644
+--- a/openmmtools/multistate/multistatesampler.py
++++ b/openmmtools/multistate/multistatesampler.py
+@@ -1357,18 +1357,42 @@ def _minimize_replica(self, replica_id, tolerance, max_iterations):
+         thermodynamic_state_id = self._replica_thermodynamic_states[replica_id]
+         thermodynamic_state = self._thermodynamic_states[thermodynamic_state_id]
+ 
+-        # Temporarily disable the barostat during minimization.
+-        # Otherwise, the minimizer will modify the box
+-        # vectors and may cause instabilities.
+-        pressure = thermodynamic_state.pressure
+-        thermodynamic_state.pressure = None
+         sampler_state = self._sampler_states[replica_id]
++        
++        # Determine whether we need a temporary NVT state
++        barostat_types = (
++            openmm.MonteCarloBarostat,
++            openmm.MonteCarloMembraneBarostat,
++            openmm.MonteCarloAnisotropicBarostat,
++        )
++
++        has_barostat = any(
++            isinstance(thermodynamic_state.system.getForce(i), barostat_types)
++            for i in range(thermodynamic_state.system.getNumForces())
++        )
+ 
++        if has_barostat:
++            # Deep copy system and remove all barostats
++            min_system = copy.deepcopy(thermodynamic_state.system)
++            for i in reversed(range(min_system.getNumForces())):
++                if isinstance(min_system.getForce(i), barostat_types):
++                    min_system.removeForce(i)
++
++            # Temporary NVT ThermodynamicState for minimization
++            minimization_state = states.ThermodynamicState(
++                system=min_system,
++                temperature=thermodynamic_state.temperature,
++                pressure=None
++            )
++        else:
++            # Use original state if no barostat
++            minimization_state = thermodynamic_state
++ 
+         # Use the FIRE minimizer
+         integrator = FIREMinimizationIntegrator(tolerance=tolerance)
+ 
+         # Get context and bound integrator from energy_context_cache
+-        context, integrator = self.energy_context_cache.get_context(thermodynamic_state, integrator)
++        context, integrator = self.energy_context_cache.get_context(minimization_state, integrator)
+         # inform of platform used in current context
+         logger.debug(f"{type(integrator).__name__}: Minimize using {context.getPlatform().getName()} platform.")
+ 
+@@ -1376,10 +1400,9 @@ def _minimize_replica(self, replica_id, tolerance, max_iterations):
+         sampler_state.apply_to_context(context)
+ 
+         # Compute the initial energy of the system for logging.
+-        initial_energy = thermodynamic_state.reduced_potential(context)
++        initial_energy = minimization_state.reduced_potential(context)
+         logger.debug('Replica {}/{}: initial energy {:8.3f}kT'.format(
+             replica_id + 1, self.n_replicas, initial_energy))
+-
+         # Minimize energy.
+         try:
+             if max_iterations == 0:
+@@ -1400,18 +1423,14 @@ def _minimize_replica(self, replica_id, tolerance, max_iterations):
+         # Get the minimized positions.
+         sampler_state.update_from_context(context)
+         
+-        # Restore the barostat
+-        thermodynamic_state.pressure = pressure
+-
+         # Compute the final energy of the system for logging.
+-        final_energy = thermodynamic_state.reduced_potential(sampler_state)
++        final_energy = minimization_state.reduced_potential(sampler_state)
+         logger.debug('Replica {}/{}: final energy {:8.3f}kT'.format(
+             replica_id + 1, self.n_replicas, final_energy))
+         # TODO if energy > 0, use slower openmm minimizer
+ 
+         # Clean up the integrator
+         del context
+-
+         # Return minimized positions.
+         return sampler_state.positions
+ 
+diff --git a/openmmtools/tests/test_sampling.py b/openmmtools/tests/test_sampling.py
+index 5c87e7ff..1312638f 100644
+--- a/openmmtools/tests/test_sampling.py
++++ b/openmmtools/tests/test_sampling.py
+@@ -1716,23 +1716,51 @@ def test_compute_energies(self):
+                     sampler._energy_unsampled_states, energy_unsampled_states
+                 )
+ 
+-    def test_minimize(self):
+-        """Test MultiStateSampler minimize method.
+-
+-        The purpose of this test is mainly to make sure that MPI doesn't mix
+-        the information of the minimized StateSamplers when it communicates
+-        the new positions. It also checks that the energies are effectively
+-        decreased.
+-
++    @pytest.mark.parametrize("barostat_type", [openmm.MonteCarloBarostat, openmm.MonteCarloMembraneBarostat, openmm.MonteCarloAnisotropicBarostat])
++    def test_minimize(self, barostat_type):
+         """
+-        thermodynamic_states, sampler_states, unsampled_states = copy.deepcopy(
+-            self.alanine_test
+-        )
++        Test MultiStateSampler minimize method.
++
++        The purpose of this test is:        
++        - Ensure that MPI doesn't mix the information of the minimized 
++          StateSamplers when it communicates the new positions
++        - Checks that energies decrease
++        - Barostats are temporarily disabled during minimization
++        - Barostats are restored afterward
++        """
++        # Use periodic alanine system
++        alanine_test = testsystems.AlanineDipeptideExplicit(constraints=None)
++        
++        # Create thermodynamic states and sampler states
++        thermodynamic_states = [states.ThermodynamicState(system=alanine_test.system,
++                                                          temperature=300*unit.kelvin,
++                                                          pressure=1.0*unit.atmosphere)]
++        sampler_states = [states.SamplerState(positions=alanine_test.positions)]
++        unsampled_states = []
++
+         n_states = len(thermodynamic_states)
+         n_replicas = len(sampler_states)
+         if n_replicas == 1:
+             # This test is intended for use with more than one replica
+             return
++         
++        # Add the specified barostat to each thermodynamic state
++        for ts in thermodynamic_states:
++            system = ts.system
++            if barostat_type is openmm.MonteCarloBarostat:
++                system.addForce(openmm.MonteCarloBarostat(1.0*unit.atmosphere, 300*unit.kelvin, 25))
++            elif barostat_type is openmm.MonteCarloMembraneBarostat:
++                system.addForce(openmm.MonteCarloMembraneBarostat(
++                    1.0*unit.atmosphere,
++                    0,
++                    300*unit.kelvin,
++                    openmm.MonteCarloMembraneBarostat.XYIsotropic,
++                    openmm.MonteCarloMembraneBarostat.ZFree,
++                    25))
++            else:
++                system.addForce(openmm.MonteCarloAnisotropicBarostat(
++                    1.0 * unit.atmosphere, 300 * unit.kelvin
++                ))
+ 
+         with self.temporary_storage_path() as storage_path:
+             sampler = self.SAMPLER()
+@@ -1763,10 +1791,31 @@ def test_minimize(self):
+                 sampler._energy_thermodynamic_states[i, j]
+                 for i, j in enumerate(state_indices)
+             ]
++            
++            # Wrap _minimize_replica to track temporary systems
++            original_minimize = sampler._minimize_replica
++            systems_used_in_minimization = []
++    
++            def tracking_minimize(replica_id, tolerance, max_iterations):
++                thermodynamic_state = sampler._thermodynamic_states[replica_id]
++                # Temporary NVT system as in minimization
++                min_system = copy.deepcopy(thermodynamic_state.system)
++                # Remove any barostats
++                for i in reversed(range(min_system.getNumForces())):
++                    f = min_system.getForce(i)
++                    if isinstance(f, (openmm.MonteCarloBarostat, openmm.MonteCarloMembraneBarostat)):
++                        min_system.removeForce(i)
++                systems_used_in_minimization.append(min_system)
++                return original_minimize(replica_id, tolerance, max_iterations)
++    
++            sampler._minimize_replica = tracking_minimize
+ 
+             # Minimize.
+             sampler.minimize()
+ 
++            # Restore original method
++            sampler._minimize_replica = original_minimize
++
+             # The relative positions between the new sampler states should
+             # be still translated the same way (i.e. we are not assigning
+             # the minimized positions to the incorrect sampler states).
+@@ -1805,6 +1854,26 @@ def test_minimize(self):
+                     new_sampler_states, stored_sampler_states
+                 ):
+                     assert np.allclose(new_state.positions, stored_state.positions)
++            
++            # Check that the barostat was removed during minimization
++            for system in systems_used_in_minimization:
++                forces = system.getForces()
++                assert not any(
++                    isinstance(f, (openmm.MonteCarloBarostat, openmm.MonteCarloMembraneBarostat))
++                    for f in forces
++                ), "Barostat should be disabled during minimization"
++        
++            # Check that the barostat is present after the minimization
++            for thermodynamic_state in sampler._thermodynamic_states:
++                # Get all forces
++                forces = thermodynamic_state.system.getForces()
++                # Check if the system originally had any volume-changing barostats
++                barostat_present = any(
++                    isinstance(f, (openmm.MonteCarloBarostat, openmm.MonteCarloMembraneBarostat))
++                    for f in forces
++                )
++                # Assert that at least one barostat is present
++                assert barostat_present, "Barostat should be restored after minimization"
+ 
+     def test_equilibrate(self):
+         """Test equilibration of MultiStateSampler simulation.

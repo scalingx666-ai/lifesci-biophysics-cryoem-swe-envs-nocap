@@ -1,0 +1,297 @@
+diff --git a/vermouth/map_parser.py b/vermouth/map_parser.py
+index d16832f70..6a18a8473 100644
+--- a/vermouth/map_parser.py
++++ b/vermouth/map_parser.py
+@@ -722,6 +722,21 @@ def _blocks(self, line, lineno=0, direction=None, map_type=None):
+                 fetch = False
+             if fetch and attrs.get('resname') is not None:
+                 block = getattr(self.force_fields[self.ff[direction]], map_type+'s')[attrs['resname']]
++                if map_type == 'modification':
++                    # Add the modifications to the mapping block_from, so they
++                    # participate in the matching criterion.
++
++                    # Caveat emptor
++                    ###############
++                    # Copying the modification here before modifying it would be
++                    # a *good* idea, but that doesn't work (probably because
++                    # Links don't have a sane copy method). Better than this
++                    # would be to add the modifications attribute at the ff
++                    # parser level. This hack-around (and adding it to the ff
++                    # parser) probably have unintended side effects.
++                    # block = block.copy()
++                    for idx in block.nodes:
++                        block.nodes[idx]['modifications'] = [block]
+                 builder_methods[direction](block)
+             if direction == 'from':
+                 if 'resname' in attrs and isinstance(attrs['resname'], str):
+diff --git a/vermouth/processors/canonicalize_modifications.py b/vermouth/processors/canonicalize_modifications.py
+index 59eaea9f1..8960a5761 100644
+--- a/vermouth/processors/canonicalize_modifications.py
++++ b/vermouth/processors/canonicalize_modifications.py
+@@ -27,7 +27,7 @@
+ 
+ from .processor import Processor
+ from ..log_helpers import StyleAdapter, get_logger
+-from ..utils import format_atom_string
++from ..utils import format_atom_string, are_all_equal
+ 
+ LOGGER = StyleAdapter(get_logger(__name__))
+ 
+@@ -74,7 +74,8 @@ def find_ptm_atoms(molecule):
+     # Atomnames have already been fixed, and missing atoms have been added.
+     # In addition, unrecognized atoms have been labeled with the PTM attribute.
+     extra_atoms = set(n_idx for n_idx in molecule
+-                      if molecule.nodes[n_idx].get('PTM_atom', False))
++                      if (molecule.nodes[n_idx].get('PTM_atom', False)
++                          or molecule.nodes[n_idx].get('modifications')))
+     ptms = []
+     while extra_atoms:
+         # First PTM atom we'll look at
+@@ -152,10 +153,40 @@ def identify_ptms(residue, residue_ptms, known_ptms):
+         Not all PTM atoms in ``residue`` can be covered with ``known_PTMs``.
+     """
+     to_cover = set()
++    cover = []
+     for res_ptm in residue_ptms:
+-        to_cover.update(res_ptm[0])
+-        to_cover.update(res_ptm[1])
+-    return _cover_graph(residue, to_cover, known_ptms)
++        ptm_atoms, anchors = res_ptm
++        # For every node in this residue, get all modifications already known.
++        residue_mods = [residue.nodes[idx].get('modifications', []) for idx in ptm_atoms]
++        # Deduplicate the modifications so we only check e.g. C-ter once for
++        # this residue
++        used_mods = []
++        for node_mods in residue_mods:
++            for mod in node_mods:
++                if mod not in used_mods:
++                    used_mods.append(mod)
++        if used_mods:
++            # Store all atoms matched with already known mods (in used_mods) in
++            # known_matched, so we can subtract them from ptm_atoms afterwards.
++            # This may cause issues with overlapping modifications. It may be
++            # better to subtract match from ptm_atoms in the loop.
++            known_matched = set()
++            for mod in used_mods:
++                gm = nx.isomorphism.GraphMatcher(residue.subgraph(ptm_atoms), mod,
++                                                 node_match=nx.isomorphism.categorical_node_match('atomname', ''))
++                match = list(gm.subgraph_isomorphisms_iter())
++                assert len(match) == 1
++                match = match[0]
++                cover.append((mod, match))
++                # (That would be here)
++                known_matched.update(match)
++            ptm_atoms -= known_matched
++            assert not ptm_atoms
++        else:
++            to_cover.update(ptm_atoms)
++            to_cover.update(anchors)
++    cover += _cover_graph(residue, to_cover, known_ptms)
++    return cover
+ 
+ 
+ def _cover_graph(graph, to_cover, fragments):
+@@ -325,8 +356,13 @@ def key_func(ptm_atoms):
+                                          type='change-atom')
+                             mol_node[attr_name] = val
+             for n_idx in n_idxs:
+-                molecule.nodes[n_idx]['modifications'] = molecule.nodes[n_idx].get('modifications', [])
+-                molecule.nodes[n_idx]['modifications'].append(ptm)
++                node = molecule.nodes[n_idx]
++                if not ('modification' in node and ptm in node.get('modifications', [])):
++                    # These nodes already had the modification annotated.
++                    # Also note that 'modification' != 'modifications'. Yes,
++                    # this is an issue. No, I'm not fixing that.
++                    node['modifications'] = node.get('modifications', [])
++                    node['modifications'].append(ptm)
+ 
+ 
+ class CanonicalizeModifications(Processor):
+diff --git a/vermouth/processors/do_mapping.py b/vermouth/processors/do_mapping.py
+index 10312707c..6e0c84cfb 100644
+--- a/vermouth/processors/do_mapping.py
++++ b/vermouth/processors/do_mapping.py
+@@ -139,18 +139,25 @@ def node_should_exist(modification, node_idx):
+     return not modification.nodes[node_idx].get('PTM_atom', False)
+ 
+ 
+-def ptm_resname_match(node1, node2):
++def ptm_resname_match(mol_node, map_node):
+     """
+     As :func:`node_matcher`, except that empty resname and false PTM_atom
+     attributes from `node2` are removed.
+     """
+-    if 'resname' in node2 and not node2['resname']:
+-        node2 = node2.copy()
+-        del node2['resname']
+-    if 'PTM_atom' in node2 and not node2['PTM_atom']:
+-        del node2['PTM_atom']
+-    is_equal = node_matcher(node1, node2)
+-    return is_equal
++    if 'resname' in map_node and not map_node['resname']:
++        map_node = map_node.copy()
++        del map_node['resname']
++    if 'PTM_atom' in map_node and not map_node['PTM_atom']:
++        map_node = map_node.copy()
++        del map_node['PTM_atom']
++    if 'modifications' in mol_node:
++        map_node = map_node.copy()
++        matching_mod = all(map_mod in mol_node.get('modifications', [])
++                           for map_mod in map_node.pop('modifications', []))
++    else:
++        matching_mod = True
++    is_equal = node_matcher(mol_node, map_node)
++    return is_equal and matching_mod
+ 
+ 
+ def cover(to_cover, options):
+@@ -229,9 +236,11 @@ def modification_matches(molecule, mappings):
+         A list with the following items:
+             Dict describing the correspondence of node keys in `molecule` to
+                 node keys in the modification.
++
+             The modification.
+-                Dict with all reference atoms, mapping modification nodes to
+-                    nodes in `molecule`.
++
++            Dict with all reference atoms, mapping modification nodes to
++                nodes in `molecule`.
+     """
+     modified_nodes = set()  # This will contain whole residues.
+     for idx, node in molecule.nodes.items():
+@@ -239,13 +248,15 @@ def modification_matches(molecule, mappings):
+             modified_nodes.add(idx)
+     ptm_subgraph = molecule.subgraph(modified_nodes)
+     grouped = nx.connected_components(ptm_subgraph)
+-    found_ptm_groups = set()
++    found_ptm_groups = []
++    # For every modification group we would like a set with the names of the
++    # involved modifications, so we can use that to figure out which mod
++    # mappings should be used.
+     for group in grouped:
+         modifications = {
+-            tuple(mod.name for mod in molecule.nodes[mol_idx].get('modifications', []))
+-            for mol_idx in group
++            mod.name for mol_idx in group for mod in molecule.nodes[mol_idx].get('modifications', [])
+         }
+-        found_ptm_groups.update(modifications)
++        found_ptm_groups.append(modifications)
+     needed_mod_mappings = set()
+     known_mod_mappings = get_mod_mappings(mappings)
+     for group in found_ptm_groups:
+@@ -269,13 +280,7 @@ def modification_matches(molecule, mappings):
+     # define most modifications at the same time get processed first
+     for mod_name in sorted(needed_mod_mappings, key=len, reverse=True):
+         mod_mapping = known_mod_mappings[mod_name]
+-        # TODO: include modifications in matching criterion (just add it to the
+-        #       modification from-block).
+-        # For now, just make sure the intersection with the modified_nodes is
+-        # not empty.
+         for mol_to_mod, modification, references in mod_mapping.map(molecule, node_match=ptm_resname_match):
+-            if not modified_nodes & set(mol_to_mod):
+-                continue
+             matches.append((mol_to_mod, modification, references))
+             if not set(mol_to_mod) <= modified_nodes:
+                 # TODO: better message
+@@ -437,7 +442,9 @@ def apply_mod_mapping(match, molecule, graph_out, mol_to_out, out_to_mol):
+             # Undefined loop variable is guarded against by the else-raise above
+             mod_to_out[mod_idx] = out_idx  # pylint: disable=undefined-loop-variable
+             graph_out.nodes[out_idx].update(modification.nodes[mod_idx].get('replace', {})) # pylint: disable=undefined-loop-variable
+-        graph_out.nodes[out_idx]['modification'] = modification
++        graph_out.nodes[out_idx]['modifications'] = graph_out.nodes[out_idx].get('modifications', [])
++        if modification not in graph_out.nodes[out_idx]['modifications']:
++            graph_out.nodes[out_idx]['modifications'].append(modification)
+ 
+     for mol_idx in mol_to_mod:
+         for mod_idx, weight in mol_to_mod[mol_idx].items():
+@@ -641,11 +648,9 @@ def do_mapping(molecule, mappings, to_ff, attribute_keep=(), attribute_must=()):
+                 LOGGER.warning('The attributes {} for atom {} are going to'
+                                ' be garbage.', attrs_not_sane, format_atom_string(graph_out.nodes[out_idx]),
+                                type='inconsistent-data')
+-
+-        if graph_out[out_idx].get('atomname', '') is None:
++        if graph_out.nodes[out_idx].get('atomname', '') is None:
+             to_remove.add(out_idx)
+ 
+-
+     # We need to add edges between residues. Within residues comes from the
+     # blocks.
+     for match1, match2 in combinations(all_matches, 2):
+diff --git a/vermouth/processors/repair_graph.py b/vermouth/processors/repair_graph.py
+index 422eb8f4e..6c9378cd8 100644
+--- a/vermouth/processors/repair_graph.py
++++ b/vermouth/processors/repair_graph.py
+@@ -86,6 +86,17 @@ def _patch_modification(block, modification):
+     anchor_mod_to_block = {val: key for key, val in anchor_block_to_mod.items()}
+ 
+     result = Block(nx.union(block, non_anchor, rename=(None, modification.name+'-')))
++    # Mark the modified atoms with the specified modification, so canonicalize
++    # modifications has an easier job
++    for idx in anchor_block_to_mod:
++        node_mods = result.nodes[idx].get('modifications', [])
++        if modification not in node_mods:
++            result.nodes[idx]['modifications'] = node_mods + [modification]
++    for mod_idx in non_anchor_idxs:
++        idx = '{}-{}'.format(modification.name, mod_idx)
++        node_mods = result.nodes[idx].get('modifications', [])
++        if modification not in node_mods:
++            result.nodes[idx]['modifications'] = node_mods + [modification]
+     for mod_idx, mod_jdx in modification.edges_between(anchor_idxs, non_anchor_idxs):
+         if mod_idx in non_anchor_idxs:
+             mod_idx, mod_jdx = mod_jdx, mod_idx
+diff --git a/vermouth/tests/test_do_mapping.py b/vermouth/tests/test_do_mapping.py
+index e0fd06873..e32b04a85 100644
+--- a/vermouth/tests/test_do_mapping.py
++++ b/vermouth/tests/test_do_mapping.py
+@@ -326,40 +326,40 @@ def modifications():
+     """
+     mods = {}
+     mod_a = Link(force_field=FF_UNIVERSAL, name='mA')
+-    mod_a.add_node('mA', atomname='mA', PTM_atom=True)
++    mod_a.add_node('mA', atomname='mA', PTM_atom=True, modifications=[mod_a])
+     mods['mA'] = mod_a
+ 
+     mod_c = Link(force_field=FF_UNIVERSAL, name='mC')
+-    mod_c.add_node('mC', atomname='mC', PTM_atom=True)
++    mod_c.add_node('mC', atomname='mC', PTM_atom=True, modifications=[mod_c])
+     mods['mC'] = mod_c
+ 
+     mod_d = Link(force_field=FF_UNIVERSAL, name='mD')
+-    mod_d.add_node('mD', atomname='mD', PTM_atom=True)
++    mod_d.add_node('mD', atomname='mD', PTM_atom=True, modifications=[mod_d])
+     mods['mD'] = mod_d
+ 
+     mod_fg = Link(force_field=FF_UNIVERSAL, name='mFG')
+-    mod_fg.add_node('mF', atomname='mF', PTM_atom=True)
+-    mod_fg.add_node('mG', atomname='mG', PTM_atom=True)
++    mod_fg.add_node('mF', atomname='mF', PTM_atom=True, modifications=[mod_fg])
++    mod_fg.add_node('mG', atomname='mG', PTM_atom=True, modifications=[mod_fg])
+     mod_fg.add_edge('mF', 'mG')
+     mod_fg.add_interaction('bond', ['mF', 'mG'], (3, 4))
+     mods['mFG'] = mod_fg
+ 
+     mod_i = Link(force_field=FF_UNIVERSAL, name='mI')
+-    mod_i.add_node('mI', atomname='mI', PTM_atom=True)
++    mod_i.add_node('mI', atomname='mI', PTM_atom=True, modifications=[mod_i])
+     mods['mI'] = mod_i
+     mod_i2 = Link(force_field=FF_UNIVERSAL, name='mI2')
+-    mod_i2.add_node('mI2', atomname='mI2', PTM_atom=True)
++    mod_i2.add_node('mI2', atomname='mI2', PTM_atom=True, modifications=[mod_i2])
+     mods['mI2'] = mod_i2
+ 
+     mod_j = Link(force_field=FF_UNIVERSAL, name='mJ')
+-    mod_j.add_node('mJ', atomname='mJ', PTM_atom=True)
++    mod_j.add_node('mJ', atomname='mJ', PTM_atom=True, modifications=[mod_j])
+     mods['mJ'] = mod_j
+     mod_j2 = Link(force_field=FF_UNIVERSAL, name='mJ2')
+-    mod_j2.add_node('mJ2', atomname='mJ2', PTM_atom=True)
++    mod_j2.add_node('mJ2', atomname='mJ2', PTM_atom=True, modifications=[mod_j2])
+     mods['mJ2'] = mod_j2
+     mod = Link(name=('mJ', 'mJ2'), force_field=FF_UNIVERSAL)
+-    mod.add_nodes_from((['mJ', {'atomname': 'mJ', 'PTM_atom': True}],
+-                        ['mJ2', {'atomname': 'mJ2', 'PTM_atom': True}],
++    mod.add_nodes_from((['mJ', {'atomname': 'mJ', 'PTM_atom': True, 'modifications': [mods['mJ']]}],
++                        ['mJ2', {'atomname': 'mJ2', 'PTM_atom': True, 'modifications': [mods['mJ2']]}],
+                         ['J', {'atomname': 'J', 'PTM_atom': False}]))
+     mod.add_edges_from([('J', 'mJ'), ('J', 'mJ2')])
+     mods[('mJ', 'mJ2')] = mod

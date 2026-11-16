@@ -1,0 +1,365 @@
+diff --git a/.github/actions/setup-deps/action.yaml b/.github/actions/setup-deps/action.yaml
+index 8978c9c777..349cc7d975 100644
+--- a/.github/actions/setup-deps/action.yaml
++++ b/.github/actions/setup-deps/action.yaml
+@@ -61,7 +61,7 @@ inputs:
+   distopia:
+     default: 'distopia>=0.4.0'
+   gemmi:
+-    default: 'gemmi>=0.7.3'
++    default: 'gemmi>=0.7.5'
+   h5py:
+     default: 'h5py>=2.10'
+   hole2:
+diff --git a/azure-pipelines.yml b/azure-pipelines.yml
+index 831d943aa1..f48ea4ba74 100644
+--- a/azure-pipelines.yml
++++ b/azure-pipelines.yml
+@@ -114,7 +114,7 @@ jobs:
+       tidynamics>=1.0.0
+       imdclient>=0.2.2
+       pytng>=0.3.4
+-      gemmi>=0.7.3
++      gemmi>=0.7.5
+ 
+     # remove from azure to avoid test hanging #4707
+     # "gsd>3.0.0"
+diff --git a/package/MDAnalysis/coordinates/MMCIF.py b/package/MDAnalysis/coordinates/MMCIF.py
+index 4bef352ba9..1e41c483ef 100644
+--- a/package/MDAnalysis/coordinates/MMCIF.py
++++ b/package/MDAnalysis/coordinates/MMCIF.py
+@@ -60,7 +60,7 @@
+ from . import base
+ 
+ if TYPE_CHECKING:
+-    from gemmi import Model, Structure
++    from gemmi import Structure
+ 
+ try:
+     import gemmi
+@@ -113,21 +113,20 @@ def _read_gemmi_structure(filename: str | Path) -> "Structure":
+             raise e
+ 
+ 
+-def _get_coordinates(model: "Model") -> np.ndarray:
+-    """Get coordinates of all atoms in the `gemmi.Model` object.
++def _get_coordinates(structure: "Structure") -> np.ndarray:
++    """Get coordinates of all atoms in a single-model `gemmi.Structure`.
+ 
+     Parameters
+     ----------
+-    model
+-        input ``gemmi.Model``, e.g. ``gemmi.read_structure('file.cif')[0]``
++    structure
++        input ``gemmi.Structure`` holding only one model; ``gemmi.FlatStructure``
++        includes atoms from every model, so extra models must be removed first
+ 
+     Returns
+     -------
+         np.ndarray, shape [n, 3], where ``n`` is the number of atoms in the structure.
+     """
+-    return np.array(
+-        [[*at.pos.tolist()] for chain in model for res in chain for at in res]
+-    )
++    return np.asarray(gemmi.FlatStructure(structure).pos)
+ 
+ 
+ class MMCIFReader(base.SingleFrameReaderBase):
+@@ -167,9 +166,9 @@ def _read_first_frame(self):
+             )
+             warnings.warn(wmsg)
+             logger.warning(wmsg)
++            del structure[1:]
+ 
+-        model = structure[0]
+-        coords = _get_coordinates(model)
++        coords = _get_coordinates(structure)
+         self.n_atoms = len(coords)
+         self.ts = self._Timestep.from_coordinates(coords, **self._ts_kwargs)
+         if np.allclose(cell_dims, np.array([1.0, 1.0, 1.0, 90.0, 90.0, 90.0])):
+diff --git a/package/MDAnalysis/core/topologyattrs.py b/package/MDAnalysis/core/topologyattrs.py
+index 63a637ca97..6ad9dc5198 100644
+--- a/package/MDAnalysis/core/topologyattrs.py
++++ b/package/MDAnalysis/core/topologyattrs.py
+@@ -784,6 +784,30 @@ def __init__(self, vals, guessed=False):
+         self.name_lookup = np.array(name_lookup, dtype=object)
+         self.values = self.name_lookup[self.nmidx]
+ 
++    @classmethod
++    def _from_lookup(cls, nmidx, name_lookup, guessed=False):
++        """Create the attribute from precomputed interning arrays
++
++        Skips the per-value loop of ``__init__``, for parsers that can
++        factorize a column in bulk (e.g. with :func:`numpy.unique`).
++
++        Parameters
++        ----------
++        nmidx : numpy.ndarray
++          index into `name_lookup` for each object
++        name_lookup : numpy.ndarray
++          the distinct string values, without duplicates
++
++        .. versionadded:: 2.11.0
++        """
++        attr = cls.__new__(cls)
++        attr._guessed = guessed
++        attr.name_lookup = np.asarray(name_lookup, dtype=object)
++        attr.namedict = {name: i for i, name in enumerate(attr.name_lookup)}
++        attr.nmidx = np.asarray(nmidx, dtype=int)
++        attr.values = attr.name_lookup[attr.nmidx]
++        return attr
++
+     def _add_new(self, newval):
+         """Append new value to the TopologyAttr
+ 
+diff --git a/package/MDAnalysis/topology/MMCIFParser.py b/package/MDAnalysis/topology/MMCIFParser.py
+index 17516e3298..011fe958ed 100644
+--- a/package/MDAnalysis/topology/MMCIFParser.py
++++ b/package/MDAnalysis/topology/MMCIFParser.py
+@@ -81,6 +81,24 @@
+ logger = logging.getLogger("MDAnalysis.topology.MMCIFParser")
+ 
+ 
++def _factorize(column: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++    """Split a fixed-width bytes column into an index per entry and the
++    distinct decoded strings, sorting the bytes as unsigned integers"""
++    column = np.ascontiguousarray(column)
++    codes, nmidx = np.unique(
++        column.view(f"u{column.dtype.itemsize}"), return_inverse=True
++    )
++    return nmidx, codes.view(column.dtype).astype(str).astype(object)
++
++
++def _dedupe(nmidx: np.ndarray, values) -> tuple[np.ndarray, np.ndarray]:
++    """Merge distinct values that became equal after being transformed"""
++    values, remap = np.unique(
++        np.asarray(values, dtype=object), return_inverse=True
++    )
++    return remap[nmidx], values
++
++
+ class MMCIFParser(TopologyReaderBase):
+     """Parser that obtains a list of atoms from a standard MMCIF/PDBx file using
+     the `gemmi library <https://gemmi.readthedocs.io>`_.
+@@ -137,54 +155,32 @@ def parse(self, **kwargs) -> Topology:
+             )
+             warnings.warn(wmsg)
+             logger.warning(wmsg)
+-        model = structure[0]
+-
+-        # TODO: gemmi.FlatStructure provides vectorised column access to all atom
+-        # fields and could replace the per-atom Python loop below for a speed-up
+-        # on large structures. gemmi API is still not 100% there yes so worth revisiting
+-        # later once it matures more
+-        altlocs = []
+-        serials = []
+-        names = []
+-        chainids = []
+-        elements = []
+-        formalcharges = []
+-        weights = []
+-        occupancies = []
+-        record_types = []
+-        tempfactors = []
+-        icodes = []
+-        resids = []
+-        resnames = []
+-
+-        for chain in model:
+-            for residue in chain:
+-                match residue.het_flag:
+-                    case "A":
+-                        rec = "ATOM"
+-                    case "H":
+-                        rec = "HETATM"
+-                    case _:
+-                        # Intentionally strict: this also rejects the "\0"
+-                        # (unspecified) het_flag, so an mmCIF lacking the
+-                        # ``group_PDB`` field will fail to parse.
+-                        raise ValueError(
+-                            "Found an atom that is neither ATOM nor HETATM"
+-                        )
+-                for atom in residue:
+-                    altlocs.append(atom.altloc if atom.has_altloc() else "")
+-                    serials.append(atom.serial)
+-                    names.append(atom.name)
+-                    chainids.append(chain.name)
+-                    elements.append(atom.element.name)
+-                    formalcharges.append(atom.charge)
+-                    weights.append(atom.element.weight)
+-                    occupancies.append(atom.occ)
+-                    record_types.append(rec)
+-                    tempfactors.append(atom.b_iso)
+-                    icodes.append(residue.seqid.icode.strip())
+-                    resids.append(residue.seqid.num)
+-                    resnames.append(residue.name)
++            del structure[1:]
++
++        import gemmi
++
++        flat = gemmi.FlatStructure(structure)
++        flat.strings_as_numbers = False
++
++        # String columns are factorized in bulk into (per-atom index, distinct
++        # values) pairs, the layout MDAnalysis interns strings in anyway
++        het_idx, het_flags = _factorize(np.asarray(flat.het_flags).view("S1"))
++        # Intentionally strict: this also rejects the "\0" (unspecified)
++        # het_flag, so an mmCIF lacking the ``group_PDB`` field will fail
++        # to parse.
++        if not set(het_flags) <= {"A", "H"}:
++            raise ValueError("Found an atom that is neither ATOM nor HETATM")
++        record_types = np.where(het_flags == "A", "ATOM", "HETATM")
++
++        # gemmi stores "no altloc" as "\0", which numpy decodes to ""
++        altlocs = _factorize(np.asarray(flat.altlocs).view("S1"))
++        names = _factorize(np.asarray(flat.atom_names))
++        chain_idx, chainids = _factorize(np.asarray(flat.chain_ids))
++        elem_idx, elements = _factorize(np.asarray(flat.element_names))
++        resname_idx, resnames = _factorize(np.asarray(flat.residue_names))
++        icode_idx, icodes = _factorize(np.asarray(flat.icodes).view("S1"))
++        icode_idx, icodes = _dedupe(icode_idx, [c.strip() for c in icodes])
++        resids = np.asarray(flat.resnums)
+ 
+         # As in PDBParser: feed atomtypes the raw element column, but
+         # validate elements against known symbols before storing them
+@@ -205,41 +201,37 @@ def parse(self, **kwargs) -> Topology:
+ 
+         # Atom Attributes
+         attrs = [
+-            AltLocs(altlocs),
+-            Atomids(serials),
+-            Atomnames(names),
+-            Atomtypes(elements),
++            AltLocs._from_lookup(*altlocs),
++            Atomids(np.asarray(flat.serials)),
++            Atomnames._from_lookup(*names),
++            Atomtypes._from_lookup(elem_idx, elements),
+             # ----------------------------
+-            ChainIDs(chainids),
+-            Elements(validated_elements),
+-            FormalCharges(formalcharges),
+-            Masses(weights),
++            ChainIDs._from_lookup(chain_idx, chainids),
++            Elements._from_lookup(*_dedupe(elem_idx, validated_elements)),
++            FormalCharges(np.asarray(flat.charge)),
++            Masses(np.asarray(flat.element_weights)),
+             # ----------------------------
+-            Occupancies(occupancies),
+-            RecordTypes(record_types),
+-            Tempfactors(tempfactors),
++            Occupancies(np.asarray(flat.occ)),
++            RecordTypes._from_lookup(het_idx, record_types),
++            Tempfactors(np.asarray(flat.b_iso)),
+         ]
+-        n_atoms = len(altlocs)
++        n_atoms = len(resids)
+ 
+         # Residue Attributes
+-        resids = np.array(resids)
+-        resnames = np.array(resnames)
+-        icodes = np.array(icodes)
+-        chainids = np.array(chainids)
+-        residx, (resids, resnames, icodes, chainids) = change_squash(
+-            (resids, resnames, icodes, chainids),
+-            (resids, resnames, icodes, chainids),
++        residx, (resids, resname_idx, icode_idx, chain_idx) = change_squash(
++            (resids, resname_idx, icode_idx, chain_idx),
++            (resids, resname_idx, icode_idx, chain_idx),
+         )
+         attrs.append(Resids(resids))
+-        attrs.append(Resnames(resnames))
++        attrs.append(Resnames._from_lookup(resname_idx, resnames))
+         attrs.append(Resnums(resids.copy()))
+-        attrs.append(ICodes(icodes))
++        attrs.append(ICodes._from_lookup(icode_idx, icodes))
+         n_residues = len(resids)
+ 
+         # Segment Attributes
+-        segidx, (segids,) = change_squash((chainids,), (chainids,))
+-        attrs.append(Segids(segids))
+-        n_segments = len(segids)
++        segidx, (chain_idx,) = change_squash((chain_idx,), (chain_idx,))
++        attrs.append(Segids._from_lookup(chain_idx, chainids))
++        n_segments = len(chain_idx)
+ 
+         return Topology(
+             n_atoms,
+diff --git a/package/pyproject.toml b/package/pyproject.toml
+index 0580d65705..81be6269e4 100644
+--- a/package/pyproject.toml
++++ b/package/pyproject.toml
+@@ -76,7 +76,7 @@ extra_formats = [
+     "pyedr>=0.7.0",
+     "pytng>=0.2.3",
+     "gsd>3.0.0",
+-    "gemmi>=0.7.3",
++    "gemmi>=0.7.5",
+     "rdkit>=2022.09.1",
+     "imdclient>=0.2.2",
+ ]
+diff --git a/testsuite/MDAnalysisTests/core/test_topologyattrs.py b/testsuite/MDAnalysisTests/core/test_topologyattrs.py
+index 064b08c65c..4d8b3349aa 100644
+--- a/testsuite/MDAnalysisTests/core/test_topologyattrs.py
++++ b/testsuite/MDAnalysisTests/core/test_topologyattrs.py
+@@ -712,6 +712,28 @@ def test_issue3437(self, universe):
+         assert len(ag2) == 5
+         assert (ag2.ix == ag.ix).all()
+ 
++    def test_from_lookup(self):
++        # sorted lookup order (as from np.unique) differs from the first-seen
++        # order of __init__, which interning must not depend on
++        values = ["CA", "N", "CA", "O", "N"]
++        lookup, nmidx = np.unique(values, return_inverse=True)
++        attr = tpattrs.Atomnames._from_lookup(nmidx, lookup)
++        ref = tpattrs.Atomnames(values)
++
++        assert_equal(attr.values, ref.values)
++        assert attr.values.dtype == ref.values.dtype
++        assert all(
++            attr.name_lookup[i] == nm for nm, i in attr.namedict.items()
++        )
++
++        u = mda.Universe.empty(n_atoms=5)
++        u.add_TopologyAttr(attr)
++        assert_equal(u.select_atoms("name N").ix, [1, 4])
++
++        u.atoms[[0, 1]].names = ["N", "CB"]
++        assert_equal(u.atoms.names, ["N", "CB", "CA", "O", "N"])
++        assert_equal(u.select_atoms("name N").ix, [0, 4])
++
+ 
+ class Testcenter_of_charge:
+ 
+diff --git a/testsuite/MDAnalysisTests/data/mmcif/5PTI.cif.gz b/testsuite/MDAnalysisTests/data/mmcif/5PTI.cif.gz
+new file mode 100644
+index 0000000000..c4e9126c85
+Binary files /dev/null and b/testsuite/MDAnalysisTests/data/mmcif/5PTI.cif.gz differ
+diff --git a/testsuite/MDAnalysisTests/topology/test_mmcif.py b/testsuite/MDAnalysisTests/topology/test_mmcif.py
+index 9d372f3f51..a0a9c53c6b 100644
+--- a/testsuite/MDAnalysisTests/topology/test_mmcif.py
++++ b/testsuite/MDAnalysisTests/topology/test_mmcif.py
+@@ -102,6 +102,24 @@ def test_types_from_elements():
+     assert set(u.atoms.elements) == {"C", "N", "O"}
+ 
+ 
++@pytest.mark.skipif(not HAS_GEMMI, reason="gemmi not installed")
++def test_unknown_elements():
++    # 5PTI is a joint X-ray/neutron structure: 229 deuterium (D) atoms and
++    # one unknown (X) atom, neither of which MDAnalysis knows as an element
++    with pytest.warns(UserWarning, match="Unknown element") as record:
++        u = mda.Universe(f"{MMCIF_FOLDER}/5PTI.cif.gz")
++    assert {str(w.message).split()[2] for w in record} >= {"D", "X"}
++
++    unknown = u.atoms[u.atoms.elements == ""]
++    assert len(unknown) == 230
++    # types keep the raw element column
++    assert set(unknown.types) == {"D", "X"}
++    # both unknowns intern to a single "" entry, so lookups find all of them
++    elements = u._topology.elements
++    assert len(set(elements.name_lookup)) == len(elements.name_lookup)
++    assert (elements.nmidx == elements.namedict[""]).sum() == 230
++
++
+ @pytest.mark.skipif(not HAS_GEMMI, reason="gemmi not installed")
+ def test_altlocs():
+     # gemmi stores absent altlocs as "\0", which must not leak into the

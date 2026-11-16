@@ -1,0 +1,1590 @@
+diff --git a/src/force/fcp.cu b/src/force/fcp.cu
+index b17f29bda..e37716ddc 100644
+--- a/src/force/fcp.cu
++++ b/src/force/fcp.cu
+@@ -53,6 +53,7 @@ FCP::FCP(FILE* fid, const int num_types, const int N, const Box& box)
+   fcp_data.u.resize(N * 3);
+   fcp_data.r0.resize(N * 3, Memory_Type::managed);
+   fcp_data.pfv.resize(N * 13);
++  total_force.resize(3);
+ 
+   // read in the equilibrium positions and force constants
+   read_r0(N);
+@@ -1020,6 +1021,66 @@ static __global__ void gpu_save_pfv(
+   }
+ }
+ 
++// get the total force
++static __global__ void gpu_sum_force(int N, double* g_fx, double* g_fy, double* g_fz, double* g_f)
++{
++  //<<<3, 1024>>>
++  int tid = threadIdx.x;
++  int bid = blockIdx.x;
++  int number_of_batches = (N - 1) / 1024 + 1;
++  __shared__ double s_f[1024];
++  double f = 0.0;
++
++  switch (bid) {
++    case 0:
++      for (int batch = 0; batch < number_of_batches; ++batch) {
++        int n = tid + batch * 1024;
++        if (n < N)
++          f += g_fx[n];
++      }
++      break;
++    case 1:
++      for (int batch = 0; batch < number_of_batches; ++batch) {
++        int n = tid + batch * 1024;
++        if (n < N)
++          f += g_fy[n];
++      }
++      break;
++    case 2:
++      for (int batch = 0; batch < number_of_batches; ++batch) {
++        int n = tid + batch * 1024;
++        if (n < N)
++          f += g_fz[n];
++      }
++      break;
++  }
++  s_f[tid] = f;
++  __syncthreads();
++
++  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
++    if (tid < offset) {
++      s_f[tid] += s_f[tid + offset];
++    }
++    __syncthreads();
++  }
++
++  if (tid == 0) {
++    g_f[bid] = s_f[0];
++  }
++}
++
++// correct the total force
++static __global__ void
++gpu_correct_force(int N, double one_over_N, double* g_fx, double* g_fy, double* g_fz, double* g_f)
++{
++  int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < N) {
++    g_fx[i] -= g_f[0] * one_over_N;
++    g_fy[i] -= g_f[1] * one_over_N;
++    g_fz[i] -= g_f[2] * one_over_N;
++  }
++}
++
+ // Wrapper of the above kernels
+ void FCP::compute(
+   Box& box,
+@@ -1127,4 +1188,21 @@ void FCP::compute(
+     virial_per_atom.data());
+ 
+   GPU_CHECK_KERNEL
++
++  gpu_sum_force<<<3, 1024>>>(
++    number_of_atoms,
++    force_per_atom.data(),
++    force_per_atom.data() + number_of_atoms,
++    force_per_atom.data() + 2 * number_of_atoms,
++    total_force.data());
++  GPU_CHECK_KERNEL
++
++  gpu_correct_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
++    number_of_atoms,
++    1.0 / number_of_atoms,
++    force_per_atom.data(),
++    force_per_atom.data() + number_of_atoms,
++    force_per_atom.data() + 2 * number_of_atoms,
++    total_force.data());
++  GPU_CHECK_KERNEL
+ }
+diff --git a/src/force/fcp.cuh b/src/force/fcp.cuh
+index 67dfadea9..c25e66a8c 100644
+--- a/src/force/fcp.cuh
++++ b/src/force/fcp.cuh
+@@ -47,6 +47,7 @@ protected:
+   int order, heat_order, number2, number3, number4, number5, number6;
+   char file_path[200];
+   FCP_Data fcp_data;
++  GPU_Vector<double> total_force;
+   void read_r0(const int N);
+   void read_fc2(const int N, const Box& box);
+   void read_fc3(const int N, const Box& box);
+diff --git a/src/force/force.cu b/src/force/force.cu
+index b8e7db023..c09fa298c 100644
+--- a/src/force/force.cu
++++ b/src/force/force.cu
+@@ -43,16 +43,9 @@ The driver class calculating force and related quantities.
+ #include "utilities/read_file.cuh"
+ #include "utilities/run_input.cuh"
+ #include <cstring>
+-#include <iostream>
+ #include <vector>
+ 
+-#define BLOCK_SIZE 128
+-
+-Force::Force(void)
+-{
+-  is_fcp = false;
+-  has_non_nep = false;
+-}
++Force::Force(void) {}
+ 
+ void Force::check_types(const std::string& file_potential)
+ {
+@@ -73,28 +66,19 @@ void Force::check_types(const std::string& file_potential)
+   }
+ }
+ 
+-void Force::parse_potential(
++std::unique_ptr<Potential> Force::create_potential(
+   const std::vector<std::string>& tokens,
++  FILE* fid_potential,
++  char* potential_name,
++  const int num_types,
+   const Box& box,
+   const int number_of_atoms,
+-  const RunInput& run_input)
++  const RunInput& run_input,
++  bool& is_nep)
+ {
+   const int num_param = tokens.size();
+-  if (num_param != 2 && num_param != 3) {
+-    PRINT_INPUT_ERROR("potential should have 1 or 2 parameters.\n");
+-  }
+-
+   std::unique_ptr<Potential> potential;
+-  FILE* fid_potential = my_fopen(tokens[1].c_str(), "r");
+-  char potential_name[100];
+-  int count = fscanf(fid_potential, "%s", potential_name);
+-  if (count != 1) {
+-    PRINT_INPUT_ERROR("reading error for potential file.");
+-  }
+-  int num_types = get_number_of_types(fid_potential);
+-  number_of_atoms_ = number_of_atoms;
+-  bool is_nep = false;
+-  // determine the potential
++
+   if (strcmp(potential_name, "tersoff_1989") == 0) {
+     potential.reset(new Tersoff1989(fid_potential, num_types, number_of_atoms));
+   } else if (strcmp(potential_name, "tersoff_1988") == 0) {
+@@ -128,7 +112,6 @@ void Force::parse_potential(
+     strcmp(potential_name, "nep4_zbl_charge3") == 0) {
+     potential.reset(new NEP_Charge(tokens[1].c_str(), number_of_atoms, run_input));
+     is_nep = true;
+-    check_types(tokens[1]);
+   } else if (
+     strcmp(potential_name, "nep4") == 0 || strcmp(potential_name, "nep4_zbl") == 0 ||
+     strcmp(potential_name, "nep4_temperature") == 0 ||
+@@ -158,8 +141,6 @@ void Force::parse_potential(
+           num_gpus, tokens[1].c_str(), number_of_atoms, partition_direction, run_input));
+     }
+     is_nep = true;
+-    // Check if the types for this potential are compatible with the possibly other potentials
+-    check_types(tokens[1]);
+ #ifdef USE_DEEPMD
+   } else if (strcmp(potential_name, "dp") == 0) {
+     if (num_param != 3) {
+@@ -202,6 +183,43 @@ void Force::parse_potential(
+   } else {
+     PRINT_INPUT_ERROR("illegal potential model.\n");
+   }
++
++  return potential;
++}
++
++void Force::parse_potential(
++  const std::vector<std::string>& tokens,
++  const Box& box,
++  const int number_of_atoms,
++  const RunInput& run_input)
++{
++  const int num_param = tokens.size();
++  if (num_param != 2 && num_param != 3) {
++    PRINT_INPUT_ERROR("potential should have 1 or 2 parameters.\n");
++  }
++
++  FILE* fid_potential = my_fopen(tokens[1].c_str(), "r");
++  char potential_name[100];
++  int count = fscanf(fid_potential, "%s", potential_name);
++  if (count != 1) {
++    PRINT_INPUT_ERROR("reading error for potential file.");
++  }
++  int num_types = get_number_of_types(fid_potential);
++  bool is_nep = false;
++  std::unique_ptr<Potential> potential = create_potential(
++    tokens,
++    fid_potential,
++    potential_name,
++    num_types,
++    box,
++    number_of_atoms,
++    run_input,
++    is_nep);
++
++  if (is_nep) {
++    // Check if the types for this potential are compatible with the possibly other potentials
++    check_types(tokens[1]);
++  }
+   fclose(fid_potential);
+ 
+   potential->N1 = 0;
+@@ -224,92 +242,6 @@ int Force::get_number_of_types(FILE* fid_potential)
+   return num_of_types;
+ }
+ 
+-static __global__ void gpu_add_driving_force(
+-  int N,
+-  double fe_x,
+-  double fe_y,
+-  double fe_z,
+-  double* g_sxx,
+-  double* g_sxy,
+-  double* g_sxz,
+-  double* g_syx,
+-  double* g_syy,
+-  double* g_syz,
+-  double* g_szx,
+-  double* g_szy,
+-  double* g_szz,
+-  double* g_fx,
+-  double* g_fy,
+-  double* g_fz)
+-{
+-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+-  if (i < N) {
+-    g_fx[i] += fe_x * g_sxx[i] + fe_y * g_syx[i] + fe_z * g_szx[i];
+-    g_fy[i] += fe_x * g_sxy[i] + fe_y * g_syy[i] + fe_z * g_szy[i];
+-    g_fz[i] += fe_x * g_sxz[i] + fe_y * g_syz[i] + fe_z * g_szz[i];
+-  }
+-}
+-
+-// get the total force
+-static __global__ void gpu_sum_force(int N, double* g_fx, double* g_fy, double* g_fz, double* g_f)
+-{
+-  //<<<3, 1024>>>
+-  int tid = threadIdx.x;
+-  int bid = blockIdx.x;
+-  int number_of_batches = (N - 1) / 1024 + 1;
+-  __shared__ double s_f[1024];
+-  double f = 0.0;
+-
+-  switch (bid) {
+-    case 0:
+-      for (int batch = 0; batch < number_of_batches; ++batch) {
+-        int n = tid + batch * 1024;
+-        if (n < N)
+-          f += g_fx[n];
+-      }
+-      break;
+-    case 1:
+-      for (int batch = 0; batch < number_of_batches; ++batch) {
+-        int n = tid + batch * 1024;
+-        if (n < N)
+-          f += g_fy[n];
+-      }
+-      break;
+-    case 2:
+-      for (int batch = 0; batch < number_of_batches; ++batch) {
+-        int n = tid + batch * 1024;
+-        if (n < N)
+-          f += g_fz[n];
+-      }
+-      break;
+-  }
+-  s_f[tid] = f;
+-  __syncthreads();
+-
+-  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+-    if (tid < offset) {
+-      s_f[tid] += s_f[tid + offset];
+-    }
+-    __syncthreads();
+-  }
+-
+-  if (tid == 0) {
+-    g_f[bid] = s_f[0];
+-  }
+-}
+-
+-// correct the total force
+-static __global__ void
+-gpu_correct_force(int N, double one_over_N, double* g_fx, double* g_fy, double* g_fz, double* g_f)
+-{
+-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+-  if (i < N) {
+-    g_fx[i] -= g_f[0] * one_over_N;
+-    g_fy[i] -= g_f[1] * one_over_N;
+-    g_fz[i] -= g_f[2] * one_over_N;
+-  }
+-}
+-
+ static __global__ void initialize_properties(
+   int N, double* g_fx, double* g_fy, double* g_fz, double* g_pe, double* g_virial)
+ {
+@@ -333,104 +265,9 @@ static __global__ void initialize_properties(
+ 
+ void Force::finalize()
+ {
+-  compute_hnemd_ = false;
+-  compute_hnemdec_ = -1;
+   multiple_potentials_mode_ = "observe";
+ }
+ 
+-void Force::set_hnemd_parameters(
+-  const double hnemd_fe_x, const double hnemd_fe_y, const double hnemd_fe_z)
+-{
+-  if (compute_hnemd_ || compute_hnemdec_ >= 0) {
+-    PRINT_INPUT_ERROR("Cannot have more than one HNEMD method within one run.");
+-  }
+-  if (hnemd_force_sum_.size() != 3) {
+-    hnemd_force_sum_.resize(3);
+-  }
+-  compute_hnemd_ = true;
+-  hnemd_fe_[0] = hnemd_fe_x;
+-  hnemd_fe_[1] = hnemd_fe_y;
+-  hnemd_fe_[2] = hnemd_fe_z;
+-}
+-
+-void Force::set_hnemdec_parameters(
+-  const int compute_hnemdec,
+-  const double hnemd_fe_x,
+-  const double hnemd_fe_y,
+-  const double hnemd_fe_z,
+-  const std::vector<double>& mass,
+-  const std::vector<int>& type,
+-  const std::vector<int>& type_size,
+-  const double T)
+-{
+-  if (compute_hnemd_ || compute_hnemdec_ >= 0) {
+-    PRINT_INPUT_ERROR("Cannot have more than one HNEMD method within one run.");
+-  }
+-
+-  int N = mass.size();
+-  int number_of_types = type_size.size();
+-  compute_hnemdec_ = compute_hnemdec;
+-  temperature = T;
+-
+-  double total_mass = 0;
+-  std::vector<double> cpu_coefficient;
+-  std::vector<double> mass_type;
+-  mass_type.resize(number_of_types);
+-  int find_mass_type = 0;
+-  for (int i = 0; i < N; i++) {
+-    if (mass_type[type[i]] != mass[i]) {
+-      mass_type[type[i]] = mass[i];
+-      find_mass_type += 1;
+-    }
+-    total_mass += mass[i];
+-  }
+-  if (find_mass_type != number_of_types) {
+-    PRINT_INPUT_ERROR("mass type and element type do not match.\n");
+-  }
+-
+-  // find atom types' fraction
+-  if (compute_hnemdec_ == 0) {
+-    cpu_coefficient.resize(number_of_types * 2);
+-    coefficient.resize(number_of_types * 2);
+-    const size_t tensor_size = static_cast<size_t>(N) * 9;
+-    if (hnemdec_tensor_per_atom_.size() != tensor_size) {
+-      hnemdec_tensor_per_atom_.resize(tensor_size);
+-    }
+-    if (hnemdec_tensor_sum_.size() != 9) {
+-      hnemdec_tensor_sum_.resize(9);
+-    }
+-
+-    for (int i = 0; i < number_of_types; i++) {
+-      double c_hv = (total_mass - N * mass_type[i]) / total_mass;
+-      cpu_coefficient[i * 2] = (c_hv - 1) / N;
+-      cpu_coefficient[i * 2 + 1] = K_B * temperature * c_hv;
+-    }
+-
+-    coefficient.copy_from_host(cpu_coefficient.data());
+-  } else if ((compute_hnemdec_ > 0) && (compute_hnemdec_ <= number_of_types)) {
+-    int element_index = compute_hnemdec_ - 1;
+-    cpu_coefficient.resize(number_of_types);
+-    cpu_coefficient[element_index] = double(N) / type_size[element_index];
+-    double partial_mass = 0;
+-    for (int i = 0; i < number_of_types; i++) {
+-      if (i != element_index) {
+-        partial_mass += mass_type[i] * type_size[i];
+-      }
+-    }
+-    for (int i = 0; i < number_of_types; i++) {
+-      if (i != element_index) {
+-        cpu_coefficient[i] = -1 * N * mass_type[i] / partial_mass;
+-      }
+-    }
+-    coefficient.resize(number_of_types);
+-    coefficient.copy_from_host(cpu_coefficient.data());
+-  }
+-
+-  hnemd_fe_[0] = hnemd_fe_x;
+-  hnemd_fe_[1] = hnemd_fe_y;
+-  hnemd_fe_[2] = hnemd_fe_z;
+-}
+-
+ static __global__ void gpu_apply_pbc(
+   int N, Box box, double* g_x, double* g_y, double* g_z, int* g_position_image)
+ {
+@@ -624,76 +461,6 @@ void Force::compute_potentials(
+   }
+ }
+ 
+-void Force::apply_hnemd(
+-  const int number_of_atoms,
+-  GPU_Vector<double>& force_per_atom,
+-  GPU_Vector<double>& virial_per_atom)
+-{
+-  // the virial tensor:
+-  // xx xy xz    0 3 4
+-  // yx yy yz    6 1 5
+-  // zx zy zz    7 8 2
+-  gpu_add_driving_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+-    number_of_atoms,
+-    hnemd_fe_[0],
+-    hnemd_fe_[1],
+-    hnemd_fe_[2],
+-    virial_per_atom.data() + 0 * number_of_atoms,
+-    virial_per_atom.data() + 3 * number_of_atoms,
+-    virial_per_atom.data() + 4 * number_of_atoms,
+-    virial_per_atom.data() + 6 * number_of_atoms,
+-    virial_per_atom.data() + 1 * number_of_atoms,
+-    virial_per_atom.data() + 5 * number_of_atoms,
+-    virial_per_atom.data() + 7 * number_of_atoms,
+-    virial_per_atom.data() + 8 * number_of_atoms,
+-    virial_per_atom.data() + 2 * number_of_atoms,
+-    force_per_atom.data(),
+-    force_per_atom.data() + number_of_atoms,
+-    force_per_atom.data() + 2 * number_of_atoms);
+-
+-  gpu_sum_force<<<3, 1024>>>(
+-    number_of_atoms,
+-    force_per_atom.data(),
+-    force_per_atom.data() + number_of_atoms,
+-    force_per_atom.data() + 2 * number_of_atoms,
+-    hnemd_force_sum_.data());
+-  GPU_CHECK_KERNEL
+-
+-  gpu_correct_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+-    number_of_atoms,
+-    1.0 / number_of_atoms,
+-    force_per_atom.data(),
+-    force_per_atom.data() + number_of_atoms,
+-    force_per_atom.data() + 2 * number_of_atoms,
+-    hnemd_force_sum_.data());
+-  GPU_CHECK_KERNEL
+-}
+-
+-void Force::correct_fcp_force(
+-  const int number_of_atoms, GPU_Vector<double>& force_per_atom)
+-{
+-  // always correct the force when using the FCP potential
+-  if (is_fcp && !compute_hnemd_) {
+-    GPU_Vector<double> ftot(3); // total force vector of the system
+-    gpu_sum_force<<<3, 1024>>>(
+-      number_of_atoms,
+-      force_per_atom.data(),
+-      force_per_atom.data() + number_of_atoms,
+-      force_per_atom.data() + 2 * number_of_atoms,
+-      ftot.data());
+-    GPU_CHECK_KERNEL
+-
+-    gpu_correct_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+-      number_of_atoms,
+-      1.0 / number_of_atoms,
+-      force_per_atom.data(),
+-      force_per_atom.data() + number_of_atoms,
+-      force_per_atom.data() + 2 * number_of_atoms,
+-      ftot.data());
+-    GPU_CHECK_KERNEL
+-  }
+-}
+-
+ void Force::compute(
+   Box& box,
+   GPU_Vector<double>& position_per_atom,
+@@ -722,148 +489,6 @@ void Force::compute(
+     force_per_atom,
+     virial_per_atom);
+ 
+-  if (compute_hnemd_) {
+-    apply_hnemd(number_of_atoms, force_per_atom, virial_per_atom);
+-  }
+-
+-  correct_fcp_force(number_of_atoms, force_per_atom);
+-}
+-
+-static __global__ void gpu_find_per_atom_tensor(
+-  int N,
+-  double* g_mass,
+-  double* g_potential,
+-  double* g_vx,
+-  double* g_vy,
+-  double* g_vz,
+-  double* g_sxx,
+-  double* g_sxy,
+-  double* g_sxz,
+-  double* g_syx,
+-  double* g_syy,
+-  double* g_syz,
+-  double* g_szx,
+-  double* g_szy,
+-  double* g_szz,
+-  double* g_tensor)
+-{
+-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+-  if (i < N) {
+-    double mass = g_mass[i];
+-    double potential = g_potential[i];
+-    double vx = g_vx[i];
+-    double vy = g_vy[i];
+-    double vz = g_vz[i];
+-    double energy = mass * (vx * vx + vy * vy + vz * vz) * 0.5 + potential;
+-    // the tensor:
+-    // xx xy xz    0 3 4
+-    // yx yy yz    6 1 5
+-    // zx zy zz    7 8 2
+-    g_tensor[i] = energy + g_sxx[i];
+-    g_tensor[i + 3 * N] = g_sxy[i];
+-    g_tensor[i + 4 * N] = g_sxz[i];
+-    g_tensor[i + 6 * N] = g_syx[i];
+-    g_tensor[i + N] = energy + g_syy[i];
+-    g_tensor[i + 5 * N] = g_syz[i];
+-    g_tensor[i + 7 * N] = g_szx[i];
+-    g_tensor[i + 8 * N] = g_szy[i];
+-    g_tensor[i + 2 * N] = energy + g_szz[i];
+-  }
+-}
+-
+-static __global__ void gpu_sum_tensor(int N, double* g_tensor, double* g_sum_tensor)
+-{
+-  //<<<9,1024>>>
+-  int tid = threadIdx.x;
+-  int bid = blockIdx.x;
+-  int number_of_batches = (N - 1) / 1024 + 1;
+-  __shared__ double s_t[1024];
+-  double t = 0.0;
+-
+-  for (int batch = 0; batch < number_of_batches; ++batch) {
+-    int n = tid + batch * 1024;
+-    if (n < N)
+-      t += g_tensor[bid * N + n];
+-  }
+-  s_t[tid] = t;
+-  __syncthreads();
+-
+-  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+-    if (tid < offset) {
+-      s_t[tid] += s_t[tid + offset];
+-    }
+-    __syncthreads();
+-  }
+-
+-  if (tid == 0) {
+-    g_sum_tensor[bid] = s_t[0];
+-  }
+-}
+-
+-static __global__ void gpu_add_driving_force(
+-  int N,
+-  const double* g_coefficient,
+-  const int* g_type,
+-  double fe_x,
+-  double fe_y,
+-  double fe_z,
+-  double* g_sxx,
+-  double* g_sxy,
+-  double* g_sxz,
+-  double* g_syx,
+-  double* g_syy,
+-  double* g_syz,
+-  double* g_szx,
+-  double* g_szy,
+-  double* g_szz,
+-  double* g_tensor_tot,
+-  double* g_fx,
+-  double* g_fy,
+-  double* g_fz)
+-{
+-  // heat flow algorithm
+-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+-  if (i < N) {
+-    int type2 = g_type[i] * 2;
+-    double coefficient1 = g_coefficient[type2];
+-    double coefficient2 = g_coefficient[type2 + 1];
+-    // the tensor:
+-    // xx xy xz    0 3 4
+-    // yx yy yz    6 1 5
+-    // zx zy zz    7 8 2
+-    g_fx[i] += fe_x * (g_sxx[i] + coefficient1 * g_tensor_tot[0] + coefficient2) +
+-               fe_y * (g_syx[i] + coefficient1 * g_tensor_tot[6]) +
+-               fe_z * (g_szx[i] + coefficient1 * g_tensor_tot[7]);
+-
+-    g_fy[i] += fe_x * (g_sxy[i] + coefficient1 * g_tensor_tot[3]) +
+-               fe_y * (g_syy[i] + coefficient1 * g_tensor_tot[1] + coefficient2) +
+-               fe_z * (g_szy[i] + coefficient1 * g_tensor_tot[8]);
+-
+-    g_fz[i] += fe_x * (g_sxz[i] + coefficient1 * g_tensor_tot[4]) +
+-               fe_y * (g_syz[i] + coefficient1 * g_tensor_tot[5]) +
+-               fe_z * (g_szz[i] + coefficient1 * g_tensor_tot[2] + coefficient2);
+-  }
+-}
+-
+-static __global__ void gpu_add_driving_force(
+-  int N,
+-  const double* g_coefficient,
+-  const int* g_type,
+-  double fe_x,
+-  double fe_y,
+-  double fe_z,
+-  double* g_fx,
+-  double* g_fy,
+-  double* g_fz)
+-{
+-  // color conductivity algorithm
+-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+-  if (i < N) {
+-    double coefficient = g_coefficient[g_type[i]];
+-    g_fx[i] += fe_x * coefficient;
+-    g_fy[i] += fe_y * coefficient;
+-    g_fz[i] += fe_z * coefficient;
+-  }
+ }
+ 
+ void Force::compute(
+@@ -897,70 +522,4 @@ void Force::compute(
+     force_per_atom,
+     virial_per_atom);
+ 
+-  if (compute_hnemd_) {
+-    apply_hnemd(number_of_atoms, force_per_atom, virial_per_atom);
+-  } else if (compute_hnemdec_ == 0) {
+-    // the tensor:
+-    // xx xy xz    0 3 4
+-    // yx yy yz    6 1 5
+-    // zx zy zz    7 8 2
+-    gpu_find_per_atom_tensor<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+-      number_of_atoms,
+-      mass_per_atom.data(),
+-      potential_per_atom.data(),
+-      velocity_per_atom.data(),
+-      velocity_per_atom.data() + number_of_atoms,
+-      velocity_per_atom.data() + 2 * number_of_atoms,
+-      virial_per_atom.data() + 0 * number_of_atoms,
+-      virial_per_atom.data() + 3 * number_of_atoms,
+-      virial_per_atom.data() + 4 * number_of_atoms,
+-      virial_per_atom.data() + 6 * number_of_atoms,
+-      virial_per_atom.data() + 1 * number_of_atoms,
+-      virial_per_atom.data() + 5 * number_of_atoms,
+-      virial_per_atom.data() + 7 * number_of_atoms,
+-      virial_per_atom.data() + 8 * number_of_atoms,
+-      virial_per_atom.data() + 2 * number_of_atoms,
+-      hnemdec_tensor_per_atom_.data());
+-    GPU_CHECK_KERNEL
+-
+-    gpu_sum_tensor<<<9, 1024>>>(
+-      number_of_atoms, hnemdec_tensor_per_atom_.data(), hnemdec_tensor_sum_.data());
+-    GPU_CHECK_KERNEL
+-
+-    gpu_add_driving_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+-      number_of_atoms,
+-      coefficient.data(),
+-      type.data(),
+-      hnemd_fe_[0],
+-      hnemd_fe_[1],
+-      hnemd_fe_[2],
+-      hnemdec_tensor_per_atom_.data() + 0 * number_of_atoms,
+-      hnemdec_tensor_per_atom_.data() + 3 * number_of_atoms,
+-      hnemdec_tensor_per_atom_.data() + 4 * number_of_atoms,
+-      hnemdec_tensor_per_atom_.data() + 6 * number_of_atoms,
+-      hnemdec_tensor_per_atom_.data() + 1 * number_of_atoms,
+-      hnemdec_tensor_per_atom_.data() + 5 * number_of_atoms,
+-      hnemdec_tensor_per_atom_.data() + 7 * number_of_atoms,
+-      hnemdec_tensor_per_atom_.data() + 8 * number_of_atoms,
+-      hnemdec_tensor_per_atom_.data() + 2 * number_of_atoms,
+-      hnemdec_tensor_sum_.data(),
+-      force_per_atom.data(),
+-      force_per_atom.data() + number_of_atoms,
+-      force_per_atom.data() + 2 * number_of_atoms);
+-    GPU_CHECK_KERNEL
+-
+-  } else if (compute_hnemdec_ != -1) {
+-    gpu_add_driving_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
+-      number_of_atoms,
+-      coefficient.data(),
+-      type.data(),
+-      hnemd_fe_[0],
+-      hnemd_fe_[1],
+-      hnemd_fe_[2],
+-      force_per_atom.data(),
+-      force_per_atom.data() + number_of_atoms,
+-      force_per_atom.data() + 2 * number_of_atoms);
+-  }
+-
+-  correct_fcp_force(number_of_atoms, force_per_atom);
+ }
+diff --git a/src/force/force.cuh b/src/force/force.cuh
+index 943a53589..3bc8877cb 100644
+--- a/src/force/force.cuh
++++ b/src/force/force.cuh
+@@ -61,16 +61,6 @@ public:
+   void finalize();
+ 
+   int get_number_of_types(FILE* fid_potential);
+-  void set_hnemd_parameters(const double, const double, const double);
+-  void set_hnemdec_parameters(
+-    const int compute_hnemdec,
+-    const double hnemd_fe_x,
+-    const double hnemd_fe_y,
+-    const double hnemd_fe_z,
+-    const std::vector<double>& mass,
+-    const std::vector<int>& type,
+-    const std::vector<int>& type_size,
+-    const double T);
+   void set_multiple_potentials_mode(std::string mode);
+   void set_temperature_range(
+     const double temperature1, const double temperature2, const int number_of_steps);
+@@ -79,21 +69,21 @@ public:
+   Potential& get_potential(const int index);
+ 
+ private:
++  std::unique_ptr<Potential> create_potential(
++    const std::vector<std::string>& tokens,
++    FILE* fid_potential,
++    char* potential_name,
++    const int num_types,
++    const Box& box,
++    const int number_of_atoms,
++    const RunInput& run_input,
++    bool& is_nep);
++
+   double temperature = 0;
+   double delta_T;
+-  bool compute_hnemd_ = false;
+-  int compute_hnemdec_ = -1;
+-  double hnemd_fe_[3];
+-  GPU_Vector<double> coefficient;
+   std::vector<std::unique_ptr<Potential>> potentials;
+-  int number_of_atoms_ = -1;
+   bool is_fcp = false;
+   bool has_non_nep = false;
+-  // Workspace reused by the HNEMD total-force correction.
+-  GPU_Vector<double> hnemd_force_sum_;
+-  // Workspaces reused by the HNEMDEC heat-flow driving force.
+-  GPU_Vector<double> hnemdec_tensor_per_atom_;
+-  GPU_Vector<double> hnemdec_tensor_sum_;
+   std::string multiple_potentials_mode_ = "observe"; // "observe" or "average"
+   std::string atom_types[NUM_ELEMENTS];
+ 
+@@ -124,10 +114,4 @@ private:
+     GPU_Vector<double>& potential_per_atom,
+     GPU_Vector<double>& force_per_atom,
+     GPU_Vector<double>& virial_per_atom);
+-  void apply_hnemd(
+-    const int number_of_atoms,
+-    GPU_Vector<double>& force_per_atom,
+-    GPU_Vector<double>& virial_per_atom);
+-  void correct_fcp_force(
+-    const int number_of_atoms, GPU_Vector<double>& force_per_atom);
+ };
+diff --git a/src/measure/hnemd_force.cu b/src/measure/hnemd_force.cu
+new file mode 100644
+index 000000000..f2b8a02b2
+--- /dev/null
++++ b/src/measure/hnemd_force.cu
+@@ -0,0 +1,150 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "hnemd_force.cuh"
++#include "utilities/gpu_macro.cuh"
++
++static __global__ void gpu_add_hnemd_force(
++  int N,
++  double fe_x,
++  double fe_y,
++  double fe_z,
++  double* g_sxx,
++  double* g_sxy,
++  double* g_sxz,
++  double* g_syx,
++  double* g_syy,
++  double* g_syz,
++  double* g_szx,
++  double* g_szy,
++  double* g_szz,
++  double* g_fx,
++  double* g_fy,
++  double* g_fz)
++{
++  int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < N) {
++    g_fx[i] += fe_x * g_sxx[i] + fe_y * g_syx[i] + fe_z * g_szx[i];
++    g_fy[i] += fe_x * g_sxy[i] + fe_y * g_syy[i] + fe_z * g_szy[i];
++    g_fz[i] += fe_x * g_sxz[i] + fe_y * g_syz[i] + fe_z * g_szz[i];
++  }
++}
++
++static __global__ void gpu_sum_force(
++  int N, double* g_fx, double* g_fy, double* g_fz, double* g_f)
++{
++  int tid = threadIdx.x;
++  int bid = blockIdx.x;
++  int number_of_batches = (N - 1) / 1024 + 1;
++  __shared__ double s_f[1024];
++  double f = 0.0;
++
++  switch (bid) {
++    case 0:
++      for (int batch = 0; batch < number_of_batches; ++batch) {
++        int n = tid + batch * 1024;
++        if (n < N)
++          f += g_fx[n];
++      }
++      break;
++    case 1:
++      for (int batch = 0; batch < number_of_batches; ++batch) {
++        int n = tid + batch * 1024;
++        if (n < N)
++          f += g_fy[n];
++      }
++      break;
++    case 2:
++      for (int batch = 0; batch < number_of_batches; ++batch) {
++        int n = tid + batch * 1024;
++        if (n < N)
++          f += g_fz[n];
++      }
++      break;
++  }
++  s_f[tid] = f;
++  __syncthreads();
++
++  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
++    if (tid < offset) {
++      s_f[tid] += s_f[tid + offset];
++    }
++    __syncthreads();
++  }
++
++  if (tid == 0) {
++    g_f[bid] = s_f[0];
++  }
++}
++
++static __global__ void gpu_correct_force(
++  int N, double one_over_N, double* g_fx, double* g_fy, double* g_fz, double* g_f)
++{
++  int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < N) {
++    g_fx[i] -= g_f[0] * one_over_N;
++    g_fy[i] -= g_f[1] * one_over_N;
++    g_fz[i] -= g_f[2] * one_over_N;
++  }
++}
++
++void apply_hnemd_force(
++  const int number_of_atoms,
++  const double fe_x,
++  const double fe_y,
++  const double fe_z,
++  GPU_Vector<double>& virial_per_atom,
++  GPU_Vector<double>& force_per_atom,
++  GPU_Vector<double>& force_sum)
++{
++  // the virial tensor:
++  // xx xy xz    0 3 4
++  // yx yy yz    6 1 5
++  // zx zy zz    7 8 2
++  gpu_add_hnemd_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
++    number_of_atoms,
++    fe_x,
++    fe_y,
++    fe_z,
++    virial_per_atom.data() + 0 * number_of_atoms,
++    virial_per_atom.data() + 3 * number_of_atoms,
++    virial_per_atom.data() + 4 * number_of_atoms,
++    virial_per_atom.data() + 6 * number_of_atoms,
++    virial_per_atom.data() + 1 * number_of_atoms,
++    virial_per_atom.data() + 5 * number_of_atoms,
++    virial_per_atom.data() + 7 * number_of_atoms,
++    virial_per_atom.data() + 8 * number_of_atoms,
++    virial_per_atom.data() + 2 * number_of_atoms,
++    force_per_atom.data(),
++    force_per_atom.data() + number_of_atoms,
++    force_per_atom.data() + 2 * number_of_atoms);
++
++  gpu_sum_force<<<3, 1024>>>(
++    number_of_atoms,
++    force_per_atom.data(),
++    force_per_atom.data() + number_of_atoms,
++    force_per_atom.data() + 2 * number_of_atoms,
++    force_sum.data());
++  GPU_CHECK_KERNEL
++
++  gpu_correct_force<<<(number_of_atoms - 1) / 128 + 1, 128>>>(
++    number_of_atoms,
++    1.0 / number_of_atoms,
++    force_per_atom.data(),
++    force_per_atom.data() + number_of_atoms,
++    force_per_atom.data() + 2 * number_of_atoms,
++    force_sum.data());
++  GPU_CHECK_KERNEL
++}
+diff --git a/src/measure/hnemd_force.cuh b/src/measure/hnemd_force.cuh
+new file mode 100644
+index 000000000..6485c814b
+--- /dev/null
++++ b/src/measure/hnemd_force.cuh
+@@ -0,0 +1,27 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#pragma once
++
++#include "utilities/gpu_vector.cuh"
++
++void apply_hnemd_force(
++  const int number_of_atoms,
++  const double fe_x,
++  const double fe_y,
++  const double fe_z,
++  GPU_Vector<double>& virial_per_atom,
++  GPU_Vector<double>& force_per_atom,
++  GPU_Vector<double>& force_sum);
+diff --git a/src/measure/hnemd_kappa.cu b/src/measure/hnemd_kappa.cu
+index 806086b27..f0109d887 100644
+--- a/src/measure/hnemd_kappa.cu
++++ b/src/measure/hnemd_kappa.cu
+@@ -23,7 +23,7 @@ with many-body potentials, Phys. Rev. B 99, 064308 (2019).
+ 
+ #include "compute_heat.cuh"
+ #include "hnemd_kappa.cuh"
+-#include "force/force.cuh"
++#include "hnemd_force.cuh"
+ #include "utilities/common.cuh"
+ #include "utilities/error.cuh"
+ #include "utilities/gpu_macro.cuh"
+@@ -46,6 +46,29 @@ void HNEMD::pre_run(
+     return;
+   heat_all.resize(NUM_OF_HEAT_COMPONENTS * output_interval);
+   atom.heat_per_atom.resize(atom.number_of_atoms * 5);
++  force_sum_.resize(3);
++}
++
++void HNEMD::post_force(
++  const int step,
++  const double time_step,
++  Integrate& integrate,
++  std::vector<Group>& group,
++  Atom& atom,
++  Box& box,
++  Force& force)
++{
++  if (!compute)
++    return;
++
++  apply_hnemd_force(
++    atom.number_of_atoms,
++    fe_x,
++    fe_y,
++    fe_z,
++    atom.virial_per_atom,
++    atom.force_per_atom,
++    force_sum_);
+ }
+ 
+ static __global__ void
+@@ -138,11 +161,10 @@ void HNEMD::post_run(
+   const double time_step,
+   const double temperature) { compute = 0; }
+ 
+-HNEMD::HNEMD(const std::vector<std::string>& tokens, Force& force)
++HNEMD::HNEMD(const std::vector<std::string>& tokens)
+ {
+   parse(tokens);
+   action_name = "compute_hnemd";
+-  force.set_hnemd_parameters(fe_x, fe_y, fe_z);
+ }
+ 
+ void HNEMD::parse(const std::vector<std::string>& tokens)
+diff --git a/src/measure/hnemd_kappa.cuh b/src/measure/hnemd_kappa.cuh
+index 655b97e96..fbce8a9b9 100644
+--- a/src/measure/hnemd_kappa.cuh
++++ b/src/measure/hnemd_kappa.cuh
+@@ -40,6 +40,15 @@ public:
+     Box& box,
+     Force& force);
+ 
++  virtual void post_force(
++    const int step,
++    const double time_step,
++    Integrate& integrate,
++    std::vector<Group>& group,
++    Atom& atom,
++    Box& box,
++    Force& force);
++
+   virtual void end_of_step(
+       const int number_of_steps,
+       int step,
+@@ -63,5 +72,8 @@ public:
+     const double temperature);
+ 
+   void parse(const std::vector<std::string>& tokens);
+-  HNEMD(const std::vector<std::string>& tokens, Force& force);
++  HNEMD(const std::vector<std::string>& tokens);
++
++private:
++  GPU_Vector<double> force_sum_;
+ };
+diff --git a/src/measure/hnemdec_kappa.cu b/src/measure/hnemdec_kappa.cu
+index 31c3306ce..0b83b40c6 100644
+--- a/src/measure/hnemdec_kappa.cu
++++ b/src/measure/hnemdec_kappa.cu
+@@ -23,7 +23,6 @@ with many-body potentials, Phys. Rev. B 99, 064308 (2019).
+ 
+ #include "compute_heat.cuh"
+ #include "hnemdec_kappa.cuh"
+-#include "force/force.cuh"
+ #include "integrate/integrate.cuh"
+ #include "utilities/common.cuh"
+ #include "utilities/error.cuh"
+@@ -52,52 +51,205 @@ void HNEMDEC::pre_run(
+       "compute for HNEMDEC should be an integer between 0 and number_of_types.\n");
+   }
+ 
+-  force.set_hnemdec_parameters(
+-    compute,
+-    fe_x,
+-    fe_y,
+-    fe_z,
+-    atom.cpu_mass,
+-    atom.cpu_type,
+-    atom.cpu_type_size,
+-    integrate.get_temperature1());
+-
+   heat_all.resize(NUM_OF_HEAT_COMPONENTS * output_interval);
+   atom.heat_per_atom.resize(atom.number_of_atoms * 5);
+ 
+-  // find atom types' mass and factor
+   NUM_OF_DIFFUSION_COMPONENTS = 3 * number_of_types;
+-  int N = atom.number_of_atoms;
+-  diffusion_all.resize(3 * number_of_types * output_interval);
+-  cpu_mass_type.resize(number_of_types);
++  const int N = atom.number_of_atoms;
++  diffusion_all.resize(NUM_OF_DIFFUSION_COMPONENTS * output_interval);
++  cpu_mass_type.assign(number_of_types, 0.0);
+   mass_type.resize(number_of_types);
+ 
++  double total_mass = 0.0;
+   int find_mass_type = 0;
+   for (int i = 0; i < N; i++) {
+     if (cpu_mass_type[atom.cpu_type[i]] != atom.cpu_mass[i]) {
+       cpu_mass_type[atom.cpu_type[i]] = atom.cpu_mass[i];
+       find_mass_type += 1;
+     }
+-    if (find_mass_type == number_of_types) {
+-      break;
+-    }
++    total_mass += atom.cpu_mass[i];
++  }
++  if (find_mass_type != number_of_types) {
++    PRINT_INPUT_ERROR("mass type and element type do not match.\n");
+   }
+   mass_type.copy_from_host(cpu_mass_type.data());
+ 
+   if (compute == 0) {
+-    FACTOR = 1;
++    std::vector<double> cpu_coefficient(number_of_types * 2);
++    coefficient_.resize(number_of_types * 2);
++    tensor_per_atom_.resize(static_cast<size_t>(N) * 9);
++    tensor_sum_.resize(9);
++
++    const double temperature = integrate.get_temperature1();
++    for (int i = 0; i < number_of_types; i++) {
++      double c_hv = (total_mass - N * cpu_mass_type[i]) / total_mass;
++      cpu_coefficient[i * 2] = (c_hv - 1) / N;
++      cpu_coefficient[i * 2 + 1] = K_B * temperature * c_hv;
++    }
++    coefficient_.copy_from_host(cpu_coefficient.data());
++    FACTOR = 1.0;
+   } else {
+-    double partial_mass = 0;
++    const int element_index = compute - 1;
++    std::vector<double> cpu_coefficient(number_of_types, 0.0);
++    cpu_coefficient[element_index] = double(N) / atom.cpu_type_size[element_index];
++
++    double partial_mass = 0.0;
++    for (int i = 0; i < number_of_types; i++) {
++      if (i != element_index) {
++        partial_mass += cpu_mass_type[i] * atom.cpu_type_size[i];
++      }
++    }
+     for (int i = 0; i < number_of_types; i++) {
+-      if (i != compute - 1) {
+-        partial_mass += atom.cpu_type_size[i] * cpu_mass_type[i];
++      if (i != element_index) {
++        cpu_coefficient[i] = -1.0 * N * cpu_mass_type[i] / partial_mass;
+       }
+     }
+-    FACTOR = N * (1.0 / partial_mass + 1.0 / (atom.cpu_type_size[compute - 1] * cpu_mass_type[compute - 1]));
++
++    coefficient_.resize(number_of_types);
++    coefficient_.copy_from_host(cpu_coefficient.data());
++
++    FACTOR =
++      N *
++      (1.0 / partial_mass +
++       1.0 / (atom.cpu_type_size[element_index] * cpu_mass_type[element_index]));
+     FACTOR = 1.0 / FACTOR;
+   }
+ }
+ 
++static __global__ void gpu_find_per_atom_tensor(
++  int N,
++  double* g_mass,
++  double* g_potential,
++  double* g_vx,
++  double* g_vy,
++  double* g_vz,
++  double* g_sxx,
++  double* g_sxy,
++  double* g_sxz,
++  double* g_syx,
++  double* g_syy,
++  double* g_syz,
++  double* g_szx,
++  double* g_szy,
++  double* g_szz,
++  double* g_tensor)
++{
++  int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < N) {
++    double mass = g_mass[i];
++    double potential = g_potential[i];
++    double vx = g_vx[i];
++    double vy = g_vy[i];
++    double vz = g_vz[i];
++    double energy = mass * (vx * vx + vy * vy + vz * vz) * 0.5 + potential;
++    // the tensor:
++    // xx xy xz    0 3 4
++    // yx yy yz    6 1 5
++    // zx zy zz    7 8 2
++    g_tensor[i] = energy + g_sxx[i];
++    g_tensor[i + 3 * N] = g_sxy[i];
++    g_tensor[i + 4 * N] = g_sxz[i];
++    g_tensor[i + 6 * N] = g_syx[i];
++    g_tensor[i + N] = energy + g_syy[i];
++    g_tensor[i + 5 * N] = g_syz[i];
++    g_tensor[i + 7 * N] = g_szx[i];
++    g_tensor[i + 8 * N] = g_szy[i];
++    g_tensor[i + 2 * N] = energy + g_szz[i];
++  }
++}
++
++static __global__ void gpu_sum_tensor(int N, double* g_tensor, double* g_sum_tensor)
++{
++  int tid = threadIdx.x;
++  int bid = blockIdx.x;
++  int number_of_batches = (N - 1) / 1024 + 1;
++  __shared__ double s_t[1024];
++  double t = 0.0;
++
++  for (int batch = 0; batch < number_of_batches; ++batch) {
++    int n = tid + batch * 1024;
++    if (n < N)
++      t += g_tensor[bid * N + n];
++  }
++  s_t[tid] = t;
++  __syncthreads();
++
++  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
++    if (tid < offset) {
++      s_t[tid] += s_t[tid + offset];
++    }
++    __syncthreads();
++  }
++
++  if (tid == 0) {
++    g_sum_tensor[bid] = s_t[0];
++  }
++}
++
++static __global__ void gpu_add_heat_flow_driving_force(
++  int N,
++  const double* g_coefficient,
++  const int* g_type,
++  double fe_x,
++  double fe_y,
++  double fe_z,
++  double* g_sxx,
++  double* g_sxy,
++  double* g_sxz,
++  double* g_syx,
++  double* g_syy,
++  double* g_syz,
++  double* g_szx,
++  double* g_szy,
++  double* g_szz,
++  double* g_tensor_tot,
++  double* g_fx,
++  double* g_fy,
++  double* g_fz)
++{
++  int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < N) {
++    int type2 = g_type[i] * 2;
++    double coefficient1 = g_coefficient[type2];
++    double coefficient2 = g_coefficient[type2 + 1];
++    // the tensor:
++    // xx xy xz    0 3 4
++    // yx yy yz    6 1 5
++    // zx zy zz    7 8 2
++    g_fx[i] += fe_x * (g_sxx[i] + coefficient1 * g_tensor_tot[0] + coefficient2) +
++               fe_y * (g_syx[i] + coefficient1 * g_tensor_tot[6]) +
++               fe_z * (g_szx[i] + coefficient1 * g_tensor_tot[7]);
++
++    g_fy[i] += fe_x * (g_sxy[i] + coefficient1 * g_tensor_tot[3]) +
++               fe_y * (g_syy[i] + coefficient1 * g_tensor_tot[1] + coefficient2) +
++               fe_z * (g_szy[i] + coefficient1 * g_tensor_tot[8]);
++
++    g_fz[i] += fe_x * (g_sxz[i] + coefficient1 * g_tensor_tot[4]) +
++               fe_y * (g_syz[i] + coefficient1 * g_tensor_tot[5]) +
++               fe_z * (g_szz[i] + coefficient1 * g_tensor_tot[2] + coefficient2);
++  }
++}
++
++static __global__ void gpu_add_color_driving_force(
++  int N,
++  const double* g_coefficient,
++  const int* g_type,
++  double fe_x,
++  double fe_y,
++  double fe_z,
++  double* g_fx,
++  double* g_fy,
++  double* g_fz)
++{
++  int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < N) {
++    double coefficient = g_coefficient[g_type[i]];
++    g_fx[i] += fe_x * coefficient;
++    g_fy[i] += fe_y * coefficient;
++    g_fz[i] += fe_z * coefficient;
++  }
++}
++
+ static __global__ void gpu_sum_heat_and_diffusion(
+   const int N,
+   const int step,
+@@ -163,6 +315,78 @@ static __global__ void gpu_sum_heat_and_diffusion(
+   }
+ }
+ 
++void HNEMDEC::post_force(
++  const int step,
++  const double time_step,
++  Integrate& integrate,
++  std::vector<Group>& group,
++  Atom& atom,
++  Box& box,
++  Force& force)
++{
++  if (compute == -1)
++    return;
++
++  const int N = atom.number_of_atoms;
++
++  if (compute == 0) {
++    gpu_find_per_atom_tensor<<<(N - 1) / 128 + 1, 128>>>(
++      N,
++      atom.mass.data(),
++      atom.potential_per_atom.data(),
++      atom.velocity_per_atom.data(),
++      atom.velocity_per_atom.data() + N,
++      atom.velocity_per_atom.data() + 2 * N,
++      atom.virial_per_atom.data() + 0 * N,
++      atom.virial_per_atom.data() + 3 * N,
++      atom.virial_per_atom.data() + 4 * N,
++      atom.virial_per_atom.data() + 6 * N,
++      atom.virial_per_atom.data() + 1 * N,
++      atom.virial_per_atom.data() + 5 * N,
++      atom.virial_per_atom.data() + 7 * N,
++      atom.virial_per_atom.data() + 8 * N,
++      atom.virial_per_atom.data() + 2 * N,
++      tensor_per_atom_.data());
++    GPU_CHECK_KERNEL
++
++    gpu_sum_tensor<<<9, 1024>>>(N, tensor_per_atom_.data(), tensor_sum_.data());
++    GPU_CHECK_KERNEL
++
++    gpu_add_heat_flow_driving_force<<<(N - 1) / 128 + 1, 128>>>(
++      N,
++      coefficient_.data(),
++      atom.type.data(),
++      fe_x,
++      fe_y,
++      fe_z,
++      tensor_per_atom_.data() + 0 * N,
++      tensor_per_atom_.data() + 3 * N,
++      tensor_per_atom_.data() + 4 * N,
++      tensor_per_atom_.data() + 6 * N,
++      tensor_per_atom_.data() + 1 * N,
++      tensor_per_atom_.data() + 5 * N,
++      tensor_per_atom_.data() + 7 * N,
++      tensor_per_atom_.data() + 8 * N,
++      tensor_per_atom_.data() + 2 * N,
++      tensor_sum_.data(),
++      atom.force_per_atom.data(),
++      atom.force_per_atom.data() + N,
++      atom.force_per_atom.data() + 2 * N);
++    GPU_CHECK_KERNEL
++  } else {
++    gpu_add_color_driving_force<<<(N - 1) / 128 + 1, 128>>>(
++      N,
++      coefficient_.data(),
++      atom.type.data(),
++      fe_x,
++      fe_y,
++      fe_z,
++      atom.force_per_atom.data(),
++      atom.force_per_atom.data() + N,
++      atom.force_per_atom.data() + 2 * N);
++  }
++}
++
+ void HNEMDEC::end_of_step(
+   const int number_of_steps,
+   int step,
+diff --git a/src/measure/hnemdec_kappa.cuh b/src/measure/hnemdec_kappa.cuh
+index 43aa428ba..2ccd3c610 100644
+--- a/src/measure/hnemdec_kappa.cuh
++++ b/src/measure/hnemdec_kappa.cuh
+@@ -48,6 +48,15 @@ public:
+     Box& box,
+     Force& force);
+ 
++  virtual void post_force(
++    const int step,
++    const double time_step,
++    Integrate& integrate,
++    std::vector<Group>& group,
++    Atom& atom,
++    Box& box,
++    Force& force);
++
+   virtual void end_of_step(
+       const int number_of_steps,
+       int step,
+@@ -72,4 +81,9 @@ public:
+ 
+   HNEMDEC(const std::vector<std::string>& tokens);
+   void parse(const std::vector<std::string>& tokens);
++
++private:
++  GPU_Vector<double> coefficient_;
++  GPU_Vector<double> tensor_per_atom_;
++  GPU_Vector<double> tensor_sum_;
+ };
+diff --git a/src/measure/measure.cu b/src/measure/measure.cu
+index 1d921cdf5..2452f3018 100644
+--- a/src/measure/measure.cu
++++ b/src/measure/measure.cu
+@@ -208,7 +208,7 @@ bool Measure::parse_action(
+     actions_.emplace_back(std::move(action));
+   } else if (tokens[0] == "compute_hnemd") {
+     std::unique_ptr<Action> action;
+-    action.reset(new HNEMD(tokens, force));
++    action.reset(new HNEMD(tokens));
+     actions_.emplace_back(std::move(action));
+   } else if (tokens[0] == "compute_hnemdec") {
+     std::unique_ptr<Action> action;
+@@ -220,11 +220,11 @@ bool Measure::parse_action(
+     actions_.emplace_back(std::move(action));
+   } else if (tokens[0] == "compute_gkma") {
+     std::unique_ptr<Action> action;
+-    action.reset(new MODAL_ANALYSIS(tokens, number_of_types, 0, force));
++    action.reset(new MODAL_ANALYSIS(tokens, number_of_types, 0));
+     actions_.emplace_back(std::move(action));
+   } else if (tokens[0] == "compute_hnema") {
+     std::unique_ptr<Action> action;
+-    action.reset(new MODAL_ANALYSIS(tokens, number_of_types, 1, force));
++    action.reset(new MODAL_ANALYSIS(tokens, number_of_types, 1));
+     actions_.emplace_back(std::move(action));
+   } else if (tokens[0] == "deform") {
+     Deform* deform = new Deform(tokens);
+@@ -291,6 +291,8 @@ void Measure::pre_run(
+   Force& force)
+ {
+   std::vector<std::string> action_names;
++  int number_of_hnemd_methods = 0;
++  int number_of_modal_methods = 0;
+   for (auto& action : actions_) {
+     if (action->action_name == "") {
+       printf("Dear developer:\n");
+@@ -311,9 +313,26 @@ void Measure::pre_run(
+         }
+       }
+     }
++    if (
++      action->action_name == "compute_hnemd" ||
++      action->action_name == "compute_hnemdec" ||
++      action->action_name == "compute_hnema") {
++      ++number_of_hnemd_methods;
++    }
++    if (
++      action->action_name == "compute_gkma" ||
++      action->action_name == "compute_hnema") {
++      ++number_of_modal_methods;
++    }
+     action_names.emplace_back(action->action_name);
+   }
+ 
++  if (number_of_modal_methods > 1) {
++    PRINT_INPUT_ERROR("There are multiple modal_analysis keywords within one run.");
++  }
++  if (number_of_hnemd_methods > 1) {
++    PRINT_INPUT_ERROR("Cannot have more than one HNEMD method within one run.");
++  }
+ 
+   for (auto& action : actions_) {
+     action->pre_run(
+diff --git a/src/measure/modal_analysis.cu b/src/measure/modal_analysis.cu
+index 81683cf9d..4c3ee7cf9 100644
+--- a/src/measure/modal_analysis.cu
++++ b/src/measure/modal_analysis.cu
+@@ -30,7 +30,7 @@ GPUMD Contributing author: Alexander Gabourie (Stanford University)
+ ------------------------------------------------------------------------------*/
+ 
+ #include "modal_analysis.cuh"
+-#include "force/force.cuh"
++#include "hnemd_force.cuh"
+ #include "utilities/error.cuh"
+ #include "utilities/gpu_macro.cuh"
+ #include "utilities/read_file.cuh"
+@@ -459,6 +459,7 @@ void MODAL_ANALYSIS::pre_run(
+     strcpy(output_file_position, "heatmode.out");
+   } else if (method == HNEMA_METHOD) {
+     strcpy(output_file_position, "kappamode.out");
++    force_sum_.resize(3);
+   }
+ 
+   size_t eig_size = num_participating * num_modes;
+@@ -557,6 +558,28 @@ void MODAL_ANALYSIS::pre_run(
+   gpublasCreate(&ma_handle);
+ }
+ 
++void MODAL_ANALYSIS::post_force(
++  const int step,
++  const double time_step,
++  Integrate& integrate,
++  std::vector<Group>& group,
++  Atom& atom,
++  Box& box,
++  Force& force)
++{
++  if (!compute || method != HNEMA_METHOD)
++    return;
++
++  apply_hnemd_force(
++    atom.number_of_atoms,
++    fe_x,
++    fe_y,
++    fe_z,
++    atom.virial_per_atom,
++    atom.force_per_atom,
++    force_sum_);
++}
++
+ void MODAL_ANALYSIS::end_of_step(
+   const int number_of_steps,
+   int step,
+@@ -633,17 +656,16 @@ void MODAL_ANALYSIS::post_run(
+ 
+ MODAL_ANALYSIS::MODAL_ANALYSIS(
+   const std::vector<std::string>& tokens,
+-  const int number_of_types, 
+-  int method_input,
+-  Force& force)
++  const int number_of_types,
++  int method_input)
+ {
+   if (method_input == 0) {
+     parse_compute_gkma(tokens, number_of_types);
++    action_name = "compute_gkma";
+   } else {
+     parse_compute_hnema(tokens, number_of_types);
+-    force.set_hnemd_parameters(fe_x, fe_y, fe_z);
++    action_name = "compute_hnema";
+   }
+-  action_name = "modal_analysis";
+ }
+ 
+ void MODAL_ANALYSIS::parse_compute_gkma(
+diff --git a/src/measure/modal_analysis.cuh b/src/measure/modal_analysis.cuh
+index 0cdfafe8e..b0ef7e7aa 100644
+--- a/src/measure/modal_analysis.cuh
++++ b/src/measure/modal_analysis.cuh
+@@ -90,6 +90,15 @@ public:
+     Box& box,
+     Force& force);
+ 
++  virtual void post_force(
++    const int step,
++    const double time_step,
++    Integrate& integrate,
++    std::vector<Group>& group,
++    Atom& atom,
++    Box& box,
++    Force& force);
++
+   virtual void end_of_step(
+       const int number_of_steps,
+       int step,
+@@ -114,9 +123,8 @@ public:
+ 
+   MODAL_ANALYSIS(
+     const std::vector<std::string>& tokens,
+-    const int number_of_types, 
+-    int method_input,
+-    Force& force);
++    const int number_of_types,
++    int method_input);
+   void parse_compute_gkma(
+     const std::vector<std::string>& tokens, const int number_of_types);
+   void parse_compute_hnema(
+@@ -134,6 +142,7 @@ private:
+   double fe_y = 0.0;
+   double fe_z = 0.0;
+   double fe;
++  GPU_Vector<double> force_sum_;
+ 
+   gpublasHandle_t ma_handle;
+ 

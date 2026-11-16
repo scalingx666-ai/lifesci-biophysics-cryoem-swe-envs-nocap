@@ -1,0 +1,884 @@
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator.py b/scilink/agents/exp_agents/analysis_orchestrator.py
+index 6513716f4..79d0f6fb2 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator.py
+@@ -1587,6 +1587,10 @@ def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+                     if _d:
+                         feature_tables_schema.append(
+                             {"path": str(ft.resolve()), **_d})
++                        # #534: partial / split columns must reach the caller
++                        # that picks BO inputs and targets, not just the schema.
++                        for _w in _d.get("warnings") or []:
++                            warnings.append(f"Feature table {ft.name}: {_w}")
+ 
+         # staged_solutions: raw T=2 (hot-annealing) solutions filed in the
+         # staging buffer during this run. Surfaced so the meta agent can offer
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator_tools.py b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+index fceea15a2..69f6c9647 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator_tools.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+@@ -3283,6 +3283,12 @@ def _resolve_one(s):
+                             response["feature_rows"] = _desc["n_rows"]
+                             if _desc["missing"]:
+                                 response["feature_missing"] = _desc["missing"]
++                            # #534: a column empty for SOME units, or one
++                            # quantity split across two sibling columns,
++                            # silently drops units from a BO keyed on it —
++                            # say so here, where inputs/targets get chosen.
++                            if _desc.get("warnings"):
++                                response["feature_warnings"] = _desc["warnings"]
+                     # #172: surface the locked-script reuse verdict so the
+                     # orchestrator can act on a non-`good` outcome (a poorly
+                     # fitting reused recipe, or a re-derived schema).
+diff --git a/scilink/agents/exp_agents/feature_table.py b/scilink/agents/exp_agents/feature_table.py
+index d3167ae63..ab426e5b0 100644
+--- a/scilink/agents/exp_agents/feature_table.py
++++ b/scilink/agents/exp_agents/feature_table.py
+@@ -12,11 +12,82 @@
+ import csv
+ import json
+ import logging
++import re
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Trailing name tokens that carry no identity: ``metric`` and ``metric_value``
++# are the same quantity. Kept deliberately small — statistics suffixes (mean,
++# std, err) and single-letter fit-parameter names are NOT variants.
++_VARIANT_SUFFIX_TOKENS = ("value", "val")
++
++
++def _variant_key(name: str) -> str:
++    """Column name reduced to its identity: lower-cased tokens with trailing
++    ``value`` / ``val`` stripped, so ``Metric_value`` and ``metric`` collide."""
++    toks = [t for t in re.split(r"[^a-z0-9]+", str(name).lower()) if t]
++    while toks and toks[-1] in _VARIANT_SUFFIX_TOKENS:
++        toks.pop()
++    return "_".join(toks)
++
++
++def _present(value: Any) -> bool:
++    return value is not None and value != "" and not (
++        isinstance(value, float) and value != value)
++
++
++def merge_variant_columns(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """Collapse per-unit key-name variants of one quantity into one column
++    (issue #534).
++
++    Per-unit scripts are generated independently, so one unit may report a
++    derived scalar as ``metric`` while the rest report ``metric_value``. Left
++    alone, the flatten writes two sibling columns, each partially populated,
++    and a BO keyed on one of them silently drops the other units. Two names
++    are merged only when they reduce to the same :func:`_variant_key` AND no
++    unit populates both (complementary sets) — a unit carrying both is
++    evidence they are distinct quantities and they are left untouched. The
++    survivor is the name populated by the most units (first seen on a tie),
++    so a target name a caller already chose stays valid. Mutates ``rows`` in
++    place; returns the merge notes (``column``, ``merged_from``, ``units``).
++    """
++    order: List[str] = []
++    for row in rows:
++        for key in row:
++            if key not in order:
++                order.append(key)
++    groups: Dict[str, List[str]] = {}
++    for key in order:
++        groups.setdefault(_variant_key(key), []).append(key)
++    notes: List[Dict[str, Any]] = []
++    for names in groups.values():
++        if len(names) < 2:
++            continue
++        # Complementary: no unit carries more than one of the variants.
++        if any(sum(_present(row.get(n)) for n in names) > 1 for row in rows):
++            continue
++        counts = {n: sum(_present(row.get(n)) for row in rows) for n in names}
++        canonical = max(names, key=lambda n: (counts[n], -names.index(n)))
++        moved_units: List[str] = []
++        for row in rows:
++            for n in names:
++                if n == canonical or n not in row:
++                    continue
++                val = row.pop(n)
++                if _present(val):
++                    row[canonical] = val
++                    moved_units.append(str(row.get("unit", "?")))
++        merged_from = [n for n in names if n != canonical]
++        notes.append({"column": canonical, "merged_from": merged_from,
++                      "units": moved_units})
++        logger.warning(
++            f"feature table: merged variant column(s) {merged_from} into "
++            f"'{canonical}' for unit(s) {moved_units} — the same quantity was "
++            f"reported under different names (#534)")
++    return notes
++
+ 
+ def _flatten_scalars(obj: Any, prefix: str = "") -> Dict[str, Any]:
+     """Recursively collect scalar leaves of a nested dict as flat columns.
+@@ -161,11 +232,65 @@ def _extracted_feature_rows(output_dir: Path) -> List[Dict[str, Any]]:
+     return [row]
+ 
+ 
++_WARN_MAX_UNITS = 6  # unit names listed per warning before eliding
++
++
++def _feature_table_warnings(header: List[str], rows: List[List[str]]
++                            ) -> List[str]:
++    """Human-readable hazards a consumer keying a BO on this table must see
++    (issue #534): a column empty for SOME units (those units would be
++    silently excluded from an optimization keyed on it), and a pair of
++    partially populated columns whose populated unit sets are complementary
++    (the signature of one quantity reported under two names)."""
++    n = len(rows)
++    if n == 0 or not header:
++        return []
++    unit_idx = next((i for i, c in enumerate(header)
++                     if str(c).lower() == "unit"), None)
++
++    def _unit(r_i: int) -> str:
++        r = rows[r_i]
++        if unit_idx is not None and unit_idx < len(r) and r[unit_idx] != "":
++            return r[unit_idx]
++        return f"row {r_i + 1}"
++
++    def _elide(names: List[str]) -> str:
++        shown = ", ".join(names[:_WARN_MAX_UNITS])
++        extra = len(names) - _WARN_MAX_UNITS
++        return shown + (f", … (+{extra})" if extra > 0 else "")
++
++    populated: Dict[int, set] = {}
++    for i in range(len(header)):
++        populated[i] = {r_i for r_i, r in enumerate(rows)
++                        if i < len(r) and r[i] != "" and r[i].lower() != "nan"}
++    partial = [i for i in range(len(header)) if 0 < len(populated[i]) < n]
++    warnings: List[str] = []
++    for i in partial:
++        holes = sorted(set(range(n)) - populated[i])
++        warnings.append(
++            f"Column '{header[i]}' is empty for {len(holes)} of {n} units "
++            f"({_elide([_unit(h) for h in holes])}); an optimization keyed "
++            f"on it would exclude those units.")
++    for a_pos, i in enumerate(partial):
++        for j in partial[a_pos + 1:]:
++            pi, pj = populated[i], populated[j]
++            if pi & pj or len(pi | pj) != n:
++                continue
++            warnings.append(
++                f"Columns '{header[i]}' ({len(pi)} units) and '{header[j]}' "
++                f"({len(pj)} units) are populated for complementary unit sets "
++                f"— likely the same quantity reported under two names. Keying "
++                f"a BO on either one drops the other's units; pick one name "
++                f"and re-report the other units under it.")
++    return warnings
++
++
+ def describe_feature_table(path) -> Optional[Dict[str, Any]]:
+     """Schema summary of a feature CSV for callers that cannot open the file
+     (a remote MCP client, an LLM deciding inputs/targets): column names, row
+-    count, and per-column missing counts (only columns with any missing).
+-    Never raises."""
++    count, per-column missing counts (only columns with any missing), and
++    ``warnings`` — the partial-population / split-column hazards a BO
++    handoff must not proceed past silently (#534). Never raises."""
+     try:
+         with open(path, newline="", encoding="utf-8") as fh:
+             reader = csv.reader(fh)
+@@ -173,9 +298,9 @@ def describe_feature_table(path) -> Optional[Dict[str, Any]]:
+             if header is None:
+                 return None
+             missing = [0] * len(header)
+-            n = 0
++            rows: List[List[str]] = []
+             for row in reader:
+-                n += 1
++                rows.append(row)
+                 for i, v in enumerate(row[:len(header)]):
+                     if v == "" or v.lower() == "nan":
+                         missing[i] += 1
+@@ -184,8 +309,9 @@ def describe_feature_table(path) -> Optional[Dict[str, Any]]:
+                         missing[i] += 1
+         return {
+             "columns": header,
+-            "n_rows": n,
++            "n_rows": len(rows),
+             "missing": {c: m for c, m in zip(header, missing) if m},
++            "warnings": _feature_table_warnings(header, rows),
+         }
+     except Exception:  # noqa: BLE001 - descriptive only
+         return None
+@@ -211,6 +337,9 @@ def write_feature_table(output_dir) -> Optional[str]:
+         )
+         if not rows:
+             return None
++        # One quantity under two per-unit names would otherwise become two
++        # half-empty sibling columns (#534).
++        merge_variant_columns(rows)
+         columns: List[str] = []
+         for row in rows:
+             for key in row:
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index aa96efd00..d038f1261 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -304,7 +304,11 @@ def _missing_(cls, value):
+   the feature-table file PATH to `delegate_to_planning` (in `context`, and name
+   it in `task`). `feature_tables_schema` lists each table's columns, row count
+   and any columns with missing values — use it to name the input/target
+-  columns instead of opening the file.
++  columns instead of opening the file. Its `warnings` (also in the result's
++  `warnings`) flag a column that is empty for some units or one quantity split
++  across two sibling columns: a BO keyed on such a column silently drops those
++  units, so tell the user which units are affected instead of calling the
++  table BO-ready.
+ - Do NOT re-summarize the numbers as prose for the planning specialist to
+   retype — that loses precision and risks transcription errors. The planning
+   specialist ingests the file directly with its `analyze_file` tool.
+diff --git a/scilink/agents/planning_agents/orchestrator_tools.py b/scilink/agents/planning_agents/orchestrator_tools.py
+index ef06303aa..34d57f68a 100644
+--- a/scilink/agents/planning_agents/orchestrator_tools.py
++++ b/scilink/agents/planning_agents/orchestrator_tools.py
+@@ -349,6 +349,22 @@ def _capture_fidelity_spec(self, column_roles: Dict, input_columns: List[str]) -
+         else:
+             self.orch.fidelity_spec = None
+ 
++    @staticmethod
++    def _sidecar_scalar_keys(file_path: str) -> set:
++        """Scalar keys of the data file's sidecar JSON (``x.csv`` -> ``x.json``)
++        — the conditions analyze_file merges into the scalarizer output, so a
++        campaign input living there need not be a column of the table."""
++        try:
++            sidecar = Path(file_path).with_suffix(".json")
++            if not sidecar.is_file():
++                return set()
++            data = json.loads(sidecar.read_text(encoding="utf-8"))
++            if not isinstance(data, dict):
++                return set()
++            return {k for k, v in data.items() if isinstance(v, (int, float, str))}
++        except Exception:  # noqa: BLE001 - a bad sidecar must not block ingestion
++            return set()
++
+     def _compute_file_hash(self, file_path: str) -> str:
+         """Compute MD5 hash of file content for deduplication."""
+         hasher = hashlib.md5()
+@@ -3455,9 +3471,11 @@ def analyze_file(
+             _exps = (current_plan or {}).get("proposed_experiments") or [{}]
+             exp_context = _exps[0]
+ 
+-            # Inject schema requirements into context (only when generating new script)
++            # Inject schema requirements into context (only when generating a
++            # new script — a locked script ignores it; force_regenerate must
++            # still see it).
+             role_hints = None
+-            if inputs and targets and not has_locked_script:
++            if inputs and targets and script_to_use is None:
+                 exp_context = exp_context.copy() if exp_context else {}
+                 exp_context["_schema_requirements"] = {
+                     "input_columns": inputs,
+@@ -3465,6 +3483,32 @@ def analyze_file(
+                     "optimization_type": "multi-objective" if len(targets) > 1 else "single-objective"
+                 }
+                 role_hints = {"inputs": inputs, "targets": targets}
++            elif (script_to_use is None
++                    and self.orch.expected_input_columns
++                    and self.orch.expected_target_columns):
++                # #535: a continuation on an established campaign repeats the
++                # prior ingestion decision. The campaign's schema is known and
++                # checkpointed; arming it here makes the explicit table
++                # pass-through fire for a same-schema file (and gives codegen
++                # the required schema when the file is not a flat table)
++                # instead of rediscovering via codegen. Inputs that ride the
++                # file's sidecar JSON are merged after scalarization, so they
++                # are not demanded from the table itself.
++                _known_targets = list(self.orch.expected_target_columns)
++                _sidecar_keys = self._sidecar_scalar_keys(file_path)
++                _table_inputs = [c for c in self.orch.expected_input_columns
++                                 if c not in _sidecar_keys]
++                exp_context = exp_context.copy() if exp_context else {}
++                exp_context["_schema_requirements"] = {
++                    "input_columns": _table_inputs,
++                    "target_columns": _known_targets,
++                    "optimization_type": ("multi-objective"
++                                          if len(_known_targets) > 1
++                                          else "single-objective"),
++                }
++                role_hints = {"inputs": _table_inputs, "targets": _known_targets}
++                print(f"    📌 Continuation: schema armed from the campaign "
++                      f"(inputs={_table_inputs}, targets={_known_targets})")
+ 
+             try:
+                 res = self.orch.scalarizer.scalarize(
+@@ -3589,7 +3633,19 @@ def analyze_file(
+                         "status": "error",
+                         "message": f"Unexpected metrics format: {type(metrics)}"
+                     })
+-                
++
++                # Unit labels aligned to df_new's index, so a row skipped later
++                # (empty target) can be named (#534). A feature-table
++                # pass-through carries them as res["units"] (it returns only
++                # the requested columns); a codegen script may emit 'unit'.
++                _unit_series = None
++                if "unit" in df_new.columns:
++                    _unit_series = df_new["unit"].astype(str)
++                elif (isinstance(res.get("units"), list)
++                        and len(res["units"]) == len(df_new)):
++                    _unit_series = pd.Series([str(u) for u in res["units"]],
++                                             index=df_new.index)
++
+                 # DEDUPLICATION - Content-based tracking
+                 # Compute current file hash
+                 current_hash = self._compute_file_hash(file_path)
+@@ -3903,6 +3959,11 @@ def analyze_file(
+                     else:
+                         ref_cols = None
+ 
++                # df_to_append is a row-subset of df_new (index preserved), so
++                # the unit labels realign by index; 'unit' itself is not a
++                # schema column and is dropped just below.
++                _unit_labels = (_unit_series.reindex(df_to_append.index).tolist()
++                                if _unit_series is not None else None)
+                 if ref_cols:
+                     available = [c for c in ref_cols if c in df_to_append.columns]
+                     extra = [c for c in df_to_append.columns if c not in ref_cols]
+@@ -3927,13 +3988,18 @@ def analyze_file(
+                 _n_before = len(df_to_append)
+                 _keep = df_to_append[_schema_cols].notna().all(axis=1)
+                 rows_skipped_missing = int((~_keep).sum())
++                _skipped_units: List[str] = []
+                 if rows_skipped_missing:
+                     _bad_cols = [c for c in _schema_cols
+                                  if df_to_append.loc[~_keep, c].isna().any()]
++                    if _unit_labels is not None:
++                        _skipped_units = [u for u, k in zip(_unit_labels, _keep.tolist())
++                                          if not k]
+                     df_to_append = df_to_append[_keep]
+                     num_new = len(df_to_append)
+                     print(f"    ⚠️  Skipping {rows_skipped_missing}/{_n_before} row(s) "
+-                          f"with missing values in {_bad_cols}")
++                          f"with missing values in {_bad_cols}"
++                          + (f" (units: {_skipped_units})" if _skipped_units else ""))
+                     if df_to_append.empty:
+                         return json.dumps({
+                             "status": "error",
+@@ -3996,11 +4062,15 @@ def analyze_file(
+                     _resp["direction_warnings"] = _dir_warn
+                 if rows_skipped_missing:
+                     _resp["rows_skipped_missing"] = rows_skipped_missing
++                    if _skipped_units:
++                        _resp["rows_skipped_units"] = _skipped_units
+                     _resp["warning"] = (
+                         f"{rows_skipped_missing} row(s) skipped: missing values in "
+-                        f"{_bad_cols}. If those units report the quantity under a "
+-                        f"different column, re-ingest a table where it is filled in "
+-                        f"under the target name.")
++                        f"{_bad_cols}"
++                        + (f" (units: {_skipped_units})" if _skipped_units else "")
++                        + ". The optimizer will NOT see these units. If they "
++                        f"report the quantity under a different column, re-ingest "
++                        f"a table where it is filled in under the target name.")
+                 return json.dumps(_resp)
+                 
+             except Exception as e:
+diff --git a/scilink/agents/planning_agents/scalarizer_agent.py b/scilink/agents/planning_agents/scalarizer_agent.py
+index 5e1066b7a..e85b049cf 100644
+--- a/scilink/agents/planning_agents/scalarizer_agent.py
++++ b/scilink/agents/planning_agents/scalarizer_agent.py
+@@ -333,7 +333,13 @@ def _try_table_passthrough(self, df, objective_query,
+             goal = str(objective_query or "").lower()
+             if not is_feature_table:
+                 return None
+-            if any(t in goal for t in self._DERIVATION_TERMS):
++            # A derivation term that is itself a column of the table (a
++            # 'yield' or 'selectivity' column) names a quantity to READ, not
++            # to derive — the veto is for terms the table cannot satisfy
++            # (#535).
++            col_tok_union = set().union(*col_tokens.values()) if col_tokens else set()
++            if any(t in goal and t.strip() not in col_tok_union
++                   for t in self._DERIVATION_TERMS):
+                 return None
+             goal_toks = self._norm_tokens(goal)
+             requested = [c for c in cols
+@@ -348,8 +354,14 @@ def _try_table_passthrough(self, df, objective_query,
+             rt = self._norm_tokens(req)
+             if not rt:
+                 return None
+-            hit = next((c for c in cols
+-                        if rt <= col_tokens[c] or col_tokens[c] <= rt), None)
++            # An exact (case-insensitive) column name wins over a token-subset
++            # match: with sibling columns 'metric' and 'metric_value' both
++            # present, a request for 'metric' must read 'metric', not
++            # whichever sibling comes first in the header (#534).
++            hit = next((c for c in cols if str(c).lower() == req.lower()), None)
++            if hit is None:
++                hit = next((c for c in cols
++                            if rt <= col_tokens[c] or col_tokens[c] <= rt), None)
+             if hit is None or not _np_is_numeric(df[hit]):
+                 return None
+             matched[req] = hit
+@@ -376,6 +388,11 @@ def _try_table_passthrough(self, df, objective_query,
+         result = {"status": "success", "metrics": metrics,
+                   "source_script": None, "column_roles": roles,
+                   "passthrough": True, "error": None}
++        # Row identities travel alongside the requested columns so the caller
++        # can name a unit it has to skip (#534).
++        unit_col = next((c for c in cols if str(c).lower() == "unit"), None)
++        if unit_col is not None:
++            result["units"] = [str(u) for u in df[unit_col].tolist()]
+         self._log_action(
+             action="table_passthrough",
+             input_ctx={"requested": requested},
+diff --git a/tests/test_analyze_file_continuation.py b/tests/test_analyze_file_continuation.py
+new file mode 100644
+index 000000000..b55e0c527
+--- /dev/null
++++ b/tests/test_analyze_file_continuation.py
+@@ -0,0 +1,233 @@
++"""#535: a continuation on an established campaign repeats the prior
++ingestion decision. When analyze_file is called WITHOUT inputs/targets and
++the campaign schema is already established (and no script is locked — the
++first ingestion was a table pass-through), the call arms the scalarizer's
++explicit pass-through (`_schema_requirements` / `column_role_hints`) from the
++campaign schema instead of dropping to codegen rediscovery.
++
++Also covers the #534 planning-side amplifier: a row skipped for an empty
++target is reported by UNIT NAME.
++
++Drives the REAL analyze_file tool; scalarize() is stubbed to capture its
++kwargs and return fixture results (no LLM, no network)."""
++import contextlib
++import io
++import json
++import os
++import tempfile
++from pathlib import Path
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++os.environ.setdefault("MPLBACKEND", "Agg")
++
++import pandas as pd
++import pytest
++
++from scilink.agents.planning_agents.planning_orchestrator import (
++    PlanningOrchestratorAgent, AutonomyLevel,
++)
++
++SEED = ("unit,T,t,Y\n"
++        "s1,30.0,10.0,8.56\ns2,30.0,50.0,3.88\ns3,90.0,10.0,22.47\n"
++        "s4,90.0,50.0,10.81\ns5,50.0,35.0,48.83\ns6,78.0,18.0,61.1\n")
++SEED_METRICS = {"T": [30.0, 30.0, 90.0, 90.0, 50.0, 78.0],
++                "t": [10.0, 50.0, 10.0, 50.0, 35.0, 18.0],
++                "Y": [8.56, 3.88, 22.47, 10.81, 48.83, 61.1]}
++NEXT = "unit,T,t,Y\ns7,65.0,25.0,70.2\n"
++
++
++@pytest.fixture
++def orch(tmp_path):
++    data_dir = tmp_path / "data"
++    data_dir.mkdir()
++    with contextlib.redirect_stdout(io.StringIO()):
++        o = PlanningOrchestratorAgent(
++            base_dir=str(tmp_path / "session"), api_key="sk-dummy",
++            autonomy_level=AutonomyLevel.AUTONOMOUS, data_dir=str(data_dir))
++    o._calls = []
++
++    def fake_scalarize(**kw):
++        o._calls.append(kw)
++        fx = o._fixture
++        return dict(fx) if callable(fx) is False else fx(kw)
++    o.scalarizer.scalarize = fake_scalarize
++    o._data_dir_path = data_dir
++    return o
++
++
++def _passthrough(metrics, inputs, targets):
++    return {"status": "success", "metrics": metrics, "source_script": None,
++            "column_roles": {"inputs": inputs, "targets": targets},
++            "passthrough": True, "error": None}
++
++
++def _call(o, path, **kw):
++    with contextlib.redirect_stdout(io.StringIO()) as buf:
++        out = o.tools.execute_tool("analyze_file", file_path=str(path),
++                                   extraction_goal="offline fixture", **kw)
++    return json.loads(out), buf.getvalue()
++
++
++def _seed_campaign(o):
++    seed = o._data_dir_path / "seed.csv"
++    seed.write_text(SEED)
++    o._fixture = _passthrough(dict(SEED_METRICS), ["T", "t"], ["Y"])
++    res, _ = _call(o, seed, inputs=["T", "t"], targets=["Y"])
++    assert res["status"] == "success" and res["rows_added"] == 6
++    assert o.expected_input_columns == ["T", "t"]
++    assert o.expected_target_columns == ["Y"]
++    assert not o.active_scalarizer_script  # pass-through locks nothing
++    return seed
++
++
++def test_first_ingestion_without_schema_arms_nothing(orch):
++    """Unchanged: no campaign schema yet -> discovery, no hints."""
++    seed = orch._data_dir_path / "seed.csv"
++    seed.write_text(SEED)
++    orch._fixture = _passthrough(dict(SEED_METRICS), ["T", "t"], ["Y"])
++    _call(orch, seed)
++    kw = orch._calls[-1]
++    assert kw["column_role_hints"] is None
++    assert "_schema_requirements" not in (kw["experiment_context"] or {})
++
++
++def test_continuation_arms_passthrough_from_campaign_schema(orch):
++    _seed_campaign(orch)
++    nxt = orch._data_dir_path / "next.csv"
++    nxt.write_text(NEXT)
++    orch._fixture = _passthrough({"T": 65.0, "t": 25.0, "Y": 70.2}, ["T", "t"], ["Y"])
++    res, log = _call(orch, nxt)          # NO inputs / targets
++    kw = orch._calls[-1]
++    assert kw["reuse_script_path"] is None
++    assert kw["column_role_hints"] == {"inputs": ["T", "t"], "targets": ["Y"]}
++    assert kw["experiment_context"]["_schema_requirements"] == {
++        "input_columns": ["T", "t"], "target_columns": ["Y"],
++        "optimization_type": "single-objective"}
++    assert "Continuation: schema armed from the campaign" in log
++    assert res["status"] == "success" and res["rows_added"] == 1
++    assert res["data_points_collected"] == 7
++    assert orch.expected_input_columns == ["T", "t"]
++
++
++def test_continuation_sidecar_inputs_not_demanded_from_table(orch):
++    _seed_campaign(orch)
++    nxt = orch._data_dir_path / "next.csv"
++    nxt.write_text("unit,t,Y\ns7,25.0,70.2\n")
++    nxt.with_suffix(".json").write_text(json.dumps({"T": 65.0, "note": [1]}))
++    orch._fixture = _passthrough({"t": 25.0, "Y": 70.2}, ["t"], ["Y"])
++    res, _ = _call(orch, nxt)
++    kw = orch._calls[-1]
++    assert kw["column_role_hints"] == {"inputs": ["t"], "targets": ["Y"]}
++    assert kw["experiment_context"]["_schema_requirements"]["input_columns"] == ["t"]
++    assert res["status"] == "success" and res["rows_added"] == 1
++    df = pd.read_csv(orch.bo_data_path)
++    assert float(df.iloc[-1]["T"]) == 65.0   # merged from the sidecar
++
++
++def test_continuation_survives_checkpoint_restore(orch, tmp_path):
++    """The armed schema is the checkpointed one, so a restored session
++    continues deterministically too."""
++    _seed_campaign(orch)
++    with contextlib.redirect_stdout(io.StringIO()):
++        orch.tools.execute_tool("save_checkpoint")
++        restored = PlanningOrchestratorAgent(
++            base_dir=str(tmp_path / "session"), api_key="sk-dummy",
++            autonomy_level=AutonomyLevel.AUTONOMOUS,
++            data_dir=str(orch._data_dir_path), restore_checkpoint=True)
++    assert restored.expected_input_columns == ["T", "t"]
++    calls = []
++    restored.scalarizer.scalarize = lambda **kw: (
++        calls.append(kw) or _passthrough({"T": 65.0, "t": 25.0, "Y": 70.2},
++                                         ["T", "t"], ["Y"]))
++    nxt = orch._data_dir_path / "next.csv"
++    nxt.write_text(NEXT)
++    with contextlib.redirect_stdout(io.StringIO()):
++        out = json.loads(restored.tools.execute_tool(
++            "analyze_file", file_path=str(nxt), extraction_goal="x"))
++    assert out["status"] == "success"
++    assert calls[-1]["column_role_hints"] == {"inputs": ["T", "t"], "targets": ["Y"]}
++
++
++def test_locked_script_still_wins_over_campaign_arming(orch):
++    seed = orch._data_dir_path / "seed.csv"
++    seed.write_text(SEED)
++    script = orch._data_dir_path / "proc_seed.py"
++    script.write_text("# fixture\n")
++    orch._fixture = {**_passthrough(dict(SEED_METRICS), ["T", "t"], ["Y"]),
++                     "passthrough": False, "source_script": str(script)}
++    # Codegen-shaped fixture: list-of-dicts rows.
++    orch._fixture["metrics"] = [dict(T=a, t=b, Y=c) for a, b, c in
++                                zip(SEED_METRICS["T"], SEED_METRICS["t"], SEED_METRICS["Y"])]
++    res, _ = _call(orch, seed, inputs=["T", "t"], targets=["Y"])
++    assert res["status"] == "success"
++    assert orch.active_scalarizer_script == str(script)
++    nxt = orch._data_dir_path / "next.csv"
++    nxt.write_text(NEXT)
++    orch._fixture["metrics"] = [dict(T=65.0, t=25.0, Y=70.2)]
++    res, log = _call(orch, nxt)
++    kw = orch._calls[-1]
++    assert kw["reuse_script_path"] == str(script)
++    assert kw["column_role_hints"] is None       # Consistency Mode, untouched
++    assert "Continuation: schema armed" not in log
++
++
++def test_force_regenerate_with_explicit_schema_arms_it(orch):
++    """A locked script + force_regenerate=True generates a NEW script, which
++    must see the caller's explicit schema (previously suppressed by the
++    locked script's mere existence)."""
++    seed = orch._data_dir_path / "seed.csv"
++    seed.write_text(SEED)
++    script = orch._data_dir_path / "proc_seed.py"
++    script.write_text("# fixture\n")
++    rows = [dict(T=a, t=b, Y=c) for a, b, c in
++            zip(SEED_METRICS["T"], SEED_METRICS["t"], SEED_METRICS["Y"])]
++    orch._fixture = {"status": "success", "metrics": rows,
++                     "source_script": str(script),
++                     "column_roles": {"inputs": ["T", "t"], "targets": ["Y"]},
++                     "error": None}
++    _call(orch, seed, inputs=["T", "t"], targets=["Y"])
++    _call(orch, seed, inputs=["T", "t"], targets=["Y"], force_regenerate=True)
++    kw = orch._calls[-1]
++    assert kw["reuse_script_path"] is None
++    assert kw["column_role_hints"] == {"inputs": ["T", "t"], "targets": ["Y"]}
++
++
++def test_skipped_rows_are_named_by_unit_from_passthrough_units(orch):
++    """#534 amplifier: a unit whose target cell is empty is excluded from the
++    optimization data — the response must say WHICH unit. The real
++    pass-through returns only the requested columns and carries the row
++    identities as ``units``."""
++    seed = orch._data_dir_path / "seed.csv"
++    seed.write_text(SEED)
++    metrics = dict(SEED_METRICS)
++    metrics["Y"] = [8.56, 3.88, None, 10.81, 48.83, 61.1]
++    orch._fixture = {**_passthrough(metrics, ["T", "t"], ["Y"]),
++                     "units": ["s1", "s2", "s3", "s4", "s5", "s6"]}
++    res, _ = _call(orch, seed, inputs=["T", "t"], targets=["Y"])
++    assert res["status"] == "success"
++    assert res["rows_added"] == 5
++    assert res["rows_skipped_missing"] == 1
++    assert res["rows_skipped_units"] == ["s3"]
++    assert "s3" in res["warning"] and "optimizer will NOT see" in res["warning"]
++    assert "unit" not in pd.read_csv(orch.bo_data_path).columns
++
++
++def test_skipped_rows_named_from_a_unit_column_after_dedup_slice(orch):
++    """A codegen script that emits 'unit' rows; when the same file (same
++    hash) yields more rows than before, only the new rows are appended, and
++    the labels must follow that slice."""
++    f = orch._data_dir_path / "grow.csv"
++    f.write_text(SEED)
++    rows = [dict(unit=f"s{i+1}", T=a, t=b, Y=c) for i, (a, b, c) in
++            enumerate(zip(SEED_METRICS["T"], SEED_METRICS["t"], SEED_METRICS["Y"]))]
++    orch._fixture = {"status": "success", "metrics": rows[:3],
++                     "source_script": None, "column_roles": {}, "error": None}
++    res, _ = _call(orch, f, inputs=["T", "t"], targets=["Y"])
++    assert res["rows_added"] == 3
++    more = rows + [dict(unit="s7", T=1.0, t=1.0, Y=None)]
++    more[4]["Y"] = None
++    orch._fixture = {"status": "success", "metrics": more,
++                     "source_script": None, "column_roles": {}, "error": None}
++    res, _ = _call(orch, f)
++    assert res["rows_added"] == 2                      # s4, s6
++    assert res["rows_skipped_units"] == ["s5", "s7"]
+diff --git a/tests/test_feature_table_describe.py b/tests/test_feature_table_describe.py
+index 3e0ec4bda..82ca26138 100644
+--- a/tests/test_feature_table_describe.py
++++ b/tests/test_feature_table_describe.py
+@@ -1,10 +1,18 @@
+ """describe_feature_table: schema summary that travels with a feature-table
+ path (run_analysis response, run_task result, meta ledger) so callers that
+-cannot open server files can pick BO inputs/targets and see the holes."""
++cannot open server files can pick BO inputs/targets and see the holes.
++
++#534: write_feature_table merges per-unit key-name variants of one quantity
++(``metric`` vs ``metric_value``) into one column, and describe_feature_table
++warns about a column empty for SOME units / a pair of complementary columns —
++the two shapes that silently dropped a unit from BO."""
++import json
+ import tempfile
+ from pathlib import Path
+ 
+-from scilink.agents.exp_agents.feature_table import describe_feature_table
++from scilink.agents.exp_agents.feature_table import (
++    describe_feature_table, write_feature_table, merge_variant_columns,
++)
+ 
+ 
+ def test_columns_rows_and_missing():
+@@ -12,8 +20,13 @@ def test_columns_rows_and_missing():
+         p = Path(tmp) / "features.csv"
+         p.write_text("unit,T,A400,n\nw1,300,0.5,1.1\nw2,400,,1.2\nw3,500,0.7,nan\n")
+         d = describe_feature_table(p)
+-        assert d == {"columns": ["unit", "T", "A400", "n"], "n_rows": 3,
+-                     "missing": {"A400": 1, "n": 1}}
++        assert d["columns"] == ["unit", "T", "A400", "n"]
++        assert d["n_rows"] == 3
++        assert d["missing"] == {"A400": 1, "n": 1}
++        # Partial columns are named with the units they are empty for.
++        assert len(d["warnings"]) == 2
++        assert "'A400' is empty for 1 of 3 units (w2)" in d["warnings"][0]
++        assert "'n' is empty for 1 of 3 units (w3)" in d["warnings"][1]
+ 
+ 
+ def test_short_rows_count_as_missing_and_no_missing_key_when_clean():
+@@ -23,7 +36,7 @@ def test_short_rows_count_as_missing_and_no_missing_key_when_clean():
+         assert describe_feature_table(p)["missing"] == {"b": 1}
+         p.write_text("a,b\n1,2\n")
+         assert describe_feature_table(p) == {"columns": ["a", "b"], "n_rows": 1,
+-                                             "missing": {}}
++                                             "missing": {}, "warnings": []}
+ 
+ 
+ def test_never_raises():
+@@ -32,3 +45,110 @@ def test_never_raises():
+         p = Path(tmp) / "empty.csv"
+         p.write_text("")
+         assert describe_feature_table(p) is None
++
++
++def test_fully_empty_column_is_missing_but_not_partial_warning():
++    with tempfile.TemporaryDirectory() as tmp:
++        p = Path(tmp) / "f.csv"
++        p.write_text("unit,x,y\nu1,1,\nu2,2,\n")
++        d = describe_feature_table(p)
++        assert d["missing"] == {"y": 2}
++        assert d["warnings"] == []  # all-empty is a missing column, not a split
++
++
++def test_complementary_columns_flagged_as_split_quantity():
++    """The #534 shape: 8 units under one name, 1 under a variant."""
++    with tempfile.TemporaryDirectory() as tmp:
++        p = Path(tmp) / "f.csv"
++        rows = ["unit,T,metric_value,metric"]
++        rows += [f"u{i},{300 + i},{0.1 * i:.2f}," for i in range(8)]
++        rows.append("u8,308,,0.99")
++        p.write_text("\n".join(rows) + "\n")
++        d = describe_feature_table(p)
++        assert d["missing"] == {"metric_value": 1, "metric": 8}
++        split = [w for w in d["warnings"] if "complementary" in w]
++        assert len(split) == 1
++        assert "'metric_value' (8 units)" in split[0]
++        assert "'metric' (1 units)" in split[0]
++        # The per-column warning names the dropped unit.
++        assert any("'metric_value' is empty for 1 of 9 units (u8)" in w
++                   for w in d["warnings"])
++
++
++def test_overlapping_partial_columns_not_called_complementary():
++    with tempfile.TemporaryDirectory() as tmp:
++        p = Path(tmp) / "f.csv"
++        p.write_text("unit,a,b\nu1,1,\nu2,2,5\nu3,,6\n")
++        d = describe_feature_table(p)
++        assert not any("complementary" in w for w in d["warnings"])
++        assert len(d["warnings"]) == 2
++
++
++# ---------------------------------------------------------------- merge --
++
++def _series_run(tmp, params_by_unit):
++    out = Path(tmp) / "run"
++    out.mkdir()
++    results = [{"index": i, "name": name, "success": True, "parameters": params,
++                "fit_quality": {"r_squared": 0.99}}
++               for i, (name, params) in enumerate(params_by_unit.items())]
++    (out / "series_fit_results.json").write_text(json.dumps({"results": results}))
++    return out
++
++
++def _read_csv(path):
++    import csv
++    with open(path, newline="") as fh:
++        return list(csv.DictReader(fh))
++
++
++def test_variant_keys_merge_into_majority_name():
++    with tempfile.TemporaryDirectory() as tmp:
++        params = {f"u{i}": {"metric_value": 0.1 * i, "width": 2.0} for i in range(8)}
++        params["u8"] = {"metric": 0.99, "width": 2.5}
++        out = _series_run(tmp, params)
++        path = write_feature_table(out)
++        rows = _read_csv(path)
++        header = list(rows[0].keys())
++        assert "metric" not in header and "metric_value" in header
++        assert header == ["unit", "metric_value", "width", "fit_r_squared"]
++        by_unit = {r["unit"]: r for r in rows}
++        assert by_unit["u8"]["metric_value"] == "0.99"
++        assert all(r["metric_value"] != "" for r in rows)
++        d = describe_feature_table(path)
++        assert d["missing"] == {} and d["warnings"] == []
++
++
++def test_variant_keys_tie_keeps_first_seen_name():
++    with tempfile.TemporaryDirectory() as tmp:
++        out = _series_run(tmp, {"u0": {"Peak_Area_val": 1.0},
++                                "u1": {"peak_area": 2.0}})
++        rows = _read_csv(write_feature_table(out))
++        assert list(rows[0].keys()) == ["unit", "Peak_Area_val", "fit_r_squared"]
++        assert [r["Peak_Area_val"] for r in rows] == ["1.0", "2.0"]
++
++
++def test_both_populated_in_a_unit_is_not_merged():
++    with tempfile.TemporaryDirectory() as tmp:
++        out = _series_run(tmp, {"u0": {"x": 1.0, "x_value": 10.0},
++                                "u1": {"x": 2.0}})
++        rows = _read_csv(write_feature_table(out))
++        assert set(rows[0].keys()) == {"unit", "x", "x_value", "fit_r_squared"}
++        assert rows[0]["x"] == "1.0" and rows[0]["x_value"] == "10.0"
++
++
++def test_statistics_suffixes_are_not_variants():
++    with tempfile.TemporaryDirectory() as tmp:
++        out = _series_run(tmp, {"u0": {"fwhm_mean": 1.0},
++                                "u1": {"fwhm": 2.0}})
++        rows = _read_csv(write_feature_table(out))
++        assert set(rows[0].keys()) == {"unit", "fwhm_mean", "fwhm", "fit_r_squared"}
++
++
++def test_merge_notes_report_moved_units():
++    rows = [{"unit": "a", "m_value": 1.0}, {"unit": "b", "m": 2.0},
++            {"unit": "c", "m_value": 3.0}]
++    notes = merge_variant_columns(rows)
++    assert notes == [{"column": "m_value", "merged_from": ["m"], "units": ["b"]}]
++    assert rows[1] == {"unit": "b", "m_value": 2.0}
++    assert merge_variant_columns([{"unit": "a", "x": 1}]) == []
+diff --git a/tests/test_scalarizer_passthrough.py b/tests/test_scalarizer_passthrough.py
+index b421f6dde..3ca256268 100644
+--- a/tests/test_scalarizer_passthrough.py
++++ b/tests/test_scalarizer_passthrough.py
+@@ -72,6 +72,24 @@ def main():
+           and r["metrics"]["temperature_C"] == [15.18, 15.45])
+     check("column_roles carried from schema",
+           r["column_roles"]["targets"] == ["product_area"])
++    check("no 'unit' column -> no units on the result", "units" not in r)
++    sib = _csv(d, "siblings.csv",
++               "unit,metric_value,metric\nu0,0.5,\nu1,,0.9\n")
++    r_sib = h._try_table_passthrough(
++        h._load_flat_table(sib), "x",
++        {"_schema_requirements": {"target_columns": ["metric"]}}, None)
++    check("exact column name wins over a token-subset sibling (#534)",
++          r_sib is not None and r_sib["metrics"]["metric"] == [None, 0.9])
++    r_sib2 = h._try_table_passthrough(
++        h._load_flat_table(sib), "x",
++        {"_schema_requirements": {"target_columns": ["Metric_Value"]}}, None)
++    check("case-insensitive exact match",
++          r_sib2 is not None and r_sib2["metrics"]["Metric_Value"] == [0.5, None])
++    r_hs = h._try_table_passthrough(
++        h._load_flat_table(hs), "x",
++        {"_schema_requirements": {"target_columns": ["Peak_FWHM_mean"]}}, None)
++    check("feature table -> row identities carried as 'units' (#534)",
++          r_hs is not None and r_hs["units"] == ["emission_map"])
+     ctx2 = {"_schema_requirements": {"input_columns": ["temperature_C", "pH"],
+                                      "target_columns": ["selectivity"]}}
+     check("derived target (no matching column) -> codegen path",
+@@ -99,6 +117,23 @@ def main():
+           h._try_table_passthrough(h._load_flat_table(img),
+                                    "ratio of particle count to area",
+                                    None, None) is None)
++    # #535: an objective NAMED after a derivation term ('yield',
++    # 'selectivity', 'rate', ...) that is a literal column is read, not
++    # vetoed — a column that exists is read regardless of its name.
++    camp = _csv(d, "campaign_features.csv",
++                "unit,temperature_C,yield\nrun_07,62.5,0.81\n")
++    r = h._try_table_passthrough(
++        h._load_flat_table(camp),
++        "Research objective: maximize yield of the coupling step.\n\n"
++        "Extract the temperature and yield for this run.", None, None)
++    check("goal naming a literal 'yield' column -> pass-through fires",
++          r is not None and r["metrics"]["yield"] == 0.81
++          and r["metrics"]["temperature_C"] == 62.5)
++    check("derivation term absent from the columns still vetoes",
++          h._try_table_passthrough(
++              h._load_flat_table(camp),
++              "Research objective: maximize yield.\n\nCompute the rate of "
++              "yield change with temperature", None, None) is None)
+ 
+     print("4) row-count trap:")
+     df1 = h._load_flat_table(img)

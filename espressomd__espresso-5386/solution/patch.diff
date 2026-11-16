@@ -1,0 +1,226 @@
+diff --git a/src/core/reaction_methods/ReactionAlgorithm.cpp b/src/core/reaction_methods/ReactionAlgorithm.cpp
+index 17f0760c26..6bb7713c36 100644
+--- a/src/core/reaction_methods/ReactionAlgorithm.cpp
++++ b/src/core/reaction_methods/ReactionAlgorithm.cpp
+@@ -33,6 +33,7 @@
+ 
+ #include <boost/mpi/collectives/all_reduce.hpp>
+ #include <boost/mpi/collectives/broadcast.hpp>
++#include <boost/mpi/operations.hpp>
+ #include <boost/serialization/serialization.hpp>
+ 
+ #include <algorithm>
+@@ -334,17 +335,74 @@ void ReactionAlgorithm::check_exclusion_range(int p_id, int p_type) {
+ 
+   auto p1_ptr = get_real_particle(p_id);
+ 
+-  std::vector<int> particle_ids;
++  auto const &system = System::get_system();
++  auto const &box_geo = *system.box_geo;
++  auto &cell_structure = *system.cell_structure;
++
++  /* Test whether particle @p p2 lies inside the exclusion range of the
++   * inserted particle located at @p p1_pos. */
++  auto const is_inside_exclusion_range = [&](Utils::Vector3d const &p1_pos,
++                                             Particle const &p2) {
++    double excluded_distance;
++    if (not exclusion_radius_per_type.contains(p_type) or
++        not exclusion_radius_per_type.contains(p2.type())) {
++      excluded_distance = exclusion_range;
++    } else if (exclusion_radius_per_type[p2.type()] == 0.) {
++      return false;
++    } else {
++      excluded_distance = exclusion_radius_per_type[p_type] +
++                          exclusion_radius_per_type[p2.type()];
++    }
++    auto const d_min = box_geo.get_mi_vector(p2.pos(), p1_pos).norm();
++    return d_min < excluded_distance;
++  };
++
+   if (neighbor_search_order_n) {
++    /* Exhaustive O(N) search. The candidate id list is global (every rank
++     * holds the full list), but each real particle is owned by exactly one
++     * rank. We broadcast the position of the inserted particle to every rank,
++     * let each rank distance-test the candidates it owns locally (real,
++     * non-ghost copies, to avoid double-counting ghosts), and OR-reduce the
++     * partial results. This keeps the check correct even when a candidate
++     * sits within exclusion_range of the inserted particle but beyond the
++     * ghost layer of the inserted particle's domain, where get_local_particle
++     * would return nullptr. */
+     auto all_ids = get_particle_ids_parallel();
+     /* remove the inserted particle id */
+     std::erase(all_ids, p_id);
+-    particle_ids = all_ids;
+-  } else {
+-    auto &system = System::get_system();
+-    system.on_observable_calc();
++
++    /* broadcast the position of the inserted particle from its owning rank */
++    auto p1_pos = (p1_ptr != nullptr) ? p1_ptr->pos() : Utils::Vector3d{};
++    auto const owner_rank =
++        boost::mpi::all_reduce(m_comm, (p1_ptr != nullptr) ? m_comm.rank() : -1,
++                               boost::mpi::maximum<int>());
++    boost::mpi::broadcast(m_comm, p1_pos, owner_rank);
++
++    bool local_touched = false;
++    for (auto const p2_id : all_ids) {
++      auto const p2_ptr = cell_structure.get_local_particle(p2_id);
++      /* only the owning rank (real, non-ghost copy) tests each candidate */
++      if (p2_ptr != nullptr and not p2_ptr->is_ghost() and
++          is_inside_exclusion_range(p1_pos, *p2_ptr)) {
++        local_touched = true;
++        break;
++      }
++    }
++    particle_inside_exclusion_range_touched =
++        boost::mpi::all_reduce(m_comm, local_touched, std::logical_or<>());
++    return;
++  }
++
++  /* Neighbor search via the cell structure: the neighbor ids returned by
++   * get_short_range_neighbors are local/ghost on the inserted particle's rank
++   * and within the interaction range, so resolving them with
++   * get_local_particle is correct here. */
++  std::vector<int> particle_ids;
++  {
++    auto &mutable_system = System::get_system();
++    mutable_system.on_observable_calc();
+     auto const local_ids =
+-        get_short_range_neighbors(system, p_id, m_max_exclusion_range);
++        get_short_range_neighbors(mutable_system, p_id, m_max_exclusion_range);
+     assert(p1_ptr == nullptr or !!local_ids);
+     if (local_ids) {
+       particle_ids = std::move(*local_ids);
+@@ -352,30 +410,12 @@ void ReactionAlgorithm::check_exclusion_range(int p_id, int p_type) {
+   }
+ 
+   if (p1_ptr != nullptr) {
+-    auto &p1 = *p1_ptr;
+-    auto const &system = System::get_system();
+-    auto const &box_geo = *system.box_geo;
+-    auto &cell_structure = *system.cell_structure;
+-
++    auto const &p1 = *p1_ptr;
+     /* Check if the inserted particle within the exclusion radius of any other
+      * particle */
+     for (auto const p2_id : particle_ids) {
+       if (auto const p2_ptr = cell_structure.get_local_particle(p2_id)) {
+-        auto const &p2 = *p2_ptr;
+-        double excluded_distance;
+-        if (not exclusion_radius_per_type.contains(p_type) or
+-            not exclusion_radius_per_type.contains(p2.type())) {
+-          excluded_distance = exclusion_range;
+-        } else if (exclusion_radius_per_type[p2.type()] == 0.) {
+-          continue;
+-        } else {
+-          excluded_distance = exclusion_radius_per_type[p_type] +
+-                              exclusion_radius_per_type[p2.type()];
+-        }
+-
+-        auto const d_min = box_geo.get_mi_vector(p2.pos(), p1.pos()).norm();
+-
+-        if (d_min < excluded_distance) {
++        if (is_inside_exclusion_range(p1.pos(), *p2_ptr)) {
+           particle_inside_exclusion_range_touched = true;
+           break;
+         }
+diff --git a/src/core/reaction_methods/ReactionAlgorithm.hpp b/src/core/reaction_methods/ReactionAlgorithm.hpp
+index 98b1cb840f..60f77e187e 100644
+--- a/src/core/reaction_methods/ReactionAlgorithm.hpp
++++ b/src/core/reaction_methods/ReactionAlgorithm.hpp
+@@ -249,7 +249,11 @@ class ReactionAlgorithm {
+ 
+   int create_particle(int p_type);
+   void hide_particle(int p_id, int p_type) const;
++
++protected:
+   void check_exclusion_range(int p_id, int p_type);
++
++private:
+   auto get_random_uniform_number() {
+     return m_uniform_real_distribution(m_generator);
+   }
+diff --git a/src/core/reaction_methods/tests/ReactionAlgorithm_test.cpp b/src/core/reaction_methods/tests/ReactionAlgorithm_test.cpp
+index 0b8eda6589..193efd4e66 100644
+--- a/src/core/reaction_methods/tests/ReactionAlgorithm_test.cpp
++++ b/src/core/reaction_methods/tests/ReactionAlgorithm_test.cpp
+@@ -70,6 +70,7 @@ namespace Testing {
+ class ReactionAlgorithm : public ReactionMethods::ReactionAlgorithm {
+ public:
+   using Base = ReactionMethods::ReactionAlgorithm;
++  using Base::check_exclusion_range;
+   using Base::clear_old_system_state;
+   using Base::displacement_mc_move;
+   using Base::get_old_system_state;
+@@ -343,4 +344,71 @@ BOOST_FIXTURE_TEST_CASE(ReactionAlgorithm_test, ParticleFactory) {
+   }
+ }
+ 
++// Test exclusion range larger than ghost layer. The order N range check must
++// detect a candidate particle that is owned by a *different* MPI rank and is
++// not a ghost on the inserted particle's rank. On the buggy code the distance
++// loop runs only on the inserted particle's owning rank and resolves the
++// candidate via get_local_particle (local + ghost only), so a remote,
++// non-ghost particle within exclusion_range is silently missed and the flag
++// stays false. The correct behavior is that the overlap is detected on any
++// number of ranks.
++BOOST_FIXTURE_TEST_CASE(order_n_remote_particle_exclusion_range,
++                        ParticleFactory) {
++  auto const comm = boost::mpi::communicator();
++  auto const &cell_structure = *espresso::system->cell_structure;
++
++  // start from a clean, consistent distributed state (earlier test cases may
++  // leave particles behind, possibly with a stale real copy on more than one
++  // rank)
++  ::remove_all_particles();
++  // box 1x1x1; with 2 ranks the node grid is {2, 1, 1}, splitting the box
++  // along x. The ghost layer (max_range) is then about one cell wide in x, so
++  // a particle sitting 0.05 from an x-boundary is real on exactly one rank and
++  // NOT a ghost on the other rank.
++  espresso::system->set_box_l(Utils::Vector3d::broadcast(1.));
++
++  int const type = 0;
++  // particle 0 -> owned by the rank holding small x, particle 1 -> owned by
++  // the rank holding large x; neither is a ghost on the other rank.
++  ::make_new_particle(0, {0.05, 0.5, 0.5});
++  ::make_new_particle(1, {0.95, 0.5, 0.5});
++  set_particle_property(0, &Particle::type, type);
++  set_particle_property(1, &Particle::type, type);
++
++  if (comm.size() == 2) {
++    // precondition: the ghost layer is much narrower than the distance of
++    // either particle to the far domain, so the particles are genuinely not
++    // mutual ghosts (the condition that makes the bug observable)
++    BOOST_REQUIRE_LT(cell_structure.max_range()[0], 0.45);
++
++    // exclusion_range (0.5) larger than the minimum-image distance between
++    // the two particles (mi-distance is 0.1) so an exclusion-range violation
++    // exists, but the candidate is on a remote rank beyond the ghost layer.
++    auto r_algo = Testing::ReactionAlgorithm(comm, 42, 1., 0.5, {});
++    r_algo.neighbor_search_order_n = true;
++
++    // inserted particle == particle 0; particle 1 lies within the exclusion
++    // range and must be detected.
++    r_algo.particle_inside_exclusion_range_touched = false;
++    r_algo.check_exclusion_range(0, type);
++    BOOST_CHECK(r_algo.particle_inside_exclusion_range_touched);
++
++    // symmetric case: inserted particle == particle 1
++    r_algo.particle_inside_exclusion_range_touched = false;
++    r_algo.check_exclusion_range(1, type);
++    BOOST_CHECK(r_algo.particle_inside_exclusion_range_touched);
++
++    // negative control: a small exclusion range below the mi-distance must
++    // NOT flag an overlap (the order_n branch must not over-detect either)
++    auto r_algo_small = Testing::ReactionAlgorithm(comm, 42, 1., 0.05, {});
++    r_algo_small.neighbor_search_order_n = true;
++    r_algo_small.particle_inside_exclusion_range_touched = false;
++    r_algo_small.check_exclusion_range(0, type);
++    BOOST_CHECK(!r_algo_small.particle_inside_exclusion_range_touched);
++  }
++
++  remove_particle(0);
++  remove_particle(1);
++}
++
+ BOOST_AUTO_TEST_SUITE_END()

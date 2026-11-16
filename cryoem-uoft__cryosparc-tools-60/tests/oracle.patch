@@ -1,0 +1,761 @@
+diff --git a/cryosparc/command.py b/cryosparc/command.py
+index b6207f3e..a14f19d2 100644
+--- a/cryosparc/command.py
++++ b/cryosparc/command.py
+@@ -14,6 +14,8 @@
+ from urllib.parse import urlencode
+ from warnings import warn
+ 
++from .errors import CommandError
++
+ MAX_ATTEMPTS = int(os.getenv("CRYOSPARC_COMMAND_RETRIES", 3))
+ RETRY_INTERVAL = int(os.getenv("CRYOSPARC_COMMAND_RETRY_SECONDS", 30))
+ 
+@@ -73,13 +75,9 @@ class CommandClient:
+ 
+     """
+ 
++    Error = CommandError
+     service: str
+ 
+-    class Error(Exception):
+-        def __init__(self, parent: "CommandClient", reason: str, *args: object, url: str = "") -> None:
+-            msg = f"*** {type(parent).__name__}: ({url}) {reason}"
+-            super().__init__(msg, *args)
+-
+     def __init__(
+         self,
+         service: str = "command",
+@@ -100,24 +98,35 @@ def __init__(
+     def _get_callable(self, key):
+         def func(*args, **kwargs):
+             params = kwargs if len(kwargs) else args
+-            data = {
+-                "jsonrpc": "2.0",
+-                "method": key,
+-                "params": params,
+-                "id": str(uuid.uuid4()),
+-            }
++            data = {"jsonrpc": "2.0", "method": key, "params": params, "id": str(uuid.uuid4())}
+             res = None
+             try:
+                 with make_json_request(self, "/api", data=data, _stacklevel=4) as request:
+                     res = json.loads(request.read())
+-            except CommandClient.Error as err:
+-                raise CommandClient.Error(
+-                    self, f'Did not receive a JSON response from method "{key}" with params {params}', url=self._url
++            except CommandError as err:
++                raise CommandError(
++                    f'Encounted error from JSONRPC function "{key}" with params {params}',
++                    url=self._url,
++                    code=err.code,
++                    data=err.data,
+                 ) from err
+ 
+-            assert res, f'JSON response not received for method "{key}" with params {params}'
+-            assert "error" not in res, f'Error for "{key}" with params {params}:\n' + format_server_error(res["error"])
+-            return res["result"]
++            if not res:
++                raise CommandError(
++                    f'JSON response not received from JSONRPC function "{key}" with params {params}',
++                    url=self._url,
++                )
++            elif "error" in res:
++                error = res["error"]
++                raise CommandError(
++                    f'Encountered {error.get("name", "Error")} from JSONRPC function "{key}" with params {params}:\n'
++                    f"{format_server_error(error)}",
++                    url=self._url,
++                    code=error.get("code"),
++                    data=error.get("data"),
++                )
++            else:
++                return res["result"]  # OK
+ 
+         return func
+ 
+@@ -154,7 +163,7 @@ def make_request(
+         headers (dict, optional): HTTP headers. Defaults to {}.
+ 
+     Raises:
+-        CommandClient.Error: General error such as timeout, URL or HTTP
++        CommandError: General error such as timeout, URL or HTTP
+ 
+     Yields:
+         http.client.HTTPResponse:  Use with a context manager to get HTTP response
+@@ -171,6 +180,8 @@ def make_request(
+     headers = {"Originator": "client", **client._headers, **headers}
+     attempt = 1
+     error_reason = "<unknown>"
++    code = 500
++    resdata = None
+     while attempt < MAX_ATTEMPTS:
+         request = Request(url, data=data, headers=headers, method=method)
+         response = None
+@@ -179,12 +190,16 @@ def make_request(
+                 yield response
+                 return
+         except HTTPError as error:  # command server reported an error
++            code = error.code
+             error_reason = (
+                 f"HTTP Error {error.code} {error.reason}; "
+                 f"please check cryosparcm log {client.service} for additional information."
+             )
+             if error.readable():
+-                error_reason += "\nResponse from server: " + str(error.read())
++                resdata = error.read()
++                error_reason += f"\nResponse from server: {data}"
++            if resdata and error.headers.get_content_type() == "application/json":
++                resdata = json.loads(resdata)
+ 
+             warn(f"*** {type(client).__name__}: ({url}) {error_reason}", stacklevel=_stacklevel)
+             break
+@@ -207,7 +222,7 @@ def make_request(
+             )
+             attempt += 1
+ 
+-    raise CommandClient.Error(client, error_reason, url=url)
++    raise CommandError(error_reason, url=url, code=code, data=resdata)
+ 
+ 
+ def make_json_request(client: CommandClient, url="", *, query={}, data=None, headers={}, _stacklevel=3):
+@@ -226,6 +241,9 @@ def make_json_request(client: CommandClient, url="", *, query={}, data=None, hea
+     Yields:
+         http.client.HTTPResponse: Use with a context manager to get HTTP response
+ 
++    Raises:
++        CommandError: General error such as timeout, URL or HTTP
++
+     Example:
+ 
+         >>> from cryosparc.command import CommandClient, make_json_request
+@@ -240,6 +258,9 @@ def make_json_request(client: CommandClient, url="", *, query={}, data=None, hea
+ 
+ 
+ def format_server_error(error):
++    """
++    :meta private:
++    """
+     err = error["message"] if "message" in error else str(error)
+     if "data" in error and error["data"]:
+         if isinstance(error["data"], dict) and "traceback" in error["data"]:
+diff --git a/cryosparc/dataset.py b/cryosparc/dataset.py
+index 0761fd3d..53ac583c 100644
+--- a/cryosparc/dataset.py
++++ b/cryosparc/dataset.py
+@@ -63,6 +63,7 @@
+     arraydtype,
+     safe_makefield,
+ )
++from .errors import DatasetLoadError
+ from .stream import AsyncBinaryIO, Streamable
+ from .column import Column
+ from .row import Row, Spool, R
+@@ -101,12 +102,6 @@
+ MAGIC_PREFIX_FORMATS = {v: k for k, v in FORMAT_MAGIC_PREFIXES.items()}  # inverse dict
+ 
+ 
+-class DatasetLoadError(Exception):
+-    """Exception type raised when a dataset cannot be loaded"""
+-
+-    pass
+-
+-
+ class Dataset(Streamable, MutableMapping[str, Column], Generic[R]):
+     """
+     Accessor class for working with CryoSPARC .cs files.
+diff --git a/cryosparc/errors.py b/cryosparc/errors.py
+new file mode 100644
+index 00000000..97b978fc
+--- /dev/null
++++ b/cryosparc/errors.py
+@@ -0,0 +1,78 @@
++"""
++Definitions for various error classes raised by cryosparc-tools functions
++"""
++from typing import Any, List
++from typing_extensions import TypedDict
++
++from .spec import Datafield, Datatype, SlotSpec
++
++
++class DatasetLoadError(Exception):
++    """Exception type raised when a dataset cannot be loaded"""
++
++    pass
++
++
++class CommandError(Exception):
++    """
++    Raised by failed request to a CryoSPARC command server.
++    """
++
++    code: int
++    data: Any
++
++    def __init__(self, reason: str, *args: object, url: str = "", code: int = 500, data: Any = None) -> None:
++        msg = f"*** ({url}, code {code}) {reason}"
++        super().__init__(msg, *args)
++        self.code = code
++        self.data = data
++
++
++class SlotsValidation(TypedDict):
++    """
++    Data from validation error when specifying external result input/output slots.
++
++    :meta private:
++    """
++
++    type: Datatype
++    valid: List[SlotSpec]
++    invalid: List[Datafield]
++    valid_dtypes: List[str]
++
++
++class InvalidSlotsError(ValueError):
++    """
++    Raised by functions that accept slots arguments, and CryoSPARC reports that
++    given slots are not valid.
++    """
++
++    def __init__(self, caller: str, validation: SlotsValidation):
++        type = validation["type"]
++        valid_slots = validation["valid"]
++        invalid_slots = validation["invalid"]
++        valid_dtypes = validation["valid_dtypes"]
++        msg = "\n".join(
++            [
++                f"Unknown {type} slot dtype(s): {', '.join(s['dtype'] for s in invalid_slots)}. "
++                "Only the following slot dtypes are valid:",
++                "",
++            ]
++            + [f" - {t}" for t in valid_dtypes]
++            + [
++                "",
++                "If adding a dynamic result such as alignments_class_#, specify a "
++                "slots=... argument with a full data field specification:",
++                "",
++                f"    {caller}(... , slots=[",
++                "        ...",
++            ]
++            + [f"        {repr(s)}," for s in valid_slots]
++            + [
++                "        {'dtype': '<INSERT HERE>', 'prefix': '%s', 'required': True}," % s["dtype"]
++                for s in invalid_slots
++            ]
++            + ["        ...", "    ])"]
++        )
++
++        return super().__init__(msg)
+diff --git a/cryosparc/job.py b/cryosparc/job.py
+index 2892ab5d..125ada2d 100644
+--- a/cryosparc/job.py
++++ b/cryosparc/job.py
+@@ -9,22 +9,24 @@
+ from typing import IO, TYPE_CHECKING, Any, Iterable, List, Optional, Pattern, Union, overload
+ from typing_extensions import Literal
+ 
+-from .command import make_json_request, make_request
++
++from .command import CommandError, make_json_request, make_request
+ from .dataset import Dataset, DEFAULT_FORMAT
++from .errors import InvalidSlotsError
+ from .spec import (
+     ASSET_CONTENT_TYPES,
+     IMAGE_CONTENT_TYPES,
+     TEXT_CONTENT_TYPES,
+     AssetDetails,
+     AssetFormat,
+-    MongoController,
++    Datatype,
++    EventLogAsset,
+     ImageFormat,
++    JobDocument,
+     JobStatus,
++    MongoController,
++    SlotSpec,
+     TextFormat,
+-    EventLogAsset,
+-    Datatype,
+-    Datafield,
+-    JobDocument,
+ )
+ from .util import bopen, first
+ 
+@@ -1049,7 +1051,7 @@ def add_input(
+         name: Optional[str] = None,
+         min: int = 0,
+         max: Union[int, Literal["inf"]] = "inf",
+-        slots: Iterable[Union[str, Datafield]] = [],
++        slots: Iterable[SlotSpec] = [],
+         title: Optional[str] = None,
+     ):
+         """
+@@ -1065,12 +1067,17 @@ def add_input(
+             max (int | Literal["inf"], optional): Maximum number of input
+                 connections. Specify ``"inf"`` for unlimited connections.
+                 Defaults to "inf".
+-            slots (list[str | Datafield], optional): List of slots that should
++            slots (list[SlotSpec], optional): List of slots that should
+                 be connected to this input, such as ``"location"`` or ``"blob"``
+                 Defaults to [].
+             title (str, optional): Human-readable title for this input. Defaults
+                 to None.
+ 
++        Raises:
++            CommandError: General CryoSPARC network access error such as
++                timeout, URL or HTTP
++            InvalidSlotsError: slots argument is invalid
++
+         Returns:
+             str: name of created input
+ 
+@@ -1092,16 +1099,21 @@ def add_input(
+             ... )
+             "input_micrographs"
+         """
+-        self.cs.vis.add_external_job_input(  # type: ignore
+-            project_uid=self.project_uid,
+-            job_uid=self.uid,
+-            type=type,
+-            name=name,
+-            min=min,
+-            max=max,
+-            slots=slots,
+-            title=title,
+-        )
++        try:
++            self.cs.vis.add_external_job_input(  # type: ignore
++                project_uid=self.project_uid,
++                job_uid=self.uid,
++                type=type,
++                name=name,
++                min=min,
++                max=max,
++                slots=slots,
++                title=title,
++            )
++        except CommandError as err:
++            if err.code == 422 and err.data and "slots" in err.data:
++                raise InvalidSlotsError("add_input", err.data["slots"]) from err
++            raise
+         self.refresh()
+         return self.doc["input_slot_groups"][-1]["name"]
+ 
+@@ -1110,7 +1122,7 @@ def add_output(
+         self,
+         type: Datatype,
+         name: Optional[str] = ...,
+-        slots: List[Union[str, Datafield]] = ...,
++        slots: List[SlotSpec] = ...,
+         passthrough: Optional[str] = ...,
+         title: Optional[str] = None,
+     ) -> str:
+@@ -1121,7 +1133,7 @@ def add_output(
+         self,
+         type: Datatype,
+         name: Optional[str] = ...,
+-        slots: List[Union[str, Datafield]] = ...,
++        slots: List[SlotSpec] = ...,
+         passthrough: Optional[str] = ...,
+         title: Optional[str] = None,
+         alloc: Union[int, Dataset] = ...,
+@@ -1132,7 +1144,7 @@ def add_output(
+         self,
+         type: Datatype,
+         name: Optional[str] = None,
+-        slots: List[Union[str, Datafield]] = [],
++        slots: List[SlotSpec] = [],
+         passthrough: Optional[str] = None,
+         title: Optional[str] = None,
+         alloc: Union[int, Dataset, Literal[None]] = None,
+@@ -1145,7 +1157,7 @@ def add_output(
+             type (Datatype): cryo-EM datatype for this output, e.g., "particle"
+             name (str, optional): Output name key, e.g., "selected_particles".
+                 Same as ``type`` if not specified. Defaults to None.
+-            slots (list[str, Datafield], optional): List of slot expected to be
++            slots (list[SlotSpec], optional): List of slot expected to be
+                 created for this output, such as ``location`` or ``blob``. Do
+                 not specify any slots that were passed through from an input
+                 unless those slots are modified in the output. Defaults to [].
+@@ -1160,6 +1172,11 @@ def add_output(
+                 which to inherit unique row IDs (useful when adding passthrough
+                 outputs). Defaults to None.
+ 
++        Raises:
++            CommandError: General CryoSPARC network access error such as
++                timeout, URL or HTTP
++            InvalidSlotsError: slots argument is invalid
++
+         Returns:
+             str | Dataset: Name of the created output. If ``alloc`` is
+                 specified as an integer, instead returns blank dataset with the
+@@ -1203,15 +1220,20 @@ def add_output(
+             ... )
+             "particle_alignments"
+         """
+-        self.cs.vis.add_external_job_output(  # type: ignore
+-            project_uid=self.project_uid,
+-            job_uid=self.uid,
+-            type=type,
+-            name=name,
+-            slots=slots,
+-            passthrough=passthrough,
+-            title=title,
+-        )
++        try:
++            self.cs.vis.add_external_job_output(  # type: ignore
++                project_uid=self.project_uid,
++                job_uid=self.uid,
++                type=type,
++                name=name,
++                slots=slots,
++                passthrough=passthrough,
++                title=title,
++            )
++        except CommandError as err:
++            if err.code == 422 and err.data and "slots" in err.data:
++                raise InvalidSlotsError("add_output", err.data["slots"]) from err
++            raise
+         self.refresh()
+         result_name = self.doc["output_result_groups"][-1]["name"]
+         return result_name if alloc is None else self.alloc_output(result_name, alloc)
+@@ -1221,7 +1243,7 @@ def connect(
+         target_input: str,
+         source_job_uid: str,
+         source_output: str,
+-        slots: List[Union[str, Datafield]] = [],
++        slots: List[SlotSpec] = [],
+         title: str = "",
+         desc: str = "",
+         refresh: bool = True,
+@@ -1237,7 +1259,7 @@ def connect(
+             source_job_uid (str): Job UID to connect from, e.g., "J42"
+             source_output (str): Job output name to connect from , e.g.,
+                 "particles"
+-            slots (list[str | Datafield], optional): List of slots to add to
++            slots (list[SlotSpec], optional): List of slots to add to
+                 created input. All if not specified. Defaults to [].
+             title (str, optional): Human readable title for created input.
+                 Defaults to "".
+@@ -1246,6 +1268,11 @@ def connect(
+             refresh (bool, optional): Auto-refresh job document after
+                 connecting. Defaults to True.
+ 
++        Raises:
++            CommandError: General CryoSPARC network access error such as
++                timeout, URL or HTTP
++            InvalidSlotsError: slots argument is invalid
++
+         Examples:
+ 
+             Connect J3 to CTF-corrected micrographs from J2's ``micrographs``
+@@ -1258,16 +1285,21 @@ def connect(
+ 
+         """
+         assert source_job_uid != self.uid, f"Cannot connect job {self.uid} to itself"
+-        self.cs.vis.connect_external_job(  # type: ignore
+-            project_uid=self.project_uid,
+-            source_job_uid=source_job_uid,
+-            source_output=source_output,
+-            target_job_uid=self.uid,
+-            target_input=target_input,
+-            slots=slots,
+-            title=title,
+-            desc=desc,
+-        )
++        try:
++            self.cs.vis.connect_external_job(  # type: ignore
++                project_uid=self.project_uid,
++                source_job_uid=source_job_uid,
++                source_output=source_output,
++                target_job_uid=self.uid,
++                target_input=target_input,
++                slots=slots,
++                title=title,
++                desc=desc,
++            )
++        except CommandError as err:
++            if err.code == 422 and err.data and "slots" in err.data:
++                raise InvalidSlotsError("connect", err.data["slots"]) from err
++            raise
+         if refresh:
+             self.refresh()
+ 
+diff --git a/cryosparc/project.py b/cryosparc/project.py
+index d64e1dcf..de97d2dd 100644
+--- a/cryosparc/project.py
++++ b/cryosparc/project.py
+@@ -6,7 +6,7 @@
+ from .job import Job, ExternalJob
+ from .dataset import Dataset, DEFAULT_FORMAT
+ from .row import R
+-from .spec import MongoController, Datafield, Datatype, ProjectDocument
++from .spec import MongoController, Datatype, ProjectDocument, SlotSpec
+ 
+ if TYPE_CHECKING:
+     from numpy.typing import NDArray  # type: ignore
+@@ -199,7 +199,7 @@ def save_external_result(
+         dataset: Dataset[R],
+         type: Datatype,
+         name: Optional[str] = None,
+-        slots: Optional[List[Union[str, Datafield]]] = None,
++        slots: Optional[List[SlotSpec]] = None,
+         passthrough: Optional[Tuple[str, str]] = None,
+         title: Optional[str] = None,
+         desc: Optional[str] = None,
+@@ -260,7 +260,7 @@ def save_external_result(
+             type (Datatype): Type of output dataset.
+             name (str, optional): Name of output on created External job. Same
+                 as type if unspecified. Defaults to None.
+-            slots (list[str | Datafield], optional): List of slots expected to
++            slots (list[SlotSpec], optional): List of slots expected to
+                 be created for this output such as ``location`` or ``blob``. Do
+                 not specify any slots that were passed through from an input
+                 unless those slots are modified in the output. Defaults to None.
+diff --git a/cryosparc/spec.py b/cryosparc/spec.py
+index 301c7018..8ad08eca 100644
+--- a/cryosparc/spec.py
++++ b/cryosparc/spec.py
+@@ -206,6 +206,12 @@ class Datafield(TypedDict):
+     input/output. Assumed to be ``True`` if not specified"""
+ 
+ 
++SlotSpec = Union[str, Datafield]
++"""
++A result slot specification for the slots=... argument.
++"""
++
++
+ class InputSlot(TypedDict):
+     """
+     Dictionary entry in Job document's ``input_slot_groups.slots`` property.
+diff --git a/cryosparc/tools.py b/cryosparc/tools.py
+index f2f4c146..fea0d24e 100644
+--- a/cryosparc/tools.py
++++ b/cryosparc/tools.py
+@@ -25,6 +25,7 @@
+ import re
+ import tempfile
+ from warnings import warn
++from cryosparc.errors import InvalidSlotsError
+ import numpy as n
+ 
+ if TYPE_CHECKING:
+@@ -32,7 +33,7 @@
+ 
+ from . import __version__
+ from . import mrc
+-from .command import CommandClient, make_json_request, make_request
++from .command import CommandClient, CommandError, make_json_request, make_request
+ from .dataset import DEFAULT_FORMAT, Dataset
+ from .row import R
+ from .project import Project
+@@ -41,11 +42,11 @@
+ from .spec import (
+     ASSET_EXTENSIONS,
+     AssetDetails,
+-    Datafield,
+     Datatype,
+     JobSection,
+     SchedulerLane,
+     SchedulerTarget,
++    SlotSpec,
+ )
+ from .util import bopen, noopcontext, padarray, trimarray
+ 
+@@ -433,7 +434,7 @@ def save_external_result(
+         dataset: Dataset[R],
+         type: Datatype,
+         name: Optional[str] = None,
+-        slots: Optional[List[Union[str, Datafield]]] = None,
++        slots: Optional[List[SlotSpec]] = None,
+         passthrough: Optional[Tuple[str, str]] = None,
+         title: Optional[str] = None,
+         desc: Optional[str] = None,
+@@ -492,7 +493,7 @@ def save_external_result(
+             type (Datatype): Type of output dataset.
+             name (str, optional): Name of output on created External job. Same
+                 as type if unspecified. Defaults to None.
+-            slots (list[str | Datafield], optional): List of slots expected to
++            slots (list[SlotSpec], optional): List of slots expected to
+                 be created for this output such as ``location`` or ``blob``. Do
+                 not specify any slots that were passed through from an input
+                 unless those slots are modified in the output. Defaults to None.
+@@ -505,6 +506,11 @@ def save_external_result(
+             desc (str, optional): Markdown description for this output. Defaults
+                 to None.
+ 
++        Raises:
++            CommandError: General CryoSPARC network access error such as
++                timeout, URL or HTTP
++            InvalidSlotsError: slots argument is invalid
++
+         Returns:
+             str: UID of created job where this output was saved
+         """
+@@ -517,17 +523,22 @@ def save_external_result(
+         assert slot_names.intersection(prefixes) == slot_names, "Given dataset missing required slots"
+ 
+         passthrough_str = ".".join(passthrough) if passthrough else None
+-        job_uid, output = self.vis.create_external_result(  # type: ignore
+-            project_uid=project_uid,
+-            workspace_uid=workspace_uid,
+-            type=type,
+-            name=name,
+-            slots=slots,
+-            passthrough=passthrough_str,
+-            user=self.user_id,
+-            title=title,
+-            desc=desc,
+-        )
++        try:
++            job_uid, output = self.vis.create_external_result(  # type: ignore
++                project_uid=project_uid,
++                workspace_uid=workspace_uid,
++                type=type,
++                name=name,
++                slots=slots,
++                passthrough=passthrough_str,
++                user=self.user_id,
++                title=title,
++                desc=desc,
++            )
++        except CommandError as err:
++            if err.code == 422 and err.data and "slots" in err.data:
++                raise InvalidSlotsError("save_external_result", err.data["slots"]) from err
++            raise
+ 
+         job = self.find_external_job(project_uid, job_uid)
+         with job.run():
+diff --git a/cryosparc/workspace.py b/cryosparc/workspace.py
+index 70236e6a..85084d7d 100644
+--- a/cryosparc/workspace.py
++++ b/cryosparc/workspace.py
+@@ -3,7 +3,7 @@
+ from .dataset import Dataset
+ from .row import R
+ from .job import Job, ExternalJob
+-from .spec import MongoController, Datafield, Datatype, WorkspaceDocument
++from .spec import MongoController, Datatype, SlotSpec, WorkspaceDocument
+ 
+ if TYPE_CHECKING:
+     from .tools import CryoSPARC
+@@ -125,7 +125,7 @@ def save_external_result(
+         dataset: Dataset[R],
+         type: Datatype,
+         name: Optional[str] = None,
+-        slots: Optional[List[Union[str, Datafield]]] = None,
++        slots: Optional[List[SlotSpec]] = None,
+         passthrough: Optional[Tuple[str, str]] = None,
+         title: Optional[str] = None,
+         desc: Optional[str] = None,
+@@ -138,7 +138,7 @@ def save_external_result(
+             type (Datatype): Type of output dataset.
+             name (str, optional): Name of output on created External job. Same
+                 as type if unspecified. Defaults to None.
+-            slots (list[str | Datafield], optional): List of slots expected to
++            slots (list[SlotSpec], optional): List of slots expected to
+                 be created for this output such as ``location`` or ``blob``. Do
+                 not specify any slots that were passed through from an input
+                 unless those slots are modified in the output. Defaults to None.
+diff --git a/docs/_toc.yml b/docs/_toc.yml
+index a2d2be62..5c91a9f7 100644
+--- a/docs/_toc.yml
++++ b/docs/_toc.yml
+@@ -4,42 +4,43 @@
+ format: jb-book
+ root: intro
+ parts:
+-- caption: Examples
+-  numbered: True
+-  chapters:
+-  - file: examples/recenter-particles
+-  - file: examples/cryolo
+-  - file: examples/3dflex-custom-latent-trajectory
+-  - file: examples/3dflex-custom-mesh-rigidity-weights
+-  - file: examples/hi-res-2d-classes
+-  - file: examples/xml-exposure-groups
+-  - file: examples/custom-workflow
+-  - file: examples/delete-rejected-exposures
+-  - file: examples/upscale-expanded-particles
+-  - file: examples/connect_series_to_class3D
+-- caption: API Reference
+-  chapters:
+-  - file: api/index
+-    sections:
+-    - file: api/cryosparc
+-    - file: api/tools
+-    - file: api/project
+-    - file: api/workspace
+-    - file: api/job
+-    - file: api/dataset
+-    - file: api/column
+-    - file: api/row
+-    - file: api/dtype
+-    - file: api/spec
+-    - file: api/util
+-    - file: api/mrc
+-    - file: api/star
+-    - file: api/command
+-- caption: Links
+-  chapters:
+-  - url: https://github.com/cryoem-uoft/cryosparc-tools
+-    title: GitHub Repository
+-  - url: https://github.com/cryoem-uoft/cryosparc-tools/blob/main/CHANGELOG.md
+-    title: Changelog
+-  - url: https://github.com/cryoem-uoft/cryosparc-tools/blob/main/LICENSE
+-    title: License
++  - caption: Examples
++    numbered: True
++    chapters:
++      - file: examples/recenter-particles
++      - file: examples/cryolo
++      - file: examples/3dflex-custom-latent-trajectory
++      - file: examples/3dflex-custom-mesh-rigidity-weights
++      - file: examples/hi-res-2d-classes
++      - file: examples/xml-exposure-groups
++      - file: examples/custom-workflow
++      - file: examples/delete-rejected-exposures
++      - file: examples/upscale-expanded-particles
++      - file: examples/connect_series_to_class3D
++  - caption: API Reference
++    chapters:
++      - file: api/index
++        sections:
++          - file: api/cryosparc
++          - file: api/tools
++          - file: api/project
++          - file: api/workspace
++          - file: api/job
++          - file: api/dataset
++          - file: api/column
++          - file: api/row
++          - file: api/dtype
++          - file: api/spec
++          - file: api/util
++          - file: api/mrc
++          - file: api/star
++          - file: api/command
++          - file: api/errors
++  - caption: Links
++    chapters:
++      - url: https://github.com/cryoem-uoft/cryosparc-tools
++        title: GitHub Repository
++      - url: https://github.com/cryoem-uoft/cryosparc-tools/blob/main/CHANGELOG.md
++        title: Changelog
++      - url: https://github.com/cryoem-uoft/cryosparc-tools/blob/main/LICENSE
++        title: License
+diff --git a/docs/api/errors.rst b/docs/api/errors.rst
+new file mode 100644
+index 00000000..f178d20f
+--- /dev/null
++++ b/docs/api/errors.rst
+@@ -0,0 +1,6 @@
++cryosparc.errors
++================
++
++.. automodule:: cryosparc.errors
++    :autosummary:
++    :members:

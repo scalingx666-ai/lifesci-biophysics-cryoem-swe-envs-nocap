@@ -1,0 +1,167 @@
+diff --git a/news/fix_charge_reordering.rst b/news/fix_charge_reordering.rst
+new file mode 100644
+index 000000000..6fffdad0d
+--- /dev/null
++++ b/news/fix_charge_reordering.rst
+@@ -0,0 +1,23 @@
++**Added:**
++
++* <news item>
++
++**Changed:**
++
++* <news item>
++
++**Deprecated:**
++
++* <news item>
++
++**Removed:**
++
++* <news item>
++
++**Fixed:**
++
++* Ligands are now returned in the input order by ``bulk_assign_partial_charges`` and the CLI when using more than one processor to assign charges.
++
++**Security:**
++
++* <news item>
+diff --git a/src/openfe/protocols/openmm_utils/charge_generation.py b/src/openfe/protocols/openmm_utils/charge_generation.py
+index 332eda519..0196eb5f0 100644
+--- a/src/openfe/protocols/openmm_utils/charge_generation.py
++++ b/src/openfe/protocols/openmm_utils/charge_generation.py
+@@ -500,27 +500,36 @@ def bulk_assign_partial_charges(
+         "generate_n_conformers": generate_n_conformers,
+         "nagl_model": nagl_model,
+     }
+-    charged_ligands = []
+ 
+     if processors > 1:
+         from concurrent.futures import ProcessPoolExecutor, as_completed
+ 
++        charged_ligands: list[SmallMoleculeComponent | None] = [None] * len(molecules)
+         with ProcessPoolExecutor(max_workers=processors) as pool:
+-            work_list = [
++            # track the input ordering as multiprocessing can shuffle the order of the ligands
++            future_to_index = {
+                 pool.submit(
+                     assign_offmol_partial_charges,
+                     m.to_openff(),
+                     **charge_keywords,  # type: ignore
+-                )
+-                for m in molecules
+-            ]
++                ): i
++                for i, m in enumerate(molecules)
++            }
+ 
+             for work in tqdm.tqdm(
+-                as_completed(work_list), desc="Generating charges", ncols=80, total=len(molecules)
++                as_completed(future_to_index),
++                desc="Generating charges",
++                ncols=80,
++                total=len(molecules),
+             ):
+-                charged_ligands.append(SmallMoleculeComponent.from_openff(work.result()))
++                i = future_to_index[work]
++                charged_ligands[i] = SmallMoleculeComponent.from_openff(work.result())
++
++        # fix the typing
++        charged_ligands = [mol for mol in charged_ligands if mol is not None]
+ 
+     else:
++        charged_ligands = []
+         for m in tqdm.tqdm(molecules, desc="Generating charges", ncols=80, total=len(molecules)):
+             mol_with_charge = assign_offmol_partial_charges(m.to_openff(), **charge_keywords)  # type: ignore
+             charged_ligands.append(SmallMoleculeComponent.from_openff(mol_with_charge))
+diff --git a/src/openfecli/tests/commands/test_charge_generation.py b/src/openfecli/tests/commands/test_charge_generation.py
+index 616e089e2..d518a7ed7 100644
+--- a/src/openfecli/tests/commands/test_charge_generation.py
++++ b/src/openfecli/tests/commands/test_charge_generation.py
+@@ -1,4 +1,5 @@
+ import logging
++from importlib import resources
+ 
+ import numpy as np
+ import pytest
+@@ -8,6 +9,7 @@
+ from openff.toolkit import Molecule
+ from openff.units import unit
+ from openff.utilities.testing import skip_if_missing
++from rdkit import Chem
+ 
+ from openfe.protocols.openmm_utils.charge_generation import (
+     HAS_NAGL,
+@@ -40,6 +42,12 @@ def methane_with_charges(methane) -> Molecule:
+     return methane
+ 
+ 
++@pytest.fixture
++def benzene_modifications_filepath():
++    with resources.as_file(resources.files("openfe.tests.data")) as d:
++        yield str(d / "benzene_modifications.sdf")
++
++
+ def test_missing_output(methane, tmp_path):
+     runner = CliRunner()
+     mol_path = tmp_path / "methane.sdf"
+@@ -133,11 +141,15 @@ def test_charge_molecules_overwrite(
+ @pytest.mark.skipif(
+     HAS_OPENEYE, reason="cannot use NAGL with rdkit backend when OpenEye is installed"
+ )
+-def test_charge_settings(methane, tmp_path, caplog, yaml_nagl_settings, ncores):
++def test_charge_settings(
++    benzene_modifications_filepath, tmp_path, caplog, yaml_nagl_settings, ncores
++):
+     runner = CliRunner()
+-    mol_path = tmp_path / "methane.sdf"
+-    methane.to_file(str(mol_path), "sdf")
+-    output_file = str(tmp_path / "charged_methane.sdf")
++    output_file = str(tmp_path / "charged_benzenes.sdf")
++
++    # get the input order
++    supplier = Chem.SDMolSupplier(benzene_modifications_filepath, removeHs=False)
++    input_order = [mol.GetProp("_Name") for mol in supplier]
+ 
+     # use nagl charges for CI speed!
+     settings_path = tmp_path / "settings.yaml"
+@@ -148,15 +160,31 @@ def test_charge_settings(methane, tmp_path, caplog, yaml_nagl_settings, ncores):
+         caplog.set_level(logging.INFO)
+         # make sure the charges are picked up
+         result = runner.invoke(
+-            charge_molecules, ["-M", mol_path, "-o", output_file, "-s", settings_path, "-n", ncores]
++            charge_molecules,
++            [
++                "-M",
++                benzene_modifications_filepath,
++                "-o",
++                output_file,
++                "-s",
++                settings_path,
++                "-n",
++                ncores,
++            ],
+         )
+ 
+         assert result.exit_code == 0
+-
+         assert "Partial charges are present for" in caplog.text
+         assert "Partial Charge Generation: nagl" in result.output
+-        # make sure the charges have been saved
+-        methane = SmallMoleculeComponent.from_sdf_file(filename=output_file)
+-        off_methane = methane.to_openff()
+-        assert off_methane.partial_charges is not None
+-        assert len(off_methane.partial_charges) == 5
++
++        # make sure the charges have been saved and the order of the molecules is preserved
++        supplier_out = Chem.SDMolSupplier(output_file, removeHs=False)
++        output_order = []
++        for mol in supplier_out:
++            smc = SmallMoleculeComponent.from_rdkit(mol)
++            off_mol = smc.to_openff()
++            assert off_mol.partial_charges is not None
++            assert len(off_mol.partial_charges) == off_mol.n_atoms
++            output_order.append(smc.name)
++
++        assert input_order == output_order

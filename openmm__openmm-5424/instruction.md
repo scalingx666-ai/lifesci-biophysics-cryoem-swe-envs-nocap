@@ -1,0 +1,19 @@
+# Issue
+
+**Title:** Only copy changed parameters in the common NonbondedForce kernel
+
+## Description
+
+#4610 gave `NonbondedForce::updateParametersInContext()` the range of particles and exceptions that actually changed, but in `CommonCalcNonbondedForceKernel::copyParametersToContext()` that range only reached the GPU uploads. Every host-side loop still ran over the whole force: the `hasCoulomb`/`hasLJ` validation and the parameter gather over all particles, the exception validation over all exceptions (rebuilding the list of non-excluded ones and re-reading every non-excluded one on any exception change), and an allocation of one vector per particle for offsets whether or not any existed. This means that an update that changed three atoms cost the same as one that changed all of them. For example, for BPTI in TIP3P with amber14 and PME (taken from [grand's bpti-ncmc example](https://github.com/essex-lab/grand/tree/master/examples/bpti-ncmc)), which has 9718 atoms and 13699 exceptions, it took 0.35 ms on CUDA, which is about seven times a `CustomNonbondedForce` update of the same atoms (0.05 ms). (This was run locally on an RTX 5070 Ti.) The CPU and Reference kernels already honour the particle range, and the common `CustomNonbondedForce` kernel honours its range fully.
+
+This PR makes the common `NonbondedForce` kernel do the same: the list of non-excluded exceptions and host copies of the parameter arrays are kept from initialisation, only the changed range is validated, read and uploaded, and the offset vectors are built only when the force has offsets. `exceptionIndex` becomes a dense `vector<int>` rather than a `map`.
+
+The one check that must stay global is that no offset refers to an excluded exception, since the offset setters do not mark the changed range; it now costs one lookup per offset. For the same reason a force that does have offsets still rebuilds and re-uploads all of them on every update; that block is unchanged apart from being skipped when there are none. Since adding an exception does not mark the changed range either, the number of exceptions is now checked against the number at initialisation, in the same way the number of particles already was; previously an added exception that was excluded was silently ignored, and one that was not was caught by the full scan. Results are unchanged.
+
+For the `grand` example system referenced above, updating three atoms drops from 0.350 ms to 0.073 ms and three exceptions from 0.302 ms to 0.043 ms. An update that changes every particle also gets about 3x faster, from 0.347 ms to 0.120 ms, because the exception scan and the offset allocation ran on every call irrespective of what had changed, so removing them helps regardless of the size of the update. Two tests are added: one that changes different subsets of particles and exceptions in turn, checking against Reference each time and that an excluded exception cannot be made non-excluded nor an exception added, and one for a force whose epsilons are all zero, so that the common platform compiles its kernel without Lennard-Jones terms and must reject a later nonzero epsilon while still accepting charge changes.
+
+This was discovered by Claude Code Opus 5 in the process of implementing the prototype discussed in #5410. The implementation here was also assisted by Opus 5.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `b93b58e041ca`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,444 @@
+diff --git a/scilink/wrappers/litellm_wrapper.py b/scilink/wrappers/litellm_wrapper.py
+index 0d5702a01..2185ecb94 100644
+--- a/scilink/wrappers/litellm_wrapper.py
++++ b/scilink/wrappers/litellm_wrapper.py
+@@ -32,6 +32,7 @@
+ import json
+ import logging
+ import time
++from .tool_schema import normalize_tools
+ from types import SimpleNamespace
+ from typing import Any, Dict, List, Optional, Union
+ 
+@@ -239,6 +240,21 @@ def _check_litellm():
+     litellm.suppress_debug_info = True
+ 
+ 
++def _openai_tools_need_no_reasoning(model: str) -> bool:
++    """True for OpenAI gpt-5 family models on chat completions, which reject
++    function tools unless ``reasoning_effort`` is ``"none"`` (observed live:
++    "Function tools with reasoning_effort are not supported for gpt-5.6-sol
++    in /v1/chat/completions ... set reasoning_effort to 'none'")."""
++    m = str(model or "").lower()
++    if "/" in m:
++        provider, _, name = m.partition("/")
++        if provider != "openai":
++            return False
++    else:
++        name = m
++    return name.startswith("gpt-5")
++
++
+ def _scope_drop_params(model) -> None:
+     """Enable LiteLLM param-dropping only for Bedrock models.
+ 
+@@ -284,6 +300,10 @@ def litellm_completion(*args, **kwargs):
+     ceiling.
+     """
+     model = kwargs.get("model") or (args[0] if args else None)
++    if kwargs.get("tools"):
++        kwargs["tools"] = normalize_tools(kwargs["tools"])
++        if _openai_tools_need_no_reasoning(model) and "reasoning_effort" not in kwargs:
++            kwargs["reasoning_effort"] = "none"
+     _scope_drop_params(model)
+     kwargs.setdefault("num_retries", 4)   # retry transient provider errors w/ backoff
+     if ("max_tokens" not in kwargs
+@@ -573,7 +593,16 @@ def _build_params(self, generation_config: Any, tools: Optional[List]) -> Dict:
+             params["max_tokens"] = _resolve_max_output_tokens(self.model)
+ 
+         if tools:
+-            params["tools"] = tools
++            # One portable spelling of every tool schema for every provider
++            # (#606): multi-type parameters become anyOf with type-scoped
++            # keywords, oneOf becomes anyOf. Gemini validates declarations up
++            # front and rejects the lenient shapes the authors wrote.
++            params["tools"] = normalize_tools(tools)
++            # OpenAI's reasoning models refuse function tools on chat
++            # completions unless reasoning is off; a caller's explicit
++            # setting still wins.
++            if _openai_tools_need_no_reasoning(self.model) and "reasoning_effort" not in params:
++                params["reasoning_effort"] = "none"
+ 
+         return params
+     
+diff --git a/scilink/wrappers/openai_wrapper_tools.py b/scilink/wrappers/openai_wrapper_tools.py
+index d1e42ac05..a2f7967bf 100644
+--- a/scilink/wrappers/openai_wrapper_tools.py
++++ b/scilink/wrappers/openai_wrapper_tools.py
+@@ -1,4 +1,5 @@
+ import io
++from .tool_schema import normalize_tools
+ import re
+ import base64
+ from types import SimpleNamespace
+@@ -40,7 +41,7 @@ def generate_content(self, contents, generation_config=None, safety_settings=Non
+         """
+         messages = self._prompt_parser(contents)
+         params = self._map_gen_config(generation_config)
+-        oa_tools = genai_tools_to_openai_tools(tools)
++        oa_tools = normalize_tools(genai_tools_to_openai_tools(tools))   # portable schemas (#606)
+         resp = self.client.chat.completions.create(
+             model=self.model,
+             messages=messages,
+diff --git a/scilink/wrappers/tool_schema.py b/scilink/wrappers/tool_schema.py
+new file mode 100644
+index 000000000..82742e264
+--- /dev/null
++++ b/scilink/wrappers/tool_schema.py
+@@ -0,0 +1,198 @@
++"""Portable tool-parameter schemas (#606).
++
++Tool declarations are authored once, in lenient JSON Schema, and sent to
++whichever provider the session uses. Providers disagree on what they accept:
++
++- Gemini validates every declaration up front and rejects ``items`` on a
++  non-array schema, so a multi-type ``"type": ["string", "array", "object"]``
++  with one shared ``items`` (lenient, accepted by Anthropic and OpenAI) fails
++  the WHOLE request once LiteLLM has expanded the type list into ``any_of``
++  and copied ``items`` onto every variant. LiteLLM also drops ``oneOf`` to an
++  empty schema for Gemini, which silently un-types the parameter.
++- OpenAI's reasoning models refuse function tools on chat completions unless
++  ``reasoning_effort`` is ``"none"`` (handled in the LiteLLM wrapper).
++
++:func:`normalize_schema` rewrites any schema into the common subset every
++provider accepts: a multi-type ``type`` becomes an explicit ``anyOf`` whose
++variants carry only the keywords that apply to their own type (``items`` on
++arrays, ``properties`` on objects, ...); ``oneOf`` becomes ``anyOf``; nested
++schemas are normalized recursively; everything else is left alone. It is
++applied centrally, in the provider wrappers, so every agent and mode is
++covered without touching the tool authors' declarations.
++:func:`gemini_schema_problems` is the matching rules check that a test can
++run over every registered tool so a non-portable schema fails in CI.
++"""
++from __future__ import annotations
++
++import copy
++from typing import Any, Dict, List, Optional
++
++# Keywords that only make sense on one JSON type; a multi-type schema's
++# shared keywords are handed to the variant they belong to.
++_TYPE_KEYS: Dict[str, tuple] = {
++    "array": ("items", "minItems", "maxItems", "uniqueItems", "prefixItems", "contains"),
++    "object": ("properties", "required", "additionalProperties", "minProperties",
++               "maxProperties", "patternProperties", "propertyOrdering"),
++    "string": ("minLength", "maxLength", "pattern", "format"),
++    "number": ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"),
++    "integer": ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"),
++}
++_ALL_TYPE_KEYS = {k for keys in _TYPE_KEYS.values() for k in keys}
++# Keywords that stay on the parent of an anyOf (they describe the parameter,
++# not one of its shapes).
++_SHARED_KEYS = ("description", "title", "default", "nullable", "deprecated")
++_SUBSCHEMA_LISTS = ("anyOf", "oneOf", "allOf", "prefixItems")
++_SUBSCHEMA_MAPS = ("properties", "patternProperties", "$defs", "definitions")
++
++
++def normalize_schema(schema: Any) -> Any:
++    """A provider-portable copy of ``schema`` (never mutates the input)."""
++    return _normalize(copy.deepcopy(schema))
++
++
++def _normalize(node: Any) -> Any:
++    if isinstance(node, list):
++        return [_normalize(v) for v in node]
++    if not isinstance(node, dict):
++        return node
++    # oneOf is not in Gemini's schema subset (LiteLLM drops it to {}); anyOf
++    # is the portable spelling and is equivalent for tool arguments.
++    if "oneOf" in node:
++        variants = node.pop("oneOf")
++        node["anyOf"] = list(node.get("anyOf", [])) + list(variants)
++    t = node.get("type")
++    if isinstance(t, list):
++        node = _expand_type_list(node, [x for x in t])
++    # Recurse into every nested schema position.
++    for key in _SUBSCHEMA_MAPS:
++        if isinstance(node.get(key), dict):
++            node[key] = {k: _normalize(v) for k, v in node[key].items()}
++    for key in _SUBSCHEMA_LISTS:
++        if isinstance(node.get(key), list):
++            node[key] = [_normalize(v) for v in node[key]]
++    for key in ("items", "additionalProperties", "not", "contains"):
++        if isinstance(node.get(key), dict):
++            node[key] = _normalize(node[key])
++    return node
++
++
++def _expand_type_list(node: Dict[str, Any], types: List[Any]) -> Dict[str, Any]:
++    """``{"type": [A, B], <keywords>}`` → ``{"anyOf": [{A + A's keywords},
++    {B + B's keywords}], <shared keywords>}``. A single-element list is just
++    unwrapped. ``null`` becomes its own ``{"type": "null"}`` variant (the
++    standard spelling; LiteLLM turns it into Gemini's ``nullable``)."""
++    types = [x for x in types if isinstance(x, str)]
++    if not types:
++        node.pop("type", None)
++        return node
++    if len(types) == 1:
++        node["type"] = types[0]
++        return node
++    variants = []
++    enum = node.get("enum")
++    for t in types:
++        v: Dict[str, Any] = {"type": t}
++        for key in _TYPE_KEYS.get(t, ()):
++            if key in node:
++                v[key] = node[key]
++        if enum is not None and t not in ("null", "array", "object"):
++            v["enum"] = [e for e in enum if _enum_matches(e, t)] or enum
++        variants.append(v)
++    out: Dict[str, Any] = {}
++    for key in _SHARED_KEYS:
++        if key in node:
++            out[key] = node[key]
++    existing = node.get("anyOf")
++    out["anyOf"] = variants + (list(existing) if isinstance(existing, list) else [])
++    return out
++
++
++def _enum_matches(value: Any, t: str) -> bool:
++    if t == "string":
++        return isinstance(value, str)
++    if t == "boolean":
++        return isinstance(value, bool)
++    if t == "integer":
++        return isinstance(value, int) and not isinstance(value, bool)
++    if t == "number":
++        return isinstance(value, (int, float)) and not isinstance(value, bool)
++    return True
++
++
++def normalize_tools(tools: Optional[List[Any]]) -> Optional[List[Any]]:
++    """Normalize the ``parameters`` of every OpenAI-style tool declaration
++    (``{"type": "function", "function": {"parameters": ...}}``); a Google-style
++    ``function_declarations`` list is handled the same way. Unknown shapes
++    pass through untouched."""
++    if not tools:
++        return tools
++    out = []
++    for tool in tools:
++        if not isinstance(tool, dict):
++            out.append(tool)
++            continue
++        tool = dict(tool)
++        fn = tool.get("function")
++        if isinstance(fn, dict) and isinstance(fn.get("parameters"), dict):
++            fn = dict(fn)
++            fn["parameters"] = normalize_schema(fn["parameters"])
++            tool["function"] = fn
++        elif isinstance(tool.get("parameters"), dict):
++            tool["parameters"] = normalize_schema(tool["parameters"])
++        elif isinstance(tool.get("function_declarations"), list):
++            tool["function_declarations"] = normalize_tools(tool["function_declarations"])
++        out.append(tool)
++    return out
++
++
++# ── the rules a Gemini function declaration must satisfy ──────────────────
++def gemini_schema_problems(schema: Any, path: str = "parameters") -> List[str]:
++    """Violations of Gemini's function-declaration schema subset, as
++    ``"<path>: <problem>"`` strings (empty = portable). Checks the shapes that
++    are known to fail at request time: a ``type`` list, ``oneOf``,
++    type-specific keywords on a schema of another type (``items`` on a
++    non-array is the #606 failure), and an ``anyOf`` variant without a type."""
++    problems: List[str] = []
++    if not isinstance(schema, dict):
++        return problems
++    t = schema.get("type")
++    if isinstance(t, list):
++        problems.append(f"{path}: 'type' is a list {t} (must be a single type or anyOf)")
++    if "oneOf" in schema:
++        problems.append(f"{path}: 'oneOf' is not accepted (use anyOf)")
++    if isinstance(t, str):
++        for owner, keys in _TYPE_KEYS.items():
++            if owner == t or (owner == "number" and t == "integer") or (owner == "integer" and t == "number"):
++                continue
++            for key in keys:
++                if key in schema and key not in _TYPE_KEYS.get(t, ()):
++                    problems.append(f"{path}: '{key}' on a {t!r} schema (only valid on {owner})")
++    for i, v in enumerate(schema.get("anyOf") or []):
++        if isinstance(v, dict) and "type" not in v and "anyOf" not in v:
++            problems.append(f"{path}.anyOf[{i}]: variant without a type")
++        problems += gemini_schema_problems(v, f"{path}.anyOf[{i}]")
++    for key in ("allOf", "prefixItems"):
++        for i, v in enumerate(schema.get(key) or []):
++            problems += gemini_schema_problems(v, f"{path}.{key}[{i}]")
++    for key in _SUBSCHEMA_MAPS:
++        for name, v in (schema.get(key) or {}).items():
++            problems += gemini_schema_problems(v, f"{path}.{key}[{name}]")
++    for key in ("items", "additionalProperties", "not", "contains"):
++        if isinstance(schema.get(key), dict):
++            problems += gemini_schema_problems(schema[key], f"{path}.{key}")
++    return problems
++
++
++def tool_schema_problems(tools: Optional[List[Any]]) -> List[str]:
++    """:func:`gemini_schema_problems` over a tool list, prefixed by tool name."""
++    out: List[str] = []
++    for tool in tools or []:
++        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
++        name = fn.get("name", "?") if isinstance(fn, dict) else "?"
++        params = fn.get("parameters") if isinstance(fn, dict) else None
++        if not isinstance(params, dict):
++            continue
++        if params.get("type") != "object":
++            out.append(f"{name}: parameters.type must be 'object'")
++        out += [f"{name}: {p}" for p in gemini_schema_problems(params)]
++    return out
+diff --git a/tests/test_tool_schema_portability.py b/tests/test_tool_schema_portability.py
+new file mode 100644
+index 000000000..8c820813e
+--- /dev/null
++++ b/tests/test_tool_schema_portability.py
+@@ -0,0 +1,152 @@
++"""#606 — tool schemas are normalized once, in the provider wrappers, into
++the subset every provider accepts; and every registered tool of every
++orchestrator passes the Gemini declaration rules after normalization, so a
++non-portable schema fails here rather than at request time."""
++import copy
++import json
++import logging
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from scilink.wrappers.tool_schema import (
++    gemini_schema_problems, normalize_schema, normalize_tools, tool_schema_problems)
++
++
++def test_multi_type_with_shared_items_becomes_scoped_anyof():
++    s = {"type": ["string", "array", "object"], "items": {"type": "string"},
++         "properties": {"k": {"type": "number"}}, "description": "d"}
++    out = normalize_schema(s)
++    assert out == {"description": "d", "anyOf": [
++        {"type": "string"},
++        {"type": "array", "items": {"type": "string"}},
++        {"type": "object", "properties": {"k": {"type": "number"}}}]}
++    assert s["type"] == ["string", "array", "object"]            # input untouched
++    assert gemini_schema_problems(out) == []
++    assert any("'items' on a 'object'" in p for p in gemini_schema_problems(
++        {"anyOf": [{"type": "object", "items": {"type": "string"}}]}))
++
++
++def test_null_single_and_enum_type_lists():
++    assert normalize_schema({"type": ["string", "null"]}) == {"anyOf": [{"type": "string"}, {"type": "null"}]}
++    assert normalize_schema({"type": ["string"], "enum": ["a"]}) == {"type": "string", "enum": ["a"]}
++    out = normalize_schema({"type": ["string", "integer"], "enum": ["a", 1]})
++    assert out == {"anyOf": [{"type": "string", "enum": ["a"]}, {"type": "integer", "enum": [1]}]}
++
++
++def test_oneof_becomes_anyof_recursively():
++    s = {"type": "object", "properties": {"skill": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": ["string", "null"]}}]}}}
++    out = normalize_schema(s)
++    sk = out["properties"]["skill"]
++    assert "oneOf" not in sk and sk["anyOf"][1]["items"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
++    assert gemini_schema_problems(out) == []
++    assert gemini_schema_problems(s) and any("oneOf" in p for p in gemini_schema_problems(s))
++
++
++def test_normalize_tools_handles_openai_and_google_shapes_and_passes_others():
++    oa = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {"p": {"type": ["string", "array"], "items": {"type": "string"}}}}}}]
++    out = normalize_tools(oa)
++    assert "anyOf" in out[0]["function"]["parameters"]["properties"]["p"]
++    assert "anyOf" not in oa[0]["function"]["parameters"]["properties"]["p"]      # original untouched
++    g = [{"function_declarations": [{"name": "f", "parameters": {"type": "object", "properties": {"p": {"oneOf": [{"type": "string"}]}}}}]}]
++    assert "anyOf" in normalize_tools(g)[0]["function_declarations"][0]["parameters"]["properties"]["p"]
++    assert normalize_tools(None) is None and normalize_tools(["not a dict"]) == ["not a dict"]
++
++
++# ── every registered tool of every orchestrator ─────────────────────────
++
++def _analysis():
++    from scilink.agents.exp_agents.analysis_orchestrator_tools import AnalysisOrchestratorTools
++    t = AnalysisOrchestratorTools.__new__(AnalysisOrchestratorTools)
++    t.orch = SimpleNamespace(base_dir=Path("/tmp/x"), model=None, analysis_results=[], futurehouse_api_key=None,
++                             current_metadata=None, _custom_skills={})
++    t.functions_map, t.openai_schemas = {}, []; t._register_all_tools(); return t.openai_schemas
++
++
++def _planning():
++    from scilink.agents.planning_agents.orchestrator_tools import OrchestratorTools
++    return OrchestratorTools(SimpleNamespace(base_dir=Path("/tmp/x"), planner=SimpleNamespace())).openai_schemas
++
++
++def _simulation():
++    from scilink.agents.sim_agents.simulation_orchestrator_tools import SimulationOrchestratorTools
++    t = SimulationOrchestratorTools.__new__(SimulationOrchestratorTools)
++    t.orch = SimpleNamespace(base_dir="/tmp/x", model=None, generated_structures=[])
++    t.functions_map, t.openai_schemas = {}, []; t.logger = logging.getLogger("sim"); t._register_all_tools(); return t.openai_schemas
++
++
++def _meta():
++    from scilink.agents.meta_agent.meta_orchestrator_tools import MetaOrchestratorTools
++    t = MetaOrchestratorTools.__new__(MetaOrchestratorTools)
++    t.orch = SimpleNamespace(base_dir=Path("/tmp/x"), model=None, _delegation_ledger=[], _children={})
++    t.functions_map, t.openai_schemas = {}, []; t._register_all_tools(); return t.openai_schemas
++
++
++ORCHESTRATORS = {"analysis": _analysis, "planning": _planning, "simulation": _simulation, "meta": _meta}
++
++
++@pytest.mark.parametrize("name", sorted(ORCHESTRATORS))
++def test_every_registered_tool_is_portable_after_normalization(name):
++    tools = ORCHESTRATORS[name]()
++    assert len(tools) > 5
++    normalized = normalize_tools(tools)
++    assert tool_schema_problems(normalized) == []
++    json.dumps(normalized)                                        # serializable for every provider
++    # names, descriptions and required lists survive untouched
++    for a, b in zip(tools, normalized):
++        assert a["function"]["name"] == b["function"]["name"]
++        assert a["function"]["description"] == b["function"]["description"]
++        assert a["function"]["parameters"].get("required", []) == b["function"]["parameters"].get("required", [])
++        assert set(a["function"]["parameters"]["properties"]) == set(b["function"]["parameters"]["properties"])
++
++
++def test_the_authored_planning_schemas_are_the_ones_gemini_rejected():
++    """The un-normalized planning set carries the #606 shapes; the check
++    catches them (so the test would have failed before the fix)."""
++    problems = tool_schema_problems(_planning())
++    assert any("search_literature" in p and "objective" in p for p in problems)
++
++
++def test_litellm_gemini_conversion_keeps_items_only_on_arrays():
++    """After normalization LiteLLM's Gemini schema builder produces no
++    `items` on a non-array variant and no empty schema from oneOf."""
++    from litellm.llms.vertex_ai.common_utils import _build_vertex_schema
++
++    def walk(node, path="p"):
++        bad = []
++        if isinstance(node, dict):
++            if node == {} and path.endswith("]"):
++                bad.append(path + ": empty schema")
++            if "items" in node and node.get("type", "").lower() not in ("array",) and "anyOf" not in node:
++                bad.append(path + ": items on " + str(node.get("type")))
++            for k, v in node.items():
++                bad += walk(v, f"{path}.{k}")
++        elif isinstance(node, list):
++            for i, v in enumerate(node):
++                bad += walk(v, f"{path}[{i}]")
++        return bad
++
++    for name, build in ORCHESTRATORS.items():
++        for tool in normalize_tools(build()):
++            params = copy.deepcopy(tool["function"]["parameters"])
++            converted = _build_vertex_schema(params)
++            for pname, prop in (converted.get("properties") or {}).items():
++                assert prop != {}, f"{name}.{tool['function']['name']}.{pname} collapsed to an empty schema"
++            assert walk(converted) == [], f"{name}.{tool['function']['name']}: {walk(converted)}"
++
++
++def test_wrapper_normalizes_tools_and_sets_reasoning_off_for_openai_gpt5():
++    from scilink.wrappers.litellm_wrapper import LiteLLMGenerativeModel, _openai_tools_need_no_reasoning
++    tools = [{"type": "function", "function": {"name": "f", "description": "d", "parameters": {
++        "type": "object", "properties": {"p": {"type": ["string", "array"], "items": {"type": "string"}}}}}}]
++    m = LiteLLMGenerativeModel.__new__(LiteLLMGenerativeModel); m.model = "openai/gpt-5.6-sol"
++    params = m._build_params(None, tools)
++    assert "anyOf" in params["tools"][0]["function"]["parameters"]["properties"]["p"]
++    assert params["reasoning_effort"] == "none"
++    m.model = "gemini/gemini-3.8-flash"
++    assert "reasoning_effort" not in m._build_params(None, tools)
++    m.model = "bedrock/us.anthropic.claude-opus-4-8"
++    assert "reasoning_effort" not in m._build_params(None, tools)
++    assert not _openai_tools_need_no_reasoning("gpt-4o") and _openai_tools_need_no_reasoning("gpt-5.6-sol")
++    assert m._build_params(None, None).get("tools") is None

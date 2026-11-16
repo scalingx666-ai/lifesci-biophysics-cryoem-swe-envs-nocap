@@ -1,0 +1,205 @@
+diff --git a/scilink/agents/exp_agents/curve_fitting_agent.py b/scilink/agents/exp_agents/curve_fitting_agent.py
+index 0a4ac6b5..ef41ce66 100644
+--- a/scilink/agents/exp_agents/curve_fitting_agent.py
++++ b/scilink/agents/exp_agents/curve_fitting_agent.py
+@@ -1674,6 +1674,10 @@ def _llm_call(prompt: str) -> str:
+                     )
+                     if out.get("status") == "success":
+                         sid = out["staged_id"]
++                    elif out.get("already_staged"):
++                        # this record's copy is already awaiting review: a
++                        # second, unlinked copy would be a duplicate (#398)
++                        continue
+                 if sid is None:
+                     sid = _staging.stage_solution("curve_fitting", technique, record)
+                 staged.append(sid)
+diff --git a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+index 40c4f5e9..24d3b6f5 100644
+--- a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
++++ b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+@@ -1788,6 +1788,10 @@ def _llm_call(prompt: str) -> str:
+                     )
+                     if out.get("status") == "success":
+                         sid = out["staged_id"]
++                    elif out.get("already_staged"):
++                        # this record's copy is already awaiting review: a
++                        # second, unlinked copy would be a duplicate (#398)
++                        continue
+                 if sid is None:
+                     sid = _staging.stage_solution("hyperspectral", technique, record)
+                 staged.append(sid)
+diff --git a/scilink/agents/exp_agents/image_analysis_agent.py b/scilink/agents/exp_agents/image_analysis_agent.py
+index 833a7b62..1bdbed32 100644
+--- a/scilink/agents/exp_agents/image_analysis_agent.py
++++ b/scilink/agents/exp_agents/image_analysis_agent.py
+@@ -1212,6 +1212,10 @@ def _llm_call(prompt: str) -> str:
+                     )
+                     if out.get("status") == "success":
+                         sid = out["staged_id"]
++                    elif out.get("already_staged"):
++                        # this record's copy is already awaiting review: a
++                        # second, unlinked copy would be a duplicate (#398)
++                        continue
+                 if sid is None:
+                     sid = _staging.stage_solution("image_analysis", technique, record)
+                 staged.append(sid)
+diff --git a/scilink/skills/_shared/_script_bank.py b/scilink/skills/_shared/_script_bank.py
+index ac257189..0c9f561d 100644
+--- a/scilink/skills/_shared/_script_bank.py
++++ b/scilink/skills/_shared/_script_bank.py
+@@ -1354,11 +1354,11 @@ def find_by_script(domain: str, script: str, *,
+     return hit[0] if hit else None
+ 
+ 
+-def promote_to_staging(domain: str, rid: str, technique: Optional[str] = None,
+-                       *, root: Optional[Path] = None,
+-                       staging_root: Optional[Path] = None,
+-                       provenance: str = "bank_proven",
+-                       extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
++def _promote_to_staging_unlocked(domain: str, rid: str, technique: Optional[str] = None,
++                                 *, root: Optional[Path] = None,
++                                 staging_root: Optional[Path] = None,
++                                 provenance: str = "bank_proven",
++                                 extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+     """Copy a bank record into the distill-staging buffer (graduation path).
+ 
+     The staged record enters the existing review-gated ceremony (upgrade an
+@@ -1367,6 +1367,11 @@ def promote_to_staging(domain: str, rid: str, technique: Optional[str] = None,
+     bank record is kept and marked ``promoted_to_staging`` so surfaces show
+     it and repeat promotions are flagged. ``technique`` defaults to a
+     deterministic label derived from the record (no LLM).
++
++    A read-modify-write of the record, so it runs under the domain lock (the
++    public ``promote_to_staging``): two promotions of one record stage it once,
++    and a success counted meanwhile is kept. The staging lock is taken inside
++    it, never the other way round.
+     """
+     from . import _staging
+ 
+@@ -1379,7 +1384,9 @@ def promote_to_staging(domain: str, rid: str, technique: Optional[str] = None,
+         # was consumed (upgrade/consolidate remove staged records) or pruned,
+         # the mark is dangling and re-promotion is legitimate.
+         if _staging.get_staged(domain, prior_sid, root=staging_root) is not None:
+-            return {"status": "error",
++            # ``already_staged``: a caller that would otherwise stage the
++            # script itself skips it — the copy under review is this record's
++            return {"status": "error", "already_staged": prior_sid,
+                     "message": (f"Record {rid} is already staged for review "
+                                 f"(staged id {prior_sid}). Review it with "
+                                 f"`scilink memory staged`.")}
+@@ -1646,3 +1653,4 @@ def wrapper(domain, *args, **kwargs):
+ archive_records = _locked(_archive_records_unlocked)
+ restore_records = _locked(_restore_records_unlocked)
+ remove_records = _locked(_remove_records_unlocked)
++promote_to_staging = _locked(_promote_to_staging_unlocked)
+diff --git a/tests/test_persistent_memory.py b/tests/test_persistent_memory.py
+index b0eac6ac..e4e64bf5 100644
+--- a/tests/test_persistent_memory.py
++++ b/tests/test_persistent_memory.py
+@@ -308,6 +308,47 @@ def test_stages_solution_no_skill_written(self, tmp_path, monkeypatch):
+         assert staged[0]["technique"] == "voigt_plus_exp_tail"
+         assert "VERBATIM_MARKER" in staged[0]["working_script"]
+ 
++    def test_a_banked_script_is_staged_once_however_often_it_is_nominated(self, tmp_path, monkeypatch):
++        """#398: the second nomination of a record already awaiting review is
++        skipped, not staged again as an unlinked copy — one after the other,
++        and from two threads at once."""
++        import threading
++        import time
++        monkeypatch.setenv("SCILINK_HOME", str(tmp_path))
++        monkeypatch.setenv("SCILINK_MEMORY", "1")
++        monkeypatch.delenv("SCILINK_SCRIPT_BANK", raising=False)
++        from scilink.agents.exp_agents.curve_fitting_agent import CurveFittingAgent
++        from scilink.skills._shared import _script_bank, _staging
++        state = self._hot_state()
++        rid = _script_bank.add_record("curve_fitting", {
++            "working_script": state["series_results"][0]["script"],
++            "data_fingerprint": {"kind": "curve", "n": 10},
++            "measurement_context": {"technique": "raman"},
++            "provenance": {"session": "s1"}})["id"]
++        agent = self._fake_agent(str(tmp_path), self._Model())
++
++        def one_copy_linked():
++            staged = _staging.list_staged("curve_fitting")
++            assert len(staged) == 1 and staged[0].get("bank_id") == rid
++            return staged[0]["id"]
++
++        first = CurveFittingAgent._maybe_stage_t2_solutions(agent, self._hot_state())
++        assert CurveFittingAgent._maybe_stage_t2_solutions(agent, self._hot_state()) == []
++        assert first == [one_copy_linked()]
++        # the same race between two nominations, staging slowed so both read first
++        _staging.remove_staged("curve_fitting", first)
++        real = _staging.stage_solution
++        monkeypatch.setattr(_staging, "stage_solution", lambda *a, **k: (time.sleep(0.3), real(*a, **k))[1])
++        outs = []
++        threads = [threading.Thread(target=lambda: outs.append(
++            CurveFittingAgent._maybe_stage_t2_solutions(agent, self._hot_state()))) for _ in range(2)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        assert sorted(len(o) for o in outs) == [0, 1]
++        one_copy_linked()
++
+     def test_no_stage_when_not_hot(self, tmp_path, monkeypatch):
+         monkeypatch.setenv("SCILINK_HOME", str(tmp_path))
+         from scilink.agents.exp_agents.curve_fitting_agent import CurveFittingAgent
+diff --git a/tests/test_script_bank_hardening.py b/tests/test_script_bank_hardening.py
+index 99c2ba65..05b459b4 100644
+--- a/tests/test_script_bank_hardening.py
++++ b/tests/test_script_bank_hardening.py
+@@ -464,8 +464,53 @@ def test_the_lock_is_reentrant_within_a_write(self, monkeypatch):
+         _bank(script="print('new')", fp=_fp(center=40, seed=2))     # must not deadlock
+         assert [r["id"] for r in sb.list_archived("curve_fitting")] == [old]
+ 
++    def _slow_staging(self, monkeypatch, during=None):
++        """Stage after a pause (and run ``during`` in it), so a second writer
++        reaches the record while a promotion is between its read and write."""
++        import time
++        from scilink.skills._shared import _staging
++        real = _staging.stage_solution
++
++        def slow(*a, **k):
++            if during:
++                during()
++            time.sleep(0.3)
++            return real(*a, **k)
++        monkeypatch.setattr(_staging, "stage_solution", slow)
++
++    def test_two_promotions_of_one_record_stage_it_once(self, monkeypatch):
++        import threading
++        from scilink.skills._shared import _staging
++        rid = _bank()
++        self._slow_staging(monkeypatch)
++        outs = []
++        threads = [threading.Thread(target=lambda: outs.append(
++            sb.promote_to_staging("curve_fitting", rid, technique="t"))) for _ in range(2)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join()
++        assert sorted(o["status"] for o in outs) == ["error", "success"]
++        assert len(_staging.list_staged("curve_fitting")) == 1
++        sid = next(o["staged_id"] for o in outs if o["status"] == "success")
++        assert _rec(rid)["promoted_to_staging"] == sid
++
++    def test_a_success_counted_during_a_promotion_is_kept(self, monkeypatch):
++        import threading
++        rid = _bank()
++        n0 = _rec(rid)["stats"]["n_successes"]
++        other = threading.Thread(target=sb.record_success, args=("curve_fitting", rid),
++                                 kwargs={"session": "s9"})
++        self._slow_staging(monkeypatch, during=other.start)
++        out = sb.promote_to_staging("curve_fitting", rid, technique="t")
++        other.join()
++        rec = _rec(rid)
++        assert out["status"] == "success" and rec["promoted_to_staging"] == out["staged_id"]
++        assert rec["stats"]["n_successes"] == n0 + 1
++
+     def test_public_names_are_the_locked_ones(self):
+         for name in ("add_record", "record_success", "record_failure",
+-                     "mark_retrieved", "archive_records", "restore_records"):
++                     "mark_retrieved", "archive_records", "restore_records",
++                     "promote_to_staging"):
+             assert getattr(sb, name).__name__ == name
+             assert getattr(sb, name).__wrapped__.__name__ == f"_{name}_unlocked"

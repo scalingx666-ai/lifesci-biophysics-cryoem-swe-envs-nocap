@@ -1,0 +1,603 @@
+diff --git a/perses/dispersed/utils.py b/perses/dispersed/utils.py
+index fdceaaa7c..2166c4e21 100644
+--- a/perses/dispersed/utils.py
++++ b/perses/dispersed/utils.py
+@@ -20,6 +20,10 @@
+ from scipy.special import logsumexp
+ import openmmtools.cache as cache
+ 
++temperature = 300.0 * unit.kelvin
++kT = kB * temperature
++beta = 1.0/kT
++
+ # Instantiate logger
+ logging.basicConfig(level = logging.NOTSET)
+ _logger = logging.getLogger("sMC_utils")
+@@ -452,6 +456,11 @@ def create_endstates(first_thermostate, last_thermostate):
+     3. set PME tolerance to 1e-5
+     4. enable LJPME to handle long range dispersion corrections in a physically reasonable manner
+ 
++    Works for `HybridTopologyFactory`
++    Note that this function is kept for legacy purposes and that `create_endstates_from_real_systems' is a more
++    general version of this function. For `HybridTopologyFactory`, both functions do the same thing, so either can be used
++    when generating unsampled endstates for `HybridTopologyFactory`. By default, `create_endstates_from_real_systems` is used.
++
+     Parameters
+     ----------
+     first_thermostate : openmmtools.states.CompoundThermodynamicState
+@@ -500,6 +509,174 @@ def create_endstates(first_thermostate, last_thermostate):
+ 
+     return unsampled_endstates
+ 
++def create_endstates_from_real_systems(htf, for_testing=False):
++    """
++    Generates unsampled endstates using LJPME as the nonbonded method to more accurately account for
++    long-range steric interactions at the lambda = 0 and lambda = 1 endstates.
++
++    Works for `HybridTopologyFactory` and `RESTCapableHybridTopologyFactory`
++
++    Tested in tests/test_relative.py::test_create_endstates()
++
++    Parameters
++    ----------
++    htf : HybridTopologyFactory or RESTCapableHybridTopologyFactory
++        hybrid factory from which to create the unsampled endstates
++    for_testing : bool, default False
++        whether to generate the unsampled endstates for testing
++        For energy validation tests, we'll use PME as the nonbonded method, since the original hybrid system uses PME (not LJPME).
++
++    Returns
++    -------
++    unsampled_endstates : list of ThermodynamicState
++        the unsampled endstate at lambda = 0, then the unsampled endstate at lambda = 1
++    """
++    import openmm
++    from perses.annihilation.relative import RESTCapableHybridTopologyFactory
++
++    TIGHT_PME_TOLERANCE = 1.0e-5
++
++    # Retrieve old and new NonbondedForces
++    old_system_nbf = htf._old_system_forces['NonbondedForce']
++    new_system_nbf = htf._new_system_forces['NonbondedForce']
++
++    # Load original hybrid_system
++    hybrid_system = htf.hybrid_system
++
++    # Make a copy of the hybrid_system
++    hybrid_system_0 = copy.deepcopy(hybrid_system)
++    hybrid_system_1 = copy.deepcopy(hybrid_system)
++
++    # Delete existing nonbonded-related forces, create a new NonbondedForce, copy particles/exceptions
++    unsampled_endstates = []
++    for lambda_val, hybrid_system in zip([0, 1], [hybrid_system_0, hybrid_system_1]):
++        # Delete existing nonbonded-related forces
++        forces = {hybrid_system.getForce(index).getName(): index for index in range(hybrid_system.getNumForces())}
++        indices_to_remove = [index for name, index in forces.items() if 'Nonbonded' in name or 'exceptions' in name]
++        for index in sorted(indices_to_remove, reverse=True):
++            hybrid_system.removeForce(index)
++
++        # Create NonbondedForce
++        nonbonded_force = openmm.NonbondedForce()
++        hybrid_system.addForce(nonbonded_force)
++
++        # Set nonbonded method and related attributes
++        if not for_testing:
++            nonbonded_force.setNonbondedMethod(openmm.NonbondedForce.LJPME)
++            nonbonded_force.setEwaldErrorTolerance(TIGHT_PME_TOLERANCE)
++        else:
++            nonbonded_force.setNonbondedMethod(openmm.NonbondedForce.PME)
++            [alpha_ewald, nx, ny, nz] = old_system_nbf.getPMEParameters()
++            delta = old_system_nbf.getEwaldErrorTolerance()
++            nonbonded_force.setPMEParameters(alpha_ewald, nx, ny, nz)
++            nonbonded_force.setEwaldErrorTolerance(delta)
++            nonbonded_force.setCutoffDistance(old_system_nbf.getCutoffDistance())
++
++        # Retrieve name of atom class for which to zero the charges/epsilons
++        atom_class_to_zero = 'unique_new_atoms' if lambda_val == 0 else 'unique_old_atoms'
++
++        # Iterate over particles in the old NonbondedForce and add them to the NonbondedForce for the hybrid system
++        done_indices = []
++        for idx in range(old_system_nbf.getNumParticles()):
++            # Given the atom index, get charge, sigma, epsilon, and hybrid index
++            hybrid_idx = htf._old_to_hybrid_map[idx]
++            alch_id, atom_class = RESTCapableHybridTopologyFactory.get_alch_identifier(htf, hybrid_idx)
++            charge, sigma, epsilon = old_system_nbf.getParticleParameters(idx)
++            if atom_class == atom_class_to_zero:
++                charge, sigma, epsilon = charge * 0, sigma, epsilon * 0
++            elif atom_class == 'core_atoms' and lambda_val == 1:  # Retrieve new system parameters for core atoms
++                new_idx = htf._hybrid_to_new_map[hybrid_idx]
++                charge, sigma, epsilon = new_system_nbf.getParticleParameters(new_idx)
++
++            # Add particle to the NonbondedForce
++            nonbonded_force.addParticle(charge, sigma, epsilon)
++
++            # Keep track of indices that have already been added
++            done_indices.append(hybrid_idx)
++
++        # Iterate over particles in the new NonbondedForce and add them to the NonbondedForce for the hybrid system
++        remaining_hybrid_indices = sorted(set(range(hybrid_system.getNumParticles())).difference(set(done_indices)))
++        for hybrid_idx in remaining_hybrid_indices:
++            # Given the atom index, get charge, sigma, and epsilon
++            idx = htf._hybrid_to_new_map[hybrid_idx]
++            alch_id, atom_class = RESTCapableHybridTopologyFactory.get_alch_identifier(htf, hybrid_idx)
++            charge, sigma, epsilon = new_system_nbf.getParticleParameters(idx)
++            if atom_class == atom_class_to_zero:
++                charge, sigma, epsilon = charge * 0, sigma, epsilon * 0
++
++            # Add particle to NonbondedForce, with zeroed charge and epsilon
++            nonbonded_force.addParticle(charge, sigma, epsilon)
++
++        # Now remove interactions between unique old/new
++        unique_news = htf._atom_classes['unique_new_atoms']
++        unique_olds = htf._atom_classes['unique_old_atoms']
++        for new in unique_news:
++            for old in unique_olds:
++                nonbonded_force.addException(old,
++                                             new,
++                                             0.0 * unit.elementary_charge ** 2,
++                                             1.0 * unit.nanometers,
++                                             0.0 * unit.kilojoules_per_mole)
++
++        # Now add add all nonzeroed exceptions to custom bond force
++        old_term_collector = {}
++        new_term_collector = {}
++
++        # Gather the old system exceptions into a dict
++        for term_idx in range(old_system_nbf.getNumExceptions()):
++            p1, p2, chargeProd, sigma, epsilon = old_system_nbf.getExceptionParameters(term_idx)  # Grab the parameters
++            hybrid_p1, hybrid_p2 = htf._old_to_hybrid_map[p1], htf._old_to_hybrid_map[p2]  # Make hybrid indices
++            sorted_indices = tuple(sorted([hybrid_p1, hybrid_p2]))  # Sort the indices
++            assert not sorted_indices in old_term_collector.keys(), f"this exception already exists"
++            old_term_collector[sorted_indices] = [term_idx, chargeProd, sigma, epsilon]
++
++        # Repeat for the new system exceptions
++        for term_idx in range(new_system_nbf.getNumExceptions()):
++            p1, p2, chargeProd, sigma, epsilon = new_system_nbf.getExceptionParameters(term_idx)
++            hybrid_p1, hybrid_p2 = htf._new_to_hybrid_map[p1], htf._new_to_hybrid_map[p2]
++            sorted_indices = tuple(sorted([hybrid_p1, hybrid_p2]))
++            assert not sorted_indices in new_term_collector.keys(), f"this exception already exists"
++            new_term_collector[sorted_indices] = [term_idx, chargeProd, sigma, epsilon]
++
++        htf_class = htf.__class__.__name__
++
++        # Iterate over the old_term_collector and add exceptions to the NonbondedForce for the hybrid system
++        for hybrid_index_pair in old_term_collector.keys():
++            # Get terms
++            idx_set = set(list(hybrid_index_pair))
++            alch_id, atom_class = RESTCapableHybridTopologyFactory.get_alch_identifier(htf, idx_set)
++            idx, chargeProd, sigma, epsilon = old_term_collector[hybrid_index_pair]
++            if atom_class == atom_class_to_zero:
++                if htf_class == 'HybridTopologyFactory' and not htf._interpolate_14s:  # When _interpolate_14s is False, the exceptions always remain on
++                    pass
++                else:
++                    chargeProd, sigma, epsilon = chargeProd * 0, sigma, epsilon * 0
++            elif atom_class == 'core_atoms' and lambda_val == 1:  # Retrieve new system parameters for core atoms
++                new_idx, chargeProd, sigma, epsilon = new_term_collector[hybrid_index_pair]
++
++            # Add exception
++            nonbonded_force.addException(hybrid_index_pair[0], hybrid_index_pair[1], chargeProd, sigma, epsilon)
++
++        # Now iterate over the new_term_collector and add exceptions to the NonbondedForce for the hybrid system
++        for hybrid_index_pair in new_term_collector.keys():
++            if hybrid_index_pair not in old_term_collector.keys():
++                # Get terms
++                idx_set = set(list(hybrid_index_pair))
++                alch_id, atom_class = RESTCapableHybridTopologyFactory.get_alch_identifier(htf, idx_set)
++                idx, chargeProd, sigma, epsilon = new_term_collector[hybrid_index_pair]
++                if atom_class == atom_class_to_zero:
++                    if htf_class == 'HybridTopologyFactory' and not htf._interpolate_14s:  # When _interpolate_14s is False, the exceptions always remain on
++                        pass
++                    else:
++                        chargeProd, sigma, epsilon = chargeProd * 0, sigma, epsilon * 0
++
++                # Add exception
++                nonbonded_force.addException(hybrid_index_pair[0], hybrid_index_pair[1], chargeProd, sigma, epsilon)
++
++        unsampled_endstates.append(ThermodynamicState(hybrid_system, temperature=temperature))
++
++    return unsampled_endstates
++
+ ################################################################
+ ##################Distributed Tasks#############################
+ ################################################################
+diff --git a/perses/samplers/multistate.py b/perses/samplers/multistate.py
+index 9d441c8e3..50f1ebfca 100644
+--- a/perses/samplers/multistate.py
++++ b/perses/samplers/multistate.py
+@@ -6,10 +6,9 @@
+ 
+ from openmmtools.multistate import sams, replicaexchange
+ from openmmtools.states import CompoundThermodynamicState, SamplerState, ThermodynamicState
++from perses.dispersed.utils import create_endstates_from_real_systems
+ from openmmtools.constants import kB
+-
+ from perses.annihilation.lambda_protocol import RelativeAlchemicalState, RESTCapableRelativeAlchemicalState, LambdaProtocol, RESTCapableLambdaProtocol
+-from perses.dispersed.utils import create_endstates
+ 
+ import numpy as np
+ import copy
+@@ -111,7 +110,7 @@ def setup(self, n_states, temperature, storage_file, minimisation_steps=100,
+         if endstates:
+             # Generating unsampled endstates
+             _logger.info('Generating unsampled endstates.')
+-            unsampled_dispersion_endstates = create_endstates(copy.deepcopy(thermodynamic_state_list[0]), copy.deepcopy(thermodynamic_state_list[-1]))
++            unsampled_dispersion_endstates = create_endstates_from_real_systems(self._hybrid_factory)
+             self.create(thermodynamic_states=thermodynamic_state_list, sampler_states=sampler_state_list,
+                     storage=reporter, unsampled_thermodynamic_states=unsampled_dispersion_endstates)
+         else:
+diff --git a/perses/tests/test_relative.py b/perses/tests/test_relative.py
+index 2f056e767..8340befde 100644
+--- a/perses/tests/test_relative.py
++++ b/perses/tests/test_relative.py
+@@ -1005,13 +1005,13 @@ def run_RESTCapableHybridTopologyFactory_energies(test_name, phase, use_point_en
+                                                  )
+         htf = solvent_delivery.get_apo_rest_htf()
+ 
+-    # validating endstate energies
++    # Validate endstate energies
+     if use_point_energies:
+         for endstate in [0, 1]:
+             validate_endstate_energies_point(htf, endstate=endstate, minimize=True)
+     else:
+         for endstate in [0, 1]:
+-            validate_endstate_energies_md(htf, endstate=endstate, n_steps=10)
++            validate_endstate_energies_md(htf, endstate=endstate, n_steps=10, save_freq=1)
+ 
+ def test_RESTCapableHybridTopologyFactory_energies():
+     """
+@@ -1047,3 +1047,114 @@ def test_RESTCapableHybridTopologyFactory_energies_GPU():
+         # Run MD validation test
+         run_RESTCapableHybridTopologyFactory_energies(test_name, phase, use_point_energies=False)
+ 
++def run_unsampled_endstate_energies(test_name, use_point_energies=True, use_md_energies=False):
++    """
++    Check that the energies of the unsampled endstate hybrid systems generated by dispersed/utils.py/create_endstates_from_real_systems()
++    match the energies of the original hybrid system.
++
++    Checks the energies using validate_unsampled_endstates_point() and/or validate_unsampled_endstates_md() -- first for
++    RESTCapableHybridTopologyFactory and then for HybridTopologyFactory
++
++    Parameters
++    ----------
++    test_name : str
++        Name of the test system. Currently supports: 'ala-dipeptide', 'barstar'.
++    use_point_energies : boolean, default True
++        Whether to run the point energy test for energy validation.
++    use_md_energies : boolean, default False
++        Whether to run the MD energy test for energy validation.
++
++    """
++
++    from perses.dispersed.utils import create_endstates_from_real_systems
++    from perses.tests.test_topology_proposal import generate_atp, generate_dipeptide_top_pos_sys
++    from perses.app.relative_point_mutation_setup import  PointMutationExecutor
++    from perses.tests.utils import validate_unsampled_endstates_point, validate_unsampled_endstates_md
++
++    if test_name == 'ala-dipeptide':
++        # Generate topology, system, systems, system generator for ALA dipeptide in solvent
++        atp, system_generator = generate_atp(phase='solvent')
++
++        # Generate hybrid factory for dipeptide mutation ALA -> THR
++        htfs = []
++        for generate_rest_factory in [True, False]:
++            htf = generate_dipeptide_top_pos_sys(atp.topology,
++                                                 'THR',
++                                                 atp.system,
++                                                 atp.positions,
++                                                 system_generator,
++                                                 conduct_htf_prop=True,
++                                                 generate_rest_capable_hybrid_topology_factory=generate_rest_factory,
++                                                 validate_endstate_energy=False)
++            htfs.append(htf)
++
++    elif test_name == 'barstar':
++        # Generate hybrid factory
++        input_filename = resource_filename('perses', 'data/barstar-mutation/1brs_barstar_renumbered.pdb')
++        chain_id = '1'
++        residue_id = '42'
++        proposed_residue = 'ALA'
++        solvent_delivery = PointMutationExecutor(input_filename,
++                                                 chain_id,
++                                                 residue_id,
++                                                 proposed_residue,
++                                                 forcefield_files=['amber14/protein.ff14SB.xml', 'amber14/tip3p.xml'],
++                                                 ionic_strength=0.05 * unit.molar,
++                                                 rest_radius=0.2,
++                                                 generate_unmodified_hybrid_topology_factory=True,
++                                                 generate_rest_capable_hybrid_topology_factory=True,
++                                                 conduct_endstate_validation=False,
++                                                 )
++        htf = solvent_delivery.get_apo_rest_htf()
++        vanilla_htf = solvent_delivery.get_apo_htf()
++        htfs = [htf, vanilla_htf]
++
++    else:
++        raise Exception(f"You specified test case name: {test_name}, but the allowed test_names are: 'ala-dipeptide' and 'barstar'")
++
++    for htf in htfs:
++        # Modify the htf for tests
++        # For these tests, we need to turn the LRC on for the CustomNonbondedForce, since the LRC is on for the real systems
++        force_dict = {force.getName(): index for index, force in enumerate(htf.hybrid_system.getForces())}
++        if htf.__class__.__name__ == 'HybridTopologyFactory':
++            htf.hybrid_system.getForce(force_dict['CustomNonbondedForce']).setUseLongRangeCorrection(True)
++        elif htf.__class__.__name__ == 'RESTCapableHybridTopologyFactory':
++            htf.hybrid_system.getForce(force_dict['CustomNonbondedForce_sterics']).setUseLongRangeCorrection(True)
++
++        # Generate unsampled endstates
++        unsampled_endstates = create_endstates_from_real_systems(htf, for_testing=True)
++
++        # Check to make sure energies are the same in the unsampled endstate hybrid system as they are in the original hybrid system
++        for endstate in [0, 1]:
++            if use_point_energies:
++                validate_unsampled_endstates_point(htf, unsampled_endstates[endstate].system, endstate, minimize=True)
++            if use_md_energies:
++                validate_unsampled_endstates_md(htf, unsampled_endstates[endstate].system, endstate, n_steps=10, save_freq=1)
++
++def test_unsampled_endstate_energies():
++    """
++    Uses run_unsampled_endstate_energies() to run energy validation for the unsampled endstates generated for
++    RESTCapableHybridTopologyFactory and HybridTopologyFactory.
++
++    Test system: alanine dipeptide in solvent.
++    """
++
++    # Run point energy validation test
++    run_unsampled_endstate_energies('ala-dipeptide', use_point_energies=True)
++
++@pytest.mark.gpu_needed
++def test_unsampled_endstate_energies_GPU():
++    """
++   Uses run_unsampled_endstate_energies() to run energy validation for the unsampled endstates generated for
++   RESTCapableHybridTopologyFactory and HybridTopologyFactory.
++
++   Test systems: alanine dipeptide in solvent and barstar in solvent
++   
++   Only run this on a GPU as the CPU is too slow.
++   """
++
++    # Alanine dipeptide in solvent -- Run MD energy validation test
++    run_unsampled_endstate_energies('ala-dipeptide', use_point_energies=False, use_md_energies=True)
++
++    # Apo barstar -- Run point and MD energy validation test
++    run_unsampled_endstate_energies('barstar', use_point_energies=True, use_md_energies=True)
+diff --git a/perses/tests/test_repex.py b/perses/tests/test_repex.py
+index d77592c50..c3c4ee0d5 100644
+--- a/perses/tests/test_repex.py
++++ b/perses/tests/test_repex.py
+@@ -69,7 +69,7 @@ def test_RESTCapableHybridTopologyFactory_repex_neutral_mutation():
+                                     hybrid_factory=htf,
+                                     online_analysis_interval=None)
+             hss.setup(n_states=12, temperature=300 * unit.kelvin, t_max=300 * unit.kelvin,
+-                      storage_file=reporter, endstates=False)
++                      storage_file=reporter, endstates=True)
+             hss.energy_context_cache = cache.ContextCache(capacity=None, time_to_live=None, platform=platform)
+             hss.sampler_context_cache = cache.ContextCache(capacity=None, time_to_live=None, platform=platform)
+ 
+@@ -170,7 +170,7 @@ def test_RESTCapableHybridTopologyFactory_repex_charge_mutation():
+                                         hybrid_factory=htf,
+                                         online_analysis_interval=None)
+                 hss.setup(n_states=12, temperature=300 * unit.kelvin, t_max=300 * unit.kelvin,
+-                          storage_file=reporter, endstates=False)
++                          storage_file=reporter, endstates=True)
+                 hss.energy_context_cache = cache.ContextCache(capacity=None, time_to_live=None, platform=platform)
+                 hss.sampler_context_cache = cache.ContextCache(capacity=None, time_to_live=None, platform=platform)
+ 
+diff --git a/perses/tests/utils.py b/perses/tests/utils.py
+index 6922afcf0..af7a4b14c 100644
+--- a/perses/tests/utils.py
++++ b/perses/tests/utils.py
+@@ -990,7 +990,7 @@ def validate_endstate_energies_point(input_htf, endstate=0, minimize=False):
+     print(f"Success! Energies are equal at lambda {endstate}!")
+ 
+ 
+-def validate_endstate_energies_md(input_htf, T_max=300 * unit.kelvin, endstate=0, n_steps=125000):
++def validate_endstate_energies_md(input_htf, T_max=300 * unit.kelvin, endstate=0, n_steps=125000, save_freq=250):
+     """
+     Check that the hybrid system's energy (without unique old/new valence energy) matches the original system's
+     energy for snapshots extracted (every 1 ps) from a MD simulation.
+@@ -1007,7 +1007,9 @@ def validate_endstate_energies_md(input_htf, T_max=300 * unit.kelvin, endstate=0
+         the endstate to test (0 or 1)
+     n_steps : int, default=125000
+         number of MD steps to run. (125000 steps == 1 ns)
+-
++    save_freq : int, default 250
++        frequency at which to save positions
++        by default, saves one snapshot every 250 steps
+     """
+     import tqdm
+     from perses.annihilation.lambda_protocol import RESTCapableRelativeAlchemicalState, RESTCapableLambdaProtocol
+@@ -1124,6 +1126,194 @@ def validate_endstate_energies_md(input_htf, T_max=300 * unit.kelvin, endstate=0
+         assert np.isclose([energy_og], [energy_hybrid]), f"Energies are not equal at frame {i}"
+         print(f"Success! Energies are equal at frame {i}!")
+ 
++def validate_unsampled_endstates_point(htf, hybrid_system, endstate=0, minimize=False):
++    """
++    Test create_endstates() to make sure that a given unsampled endstate's hybrid system has the same energies
++    for each force as the original hybrid system.
++
++    Parameters
++    ----------
++    htf : HybridTopologyFactory or RESTCapableHybridTopologyFactory
++        hybrid factory from which the unsampled endstate's hybrid system was created
++    hybrid_system : openmm.System
++        the hybrid system to test
++    endstate : int, default 0
++        the lambda value corresponding to the hybrid system's endstate, the allowed values are: 0, 1
++    minimize : bool, default False
++        whether to minimize the htf's hybrid positions before checking the energies
++
++    """
++    import copy
++    from openmmtools.states import ThermodynamicState, SamplerState
++    from perses.dispersed import feptasks
++    from perses.tests.utils import compute_potential_components
++
++    assert endstate in [0, 1], f"endstate must be 0 or 1, you supplied: {endstate}"
++
++    # Make a copy of the htf
++    htf = copy.deepcopy(htf)
++    hybrid_positions = htf.hybrid_positions
++
++    # Get original hybrid system
++    hybrid_system_og = htf.hybrid_system
++
++    # Get energy components of unsampled endstate hybrid system
++    thermostate_hybrid = ThermodynamicState(system=hybrid_system, temperature=temperature)
++    integrator_hybrid = openmm.VerletIntegrator(1.0 * unit.femtosecond)
++    context_hybrid = thermostate_hybrid.create_context(integrator_hybrid)
++    if minimize:
++        sampler_state = SamplerState(hybrid_positions)
++        feptasks.minimize(thermostate_hybrid, sampler_state)
++        hybrid_positions = sampler_state.positions
++    context_hybrid.setPositions(hybrid_positions)
++    components_hybrid = compute_potential_components(context_hybrid, beta=beta)
++
++    # Get energy components of original hybrid system
++    thermostate_other = ThermodynamicState(system=hybrid_system_og, temperature=temperature)
++    integrator_other = openmm.VerletIntegrator(1.0 * unit.femtosecond)
++    context_other = thermostate_other.create_context(integrator_other)
++    htf_class = htf.__class__.__name__
++    if htf_class == 'HybridTopologyFactory':
++        for k, v in context_other.getParameters().items():
++            if 'lambda' in k:
++                context_other.setParameter(k, endstate)
++    elif htf_class == 'RESTCapableHybridTopologyFactory':
++        for k, v in context_other.getParameters().items():
++            if 'alchemical' in k:
++                if 'old' in k:
++                    context_other.setParameter(k, 1 - endstate)
++                elif 'new' in k or 'reciprocal' in k:
++                    context_other.setParameter(k, endstate)
++    else:
++        raise Exception(f"{htf_class} is not supported. Supported factories: HybridTopologyFactory, RESTCapableHybridTopologyFactory")
++    context_other.setPositions(hybrid_positions)
++    components_other = compute_potential_components(context_other, beta=beta)
++
++    # Check that each of the valence force energies are concordant
++    # TODO: Instead of checking with np.isclose(), check whether the ratio of differences is less than a specified energy threshold (like in validate_endstate_energies())
++    bonded_keys = [hybrid_system_og.getForce(i).getName() for i in range(hybrid_system_og.getNumForces())
++                   if 'Nonbonded' not in hybrid_system_og.getForce(i).getName() and 'exceptions' not in hybrid_system_og.getForce(i).getName()]
++    for key in bonded_keys:
++        other_value = components_other[key]
++        hybrid_value = components_hybrid[key]
++        print(f"{key} -- og: {other_value}, hybrid: {hybrid_value}")
++        assert np.isclose(other_value, hybrid_value)
++
++    # Check that the nonbonded (rest of the components) force energies are concordant
++    nonbonded_other_values = [components_other[key] for key in components_other.keys() if key not in bonded_keys and 'Force' in key]  # Do not include thermostats in barostats
++    print([key for key in components_other.keys() if key not in bonded_keys])
++    print(f"Nonbondeds -- og: {np.sum(nonbonded_other_values)}, hybrid: {components_hybrid['NonbondedForce']}")
++    assert np.isclose([components_hybrid['NonbondedForce']], np.sum(nonbonded_other_values))
++
++    print(f"Success! Energies are equal at lambda {endstate}!")
++
++
++def validate_unsampled_endstates_md(htf, hybrid_system, endstate=0, n_steps=125000, save_freq=250):
++    """
++    Test create_endstates() to make sure that a given unsampled endstate's hybrid system energy matches the
++    original system's energy for snapshots extracted (every 1 ps) from a MD simulation.
++
++    E.g. at endstate=0, the unsampled endstate hybrid system's energy  should match that of the original hybrid system.
++
++    Parameters
++    ----------
++    htf : HybridTopologyFactory or RESTCapableHybridTopologyFactory
++        hybrid factory from which the unsampled endstate's hybrid system was created
++    hybrid_system : openmm.System
++        the hybrid system to test
++    endstate : int, default=0
++        the endstate to test (0 or 1)
++    n_steps : int, default=125000
++        number of MD steps to run. (125000 steps == 1 ns)
++    save_freq : int, default 250
++        frequency at which to save positions
++        by default, saves one snapshot every 250 steps
++
++    """
++    import tqdm
++    from openmmtools import integrators
++    from openmmtools.states import ThermodynamicState
++
++    # Check that endstate is 0 or 1
++    assert endstate in [0, 1], "Endstate must be 0 or 1"
++
++    # Make a copy of the htf
++    htf = copy.deepcopy(htf)
++
++    # Get original hybrid system
++    hybrid_system_og = htf.hybrid_system
++
++    # Get positions, box_vectors
++    hybrid_positions = htf.hybrid_positions
++    box_vectors = hybrid_system_og.getDefaultPeriodicBoxVectors()
++
++    # Create thermodynamic state
++    thermostate = ThermodynamicState(hybrid_system, temperature=temperature)
++
++    # Create context
++    integrator = integrators.LangevinIntegrator(temperature=temperature, collision_rate=1 / unit.picoseconds, timestep=4 * unit.femtoseconds)
++    context = thermostate.create_context(integrator)
++    context.setPositions(hybrid_positions)
++    context.setPeriodicBoxVectors(*box_vectors)
++    context.setVelocitiesToTemperature(temperature)
++
++    # Minimize
++    openmm.LocalEnergyMinimizer.minimize(context)
++
++    # Run MD
++    hybrid = list()
++    for _ in tqdm.tqdm(range(int(n_steps / save_freq))):
++        integrator.step(save_freq)
++        pos = context.getState(getPositions=True, enforcePeriodicBox=False).getPositions(asNumpy=True)
++        hybrid.append(pos)
++
++    # Make context for original hybrid system
++    thermostate = ThermodynamicState(hybrid_system_og, temperature=temperature)
++    integrator_og = integrators.LangevinIntegrator(temperature=temperature,
++                                                   collision_rate=1 / unit.picoseconds,
++                                                   timestep=4 * unit.femtoseconds)
++    context_og = thermostate.create_context(integrator_og)
++
++    # Set global parameters
++    htf_class = htf.__class__.__name__
++    if htf_class == 'HybridTopologyFactory':
++        for k, v in context_og.getParameters().items():
++            if 'lambda' in k:
++                context_og.setParameter(k, endstate)
++    elif htf_class == 'RESTCapableHybridTopologyFactory':
++        for k, v in context_og.getParameters().items():
++            if 'alchemical' in k:
++                if 'old' in k:
++                    context_og.setParameter(k, 1 - endstate)
++                elif 'new' in k or 'reciprocal' in k:
++                    context_og.setParameter(k, endstate)
++    else:
++        raise Exception(
++            f"{htf_class} is not supported. Supported factories: HybridTopologyFactory, RESTCapableHybridTopologyFactory")
++
++    # Make context for hybrid system
++    thermostate = ThermodynamicState(hybrid_system, temperature=temperature)
++    integrator_hybrid = integrators.LangevinIntegrator(temperature=temperature,
++                                                       collision_rate=1 / unit.picoseconds,
++                                                       timestep=4 * unit.femtoseconds)
++    context_hybrid = thermostate.create_context(integrator_hybrid)
++
++    # Get energies for each conformation
++    differences = list()
++    for i, pos in enumerate(tqdm.tqdm(hybrid)):
++        context_og.setPositions(pos)
++        energy_og = context_og.getState(getEnergy=True).getPotentialEnergy().value_in_unit_system(unit.md_unit_system)
++
++        context_hybrid.setPositions(pos)
++        energy_hybrid = context_hybrid.getState(getEnergy=True).getPotentialEnergy().value_in_unit_system(unit.md_unit_system)
++
++        differences.append(abs(energy_og - energy_hybrid))
++
++    # Check that the standard deviation of the differences is < 1 kT
++    stddev = np.std(differences)
++    assert stddev < 1, f"The standard deviation of the differences is > 1 kT: {stddev} kT"
++    print(f"Success! The standard deviation of the differences is < 1 kT: {stddev} kT")
++
+ def track_torsions(hybrid_factory):
+     """
+     This is a useful function for finding bugs in the `relative.py` self.handle_periodic_torsion_force() function, which creates hybrid torsion forces for the hybrid system.

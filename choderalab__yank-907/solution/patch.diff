@@ -1,0 +1,689 @@
+diff --git a/Yank/experiment.py b/Yank/experiment.py
+index c872eb89..81558099 100644
+--- a/Yank/experiment.py
++++ b/Yank/experiment.py
+@@ -24,6 +24,7 @@
+ import logging
+ import os
+ 
++import numpy as np
+ import cerberus
+ import cerberus.errors
+ import openmmtools as mmtools
+@@ -588,7 +589,7 @@ class ExperimentBuilder(object):
+         'precision': 'auto',
+         'max_n_contexts': 3,
+         'switch_experiment_interval': 0,
+-        'processes_per_experiment': None
++        'processes_per_experiment': 'auto'
+     }
+ 
+     # These options can be overwritten also in the "experiment"
+@@ -776,21 +777,21 @@ def run_experiments(self):
+             self._generate_experiments_protocols()
+ 
+             # Find all the experiments to distribute among mpicomms.
+-            all_experiments = [experiment for experiment in self._expand_experiments()]
+-            processes_per_experiment = self._options['processes_per_experiment']
++            all_experiments = list(self._expand_experiments())
+ 
+             # Cycle between experiments every switch_experiment_interval iterations
+             # until all of them are done.
+             while len(all_experiments) > 0:
+-                # Distribute experiments across MPI communicators if requested.
+-                completed = [False] * len(all_experiments)
+-                if processes_per_experiment is None:
++                # Allocate the MPI processes to the experiments that still have to be completed.
++                group_size = self._get_experiment_mpi_group_size(all_experiments)
++                if group_size is None:
++                    completed = [False] * len(all_experiments)
+                     for exp_index, exp in enumerate(all_experiments):
+                         completed[exp_index] = self._run_experiment(exp)
+                 else:
+                     completed = mpi.distribute(self._run_experiment,
+                                                distributed_args=all_experiments,
+-                                               group_size=processes_per_experiment,
++                                               group_size=group_size,
+                                                send_results_to='all')
+ 
+                 # Remove any completed experiments, releasing possible parallel resources
+@@ -968,8 +969,6 @@ def _determine_experiment_options(self, experiment):
+             self._options.
+         phase_options : dict
+             The options to pass to the AlchemicalPhaseFactory constructor.
+-        sampler_options : dict
+-            The options to pass to the ReplicaExchange constructor.
+         alchemical_region_options : dict
+             The options to pass to AlchemicalRegion.
+         alchemical_factory_options : dict
+@@ -1108,8 +1107,8 @@ def _expand_experiments(self):
+         Each generated experiment is uniquely named. If job_id and n_jobs are
+         set, this returns only the experiments assigned to this particular job.
+ 
+-        Returns
+-        -------
++        Yields
++        ------
+         experiment_path : str
+             A unique path where to save the experiment output files relative to
+             the main output directory specified by the user in the options.
+@@ -1200,9 +1199,15 @@ def check_anisotropic_cutoff(cutoff):
+             else:
+                 return utils.quantity_from_string(cutoff, unit.angstroms)
+ 
++        def check_processes_per_experiment(processes_per_experiment):
++            if processes_per_experiment == 'auto' or processes_per_experiment is None:
++                return processes_per_experiment
++            return int(processes_per_experiment)
++
+         special_conversions = {'constraints': to_openmm_app,
+                                'default_number_of_iterations': schema.to_integer_or_infinity_coercer,
+-                               'anisotropic_dispersion_cutoff': check_anisotropic_cutoff}
++                               'anisotropic_dispersion_cutoff': check_anisotropic_cutoff,
++                               'processes_per_experiment': check_processes_per_experiment}
+ 
+         # Validate parameters.
+         try:
+@@ -2372,7 +2377,7 @@ def _generate_experiments_protocols(self):
+                 continue
+ 
+             # Determine output directory and create it if it doesn't exist.
+-            self._safe_makedirs(os.path.dirname(script_filepath))
++            os.makedirs(os.path.dirname(script_filepath), exist_ok=True)
+ 
+             # Check if any of the phases needs to have its path generated.
+             protocol = self._protocols[experiment['protocol']]
+@@ -2428,8 +2433,8 @@ def __getattr__(self, _):
+         protocol = self._protocols[experiment['protocol']]
+         phases_to_generate = self._find_automatic_protocol_phases(protocol)
+ 
+-        # Build experiment.
+-        exp = self._build_experiment(experiment_path, experiment)
++        # Build experiment. Use a dummy protocol for building since it hasn't been generated yet.
++        exp = self._build_experiment(experiment_path, experiment, use_dummy_protocol=True)
+ 
+         # Generate protocols.
+         optimal_protocols = collections.OrderedDict.fromkeys(phases_to_generate)
+@@ -2614,6 +2619,52 @@ def _generate_yaml(self, experiment, file_path, overwrite_protocol=None):
+         with open(file_path, 'w') as f:
+             f.write(yaml_content)
+ 
++    def _get_experiment_protocol(self, experiment_path, experiment_description,
++                                 use_dummy_protocol=False):
++        """Obtain the protocol for this experiment.
++
++        This masks whether the protocol is hardcoded in the input YAML
++        script or it has been generated automatically.
++
++        Parameters
++        ----------
++        experiment_path : str
++            The directory where to store the output files relative to the main
++            output directory as specified by the user in the YAML script.
++        experiment_description : dict
++            A dictionary describing a single experiment.
++        use_dummy_protocol : bool, optional
++            If True, automatically-generated protocols that have not been found
++            are substituted by a dummy protocol.
++
++        Returns
++        -------
++        protocol : OrderedDict
++            A dictionary thermodynamic_variable -> list of values.
++
++        """
++        protocol_id = experiment_description['protocol']
++        protocol = copy.deepcopy(self._protocols[protocol_id])
++
++        # Check if there are automatically-generated protocols.
++        generated_alchemical_paths = self._find_automatic_protocol_phases(protocol)
++        if len(generated_alchemical_paths) > 0:
++            yaml_script_file_path = self._get_generated_yaml_script_path(experiment_path)
++
++            # Use a dummy protocol if the file doesn't exist.
++            try:
++                with open(yaml_script_file_path, 'r') as f:
++                    yaml_script = yaml.load(f, Loader=YankLoader)
++            except FileNotFoundError:
++                if not use_dummy_protocol:
++                    raise
++                for phase_name in generated_alchemical_paths:
++                    protocol[phase_name]['alchemical_path'] = {}
++            else:
++                protocol = yaml_script['protocols'][protocol_id]
++
++        return protocol
++
+     # --------------------------------------------------------------------------
+     # Experiment building
+     # --------------------------------------------------------------------------
+@@ -2626,19 +2677,80 @@ def _save_analysis_script(results_dir, phase_names):
+         with open(analysis_script_path, 'w') as f:
+             yaml.dump(analysis, f)
+ 
+-    @mpi.on_single_node(rank=0, sync_nodes=True)
+-    def _safe_makedirs(self, directory):
+-        """Create directory and avoid race conditions.
++    def _get_experiment_mpi_group_size(self, experiments):
++        """Return the MPI group size to pass when executing the experiments.
+ 
+-        This is executed only on node 0 to avoid race conditions. The
+-        processes are synchronized at the end so that the non-0 nodes
+-        won't raise an IO error when trying to write a file in a non-
+-        existing directory.
++        The heuristic tries to allocate the MPI processes among the experiments
++        roughly according to their computational costs using the number of states
++        of the first phase (either complex or solvent1).
++
++        Parameters
++        ----------
++        experiments : list of pairs
++            Each pair contains (experiment_path, experiment_description) of an
++            experiment that needs to be run (i.e. that hasn't been completed yet).
++
++        Returns
++        -------
++        groups_size : list of integers
++            The MPI processes groups to pass to mpi.distribute().
+ 
+         """
+-        # TODO when dropping Python 2, remove this and use os.makedirs(, exist_ok=True)
+-        if not os.path.isdir(directory):
+-            os.makedirs(directory)
++        mpicomm = mpi.get_mpicomm()
++        n_experiments = len(experiments)
++        processes_per_experiment = self._options['processes_per_experiment']
++
++        # Check if we need to run the experiments sequentially.
++        if mpicomm is None:
++            return None
++        n_mpi_processes = mpicomm.size
++
++        # If we are using SAMS samplers, use 1 process only for all experiments.
++        # TODO when n_replicas is a parameter of the constructor, remove this.
++        sampler_names = {self._create_experiment_sampler(exp[1], []).__class__.__name__ for exp in experiments}
++        if 'SAMSSampler' in sampler_names:
++            if processes_per_experiment != 'auto':
++                logger.warning('The option "processes_per_experiment" will be overwritten as SAMS '
++                               'simulations are currently only compatible with processes_per_experiment=1')
++            if n_mpi_processes > n_experiments:
++                logger.warning('One MPI process will be assigned to each experiment but there are '
++                               'more MPI processes than experiments. Some process will be unused.')
++            return 1
++
++        # Check if the user has specified an hardcoded
++        # number of processes per experiments.
++        if processes_per_experiment != 'auto':
++            # If more processes are requested than MPI processes, run serially.
++            if processes_per_experiment is not None and processes_per_experiment >= n_mpi_processes:
++                return None
++            return processes_per_experiment
++
++        # If there are less MPI processes than experiments, completely split the MPI comm.
++        if n_mpi_processes <= n_experiments:
++            return 1
++
++        # Split the mpicomm among the experiments.
++        group_size = min(1, int(n_mpi_processes / n_experiments))
++
++        # Estimate the computational cost of each experiment taken as the
++        # number of thermodynamic states of the complex phase.
++        experiment_costs = np.zeros(n_experiments)
++        for experiment_idx, (experiment_path, experiment_description) in enumerate(experiments):
++            protocol = self._get_experiment_protocol(experiment_path, experiment_description)
++            first_phase_name = next(iter(protocol))  # protocol is an OrderedDict
++            n_states = len(protocol[first_phase_name]['alchemical_path']['lambda_electrostatics'])
++            experiment_costs[experiment_idx] = n_states
++
++        # Find the index of the most expensive jobs.
++        n_expensive_experiments = n_mpi_processes - n_experiments
++        expensive_experiment_indices = list(reversed(np.argsort(experiment_costs)))
++        expensive_experiment_indices = expensive_experiment_indices[:n_expensive_experiments]
++
++        # The most expensive jobs are allocated an extra MPI process.
++        group_size = [group_size for _ in range(n_experiments)]
++        for expensive_experiment_idx in expensive_experiment_indices:
++            group_size[expensive_experiment_idx] += 1
++        return group_size
+ 
+     def _create_experiment_restraint(self, experiment_description):
+         """Create a restraint object for the experiment."""
+@@ -2713,7 +2825,7 @@ def _create_experiment_sampler(self, experiment_description, mc_atoms):
+         # Create the sampler.
+         return schema.call_sampler_constructor(constructor_description)
+ 
+-    def _build_experiment(self, experiment_path, experiment):
++    def _build_experiment(self, experiment_path, experiment, use_dummy_protocol=False):
+         """Prepare a single experiment.
+ 
+         Parameters
+@@ -2723,6 +2835,9 @@ def _build_experiment(self, experiment_path, experiment):
+             output directory as specified by the user in the YAML script.
+         experiment : dict
+             A dictionary describing a single experiment
++        use_dummy_protocol : bool, optional
++            If True, automatically-generated protocols that have not been found
++            are substituted by a dummy protocol.
+ 
+         Returns
+         -------
+@@ -2796,25 +2911,8 @@ def _build_experiment(self, experiment_path, experiment):
+                 solvent_ids = [None, None]
+                 regions = {}
+ 
+-        # Obtain the protocol for this experiment. We need to load the
+-        # alchemical path from the single-experiment YAML file if it has
+-        # been automatically generated.
+-        protocol = copy.deepcopy(self._protocols[experiment['protocol']])
+-        generated_alchemical_paths = self._find_automatic_protocol_phases(protocol)
+-        if len(generated_alchemical_paths) > 0:
+-            yaml_script_file_path = self._get_generated_yaml_script_path(experiment_path)
+-
+-            # The file won't exist if _build_experiment has been called
+-            # within _generate_experiment_protocol. In this case we just
+-            # use a dummy protocol.
+-            try:
+-                with open(yaml_script_file_path, 'r') as f:
+-                    yaml_script = yaml.load(f, Loader=YankLoader)
+-            except FileNotFoundError:
+-                for phase_name in generated_alchemical_paths:
+-                    protocol[phase_name]['alchemical_path'] = {}
+-            else:
+-                protocol = yaml_script['protocols'][experiment['protocol']]
++        # Obtain the protocol for this experiment.
++        protocol = self._get_experiment_protocol(experiment_path, experiment, use_dummy_protocol)
+ 
+         # Get system files.
+         system_files_paths = self._db.get_system(system_id)
+diff --git a/Yank/mpi.py b/Yank/mpi.py
+index f5a03481..681de4b5 100644
+--- a/Yank/mpi.py
++++ b/Yank/mpi.py
+@@ -57,8 +57,12 @@
+ # GLOBAL VARIABLES
+ # ==============================================================================
+ 
++# Force serial execution even in MPI environment.
+ disable_mpi = False
+ 
++# A dummy MPI communicator used to simulate an MPI environment in tests.
++_simulated_mpicomm = None
++
+ 
+ # ==============================================================================
+ # MAIN FUNCTIONS
+@@ -84,6 +88,10 @@ def get_mpicomm():
+     if disable_mpi:
+         return None
+ 
++    # If MPI is simulated, return the Dummy implementation.
++    if _simulated_mpicomm is not None:
++        return _simulated_mpicomm
++
+     # If we have already initialized MPI, return the cached MPI communicator.
+     if get_mpicomm._is_initialized:
+         return get_mpicomm._mpicomm
+@@ -422,8 +430,11 @@ def distribute(task, distributed_args, *other_args, send_results_to='all',
+         If not None, the ``distributed_args`` are distributed among groups of
+         nodes that are isolated from each other. This is particularly useful
+         if ``task`` also calls :func:`distribute`, since normally that would result
+-        in unexpected behavior. If an integer, the nodes are split into equal
+-        groups of ``group_size`` nodes. If a list of integers, the nodes are
++        in unexpected behavior.
++
++        If an integer, the nodes are split into equal groups of ``group_size``
++        nodes. If ``n_nodes % group_size != 0``, the first jobs are allocated
++        more nodes than the latest. If a list of integers, the nodes are
+         split in possibly unequal groups (see example below).
+ 
+     Other Parameters
+@@ -588,6 +599,35 @@ def _delayed_termination(*args, **kwargs):
+     return _delayed_termination
+ 
+ 
++# ==============================================================================
++# MPI TEST CLASSES
++# ==============================================================================
++
++class _DummyMPIComm():
++    """A Dummy MPI Communicator."""
++
++    def __init__(self, rank=0, size=4):
++        self.rank = rank
++        self.size = size
++
++
++@contextmanager
++def _simulated_mpi_environment(**kwargs):
++    """Context manager to temporarily set a simulated MPI environment.
++
++    Parameters
++    ----------
++    **kwargs : dict
++        The parameters to pass to _DummyMPIComm constructor.
++
++    """
++    global _simulated_mpicomm
++    old_simulated_mpicomm = _simulated_mpicomm
++    _simulated_mpicomm = _DummyMPIComm(**kwargs)
++    yield
++    _simulated_mpicomm = old_simulated_mpicomm
++
++
+ # ==============================================================================
+ # MAIN AND TESTS
+ # ==============================================================================
+diff --git a/Yank/tests/test_experiment.py b/Yank/tests/test_experiment.py
+index 405b060a..4d2230b1 100644
+--- a/Yank/tests/test_experiment.py
++++ b/Yank/tests/test_experiment.py
+@@ -176,6 +176,11 @@ def get_template_script(output_dir='.', keep_schrodinger=False, keep_openeye=Fal
+             solvent2: vacuum
+             leap:
+                 parameters: [leaprc.protein.ff14SB, leaprc.gaff]
++    samplers:
++        repex:
++            type: ReplicaExchangeSampler
++        sams:
++            type: SAMSSampler
+     protocols:
+         absolute-binding:
+             complex:
+@@ -189,8 +194,8 @@ def get_template_script(output_dir='.', keep_schrodinger=False, keep_openeye=Fal
+         hydration-protocol:
+             solvent1:
+                 alchemical_path:
+-                    lambda_electrostatics: [1.0, 0.5, 0.0]
+-                    lambda_sterics: [1.0, 0.5, 0.0]
++                    lambda_electrostatics: [1.0, 0.0]
++                    lambda_sterics: [1.0, 0.0]
+             solvent2:
+                 alchemical_path:
+                     lambda_electrostatics: [1.0, 0.0]
+@@ -397,14 +402,68 @@ def test_paths_properties():
+     assert exp_builder._db.setup_dir == os.path.join('output2', 'setup2')
+ 
+ 
++def test_processes_per_experiment():
++    """Test the determination of processes_per_experiment option."""
++    # Create a script with 4 experiments.
++    template_script = get_template_script()
++    template_script['experiment1'] = copy.deepcopy(template_script['experiments'])
++    template_script['experiment1']['system'] = utils.CombinatorialLeaf(['explicit-system', 'implicit-system'])
++    # The first two experiments have less number of states than the other two.
++    template_script['experiment1']['protocol'] = 'hydration-protocol'
++    template_script['experiment2'] = copy.deepcopy(template_script['experiments'])
++    template_script['experiment2']['system'] = 'hydration-system'
++    # The last experiment uses SAMS.
++    template_script['experiment2']['sampler'] = utils.CombinatorialLeaf(['repex', 'sams'])
++    template_script['experiments'] = ['experiment1', 'experiment2']
++
++    exp_builder = ExperimentBuilder(template_script)
++    experiments = list(exp_builder._expand_experiments())
++
++    # The default is auto.
++    assert exp_builder._options['processes_per_experiment'] == 'auto'
++
++    # When there is no MPI environment the calculation is serial.
++    assert exp_builder._get_experiment_mpi_group_size(experiments) is None
++
++    # In an MPI environment, the MPI communicator is split according
++    # to the number of experiments still have to be completed. Each
++    # test case is pair (experiments, MPICOMM size, expected return value).
++    test_cases = [
++        (experiments, 5, 1),
++        (experiments[:-1], 4, [1, 1, 2]),
++        (experiments[1:-1], 4, [2, 2]),
++        (list(reversed(experiments[1:-1])), 3, [2, 1]),
++        (experiments[:-1], 2, 1)
++    ]
++
++    for i, (exp, mpicomm_size, expected_result) in enumerate(test_cases):
++        with mpi._simulated_mpi_environment(size=mpicomm_size):
++            result = exp_builder._get_experiment_mpi_group_size(exp)
++            err_msg = ('experiments: {}\nMPICOMM size: {}\nexpected result: {}'
++                       '\nresult: {}').format(*test_cases[i], result)
++            assert result == expected_result, err_msg
++
++    # Test manual setting of processes_per_experiments.
++    test_cases = [2, None]
++    for processes_per_experiment in test_cases:
++        exp_builder._options['processes_per_experiment'] = processes_per_experiment
++        # Serial execution is always None.
++        assert exp_builder._get_experiment_mpi_group_size(experiments) is None
++        with mpi._simulated_mpi_environment(size=5):
++            assert exp_builder._get_experiment_mpi_group_size(experiments[:-1]) == processes_per_experiment
++            # When there are SAMS sampler, it's always 1.
++            assert exp_builder._get_experiment_mpi_group_size(experiments) == 1
++
++
+ def test_validation_wrong_options():
+     """YAML validation raises exception with wrong molecules."""
+     options = [
+-        {'unknown_options': 3},
+-        {'minimize': 100}
++        ("found unknown parameter", {'unknown_options': 3}),
++        ("parameter minimize=100 is incompatible with True", {'minimize': 100}),
++        ("invalid literal for int", {'processes_per_experiment': 'incorrect_string'})
+     ]
+-    for option in options:
+-        yield assert_raises, YamlParseError, ExperimentBuilder._validate_options, option, True
++    for regex, option in options:
++        yield assert_raises_regexp, YamlParseError, regex, ExperimentBuilder._validate_options, option, True
+ 
+ 
+ def test_validation_correct_molecules():
+@@ -2540,7 +2599,17 @@ def test_automatic_alchemical_path():
+         yaml_script['experiments']['protocol'] = 'hydration-protocol'
+ 
+         exp_builder = ExperimentBuilder(yaml_script)
+-        exp_builder._check_resume()  # check_resume should not raise exceptions
++
++        # ExperimentBuilder._get_experiment_protocol handles dummy protocols.
++        experiment_path, experiment_description = next(exp_builder._expand_experiments())
++        with assert_raises(FileNotFoundError):
++            exp_builder._get_experiment_protocol(experiment_path, experiment_description)
++        dummy_protocol = exp_builder._get_experiment_protocol(experiment_path, experiment_description,
++                                                              use_dummy_protocol=True)
++        assert dummy_protocol['solvent2']['alchemical_path'] == {}  # This is the dummy protocol.
++
++        # check_resume should not raise exceptions at this point.
++        exp_builder._check_resume()
+ 
+         # Building the experiment should generate the alchemical path.
+         for experiment in exp_builder.build_experiments():
+diff --git a/docs/examples/host-guest-implicit.rst b/docs/examples/host-guest-implicit.rst
+index 42ef5851..320beccf 100644
+--- a/docs/examples/host-guest-implicit.rst
++++ b/docs/examples/host-guest-implicit.rst
+@@ -27,7 +27,7 @@ Options Heading
+    options:
+      minimize: yes
+      verbose: yes
+-     number_of_iterations: 500
++     default_number_of_iterations: 500
+      temperature: 300*kelvin
+      pressure: null
+      output_dir: hgoutput
+@@ -38,7 +38,7 @@ to see what is happening.
+ We will be running implicit, non-periodic NVT system. So we set the ``temperature``, then set the ``pressure`` to ``null``
+ to ensure we are in NVT mode.
+ 
+-Finally, we set a limited number of iterations with ``number_of_iterations`` (for this example) and choose a specific
++Finally, we set a limited number of iterations with ``default_number_of_iterations`` (for this example) and choose a specific
+ output directory called ``hgoutput``. Note that this folder is relative to the ``yank.yaml`` file.
+ 
+ 
+diff --git a/docs/examples/p-xylene-explicit.rst b/docs/examples/p-xylene-explicit.rst
+index 441a7c6d..6a1c20f0 100644
+--- a/docs/examples/p-xylene-explicit.rst
++++ b/docs/examples/p-xylene-explicit.rst
+@@ -313,7 +313,7 @@ the following options:
+ .. code-block:: yaml
+ 
+    options:
+-     number_of_iterations: <Some Integer>
++     default_number_of_iterations: <Some Integer>
+      resume_simulation: yes
+ 
+ where you replace ``<Some Integer>`` with a number larger than the number of iterations you just ran.
+diff --git a/docs/running.rst b/docs/running.rst
+index 51db3f5f..e9c0149e 100644
+--- a/docs/running.rst
++++ b/docs/running.rst
+@@ -265,12 +265,12 @@ Specifying Simulation Stop Conditions
+ =====================================
+ 
+ YANK simulations will run until one of two stop conditions are met, if specified: either the
+-:ref:`maximum number of iterations <yaml_options_number_of_iterations>` is reached, or the
++:ref:`maximum number of iterations <yaml_options_default_number_of_iterations>` is reached, or the
+ :ref:`error in free energy difference of the phase <yaml_options_online_analysis_parameters>` reaches a target value
+ through online analysis.
+ These options can be combined to change when YANK stops a simulation.
+ 
+-Specifying a :ref:`maximum number of iterations <yaml_options_number_of_iterations>` will tell YANK to run each phase
++Specifying a :ref:`maximum number of iterations <yaml_options_default_number_of_iterations>` will tell YANK to run each phase
+ up to the target number of iterations. This options accepts any positive integer, ``0`` (zero), or infinity
+ (``.inf`` in the .yaml, ``float('inf')`` or ``numpy.inf`` in the API). Setting this option to ``0`` will tell YANK to only handle file
+ initialization and input preparation, without running any production simulation. Setting this to ``.inf`` will
+diff --git a/docs/site-resources/tutorial-files/implicit2_stock.yaml b/docs/site-resources/tutorial-files/implicit2_stock.yaml
+index 28d2c796..fcfed324 100644
+--- a/docs/site-resources/tutorial-files/implicit2_stock.yaml
++++ b/docs/site-resources/tutorial-files/implicit2_stock.yaml
+@@ -2,7 +2,7 @@ options:
+   minimize: yes
+   verbose: yes
+   output_dir: fxr-imp-34
+-  number_of_iterations: 3000
++  default_number_of_iterations: 3000
+   nsteps_per_iteration: 500
+   temperature: 300*kelvin
+   pressure: null
+diff --git a/docs/whatsnew.rst b/docs/whatsnew.rst
+index 973665d9..eb90558f 100644
+--- a/docs/whatsnew.rst
++++ b/docs/whatsnew.rst
+@@ -6,6 +6,11 @@ This section features and improvements of note in each release.
+ 
+ The full release history can be viewed `at the GitHub yank releases page <https://github.com/choderalab/yank/releases>`_.
+ 
++Development
++-----------
++- Renamed global option ``number_of_iterations`` to ``default_number_of_iterations``. `[docs] <http://getyank.org/latest/yamlpages/options.html#default_number_of_iterations>`_
++- Added support for automatic determination of ``processes_per_experiment`` (now the default). `[docs] <http://getyank.org/latest/yamlpages/options.html#processes_per_experiment>`_
++
+ 0.20.1 Alchemical factory options and fast computation of the energy matrix
+ ---------------------------------------------------------------------------
+ - Allow user to specify options for ``openmmtools.alchemy.AbsoluteAlchemicalFactory`` in the YAML file. In particular,
+diff --git a/docs/yamlpages/cookbook.rst b/docs/yamlpages/cookbook.rst
+index ec5f8587..d914b0f8 100644
+--- a/docs/yamlpages/cookbook.rst
++++ b/docs/yamlpages/cookbook.rst
+@@ -50,7 +50,7 @@ In this example:
+     experiments_dir: experiments
+     randomize_ligand: yes
+     minimize: yes
+-    number_of_iterations: 2000
++    default_number_of_iterations: 2000
+     temperature: 300*kelvin
+     pressure: null
+   
+@@ -124,7 +124,7 @@ In this Example:
+      minimize: yes
+      verbose: yes
+      output_dir: .
+-     number_of_iterations: 2000
++     default_number_of_iterations: 2000
+      temperature: 300*kelvin
+      pressure: 1*atmosphere
+ 
+diff --git a/docs/yamlpages/index.rst b/docs/yamlpages/index.rst
+index 45e93a1b..2e001813 100644
+--- a/docs/yamlpages/index.rst
++++ b/docs/yamlpages/index.rst
+@@ -64,7 +64,7 @@ Detailed Options List
+     * :ref:`minimize_tolerance <yaml_options_minimize_tolerance>`
+     * :ref:`number_of_equilibration_iterations <yaml_options_number_of_equilibration_iterations>`
+     * :ref:`equilibration_timestep <yaml_options_equilibration_timestep>`
+-    * :ref:`number_of_iterations <yaml_options_number_of_iterations>`
++    * :ref:`default_number_of_iterations <yaml_options_default_number_of_iterations>`
+     * :ref:`nsteps_per_iteration <yaml_options_nsteps_per_iteration>`
+     * :ref:`timestep <yaml_options_timestep>`
+     * :ref:`checkpoint_interval <yaml_options_checkpoint_interval>`
+diff --git a/docs/yamlpages/options.rst b/docs/yamlpages/options.rst
+index 2beea5de..5151a061 100644
+--- a/docs/yamlpages/options.rst
++++ b/docs/yamlpages/options.rst
+@@ -220,13 +220,15 @@ Valid options (0): <Integer>
+ .. code-block:: yaml
+ 
+    options:
+-     processes_per_experiment: null
++     processes_per_experiment: auto
+ 
+ When running YANK on multiple processes with MPI, you can run several experiments in parallel by using this option to
+-allocate a given number of processes to each experiment. If ``null``, the experiments are performed one after the
+-other on all the available MPI processes.
++allocate a given number of processes to each experiment. This option is ignored if YANK is not run with MPI. If ``null``,
++the experiments are performed one after the other on all the available MPI processes. When ``auto`` is selected, YANK
++tries to run as many experiment as possible in parallel on independent MPI processes. Currently, only
++``processes_per_experiment = 1`` is supported for the SAMS sampler.
+ 
+-Valid options (null): null / <Integer>
++Valid options (auto): auto / null / <Integer>
+ 
+ 
+ 
+@@ -540,19 +542,20 @@ Valid Options (1.0 * femtosecond): <Quantity Time> [1]_
+ 
+ 
+ 
+-.. _yaml_options_number_of_iterations:
++.. _yaml_options_default_number_of_iterations:
+ 
+ .. rst-class:: html-toggle
+ 
+-``number_of_iterations``
+-------------------------
++``default_number_of_iterations``
++--------------------------------
+ .. code-block:: yaml
+ 
+    options:
+-     number_of_iterations: 1
++     default_number_of_iterations: 1
+ 
+-Number of iterations for production simulation. Note: If :ref:`resume_simulation <yaml_options_resume_simulation>` is
+-set, this option can be used to extend previous simulations past their original number of iterations.
++Default number of iterations for the samplers that do not explicitly specify the option ``number_of_iterations``.
++Note: If :ref:`resume_simulation <yaml_options_resume_simulation>` is set, this option can be used to extend previous
++simulations past their original number of iterations.
+ 
+ Specifying ``0`` will run through the setup, create all the simulation files, store all options, and minimize the
+ initial configurations (if specified), but will not run any production simulations.
+diff --git a/docs/yank-yaml-cookbook/all-options.yaml b/docs/yank-yaml-cookbook/all-options.yaml
+index 334bc838..80db50aa 100644
+--- a/docs/yank-yaml-cookbook/all-options.yaml
++++ b/docs/yank-yaml-cookbook/all-options.yaml
+@@ -50,7 +50,7 @@ options:
+   minimize_tolerance: 1.0 * kilojoules_per_mole / nanometers    # Set minimization tolerance.
+   number_of_equilibration_iterations: 1                         # Number of equilibration iterations.
+   equilibration_timestep: 1.0 * femtosecond                     # Timestep for use in equilibration.
+-  number_of_iterations: 1                                       # Number of replica-exchange iterations to simulate.
++  default_number_of_iterations: 1                               # The default number of iterations to simulate.
+   nsteps_per_iteration: 500                                     # Number of timesteps per iteration.
+   timestep: 2.0 * femtosecond                                   # Timestep for Langevin dyanmics.
+   replica_mixing_scheme: swap-all                               # Specify how to mix replicas. Possible values are
+diff --git a/docs/yank-yaml-cookbook/combinatorial-experiment.yaml b/docs/yank-yaml-cookbook/combinatorial-experiment.yaml
+index 1314511d..8577a0b2 100644
+--- a/docs/yank-yaml-cookbook/combinatorial-experiment.yaml
++++ b/docs/yank-yaml-cookbook/combinatorial-experiment.yaml
+@@ -14,7 +14,7 @@ options:
+   temperature: 310*kelvin
+   pressure: 1*atmosphere
+   constraints: HBonds
+-  number_of_iterations: 200
++  default_number_of_iterations: 200
+   minimize: yes
+ 
+ 

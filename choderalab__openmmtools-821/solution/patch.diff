@@ -1,0 +1,248 @@
+diff --git a/openmmtools/multistate/multistatesampler.py b/openmmtools/multistate/multistatesampler.py
+index 883cd143..1b4aabb1 100644
+--- a/openmmtools/multistate/multistatesampler.py
++++ b/openmmtools/multistate/multistatesampler.py
+@@ -1350,44 +1350,13 @@ def _get_replica_move_statistics(self, replica_id):
+     def _minimize_replica(self, replica_id, tolerance, max_iterations):
+         """Minimize the specified replica.
+         """
+-
+         # Retrieve thermodynamic and sampler states.
+         thermodynamic_state_id = self._replica_thermodynamic_states[replica_id]
+         thermodynamic_state = self._thermodynamic_states[thermodynamic_state_id]
+-
+         sampler_state = self._sampler_states[replica_id]
+-        
+-        # Determine whether we need a temporary NVT state
+-        barostat_types = (
+-            openmm.MonteCarloBarostat,
+-            openmm.MonteCarloMembraneBarostat,
+-            openmm.MonteCarloAnisotropicBarostat,
+-        )
+-
+-        has_barostat = any(
+-            isinstance(thermodynamic_state.system.getForce(i), barostat_types)
+-            for i in range(thermodynamic_state.system.getNumForces())
+-        )
+-
+-        if has_barostat:
+-            # Deep copy system and remove all barostats
+-            min_system = copy.deepcopy(thermodynamic_state.system)
+-            for i in reversed(range(min_system.getNumForces())):
+-                if isinstance(min_system.getForce(i), barostat_types):
+-                    min_system.removeForce(i)
+-
+-            # Temporary NVT ThermodynamicState for minimization
+-            minimization_state = states.ThermodynamicState(
+-                system=min_system,
+-                temperature=thermodynamic_state.temperature,
+-                pressure=None
+-            )
+-        else:
+-            # Use original state if no barostat
+-            minimization_state = thermodynamic_state
+  
+         # Get context and bound integrator from energy_context_cache
+-        context, integrator = self.energy_context_cache.get_context(minimization_state)
++        context, integrator = self.energy_context_cache.get_context(thermodynamic_state)
+         # inform of platform used in current context
+         logger.debug(f"{type(integrator).__name__}: Minimize using {context.getPlatform().getName()} platform.")
+ 
+@@ -1395,22 +1364,15 @@ def _minimize_replica(self, replica_id, tolerance, max_iterations):
+         sampler_state.apply_to_context(context)
+ 
+         # Compute the initial energy of the system for logging.
+-        initial_energy = minimization_state.reduced_potential(context)
++        initial_energy = thermodynamic_state.reduced_potential(context)
+         logger.debug(f"Replica {replica_id + 1}/{self.n_replicas}: initial energy {initial_energy:8.3f}kT")
+         # Minimize energy.
+         openmm.LocalEnergyMinimizer.minimize(context, tolerance, max_iterations)
+-
+-        # Get the minimized positions.
+         sampler_state.update_from_context(context)
+         
+         # Compute the final energy of the system for logging.
+-        final_energy = minimization_state.reduced_potential(sampler_state)
++        final_energy = thermodynamic_state.reduced_potential(sampler_state)
+         logger.debug(f'Replica {replica_id + 1}/{self.n_replicas}: final energy {final_energy:8.3f}kT')
+-        # TODO if energy > 0, use slower openmm minimizer
+-        # TODO the NVT Context created above for barostat-free minimization is left in
+-        #  energy_context_cache indefinitely (capacity=None means it's never evicted) even
+-        #  though nothing else reuses it after this point. Consider explicitly removing it
+-        #  from the cache here.
+ 
+         # Return minimized positions.
+         return sampler_state.positions
+diff --git a/openmmtools/tests/test_cache.py b/openmmtools/tests/test_cache.py
+index ddf637fd..39d7bfcb 100644
+--- a/openmmtools/tests/test_cache.py
++++ b/openmmtools/tests/test_cache.py
+@@ -14,13 +14,16 @@
+ # =============================================================================
+ 
+ import itertools
++import os
+ 
+ try:
++    import openmm
+     from openmm import unit
+ except ImportError:  # OpenMM < 7.6
+-    from simtk import unit
++    from simtk import openmm, unit
+ 
+-from openmmtools import testsystems, states
++from openmmtools import multistate, testsystems, states
++from openmmtools.utils import temporary_directory
+ 
+ from openmmtools.cache import *
+ 
+@@ -463,3 +466,75 @@ def test_platform_properties(self):
+         cache.__setstate__(state)
+         assert cache._platform_properties == {"CpuThreads": "3"}
+         del context
++
++
++def _alanine_multistate_replicas(n_replicas, with_barostat):
++    """n_replicas distinct, but mutually Context-compatible, thermodynamic states.
++
++    Replicas differ only in temperature. With ``with_barostat=True`` they are
++    NPT (exercises the branch of ``_minimize_replica`` fixed by issue #818);
++    with ``with_barostat=False`` they are NVT (the other, unaffected branch).
++    """
++    alanine_test = testsystems.AlanineDipeptideExplicit(constraints=None)
++    box_vectors = alanine_test.system.getDefaultPeriodicBoxVectors()
++
++    thermodynamic_states = []
++    sampler_states = []
++    for replica_index in range(n_replicas):
++        temperature = (300 + replica_index) * unit.kelvin
++        system = copy.deepcopy(alanine_test.system)
++        if with_barostat:
++            system.addForce(openmm.MonteCarloBarostat(1.0 * unit.atmosphere, temperature, 25))
++            pressure = 1.0 * unit.atmosphere
++        else:
++            pressure = None
++        thermodynamic_states.append(
++            states.ThermodynamicState(
++                system=system, temperature=temperature, pressure=pressure
++            )
++        )
++        sampler_states.append(
++            states.SamplerState(
++                positions=alanine_test.positions, box_vectors=box_vectors
++            )
++        )
++    return thermodynamic_states, sampler_states
++
++
++def _assert_minimize_shares_context(thermodynamic_states, sampler_states):
++    """Shared assertions for the barostatted/NVT context-sharing tests below."""
++    with temporary_directory() as tmp_dir_path:
++        storage_path = os.path.join(tmp_dir_path, "test_storage.nc")
++        sampler = multistate.MultiStateSampler()
++        sampler.energy_context_cache = ContextCache(capacity=None, time_to_live=None)
++        reporter = multistate.MultiStateReporter(storage_path, checkpoint_interval=1)
++        sampler.create(thermodynamic_states, sampler_states, reporter)
++
++        # All three replicas are mutually compatible. Should require single shared Context.
++        sampler._compute_energies()
++        assert len(sampler.energy_context_cache) == 1
++
++        # we only care about Context sharing here, not a fully converged minimum.
++        sampler.minimize(
++            tolerance=10.0 * unit.kilojoules_per_mole / unit.nanometers,
++            max_iterations=1,
++        )
++
++        # Minimization must reuse that same shared Context
++        assert len(sampler.energy_context_cache) == 1
++
++
++def test_multistate_sampler_minimize_shares_barostatted_context():
++    """Regression test for issue #818: NPT replicas share one Context through minimize()."""
++    thermodynamic_states, sampler_states = _alanine_multistate_replicas(
++        n_replicas=3, with_barostat=True
++    )
++    _assert_minimize_shares_context(thermodynamic_states, sampler_states)
++
++
++def test_multistate_sampler_minimize_shares_nvt_context():
++    """Companion to the barostatted test above: NVT replicas also share one Context."""
++    thermodynamic_states, sampler_states = _alanine_multistate_replicas(
++        n_replicas=3, with_barostat=False
++    )
++    _assert_minimize_shares_context(thermodynamic_states, sampler_states)
+diff --git a/openmmtools/tests/test_sampling.py b/openmmtools/tests/test_sampling.py
+index 1c0712f8..0bd4f7f3 100644
+--- a/openmmtools/tests/test_sampling.py
++++ b/openmmtools/tests/test_sampling.py
+@@ -30,7 +30,6 @@
+ 
+ import pytest
+ import requests
+-from coverage.data import debug_data_file
+ 
+ try:
+     import openmm
+@@ -1723,8 +1722,8 @@ def test_minimize(self, barostat_type):
+         """
+         Test MultiStateSampler minimize method.
+ 
+-        The purpose of this test is:        
+-        - Ensure that MPI doesn't mix the information of the minimized 
++        The purpose of this test is:
++        - Ensure that MPI doesn't mix the information of the minimized
+           StateSamplers when it communicates the new positions
+         - Checks that energies decrease
+         - Barostats are temporarily disabled during minimization
+@@ -1808,11 +1807,11 @@ def _system_with_barostat():
+                 sampler._energy_thermodynamic_states[i, j]
+                 for i, j in enumerate(state_indices)
+             ]
+-            
++
+             # Wrap _minimize_replica to track temporary systems
+             original_minimize = sampler._minimize_replica
+             systems_used_in_minimization = []
+-    
++
+             def tracking_minimize(replica_id, tolerance, max_iterations):
+                 thermodynamic_state_id = sampler._replica_thermodynamic_states[replica_id]
+                 thermodynamic_state = sampler._thermodynamic_states[thermodynamic_state_id]
+@@ -1825,7 +1824,7 @@ def tracking_minimize(replica_id, tolerance, max_iterations):
+                         min_system.removeForce(i)
+                 systems_used_in_minimization.append(min_system)
+                 return original_minimize(replica_id, tolerance, max_iterations)
+-    
++
+             sampler._minimize_replica = tracking_minimize
+ 
+             # Loose tolerance and capped iterations: we only need energy to
+@@ -1871,7 +1870,7 @@ def tracking_minimize(replica_id, tolerance, max_iterations):
+                     new_sampler_states, stored_sampler_states
+                 ):
+                     assert np.allclose(new_state.positions, stored_state.positions)
+-            
++
+             # Check that the barostat was removed during minimization
+             for system in systems_used_in_minimization:
+                 forces = system.getForces()
+@@ -1879,7 +1878,7 @@ def tracking_minimize(replica_id, tolerance, max_iterations):
+                     isinstance(f, self.BAROSTAT_TYPES)
+                     for f in forces
+                 ), "Barostat should be disabled during minimization"
+-        
++
+             # Check that the barostat is present after the minimization
+             for thermodynamic_state in sampler._thermodynamic_states:
+                 # Get all forces
+diff --git a/openmmtools/tests/test_states.py b/openmmtools/tests/test_states.py
+index 97a96a61..b5feff88 100644
+--- a/openmmtools/tests/test_states.py
++++ b/openmmtools/tests/test_states.py
+@@ -2718,3 +2718,4 @@ def test_create_thermodynamic_state_protocol():
+     )
+     for state in states:
+         assert state.temperature == 500 * unit.kelvin
++        
+\ No newline at end of file

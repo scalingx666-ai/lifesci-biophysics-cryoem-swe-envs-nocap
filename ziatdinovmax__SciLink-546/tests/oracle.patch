@@ -1,0 +1,866 @@
+diff --git a/scilink/server/app.py b/scilink/server/app.py
+index b8b9ee47d..4892073a5 100644
+--- a/scilink/server/app.py
++++ b/scilink/server/app.py
+@@ -323,6 +323,27 @@ def get_tree(session_id: str):
+         return build_tree(session.session_dir,
+                           new_since=session.turn_started_at)
+ 
++    @app.get("/api/v1/sessions/{session_id}/delegations")
++    def get_delegations(session_id: str):
++        """The meta session's delegation ledger for the Delegations tab
++        (same payload as the `delegations` SSE event). Empty for other
++        modes rather than an error, so the client can call it blindly."""
++        session = _session_or_404(session_id)
++        from .delegations import delegation_view
++        if session.mode != "meta":
++            return {"delegations": [], "sub_agents": {}}
++        return delegation_view(session.agent, session.session_dir)
++
++    @app.get("/api/v1/sessions/{session_id}/telemetry")
++    def get_telemetry(session_id: str):
++        """Full read-only telemetry snapshot (ledger, worker action
++        histories, analysis reasoning, per-agent tool sequence) — the
++        reader behind the Streamlit Telemetry tab, exposed for the web
++        UI's future Telemetry view."""
++        session = _session_or_404(session_id)
++        from scilink.agents.meta_agent.telemetry import collect_session_telemetry
++        return collect_session_telemetry(session.agent)
++
+     @app.get("/api/v1/sessions/{session_id}/provenance")
+     def get_provenance(session_id: str):
+         session = _session_or_404(session_id)
+diff --git a/scilink/server/delegations.py b/scilink/server/delegations.py
+new file mode 100644
+index 000000000..4e5e41b2e
+--- /dev/null
++++ b/scilink/server/delegations.py
+@@ -0,0 +1,138 @@
++"""Meta-session delegation ledger, shaped for the web UI's Delegations tab.
++
++The meta orchestrator keeps ``_delegation_ledger`` in memory (restored from
++the checkpoint on resume). This module reads it — never writes — and emits
++a compact, JSON-safe view: one row per delegation with the fields the tab
++renders (specialist, label, status, context-flow edges, summary, findings,
++files relative to the session, warnings, timings) plus the per-specialist
++sub-agent annotation the Streamlit telemetry tab shows.
++
++``ledger_signature`` is the cheap change detector the turn watcher polls
++every fs tick; the full view is built only when it changes.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Tuple
++
++_SUMMARY_MAX = 1200
++_TASK_MAX = 400
++_FINDINGS_MAX = 12
++_FILES_MAX = 40
++_WARNINGS_MAX = 12
++
++
++def ledger_of(agent: Any) -> List[Dict[str, Any]]:
++    """The live ledger list, or [] for a non-meta agent."""
++    ledger = getattr(agent, "_delegation_ledger", None)
++    return list(ledger) if isinstance(ledger, list) else []
++
++
++def ledger_signature(agent: Any) -> Tuple:
++    """Changes whenever a delegation is opened, closed, or its status /
++    summary changes — cheap enough to compute on every watcher tick."""
++    return tuple(
++        (e.get("index"), e.get("status"), e.get("completed_at"),
++         len(e.get("summary") or ""), len(e.get("files_produced") or []))
++        for e in ledger_of(agent))
++
++
++def _clip(text: Any, limit: int) -> str:
++    s = " ".join(str(text or "").split())
++    return s if len(s) <= limit else s[:limit - 1] + "…"
++
++
++def _rel(path: Any, session_dir: Optional[str]) -> str:
++    """Session-relative path when inside the session (so the tab can open it
++    in the Files explorer), else the path as recorded."""
++    p = str(path or "")
++    if not session_dir or not p:
++        return p
++    try:
++        return str(Path(p).resolve().relative_to(Path(session_dir).resolve()))
++    except (ValueError, OSError):
++        return p
++
++
++def _sub_agents(session_dir: Optional[str]) -> Dict[str, List[str]]:
++    """Which worker agents each specialist used, from the ``*_state.json``
++    files the workers persist (same source as the telemetry reader, but
++    reading only the ``agent_type`` field)."""
++    out: Dict[str, List[str]] = {}
++    if not session_dir:
++        return out
++    base = Path(session_dir)
++    if not base.is_dir():
++        return out
++    labels = {"curve_fitting": "Curve Fitting", "bo": "Bayesian Optimization",
++              "scalarizer": "Scalarizer"}
++    try:
++        for sp in sorted(base.rglob("*_state.json")):
++            try:
++                data = json.loads(sp.read_text())
++            except Exception:  # noqa: BLE001 - one bad file must not hide the rest
++                continue
++            if not isinstance(data, dict) or not data.get("action_history"):
++                continue
++            parts = set(sp.parts)
++            specialist = ("analysis" if "analysis" in parts
++                          else "planning" if "planning" in parts
++                          else "simulation" if "simulation" in parts
++                          else "other")
++            raw = data.get("agent_type")
++            stem = sp.stem[:-6] if sp.stem.endswith("_state") else sp.stem
++            name = (labels.get(str(raw).strip().lower(), str(raw).strip())
++                    if isinstance(raw, str) and raw.strip()
++                    else labels.get(stem, stem.replace("_", " ").title()))
++            names = out.setdefault(specialist, [])
++            if name not in names:
++                names.append(name)
++    except OSError:
++        pass
++    return out
++
++
++def delegation_view(agent: Any, session_dir: Optional[str] = None
++                    ) -> Dict[str, Any]:
++    """The Delegations-tab payload: ``{"delegations": [...], "sub_agents":
++    {...}}``. Never raises — a malformed entry degrades to what it has."""
++    rows: List[Dict[str, Any]] = []
++    for e in ledger_of(agent):
++        try:
++            fan = e.get("fanout")
++            rows.append({
++                "index": e.get("index"),
++                "mode": e.get("mode") or "?",
++                "label": (e.get("label") or "").strip()
++                or _clip(e.get("task"), 60),
++                "task": _clip(e.get("task"), _TASK_MAX),
++                "status": e.get("status") or "running",
++                "context_from": [int(x) for x in (e.get("context_from") or [])
++                                 if str(x).isdigit()],
++                "informed_by": list(e.get("informed_by") or []),
++                "fanout": bool(fan),
++                "fanout_group": (fan.get("id") or fan.get("group")
++                                 if isinstance(fan, dict) else None),
++                "labels": list(e.get("labels") or []),   # fusion inputs
++                "timestamp": e.get("timestamp"),
++                "completed_at": e.get("completed_at"),
++                "summary": _clip(e.get("summary"), _SUMMARY_MAX),
++                "key_findings": [str(k) for k in
++                                 (e.get("key_findings") or [])[:_FINDINGS_MAX]],
++                "files_produced": [_rel(p, session_dir) for p in
++                                   (e.get("files_produced") or [])[:_FILES_MAX]],
++                "n_feature_tables": len(e.get("feature_tables") or []),
++                "warnings": [str(w) for w in
++                             (e.get("warnings") or [])[:_WARNINGS_MAX]],
++                "error": (str(e.get("error")) if e.get("error") else None),
++                "timed_out": bool(e.get("timed_out")),
++                "resumed": bool(e.get("resumed_from_interruption")),
++            })
++        except Exception:  # noqa: BLE001
++            rows.append({"index": e.get("index"), "mode": "?", "label": "?",
++                         "status": e.get("status") or "?",
++                         "context_from": [], "files_produced": [],
++                         "key_findings": [], "warnings": []})
++    return {"delegations": rows, "sub_agents": _sub_agents(session_dir)}
+diff --git a/scilink/server/runner.py b/scilink/server/runner.py
+index 359db4323..8d1b6a9da 100644
+--- a/scilink/server/runner.py
++++ b/scilink/server/runner.py
+@@ -200,6 +200,33 @@ def _watch_log(session, turn, cap) -> None:
+     last_sig = None
+     last_fs_check = 0.0
+     seen_images = turn.seen_images  # seeded in start_turn, pre-thread
++    # Meta sessions: push the delegation ledger to the Delegations tab
++    # whenever it changes (a delegation opened / closed) — polled on the
++    # same tick as the fs signature; the view is only rebuilt on change.
++    is_meta = getattr(session, "mode", None) == "meta"
++    last_ledger_sig = None
++    if is_meta:
++        from .delegations import ledger_signature
++        try:
++            last_ledger_sig = ledger_signature(session.agent)
++        except Exception:  # noqa: BLE001
++            last_ledger_sig = None
++
++    def _push_delegations(force: bool = False) -> None:
++        nonlocal last_ledger_sig
++        if not is_meta:
++            return
++        try:
++            from .delegations import delegation_view, ledger_signature
++            sig = ledger_signature(session.agent)
++            if force or sig != last_ledger_sig:
++                last_ledger_sig = sig
++                session.events.emit(
++                    "delegations",
++                    delegation_view(session.agent, session.session_dir))
++        except Exception:  # noqa: BLE001 - never break the watcher
++            pass
++
+     while turn.is_running and turn.live_capture is cap:
+         try:
+             buf = cap.getvalue()
+@@ -211,6 +238,7 @@ def _watch_log(session, turn, cap) -> None:
+         now = time.time()
+         if now - last_fs_check >= 2.0:
+             last_fs_check = now
++            _push_delegations()
+             try:
+                 sig = _fs_signature(session.session_dir)
+                 if last_sig is not None and sig != last_sig:
+@@ -234,6 +262,8 @@ def _watch_log(session, turn, cap) -> None:
+     except Exception:
+         pass
+     session.events.emit("files_changed", {})
++    # The closing delegation of a turn lands after the last in-loop tick.
++    _push_delegations(force=True)
+     # Final figure sweep: catch anything written after the last in-loop tick
+     # (and the first-window case where nothing else changed the signature) —
+     # otherwise the LAST figure of a turn is exactly the one the inset misses.
+diff --git a/scilink/server/session_manager.py b/scilink/server/session_manager.py
+index 58e405f23..b218c5dea 100644
+--- a/scilink/server/session_manager.py
++++ b/scilink/server/session_manager.py
+@@ -431,12 +431,23 @@ def snapshot(self, session: WebSession) -> Dict[str, Any]:
+                     live_log = turn.live_capture.getvalue()
+                 except Exception:
+                     pass
++        delegations = None
++        if session.mode == "meta":
++            from .delegations import delegation_view
++            try:
++                delegations = delegation_view(session.agent, session.session_dir)
++            except Exception:  # noqa: BLE001 - the tab degrades, the snapshot must not
++                delegations = None
+         return {
+             "id": session.id,
+             "mode": session.mode,
+             "model": session.model,
+             "autonomy": session.autonomy,
+             "status": session.status,
++            # Meta sessions: the delegation ledger shaped for the
++            # Delegations tab (None for the other modes). Kept in sync
++            # mid-turn by `delegations` SSE events from the turn watcher.
++            "delegations": delegations,
+             "name": load_session_name(session.session_dir),
+             "session_dir": session.session_dir,
+             # Copy: the runner thread appends to this list mid-turn, and
+diff --git a/tests/test_web_server.py b/tests/test_web_server.py
+index c580a2eae..cf24cb8e7 100644
+--- a/tests/test_web_server.py
++++ b/tests/test_web_server.py
+@@ -882,3 +882,106 @@ def test_check_folders_reports_subdirs(client, tmp_path):
+     assert good["data_files"] == []                     # top level unchanged
+     assert [(Path(d["path"]).name, d["n_files"]) for d in good["subdirs"]] == \
+         [("s2", 2), ("s10", 1)]                          # natural order, .git skipped
++
++
++# ── meta delegation view (Delegations tab) ────────────────────────
++
++def _ledger_entry(index, mode, status, **extra):
++    e = {"index": index, "timestamp": "2026-09-07T10:00:00", "mode": mode,
++         "task": f"task {index}", "label": f"label {index}", "context_keys": [],
++         "context_from": [], "status": status, "summary": "", "key_findings": [],
++         "files_produced": [], "feature_tables": [], "suggested_followups": [],
++         "warnings": [], "error": None}
++    e.update(extra)
++    return e
++
++
++def test_delegation_view_shapes_the_ledger(tmp_path):
++    from scilink.server.delegations import delegation_view, ledger_signature
++    (tmp_path / "analysis" / "results").mkdir(parents=True)
++    out_file = tmp_path / "analysis" / "results" / "fit.png"
++    out_file.write_bytes(b"x")
++    (tmp_path / "analysis" / "curve_fitting_state.json").write_text(json.dumps(
++        {"agent_type": "curve_fitting", "action_history": [{"action": "fit"}]}))
++    agent = SimpleNamespace(_delegation_ledger=[
++        _ledger_entry(1, "analysis", "success", summary="Fitted two peaks. " * 200,
++                      key_findings=["peak at 400", "peak at 600"],
++                      files_produced=[str(out_file), "/elsewhere/x.csv"],
++                      completed_at="2026-09-07T10:03:30", feature_tables=["ft"]),
++        _ledger_entry(2, "planning", "running", context_from=[1, "x"]),
++        _ledger_entry(3, "fusion", "success", labels=["a", "b"], context_from=[1]),
++    ])
++    view = delegation_view(agent, str(tmp_path))
++    rows = view["delegations"]
++    assert [r["index"] for r in rows] == [1, 2, 3]
++    assert rows[0]["files_produced"] == ["analysis/results/fit.png", "/elsewhere/x.csv"]
++    assert rows[0]["n_feature_tables"] == 1
++    assert len(rows[0]["summary"]) <= 1200 and rows[0]["summary"].endswith("…")
++    assert rows[1]["context_from"] == [1]            # non-numeric dropped
++    assert rows[2]["labels"] == ["a", "b"]
++    assert view["sub_agents"] == {"analysis": ["Curve Fitting"]}
++    # signature moves when a delegation closes
++    s1 = ledger_signature(agent)
++    agent._delegation_ledger[1]["status"] = "success"
++    agent._delegation_ledger[1]["completed_at"] = "2026-09-07T10:05:00"
++    assert ledger_signature(agent) != s1
++    # non-meta agent → empty view, never an error
++    assert delegation_view(SimpleNamespace(), str(tmp_path))["delegations"] == []
++
++
++def test_delegations_endpoint_and_snapshot(client, tmp_path):
++    from scilink.server.session_manager import WebSession
++    sdir = tmp_path / "meta_session_20260101_101010"
++    sdir.mkdir()
++    agent = SimpleNamespace(_delegation_ledger=[_ledger_entry(1, "analysis", "success")])
++    session = WebSession(id=sdir.name, session_dir=str(sdir), mode="meta",
++                         model="gpt-5.4", autonomy="autonomous", agent=agent)
++    client.app.state.manager._sessions[sdir.name] = session
++    d = client.get(f"/api/v1/sessions/{sdir.name}/delegations").json()
++    assert [r["label"] for r in d["delegations"]] == ["label 1"]
++    snap = client.get(f"/api/v1/sessions/{sdir.name}").json()
++    assert snap["delegations"]["delegations"][0]["index"] == 1
++    # an analyze session carries no ledger: empty payload, null on snapshot
++    _, adir = _fake_session(client, tmp_path)
++    assert client.get(f"/api/v1/sessions/{adir.name}/delegations").json() == {
++        "delegations": [], "sub_agents": {}}
++    assert client.get(f"/api/v1/sessions/{adir.name}").json()["delegations"] is None
++    # telemetry reader is reachable and never raises on a bare agent
++    t = client.get(f"/api/v1/sessions/{sdir.name}/telemetry").json()
++    assert t["meta"]["delegations_total"] == 1
++
++
++def test_delegation_events_during_turn(client, tmp_path):
++    """Opening and closing a delegation mid-turn must reach the SSE buffer
++    as `delegations` events, plus a final push at turn end."""
++    from scilink.server.session_manager import WebSession
++    sdir = tmp_path / "meta_session_20260101_111111"
++    sdir.mkdir()
++
++    class DelegatingMeta:
++        def __init__(self):
++            self._delegation_ledger = []
++
++        def chat(self, text):
++            time.sleep(0.3)
++            self._delegation_ledger.append(_ledger_entry(1, "analysis", "running"))
++            time.sleep(2.6)                      # watcher tick sees "running"
++            self._delegation_ledger[0]["status"] = "success"
++            self._delegation_ledger[0]["completed_at"] = "2026-09-07T10:01:00"
++            return "done"                        # closed right before the end
++
++    session = WebSession(id=sdir.name, session_dir=str(sdir), mode="meta",
++                         model="gpt-5.4", autonomy="autonomous",
++                         agent=DelegatingMeta())
++    client.app.state.manager._sessions[sdir.name] = session
++    client.post(f"/api/v1/sessions/{sdir.name}/messages", json={"content": "go"})
++    session.turn.done.wait(15)
++
++    def statuses():
++        return [ev.data["delegations"][0]["status"] for ev in session.events._ring
++                if ev.type == "delegations" and ev.data["delegations"]]
++    for _ in range(100):
++        if "success" in statuses():
++            break
++        time.sleep(0.05)
++    assert "running" in statuses() and statuses()[-1] == "success"
+diff --git a/webui/src/App.tsx b/webui/src/App.tsx
+index 8731a0adf..e7574c72b 100644
+--- a/webui/src/App.tsx
++++ b/webui/src/App.tsx
+@@ -3,6 +3,7 @@ import {
+   api,
+   type AppConfig,
+   type ChatMessage,
++  type DelegationView,
+   type LiveSession,
+   type PresentedQuestion,
+   type SessionSnapshot,
+@@ -15,6 +16,7 @@ import { ChatPanel } from "./components/ChatPanel";
+ import { FilesPanel } from "./components/FilesPanel";
+ import { PreChatHero } from "./components/PreChatHero";
+ import { AnalysisInset } from "./components/AnalysisInset";
++import { DelegationsPanel } from "./components/DelegationsPanel";
+ 
+ interface SessionState {
+   snapshot: SessionSnapshot | null;
+@@ -26,6 +28,7 @@ interface SessionState {
+   lastError: string | null;
+   filesVersion: number; // bumped on files_changed → the Files tab refetches
+   liveImages: LiveImage[]; // figures streamed during the turn (newest last)
++  delegations: DelegationView | null; // meta: the delegation ledger, live
+ }
+ 
+ export interface LiveImage {
+@@ -47,6 +50,7 @@ const emptyState: SessionState = {
+   lastError: null,
+   filesVersion: 0,
+   liveImages: [],
++  delegations: null,
+ };
+ 
+ type Action =
+@@ -67,6 +71,7 @@ function reducer(state: SessionState, action: Action): SessionState {
+         pendingQuestion: action.snapshot.pending_question,
+         liveLog: action.snapshot.live_log ?? "",
+         liveImages: action.snapshot.live_images ?? [],
++        delegations: action.snapshot.delegations ?? null,
+         name: action.snapshot.name,
+       };
+     case "session_closed":
+@@ -141,6 +146,8 @@ function reducer(state: SessionState, action: Action): SessionState {
+             liveImages: next.slice(-LIVE_IMAGE_CAP),
+           };
+         }
++        case "delegations":
++          return { ...state, delegations: ev.view };
+         case "error":
+           return { ...state, lastError: ev.message };
+         default:
+@@ -159,7 +166,7 @@ export default function App() {
+   const [busy, setBusy] = useState<string | null>(null); // init overlay text
+   const [startError, setStartError] = useState<string | null>(null);
+   const [serverStopped, setServerStopped] = useState(false);
+-  const [tab, setTab] = useState<"chat" | "files">("chat");
++  const [tab, setTab] = useState<"chat" | "files" | "delegations">("chat");
+   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+   const [attachRequest, setAttachRequest] = useState<string | null>(null);
+   const [liveSessions, setLiveSessions] = useState<LiveSession[]>([]);
+@@ -430,6 +437,19 @@ export default function App() {
+               >
+                 Files
+               </button>
++              {mode === "meta" && (
++                <button
++                  className={tab === "delegations" ? "active" : ""}
++                  onClick={() => setTab("delegations")}
++                >
++                  Delegations
++                  {state.delegations?.delegations.length ? (
++                    <span className="tab-count">
++                      {state.delegations.delegations.length}
++                    </span>
++                  ) : null}
++                </button>
++              )}
+             </div>
+             {/* Both tab bodies stay MOUNTED and toggle visibility: switching
+                 tabs must not destroy the hero's upload/objective state, a
+@@ -443,6 +463,14 @@ export default function App() {
+                 onSelect={setSelectedFile}
+               />
+             </div>
++            {mode === "meta" && (
++              <div className="tab-body" hidden={tab !== "delegations"}>
++                <DelegationsPanel
++                  view={state.delegations}
++                  running={state.status === "running"}
++                />
++              </div>
++            )}
+             <div className="tab-body" hidden={tab !== "chat"}>
+               {state.messages.length === 0 && state.status === "idle" ? (
+                 <PreChatHero
+diff --git a/webui/src/api.ts b/webui/src/api.ts
+index 32fe45c40..94491b9b1 100644
+--- a/webui/src/api.ts
++++ b/webui/src/api.ts
+@@ -74,6 +74,34 @@ export interface PresentedQuestion {
+   default: string;
+ }
+ 
++export interface DelegationRow {
++  index: number;
++  mode: string; // analysis | planning | simulation | fusion | ...
++  label: string;
++  task: string;
++  status: string; // running | success | error | interrupted | cancelled
++  context_from: number[];
++  informed_by: string[];
++  fanout: boolean;
++  fanout_group: string | null;
++  labels: string[]; // fusion: the fused branch labels
++  timestamp: string | null;
++  completed_at: string | null;
++  summary: string;
++  key_findings: string[];
++  files_produced: string[]; // session-relative when inside the session
++  n_feature_tables: number;
++  warnings: string[];
++  error: string | null;
++  timed_out: boolean;
++  resumed: boolean;
++}
++
++export interface DelegationView {
++  delegations: DelegationRow[];
++  sub_agents: Record<string, string[]>; // specialist -> worker agents used
++}
++
+ export interface SessionSnapshot {
+   id: string;
+   mode: string;
+@@ -91,6 +119,7 @@ export interface SessionSnapshot {
+     branch: string | null;
+     v?: number;
+   }[];
++  delegations: DelegationView | null; // meta sessions only
+   event_cursor: number;
+ }
+ 
+@@ -285,6 +314,8 @@ export const api = {
+   tree: (id: string) =>
+     req<{ entries: TreeEntry[]; truncated: boolean }>(`/sessions/${id}/tree`),
+ 
++  delegations: (id: string) => req<DelegationView>(`/sessions/${id}/delegations`),
++
+   provenance: (id: string) =>
+     req<{ events: ProvenanceEvent[] }>(`/sessions/${id}/provenance`),
+ 
+diff --git a/webui/src/app.css b/webui/src/app.css
+index 5b9da2aab..1d87671b1 100644
+--- a/webui/src/app.css
++++ b/webui/src/app.css
+@@ -650,3 +650,61 @@ details.card iframe { width: 100%; height: 600px; border: none; background: #fff
+ .inset-count { font-size: 11.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; min-width: 76px; text-align: center; }
+ 
+ .inset-figure { cursor: pointer; }
++
++/* ── Delegations tab (meta) ─────────────────────────────────── */
++.tab-count {
++  margin-left: 6px; padding: 0 6px; border-radius: 9px; font-size: 11px;
++  background: var(--bg-card); border: 1px solid var(--border); color: var(--text-muted);
++}
++.deleg-panel { flex: 1; overflow: auto; padding: 16px 8%; }
++.deleg-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; }
++.deleg-title { font-weight: 600; font-size: 15px; }
++.deleg-empty { margin-top: 24px; text-align: center; }
++.deleg-group { margin-bottom: 14px; }
++.deleg-group-head {
++  display: flex; align-items: center; gap: 8px; padding: 6px 0;
++  font-weight: 600; text-transform: capitalize; color: var(--text-muted);
++}
++.deleg-group-name { text-transform: capitalize; }
++.deleg-subagents { text-transform: none; font-weight: 400; }
++.deleg-row {
++  border: 1px solid var(--border); border-left: 3px solid var(--text-dim);
++  border-radius: 8px; margin: 4px 0 4px 18px; background: var(--bg-card);
++}
++.deleg-row.status-success { border-left-color: #3fb950; }
++.deleg-row.status-error { border-left-color: #f85149; }
++.deleg-row.status-running { border-left-color: #d29922; }
++.deleg-row.status-interrupted, .deleg-row.status-cancelled { border-left-color: #8893a5; }
++.deleg-row-main {
++  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
++  border: none; background: none; padding: 8px 10px; color: var(--text);
++  font-size: 13px; cursor: pointer; border-radius: 8px;
++}
++.deleg-row-main:hover { background: var(--bg-panel); border: none; }
++.deleg-glyph { width: 16px; text-align: center; }
++.status-success .deleg-glyph { color: #3fb950; }
++.status-error .deleg-glyph { color: #f85149; }
++.status-running .deleg-glyph { color: #d29922; animation: deleg-pulse 1.2s ease-in-out infinite; }
++@keyframes deleg-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
++.deleg-idx { color: var(--text-dim); font-variant-numeric: tabular-nums; }
++.deleg-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.deleg-ctx { color: #58a6ff; font-size: 12px; white-space: nowrap; }
++.deleg-tag {
++  font-size: 11px; padding: 0 6px; border-radius: 9px;
++  border: 1px solid var(--border); color: var(--text-muted);
++}
++.deleg-tag.warn { color: #d29922; border-color: #d29922; }
++.deleg-meta { white-space: nowrap; }
++.deleg-detail { padding: 4px 12px 10px 34px; font-size: 13px; }
++.deleg-field { display: grid; grid-template-columns: 96px 1fr; gap: 8px; margin: 6px 0; }
++.deleg-k { color: var(--text-dim); }
++.deleg-summary { white-space: pre-wrap; }
++.deleg-list { margin: 0; padding-left: 18px; }
++.deleg-list.warn { color: #d29922; }
++.deleg-files { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
++.deleg-chip {
++  display: inline-block; margin: 0 6px 4px 0; padding: 0 8px; border-radius: 9px;
++  border: 1px solid var(--border); font-size: 12px;
++}
++.deleg-error { color: #f85149; white-space: pre-wrap; }
++
+diff --git a/webui/src/components/DelegationsPanel.tsx b/webui/src/components/DelegationsPanel.tsx
+new file mode 100644
+index 000000000..e6004e6fe
+--- /dev/null
++++ b/webui/src/components/DelegationsPanel.tsx
+@@ -0,0 +1,240 @@
++import { useContext, useEffect, useMemo, useState } from "react";
++import type { DelegationRow, DelegationView } from "../api";
++import { UIContext } from "../UIContext";
++
++/** Mission-control view of the meta session's delegation ledger — the web
++ * twin of the Streamlit sidebar tree + telemetry graph. Grouped by
++ * specialist, rows colored by status, context-flow edges ("← #1, #2") on
++ * each row, and a click expands the delegation's task, summary, findings,
++ * files (which open in the Files tab) and warnings. Live: the ledger
++ * arrives with the session snapshot and is refreshed by `delegations` SSE
++ * events while a turn runs. */
++
++const SPECIALIST_ICON: Record<string, string> = {
++  analysis: "🧪",
++  planning: "📋",
++  simulation: "🧬",
++  fusion: "🔗",
++};
++const SPECIALIST_ORDER = ["analysis", "planning", "simulation", "fusion"];
++
++const STATUS_GLYPH: Record<string, string> = {
++  success: "✓",
++  error: "✗",
++  interrupted: "⏹",
++  cancelled: "⏹",
++  running: "⋯",
++};
++
++function shortTime(ts: string | null | undefined): string {
++  if (!ts) return "";
++  const t = ts.includes("T") ? ts.split("T", 2)[1] : ts;
++  return t.slice(0, 8);
++}
++
++function elapsed(start?: string | null, end?: string | null): string {
++  if (!start) return "";
++  const a = Date.parse(start);
++  const b = end ? Date.parse(end) : Date.now();
++  if (Number.isNaN(a) || Number.isNaN(b) || b < a) return "";
++  const s = Math.round((b - a) / 1000);
++  if (s < 60) return `${s}s`;
++  const m = Math.floor(s / 60);
++  return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
++}
++
++export function DelegationsPanel({
++  view,
++  running,
++}: {
++  view: DelegationView | null;
++  running: boolean;
++}) {
++  const ui = useContext(UIContext);
++  const [open, setOpen] = useState<number | null>(null);
++  const rows = view?.delegations ?? [];
++  const subAgents = view?.sub_agents ?? {};
++
++  const groups = useMemo(() => {
++    const by = new Map<string, DelegationRow[]>();
++    for (const r of rows) by.set(r.mode, [...(by.get(r.mode) ?? []), r]);
++    const keys = [...by.keys()].sort(
++      (a, b) =>
++        (SPECIALIST_ORDER.indexOf(a) + 1 || 99) - (SPECIALIST_ORDER.indexOf(b) + 1 || 99) ||
++        a.localeCompare(b),
++    );
++    return keys.map((k) => [k, by.get(k)!] as const);
++  }, [rows]);
++
++  const nRunning = rows.filter((r) => r.status === "running").length;
++  const byIndex = new Map(rows.map((r) => [r.index, r]));
++
++  // The elapsed time of a running delegation is computed at render; tick
++  // once a second while any row is running so it keeps counting between
++  // ledger events (which only arrive when a delegation opens or closes).
++  const [, setTick] = useState(0);
++  useEffect(() => {
++    if (!nRunning) return;
++    const t = setInterval(() => setTick((n) => n + 1), 1000);
++    return () => clearInterval(t);
++  }, [nRunning]);
++
++  return (
++    <div className="deleg-panel">
++      <div className="deleg-head">
++        <span className="deleg-title">🎛️ Mission control</span>
++        <span className="caption">
++          {rows.length} delegation{rows.length === 1 ? "" : "s"}
++          {nRunning ? ` · ${nRunning} running` : ""}
++          {running && !nRunning ? " · meta is reasoning" : ""}
++        </span>
++      </div>
++      {rows.length === 0 ? (
++        <p className="caption deleg-empty">
++          No delegations yet — describe a goal and the meta routes it to a
++          specialist. Delegations appear here as they start.
++        </p>
++      ) : (
++        <div className="deleg-tree">
++          {groups.map(([mode, list]) => (
++            <div key={mode} className="deleg-group">
++              <div className="deleg-group-head">
++                <span>{SPECIALIST_ICON[mode] ?? "•"}</span>
++                <span className="deleg-group-name">{mode}</span>
++                <span className="caption">({list.length})</span>
++                {subAgents[mode]?.length ? (
++                  <span className="caption deleg-subagents">
++                    ↳ {subAgents[mode].join(", ")}
++                  </span>
++                ) : null}
++              </div>
++              {list.map((r) => {
++                const isOpen = open === r.index;
++                const ctx = r.context_from
++                  .map((i) => `#${i}`)
++                  .join(", ");
++                return (
++                  <div key={r.index} className={`deleg-row status-${r.status}`}>
++                    <button
++                      type="button"
++                      className="deleg-row-main"
++                      onClick={() => setOpen(isOpen ? null : r.index)}
++                      title={r.task}
++                    >
++                      <span className="deleg-glyph">
++                        {STATUS_GLYPH[r.status] ?? "•"}
++                      </span>
++                      <span className="deleg-idx">#{r.index}</span>
++                      <span className="deleg-label">{r.label}</span>
++                      {r.fanout && <span className="deleg-tag">fan-out</span>}
++                      {r.timed_out && <span className="deleg-tag warn">timed out</span>}
++                      {r.resumed && <span className="deleg-tag">resumed</span>}
++                      {ctx && (
++                        <span className="deleg-ctx" title="context flowed from">
++                          ← {ctx}
++                        </span>
++                      )}
++                      <span className="deleg-meta caption">
++                        {r.status}
++                        {r.timestamp ? ` · ${shortTime(r.timestamp)}` : ""}
++                        {elapsed(r.timestamp, r.completed_at)
++                          ? ` · ${elapsed(r.timestamp, r.completed_at)}`
++                          : ""}
++                      </span>
++                    </button>
++                    {isOpen && (
++                      <div className="deleg-detail">
++                        <div className="deleg-field">
++                          <span className="deleg-k">Task</span>
++                          <span>{r.task}</span>
++                        </div>
++                        {r.context_from.length > 0 && (
++                          <div className="deleg-field">
++                            <span className="deleg-k">Context from</span>
++                            <span>
++                              {r.context_from.map((i) => {
++                                const src = byIndex.get(i);
++                                return (
++                                  <span key={i} className="deleg-chip">
++                                    #{i}
++                                    {src ? ` ${src.label}` : ""}
++                                  </span>
++                                );
++                              })}
++                            </span>
++                          </div>
++                        )}
++                        {r.labels.length > 0 && (
++                          <div className="deleg-field">
++                            <span className="deleg-k">Fused</span>
++                            <span>{r.labels.join(", ")}</span>
++                          </div>
++                        )}
++                        {r.summary && (
++                          <div className="deleg-field">
++                            <span className="deleg-k">Summary</span>
++                            <span className="deleg-summary">{r.summary}</span>
++                          </div>
++                        )}
++                        {r.key_findings.length > 0 && (
++                          <div className="deleg-field">
++                            <span className="deleg-k">Findings</span>
++                            <ul className="deleg-list">
++                              {r.key_findings.map((f, i) => (
++                                <li key={i}>{f}</li>
++                              ))}
++                            </ul>
++                          </div>
++                        )}
++                        {r.files_produced.length > 0 && (
++                          <div className="deleg-field">
++                            <span className="deleg-k">Files</span>
++                            <span className="deleg-files">
++                              {r.files_produced.map((p) => (
++                                <button
++                                  key={p}
++                                  type="button"
++                                  className="file-chip-btn"
++                                  title="Open in Files"
++                                  onClick={() => ui.openInFiles(p)}
++                                >
++                                  {p.split("/").pop()}
++                                </button>
++                              ))}
++                              {r.n_feature_tables > 0 && (
++                                <span className="caption">
++                                  {" "}· {r.n_feature_tables} feature table
++                                  {r.n_feature_tables === 1 ? "" : "s"}
++                                </span>
++                              )}
++                            </span>
++                          </div>
++                        )}
++                        {r.warnings.length > 0 && (
++                          <div className="deleg-field">
++                            <span className="deleg-k">Warnings</span>
++                            <ul className="deleg-list warn">
++                              {r.warnings.map((w, i) => (
++                                <li key={i}>{w}</li>
++                              ))}
++                            </ul>
++                          </div>
++                        )}
++                        {r.error && (
++                          <div className="deleg-field">
++                            <span className="deleg-k">Error</span>
++                            <span className="deleg-error">{r.error}</span>
++                          </div>
++                        )}
++                      </div>
++                    )}
++                  </div>
++                );
++              })}
++            </div>
++          ))}
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/webui/src/useSessionEvents.ts b/webui/src/useSessionEvents.ts
+index 48c58effc..94ef1d8bf 100644
+--- a/webui/src/useSessionEvents.ts
++++ b/webui/src/useSessionEvents.ts
+@@ -3,7 +3,7 @@
+  * and replays via Last-Event-ID (the server keeps a bounded ring). */
+ 
+ import { useEffect } from "react";
+-import type { ChatMessage, PresentedQuestion } from "./api";
++import type { ChatMessage, DelegationView, PresentedQuestion } from "./api";
+ 
+ export type SessionEvent =
+   | { type: "log"; chunk: string }
+@@ -20,6 +20,7 @@ export type SessionEvent =
+       branch: string | null;
+       v?: number;
+     }
++  | { type: "delegations"; view: DelegationView }
+   | { type: "error"; message: string };
+ 
+ export function useSessionEvents(
+@@ -65,6 +66,9 @@ export function useSessionEvents(
+         v: d.v,
+       });
+     });
++    src.addEventListener("delegations", (e) =>
++      onEvent({ type: "delegations", view: parse(e) }),
++    );
+     src.addEventListener("error", (e) => {
+       // Only our payload-carrying errors; EventSource transport errors have
+       // no data and are handled by its auto-reconnect.

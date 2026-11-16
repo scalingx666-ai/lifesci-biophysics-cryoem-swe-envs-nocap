@@ -1,0 +1,1101 @@
+diff --git a/Project.toml b/Project.toml
+index a6c985730..0ce519962 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -17,12 +17,14 @@ Distances = "b4f34e82-e78d-54a5-968a-f98e89d6e8f7"
+ Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+ EzXML = "8f5d6c58-4d21-5cfd-889c-e3ad7ee6a615"
+ FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
++FillArrays = "1a297f60-69ca-5386-bcde-b61e274b549b"
+ GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
+ Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
+ KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+ NearestNeighbors = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
+ PeriodicTable = "7b2266bf-644c-5ea3-82d8-af4bbd25a884"
++PhiloxRNG = "508b8dab-2d72-462c-b792-eb7ae329b456"
+ ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
+ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+ Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
+@@ -68,6 +70,7 @@ Distributions = "0.23, 0.24, 0.25"
+ Enzyme = "0.13.20"
+ EzXML = "1"
+ FFTW = "1"
++FillArrays = "1"
+ GLMakie = "0.8, 0.9, 0.10, 0.11, 0.12, 0.13"
+ GPUArrays = "11"
+ Graphs = "1.8"
+@@ -76,6 +79,7 @@ KernelDensity = "0.5, 0.6"
+ LinearAlgebra = "1.9"
+ NearestNeighbors = "0.4"
+ PeriodicTable = "1.1"
++PhiloxRNG = "1"
+ ProgressMeter = "1.11"
+ PythonCall = "0.9"
+ Random = "1.9"
+diff --git a/docs/src/documentation.md b/docs/src/documentation.md
+index 43fed04bf..3a53888c9 100644
+--- a/docs/src/documentation.md
++++ b/docs/src/documentation.md
+@@ -1809,8 +1809,13 @@ julia> random_velocity(10.0u"g/mol", 300.0u"K"; rng=Xoshiro(10))
+    0.23543457751795477 nm ps^-1
+ 
+ ```
+-This may not apply across Julia versions, though you can use [StableRNGs.jl](https://github.com/JuliaRandom/StableRNGs.jl).
+-It also does not apply across different backends such as CPU and GPU.
++This may not apply across Julia versions or across different backends such as CPU and GPU.
++
++Functions that generate randomness for many atoms at once may use the [Philox4x32-10](https://doi.org/10.1145/2063384.2063405) algorithm from [PhiloxRNG.jl](https://github.com/medyan-dev/PhiloxRNG.jl) internally, with the given `rng` only being used to seed Philox.
++Philox generates the same raw random numbers on all backends for the same `rng` state.
++Still, whole simulations are not expected to match bit for bit across backends due to floating point rounding differences.
++
++Other functions, such as [`random_velocity`](@ref) and the Monte Carlo methods, draw from the given `rng` directly.
+ Some functions require `Random.default_rng()` for thread safety, and will error if given a different `rng`.
+ 
+ ## Performance tips
+diff --git a/src/Molly.jl b/src/Molly.jl
+index a1f4cce7f..e8be15267 100644
+--- a/src/Molly.jl
++++ b/src/Molly.jl
+@@ -17,11 +17,13 @@ using Distances
+ using Distributions
+ using EzXML
+ using FFTW
++using FillArrays: Fill
+ using GPUArrays
+ using Graphs
+ using KernelAbstractions
+ using NearestNeighbors
+ import PeriodicTable
++using PhiloxRNG: randn_f64, randn_f32, philox4x32_10
+ using ProgressMeter
+ using SimpleCrystals
+ using SpecialFunctions
+diff --git a/src/coupling.jl b/src/coupling.jl
+index f5b6a563d..a91c67a56 100644
+--- a/src/coupling.jl
++++ b/src/coupling.jl
+@@ -194,42 +194,23 @@ function apply_coupling!(sys::System, buffers, thermostat::AndersenThermostat, s
+     return false
+ end
+ 
+-andersen_atoms_bump(r::T, dr_div_cc, vsf) where {T} = (vsf ? zero(T) : T(r < dr_div_cc))
+-
+ function apply_coupling!(sys::System{<:Any, AT, T}, buffers, thermostat::AndersenThermostat, sim,
+                          neighbors=nothing, step_n::Integer=0;
+                          n_threads::Integer=Threads.nthreads(),
+                          rng=Random.default_rng()) where {AT <: AbstractGPUArray, T}
+-    if isnothing(rng)
+-        backend = get_backend(sys.velocities)
+-        kernel! = andersen_coupling_kernel!(backend)
+-        kernel!(sys.velocities, sys.masses, sys.k * thermostat.temperature,
+-                sim.dt / thermostat.coupling_const, sys.virtual_site_flags;
+-                ndrange=length(sys.velocities))
+-        KernelAbstractions.synchronize(backend)
+-    else
+-        rand_vec_dev = to_device(rand(rng, length(sys)), AT)
+-        atoms_to_bump_dev = andersen_atoms_bump.(rand_vec_dev, sim.dt / thermostat.coupling_const,
+-                                                                sys.virtual_site_flags)
+-        atoms_to_leave_dev = one(T) .- atoms_to_bump_dev
+-        vs = random_velocities(sys, thermostat.temperature; rng=rng)
+-        sys.velocities .= sys.velocities .* atoms_to_leave_dev .+ vs .* atoms_to_bump_dev
+-    end
++    backend = get_backend(sys.velocities)
++    ctr1 = rand(rng, UInt64)
++    key = rand(rng, UInt64)
++    prob_val = clamp(Float64(sim.dt / thermostat.coupling_const), 0.0, prevfloat(1.0))
++    prob_val_u64 = round(UInt64, prob_val*2.0^64)
++    kernel! = apply_Andersen_coupling_kernel!(backend)
++    kernel!(
++        sys.velocities, sys.masses,
++        sys.k*thermostat.temperature, prob_val_u64, sys.virtual_site_flags, ctr1, key, Val{T}(), ndrange=length(sys.velocities)
++    )
+     return false
+ end
+ 
+-@kernel function andersen_coupling_kernel!(velocities::AbstractVector{SVector{D, V}},
+-                                           @Const(masses),
+-                                           kT,
+-                                           val,
+-                                           @Const(virtual_sites)) where {D, V}
+-    i = @index(Global, Linear)
+-    @inbounds if i <= length(velocities) && !virtual_sites[i] && rand() < val
+-        scale = sqrt(kT / masses[i])
+-        velocities[i] = SVector{D, V}(ntuple(i -> randn() * scale, Val(D)))
+-    end
+-end
+-
+ @doc raw"""
+     BerendsenThermostat(temperature, coupling_const) <: AbstractThermostat
+ 
+diff --git a/src/kernels.jl b/src/kernels.jl
+index a55fede46..3a7507f62 100644
+--- a/src/kernels.jl
++++ b/src/kernels.jl
+@@ -661,3 +661,111 @@ end
+         end
+     end
+ end
++
++# `Float32` gets a dedicated
++# method; any other `AbstractFloat` (including `Float64`) falls back to
++# drawing in `Float64` and converting.
++# After calling this advance ctr0 by at least 2*natoms
++@inline function randn_svec(::Type{SVector{2, Float32}}, ctr0::UInt64, ctr1::UInt64, key::UInt64, natoms::UInt64)
++    c1, c2, c3, c4 = randn_f32(ctr0, ctr1, key)
++    SVector{2, Float32}(c1, c2)
++end
++@inline function randn_svec(::Type{SVector{3, Float32}}, ctr0::UInt64, ctr1::UInt64, key::UInt64, natoms::UInt64)
++    c1, c2, c3, c4 = randn_f32(ctr0, ctr1, key)
++    SVector{3, Float32}(c1, c2, c3)
++end
++@inline function randn_svec(::Type{SVector{2, FT}}, ctr0::UInt64, ctr1::UInt64, key::UInt64, natoms::UInt64) where {FT <: AbstractFloat}
++    c1, c2 = randn_f64(ctr0, ctr1, key)
++    SVector{2, FT}(c1, c2)
++end
++@inline function randn_svec(::Type{SVector{3, FT}}, ctr0::UInt64, ctr1::UInt64, key::UInt64, natoms::UInt64) where {FT <: AbstractFloat}
++    c1, c2 = randn_f64(ctr0, ctr1, key)
++    ctr0 += natoms
++    c3, c4 = randn_f64(ctr0, ctr1, key)
++    SVector{3, FT}(c1, c2, c3)
++end
++
++@kernel function random_velocities_kernel!(
++        vels::AbstractVector{SVector{D, C}}, @Const(masses::AbstractVector),
++        kT, @Const(virtual_sites), ctr1::UInt64, key::UInt64, ::Val{FT}
++    ) where {D, C, FT}
++    i = @index(Global, Linear)
++    natoms = length(vels)%UInt64
++    ctr0 = i%UInt64
++    @inbounds if i <= length(vels)
++        if !virtual_sites[i]
++            scale = C(sqrt(kT / masses[i]))
++            vels[i] = randn_svec(SVector{D, FT}, ctr0, ctr1, key, natoms) * scale
++        else
++            vels[i] = zero(SVector{D, C})
++        end
++    end
++end
++
++@kernel function apply_Andersen_coupling_kernel!(
++        vels::AbstractVector{SVector{D, C}}, @Const(masses::AbstractVector),
++        kT, prob_val_u64::UInt64, @Const(virtual_sites), ctr1::UInt64, key::UInt64, ::Val{FT}
++    ) where {D, C, FT}
++    i = @index(Global, Linear)
++    natoms = length(vels)%UInt64
++    ctr0 = i%UInt64
++    @inbounds if i<= length(vels) && !virtual_sites[i]
++        u0, u1 = philox4x32_10(ctr0, ctr1, key)
++        rand_u64 = (UInt64(u0) | UInt64(u1)<<Int32(32))
++        if rand_u64 < prob_val_u64
++            ctr0 += natoms # advance the rng natoms
++            scale = C(sqrt(kT/masses[i]))
++            vels[i] = randn_svec(SVector{D, FT}, ctr0, ctr1, key, natoms) * scale
++        end
++    end
++end
++
++# Fused inner part of a Langevin step
++@kernel function langevin_o_step_kernel!(
++        vels::AbstractVector{SVector{D, C}},
++        @Const(vel_scales::AbstractVector),
++        @Const(noise_scales::AbstractVector),
++        philox_ctr1::UInt64,
++        philox_key::UInt64,
++        ::Val{FT},
++    ) where {D, C, FT}
++    i = @index(Global, Linear)
++    natoms = length(vels)%UInt64
++    philox_ctr0 = i%UInt64
++    @inbounds if i<= length(vels)
++        noise = randn_svec(SVector{D, FT}, philox_ctr0, philox_ctr1, philox_key, natoms)
++        vels[i] = muladd(vel_scales[i], vels[i], noise*noise_scales[i])
++    end
++end
++# host
++function langevin_o_step!(
++        vels::AbstractVector{SVector{D, C}},
++        vel_scales::AbstractVector,
++        noise_scales::AbstractVector,
++        philox_ctr1::UInt64,
++        philox_key::UInt64,
++        ::Type{FT},
++    ) where {D, C, FT}
++    natoms = UInt64(length(vels))
++    @inbounds @simd ivdep for i in eachindex(vels, vel_scales, noise_scales)
++        philox_ctr0 = i%UInt64
++        noise = randn_svec(SVector{D, FT}, philox_ctr0, philox_ctr1, philox_key, natoms)
++        vels[i] = muladd(vel_scales[i], vels[i], noise*noise_scales[i])
++    end
++    nothing
++end
++# device
++function langevin_o_step!(
++            vels::AbstractGPUArray,
++            vel_scales::AbstractVector,
++            noise_scales::AbstractVector,
++            philox_ctr1::UInt64,
++            philox_key::UInt64,
++            ::Type{FT},
++        ) where {FT}
++    backend = get_backend(vels)
++    kernel! = langevin_o_step_kernel!(backend)
++    kernel!(vels, vel_scales, noise_scales, philox_ctr1, philox_key,
++            Val{FT}(); ndrange=length(vels))
++    nothing
++end
+diff --git a/src/simulators.jl b/src/simulators.jl
+index 214146b58..8d88627ef 100644
+--- a/src/simulators.jl
++++ b/src/simulators.jl
+@@ -1077,7 +1077,17 @@ end
+         apply_loggers!(sys, neighbors, init_step, buffers, run_loggers == true;
+                        n_threads=n_threads)
+     end
+-    noise = zero(sys.velocities)
++    vel_scales = Fill(sim.vel_scale, length(masses(sys)))
++    vel_el_zero = zero(eltype(eltype(sys.velocities)))
++    kT = sim.temperature*sys.k
++    noise_scale = sim.noise_scale
++    # precompute to avoid the sqrt and division at each step
++    noise_scales = map(sys.masses, sys.virtual_site_flags) do m, vsf
++        ifelse(vsf, vel_el_zero, oftype(vel_el_zero, noise_scale * sqrt(kT/m)))
++    end
++    # Seed the per step noise
++    philox_key = rand(rng, UInt64)
++    philox_ctr1 = rand(rng, UInt64)
+     using_constraints = (length(sys.constraints) > 0)
+     if using_constraints
+         cons_coord_storage = zero(sys.coords)
+@@ -1103,12 +1113,12 @@ end
+         if using_constraints
+             cons_coord_storage .= sys.coords
+         end
+-        sys.coords .+= sys.velocities .* dt_div2
++        sys.coords .= muladd.(dt_div2, sys.velocities, sys.coords)
+ 
+-        random_velocities!(noise, sys, sim.temperature; rng=rng)
+-        sys.velocities .= sys.velocities .* sim.vel_scale .+ noise .* sim.noise_scale
++        langevin_o_step!(sys.velocities, vel_scales, noise_scales, philox_ctr1, philox_key, float_type(sys))
++        philox_ctr1 += UInt64(1)
+ 
+-        sys.coords .+= sys.velocities .* dt_div2
++        sys.coords .= muladd.(dt_div2, sys.velocities, sys.coords)
+ 
+         if using_constraints
+             pos_context = position_constraint_context(buffers, sys, step_n, sim.dt,
+@@ -1161,7 +1171,7 @@ without applying constraints.
+ - `dt::S`: the time step of the simulation.
+ - `temperature::K`: the equilibrium temperature of the simulation.
+ - `friction::F`: the friction coefficient. If units are used, it should have a
+-    dimensionality of mass per time.
++    dimensionality of mass per time. Note this is a different friction from `Langevin` which has dimensionality of inverse time.
+ - `splitting::W`: the splitting specifier. Should be a string consisting of the
+     characters `A`, `B` and `O`. Strings with no `O`s reduce to deterministic
+     symplectic schemes.
+@@ -1198,19 +1208,30 @@ end
+         report_issue(err_str, strictness)
+     end
+     n_steps = calc_n_steps(n_steps_or_time, sim.dt)
+-    M_inv = inv.(masses(sys))
++    # virtual particles should get inv mass of 0 AND mass of 0
++    # This way the O step doesn't change virtual site velocity
++    M_inv = map(masses(sys), sys.virtual_site_flags) do m, vsf
++        local x = inv(m)
++        ifelse(vsf, zero(x), x)
++    end
+     if !all(op -> op in ('A', 'B', 'O'), sim.splitting)
+         throw(ArgumentError("splitting must contain only A, B, and O steps"))
+     end
+     n_o_steps = count('O', sim.splitting)
+     if n_o_steps > 0
+-        α_eff = exp.(-sim.friction * sim.dt .* M_inv / n_o_steps)
+-        σ_eff = sqrt.((1 * unit(eltype(α_eff))) .- (α_eff .^ 2))
+-    else
+-        α_eff = nothing
+-        σ_eff = nothing
++        # These local variables are only needed in the O step
++        vel_scales = exp.((-sim.friction * sim.dt / n_o_steps) .* M_inv)
++        kT = sim.temperature*sys.k
++        vel_el_zero = zero(eltype(eltype(sys.velocities)))
++        vel_scale_one_sq = abs2(oneunit(eltype(vel_scales)))
++        noise_scales = oftype.(
++            vel_el_zero,
++            sqrt.(kT .* M_inv .* (vel_scale_one_sq .- (abs2.(vel_scales))))
++        )
++        # Seed the per step noise
++        philox_key = rand(rng, UInt64)
++        philox_ctr1 = rand(rng, UInt64)
+     end
+-
+     sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
+     place_virtual_sites!(sys)
+     init_step == 0 && !iszero(sim.remove_CM_motion) && remove_CM_motion!(sys)
+@@ -1221,7 +1242,6 @@ end
+     apply_loggers!(sys, neighbors, init_step, buffers, run_loggers == true; n_threads=n_threads)
+     forces!(forces_t, sys, neighbors, init_step, buffers, Val(false); n_threads=n_threads)
+     accels_t = calc_accels.(forces_t, masses(sys))
+-    noise = zero(sys.velocities)
+ 
+     effective_dts = [sim.dt / count(c, sim.splitting) for c in sim.splitting]
+ 
+@@ -1244,21 +1264,36 @@ end
+         end
+     end
+ 
+-    step_arg_pairs = map(enumerate(sim.splitting)) do (j, op)
+-        if op == 'A'
+-            return (A_step!, (sys, effective_dts[j]))
+-        elseif op == 'B'
+-            return (B_step!, (sys, forces_t, buffers, accels_t, effective_dts[j],
+-                              force_computation_steps[j], n_threads))
+-        elseif op == 'O'
+-            return (O_step!, (sys, noise, α_eff, σ_eff, rng, sim.temperature))
+-        end
+-    end
+-
+     progress = setup_progress(n_steps, show_progress)
+     for step_n in (init_step + 1):(init_step + n_steps)
+-        for (step!, args) in step_arg_pairs
+-            step!(args..., neighbors, step_n)
++        for (j, op) in enumerate(sim.splitting)
++            if op == 'A'
++                A_step!(sys, effective_dts[j])
++            elseif op == 'B'
++                B_step!(
++                    sys,
++                    forces_t,
++                    buffers,
++                    accels_t,
++                    effective_dts[j],
++                    force_computation_steps[j],
++                    n_threads,
++                    neighbors,
++                    step_n,
++                )
++            elseif op == 'O'
++                langevin_o_step!(
++                    sys.velocities,
++                    vel_scales,
++                    noise_scales,
++                    philox_ctr1,
++                    philox_key,
++                    float_type(sys),
++                )
++                philox_ctr1 += UInt64(1)
++            else
++                error("Unexpected op $(repr(op))")
++            end
+         end
+ 
+         sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
+@@ -1281,7 +1316,7 @@ end
+     return sys
+ end
+ 
+-function A_step!(sys, dt_eff, neighbors, step_n)
++function A_step!(sys, dt_eff)
+     sys.coords .+= sys.velocities .* dt_eff
+     sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
+     place_virtual_sites!(sys)
+@@ -1298,12 +1333,6 @@ function B_step!(sys, forces_t, buffers, accels_t, dt_eff,
+     return sys
+ end
+ 
+-function O_step!(sys, noise, α_eff, σ_eff, rng, temperature, neighbors, step_n)
+-    random_velocities!(noise, sys, temperature; rng=rng)
+-    sys.velocities .= α_eff .* sys.velocities .+ σ_eff .* noise
+-    return sys
+-end
+-
+ """
+     OverdampedLangevin(; <keyword arguments>)
+ 
+diff --git a/src/spatial.jl b/src/spatial.jl
+index 6d6831db7..d92785500 100644
+--- a/src/spatial.jl
++++ b/src/spatial.jl
+@@ -733,67 +733,6 @@ function random_velocity(atom_mass::Real, temp::Real,
+     return SVector([maxwell_boltzmann(atom_mass, temp, k; rng=rng) for i in 1:dims]...)
+ end
+ 
+-function random_velocity_3D(atom_mass::Union{Unitful.Mass, MolarMass}, virtual_site_flag,
+-                            temp::Unitful.Temperature, rng=Random.default_rng())
+-    v = SVector(
+-        maxwell_boltzmann(atom_mass, temp; rng=rng),
+-        maxwell_boltzmann(atom_mass, temp; rng=rng),
+-        maxwell_boltzmann(atom_mass, temp; rng=rng),
+-    )
+-    return v * !virtual_site_flag
+-end
+-
+-function random_velocity_3D(atom_mass::Union{Unitful.Mass, MolarMass}, virtual_site_flag,
+-                            temp::Unitful.Temperature,
+-                            k::Union{BoltzmannConstUnits, MolarBoltzmannConstUnits},
+-                            rng=Random.default_rng())
+-    v = SVector(
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-    )
+-    return v * !virtual_site_flag
+-end
+-
+-function random_velocity_3D(atom_mass::Real, virtual_site_flag, temp::Real, k::Real,
+-                            rng=Random.default_rng())
+-    v = SVector(
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-    )
+-    return v * !virtual_site_flag
+-end
+-
+-function random_velocity_2D(atom_mass::Union{Unitful.Mass, MolarMass}, virtual_site_flag,
+-                            temp::Unitful.Temperature, rng=Random.default_rng())
+-    v = SVector(
+-        maxwell_boltzmann(atom_mass, temp; rng=rng),
+-        maxwell_boltzmann(atom_mass, temp; rng=rng),
+-    )
+-    return v * !virtual_site_flag
+-end
+-
+-function random_velocity_2D(atom_mass::Union{Unitful.Mass, MolarMass}, virtual_site_flag,
+-                            temp::Unitful.Temperature,
+-                            k::Union{BoltzmannConstUnits, MolarBoltzmannConstUnits},
+-                            rng=Random.default_rng())
+-    v = SVector(
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-    )
+-    return v * !virtual_site_flag
+-end
+-
+-function random_velocity_2D(atom_mass::Real, virtual_site_flag, temp::Real, k::Real,
+-                            rng=Random.default_rng())
+-    v = SVector(
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-        maxwell_boltzmann(atom_mass, temp, k; rng=rng),
+-    )
+-    return v * !virtual_site_flag
+-end
+-
+ """
+     maxwell_boltzmann(atom_mass::Unitful.Mass, temp::Unitful.Temperature,
+                       k::BoltzmannConstUnits=Unitful.k; rng=Random.default_rng())
+@@ -839,16 +778,8 @@ for a [`System`](@ref).
+ 
+ Virtual sites are given a velocity of zero.
+ """
+-function random_velocities(sys::System{3, AT}, temp; rng=Random.default_rng()) where AT
+-    vels = random_velocity_3D.(from_device(masses(sys)), from_device(sys.virtual_site_flags),
+-                               temp, sys.k, rng)
+-    return to_device(vels, AT)
+-end
+-
+-function random_velocities(sys::System{2, AT}, temp; rng=Random.default_rng()) where AT
+-    vels = random_velocity_2D.(from_device(masses(sys)), from_device(sys.virtual_site_flags),
+-                               temp, sys.k, rng)
+-    return to_device(vels, AT)
++function random_velocities(sys::System, temp; rng=Random.default_rng())
++    random_velocities!(similar(sys.velocities), sys, temp; rng=rng)
+ end
+ 
+ """
+@@ -862,39 +793,39 @@ Virtual sites are given a velocity of zero.
+ """
+ function random_velocities!(sys, temp; rng=Random.default_rng())
+     random_velocities!(sys.velocities, sys, temp; rng=rng)
+-    return sys
+-end
+-
+-function random_velocities!(vels, sys, temp; rng=Random.default_rng())
+-    vels .= random_velocities(sys, temp; rng=rng)
+-    return vels
+-end
+-
+-function random_velocities!(vels::AbstractGPUArray, sys, temp; rng=Random.default_rng())
+-    if isnothing(rng)
+-        backend = get_backend(vels)
+-        kernel! = random_velocities_kernel!(backend)
+-        kernel!(vels, sys.masses,  sys.k*temp, sys.virtual_site_flags, ndrange=length(vels))
+-        KernelAbstractions.synchronize(backend)
+-    else
+-        vels .= random_velocities(sys, temp; rng=rng)
+-    end
+-    return vels
+-end
+-
+-@kernel function random_velocities_kernel!(velocities::AbstractVector{SVector{D, V}},
+-                                           @Const(masses),
+-                                           kT,
+-                                           @Const(virtual_sites)) where {D, V}
+-    i = @index(Global, Linear)
+-    if i <= length(velocities)
+-        @inbounds if !virtual_sites[i]
+-            scale = sqrt(kT / masses[i])
+-            velocities[i] = SVector{D, V}(ntuple(i -> randn() * scale, Val(D)))
+-        else
+-            velocities[i] = SVector{D, V}(ntuple(i -> zero(V), Val(D)))
+-        end
++    sys
++end
++
++# vels on host, do sampling on host
++function random_velocities!(vels::AbstractVector{SVector{D, C}}, sys::AbstractSystem, temp; rng=Random.default_rng()) where {D, C}
++    FT = float_type(sys)
++    ms = from_device(masses(sys))
++    vsf = from_device(sys.virtual_site_flags)
++    kT = sys.k * temp
++    ctr1 = rand(rng, UInt64)
++    key = rand(rng, UInt64)
++    natoms = UInt64(length(ms))
++    @inbounds @simd ivdep for i in eachindex(vels, vsf, ms)
++        scale = ifelse(vsf[i], zero(C), C(Base.FastMath.sqrt_fast(kT/ms[i])))
++        vels[i] = randn_svec(SVector{D, FT}, i%UInt64, ctr1, key, natoms) * scale
+     end
++    vels
++end
++
++# vels on device, do sampling on device
++function random_velocities!(vels::AbstractGPUArray, sys::AbstractSystem, temp; rng=Random.default_rng())
++    FT = float_type(sys)
++    AT = array_type(vels)
++    ms = to_device(sys.masses, AT)
++    vsf = to_device(sys.virtual_site_flags, AT)
++    kT = sys.k * temp
++    ctr1 = rand(rng, UInt64)
++    key = rand(rng, UInt64)
++    backend = get_backend(vels)
++    kernel! = random_velocities_kernel!(backend)
++    kernel!(vels, ms, kT, vsf, ctr1, key,
++            Val(FT); ndrange=length(vels))
++    vels
+ end
+ 
+ # Sometimes domain error occurs for acos if the value is > 1.0 or < -1.0
+diff --git a/test/agent.jl b/test/agent.jl
+index 784a84638..90d1b8b6c 100644
+--- a/test/agent.jl
++++ b/test/agent.jl
+@@ -1,4 +1,6 @@
+ @testset "Agent-based modelling" begin
++    Random.seed!(1234)
++
+     @enum Status susceptible infected recovered
+ 
+     # Custom atom type
+diff --git a/test/basic.jl b/test/basic.jl
+index 60f5d856f..c47c80798 100644
+--- a/test/basic.jl
++++ b/test/basic.jl
+@@ -50,6 +50,51 @@
+     @test 0.35              < std(vels_nounits_1)  < 0.55
+     @test 0.35              < std(vels_nounits_2)  < 0.55
+ 
++    for D in 2:3
++        for FT in (Float32, Float64)
++            local natoms = UInt64(1_000)
++            local vel_flat = collect(Iterators.flatten(SVector{D,FT}[
++                [Molly.randn_svec(SVector{D,FT}, i, UInt64(0), UInt64(0), natoms) for i in UInt64(1):natoms];
++                [Molly.randn_svec(SVector{D,FT}, i+2natoms, UInt64(0), UInt64(0), natoms) for i in UInt64(1):natoms];
++                [Molly.randn_svec(SVector{D,FT}, i, UInt64(1), UInt64(0), natoms) for i in UInt64(1):natoms];
++                [Molly.randn_svec(SVector{D,FT}, i, UInt64(0), UInt64(1), natoms) for i in UInt64(1):natoms];
++            ]))
++            @test 0.9  < std(vel_flat)  < 1.1
++            @test abs(mean(vel_flat)) < 0.1
++            local n_repeated = length(vel_flat) - length(unique(vel_flat))
++            if FT === Float32
++                # Birthday paradox means this is not that unlikely
++                @test n_repeated < 2
++            else
++                @test n_repeated == 0
++            end
++        end
++    end
++
++    @testset "random_velocities FT=$FT" for FT in (Float32, Float64)
++        local n_atoms = 1_000
++        local atom_mass = FT(12.0)u"g/mol"
++        local temp = FT(300.0)u"K"
++        local boundary = CubicBoundary(FT(10.0)u"nm")
++        local atoms = [Atom(mass=atom_mass) for _ in 1:n_atoms]
++        local coords = [zero(SVector{3, FT})u"nm" for _ in 1:n_atoms]
++        local velocities = [random_velocity(atom_mass, temp) for _ in 1:n_atoms]
++        local sys = System(atoms=atoms, coords=coords, boundary=boundary, velocities=velocities)
++        local vel_flat = collect(Iterators.flatten([
++            random_velocities(sys, temp; rng=Xoshiro(10));
++            random_velocities(sys, temp; rng=Xoshiro(1234));
++        ]))
++        local σ = sqrt(sys.k * temp / atom_mass)
++        @test 0.9σ < std(vel_flat) < 1.1σ
++        @test abs(mean(vel_flat)) < 0.1σ
++        local n_repeated = length(vel_flat) - length(unique(vel_flat))
++        if FT === Float32
++            @test n_repeated < 2
++        else
++            @test n_repeated == 0
++        end
++    end
++
+     b = CubicBoundary(4.0u"nm", 5.0u"nm", 6.0u"nm")
+     @test float_type(b) == Float64
+     @test Molly.length_type(b) == typeof(1.0u"nm")
+diff --git a/test/coupling.jl b/test/coupling.jl
+index f436db704..bfb432105 100644
+--- a/test/coupling.jl
++++ b/test/coupling.jl
+@@ -432,25 +432,18 @@ end
+     end
+ end
+ 
+-@testset "Monte Carlo isotropic barostat" begin
++function get_argon_sys(AT)
+     # See http://www.sklogwiki.org/SklogWiki/index.php/Argon for parameters
+     rng = Xoshiro(10)
+     n_atoms = 25
+-    n_steps = 100_000
+     atom_mass = 39.947u"g/mol"
+     boundary = CubicBoundary(8.0u"nm")
+-    temp = 288.15u"K"
+-    press = 1.0u"bar"
+-    dt = 0.0005u"ps"
+-    friction = 1.0u"ps^-1"
+-    lang = Langevin(dt=dt, temperature=temp, friction=friction)
+     atoms = fill(Atom(mass=atom_mass, σ=0.3345u"nm", ϵ=1.0451u"kJ * mol^-1"), n_atoms)
+     coords = place_atoms(n_atoms, boundary; min_dist=1.0u"nm", rng=rng)
+     n_log_steps = 500
+-
+     sys = System(
+-        atoms=atoms,
+-        coords=copy(coords),
++        atoms=to_device(atoms, AT),
++        coords=to_device(coords, AT),
+         boundary=boundary,
+         pairwise_inters=(LennardJones(),),
+         loggers=(
+@@ -465,6 +458,17 @@ end
+             volume=VolumeLogger(n_log_steps),
+         ),
+     )
++    (sys, rng)
++end
++
++@testset "25 Argon atoms NVT baseline" begin
++    sys, rng = get_argon_sys(Array)
++    temp = 288.15u"K"
++    random_velocities!(sys, temp; rng=rng)
++    n_steps = 100_000
++    dt = 0.0005u"ps"
++    friction = 1.0u"ps^-1"
++    lang = Langevin(dt=dt, temperature=temp, friction=friction)
+ 
+     simulate!(deepcopy(sys), lang, 1_000; n_threads=1, rng=rng)
+     @time simulate!(sys, lang, n_steps; n_threads=1, rng=rng)
+@@ -481,8 +485,17 @@ end
+     @test 0.1u"bar" < std(P_iso) < 0.5u"bar"
+     @test all(values(sys.loggers.volume) .== 512.0u"nm^3")
+     @test sys.boundary == CubicBoundary(8.0u"nm")
++end
++
++@testset "Monte Carlo isotropic barostat" begin
++    press = 1.0u"bar"
++    temp = 288.15u"K"
++    n_steps = 100_000
++    dt = 0.0005u"ps"
++    friction = 1.0u"ps^-1"
++    init_boundary = CubicBoundary(8.0u"nm")
+ 
+-    barostat = MonteCarloBarostat(press, temp, boundary; coupling_type = :isotropic)
++    barostat = MonteCarloBarostat(press, temp, init_boundary; coupling_type = :isotropic)
+     lang_baro = Langevin(dt=dt, temperature=temp, friction=friction, coupling=(barostat,))
+     vvand_baro = VelocityVerlet(dt=dt, coupling=(AndersenThermostat(temp, 1.0u"ps"), barostat))
+ 
+@@ -491,24 +504,8 @@ end
+             if AT <: AbstractGPUArray && sim == vvand_baro
+                 continue
+             end
+-
+-            sys = System(
+-                atoms=to_device(atoms, AT),
+-                coords=to_device(copy(coords), AT),
+-                boundary=boundary,
+-                pairwise_inters=(LennardJones(),),
+-                loggers=(
+-                    temperature=TemperatureLogger(n_log_steps),
+-                    total_energy=TotalEnergyLogger(n_log_steps),
+-                    kinetic_energy=KineticEnergyLogger(n_log_steps),
+-                    potential_energy=PotentialEnergyLogger(n_log_steps),
+-                    virial=VirialLogger(n_log_steps),
+-                    scalar_virial=ScalarVirialLogger(n_log_steps),
+-                    pressure=PressureLogger(n_log_steps),
+-                    scalar_pressure=ScalarPressureLogger(n_log_steps),
+-                    volume=VolumeLogger(n_log_steps),
+-                ),
+-            )
++            sys, rng = get_argon_sys(AT)
++            random_velocities!(sys, temp; rng=rng)
+ 
+             simulate!(deepcopy(sys), sim, 1_000; n_threads=1, rng=rng)
+             @time simulate!(sys, sim, n_steps; n_threads=1, rng=rng)
+@@ -525,64 +522,20 @@ end
+             @test 0.1u"bar" < std(P_iso) < 0.5u"bar"
+             @test 857.0u"nm^3" < mean(values(sys.loggers.volume)) < 1157.0u"nm^3"
+             @test std(values(sys.loggers.volume)) < 300u"nm^3"
+-            @test sys.boundary != CubicBoundary(8.0u"nm")
++            @test sys.boundary != init_boundary
+         end
+     end
+ end
+ 
+ @testset "Monte Carlo semiisotropic barostat" begin
+-    # See http://www.sklogwiki.org/SklogWiki/index.php/Argon for parameters
+-    rng = Xoshiro(10)
+-    n_atoms = 25
+-    n_steps = 100_000
+-    atom_mass = 39.947u"g/mol"
+-    boundary = CubicBoundary(8.0u"nm")
++    press = [1.0u"bar", 1.0u"bar"]
+     temp = 288.15u"K"
+-    press = 1.0u"bar"
++    n_steps = 100_000
+     dt = 0.0005u"ps"
+     friction = 1.0u"ps^-1"
+-    lang = Langevin(dt=dt, temperature=temp, friction=friction)
+-    atoms = fill(Atom(mass=atom_mass, σ=0.3345u"nm", ϵ=1.0451u"kJ * mol^-1"), n_atoms)
+-    coords = place_atoms(n_atoms, boundary; min_dist=1.0u"nm", rng=rng)
+-    n_log_steps = 500
+-
+-    sys = System(
+-        atoms=atoms,
+-        coords=copy(coords),
+-        boundary=boundary,
+-        pairwise_inters=(LennardJones(),),
+-        loggers=(
+-            temperature=TemperatureLogger(n_log_steps),
+-            total_energy=TotalEnergyLogger(n_log_steps),
+-            kinetic_energy=KineticEnergyLogger(n_log_steps),
+-            potential_energy=PotentialEnergyLogger(n_log_steps),
+-            virial=VirialLogger(n_log_steps),
+-            scalar_virial=ScalarVirialLogger(n_log_steps),
+-            pressure=PressureLogger(n_log_steps),
+-            scalar_pressure=ScalarPressureLogger(n_log_steps),
+-            volume=VolumeLogger(n_log_steps),
+-        ),
+-    )
+-
+-    simulate!(deepcopy(sys), lang, 1_000; n_threads=1, rng=rng)
+-    @time simulate!(sys, lang, n_steps; n_threads=1, rng=rng)
+-
+-    P_iso = [tr(P) / 3 for P in values(sys.loggers.pressure)]
+-    Vir   = [tr(V) for V in values(sys.loggers.virial)]
++    init_boundary = CubicBoundary(8.0u"nm")
+ 
+-    @test 260.0u"K" < mean(values(sys.loggers.temperature)) < 300.0u"K"
+-    @test 50.0u"kJ * mol^-1" < mean(values(sys.loggers.total_energy  )) < 120.0u"kJ * mol^-1"
+-    @test 50.0u"kJ * mol^-1" < mean(values(sys.loggers.kinetic_energy)) < 120.0u"kJ * mol^-1"
+-    @test mean(values(sys.loggers.potential_energy)) < 0.0u"kJ * mol^-1"
+-    @test -5.0u"kJ * mol^-1" < mean(Vir) < 5.0u"kJ * mol^-1"
+-    @test 1.7u"bar" < mean(P_iso) < 2.2u"bar"
+-    @test 0.1u"bar" < std(P_iso) < 0.5u"bar"
+-    @test all(values(sys.loggers.volume) .== 512.0u"nm^3")
+-    @test sys.boundary == CubicBoundary(8.0u"nm")
+-
+-    P = [1.0u"bar", 1.0u"bar"]
+-
+-    barostat = MonteCarloBarostat(P, temp, boundary; coupling_type = :semiisotropic)
++    barostat = MonteCarloBarostat(press, temp, init_boundary; coupling_type = :semiisotropic)
+     lang_baro = Langevin(dt=dt, temperature=temp, friction=friction, coupling=(barostat,))
+     vvand_baro = VelocityVerlet(dt=dt, coupling=(AndersenThermostat(temp, 1.0u"ps"), barostat))
+ 
+@@ -591,24 +544,8 @@ end
+             if AT <: AbstractGPUArray && sim == vvand_baro
+                 continue
+             end
+-
+-            sys = System(
+-                atoms=to_device(atoms, AT),
+-                coords=to_device(copy(coords), AT),
+-                boundary=boundary,
+-                pairwise_inters=(LennardJones(),),
+-                loggers=(
+-                    temperature=TemperatureLogger(n_log_steps),
+-                    total_energy=TotalEnergyLogger(n_log_steps),
+-                    kinetic_energy=KineticEnergyLogger(n_log_steps),
+-                    potential_energy=PotentialEnergyLogger(n_log_steps),
+-                    virial=VirialLogger(n_log_steps),
+-                    scalar_virial=ScalarVirialLogger(n_log_steps),
+-                    pressure=PressureLogger(n_log_steps),
+-                    scalar_pressure=ScalarPressureLogger(n_log_steps),
+-                    volume=VolumeLogger(n_log_steps),
+-                ),
+-            )
++            sys, rng = get_argon_sys(AT)
++            random_velocities!(sys, temp; rng=rng)
+ 
+             simulate!(deepcopy(sys), sim, 1_000; n_threads=1, rng=rng)
+             @time simulate!(sys, sim, n_steps; n_threads=1, rng=rng)
+@@ -629,64 +566,20 @@ end
+             @test 0.1u"bar" < std(P_z) < 0.5u"bar"
+             @test 857.0u"nm^3" < mean(values(sys.loggers.volume)) < 1157.0u"nm^3"
+             @test std(values(sys.loggers.volume)) < 300u"nm^3"
+-            @test sys.boundary != CubicBoundary(8.0u"nm")
++            @test sys.boundary != init_boundary
+         end
+     end
+ end
+ 
+ @testset "Monte Carlo anisotropic barostat" begin
+-    # See http://www.sklogwiki.org/SklogWiki/index.php/Argon for parameters
+-    rng = Xoshiro(10)
+-    n_atoms = 25
+-    n_steps = 100_000
+-    atom_mass = 39.947u"g/mol"
+-    boundary = CubicBoundary(8.0u"nm")
++    press = [1.0u"bar", 1.0u"bar", 1.0u"bar", 1.0u"bar", 1.0u"bar", 1.0u"bar"]
+     temp = 288.15u"K"
+-    press = 1.0u"bar"
++    n_steps = 100_000
+     dt = 0.0005u"ps"
+     friction = 1.0u"ps^-1"
+-    lang = Langevin(dt=dt, temperature=temp, friction=friction)
+-    atoms = fill(Atom(mass=atom_mass, σ=0.3345u"nm", ϵ=1.0451u"kJ * mol^-1"), n_atoms)
+-    coords = place_atoms(n_atoms, boundary; min_dist=1.0u"nm", rng=rng)
+-    n_log_steps = 500
++    init_boundary = CubicBoundary(8.0u"nm")
+ 
+-    sys = System(
+-        atoms=atoms,
+-        coords=copy(coords),
+-        boundary=boundary,
+-        pairwise_inters=(LennardJones(),),
+-        loggers=(
+-            temperature=TemperatureLogger(n_log_steps),
+-            total_energy=TotalEnergyLogger(n_log_steps),
+-            kinetic_energy=KineticEnergyLogger(n_log_steps),
+-            potential_energy=PotentialEnergyLogger(n_log_steps),
+-            virial=VirialLogger(n_log_steps),
+-            scalar_virial=ScalarVirialLogger(n_log_steps),
+-            pressure=PressureLogger(n_log_steps),
+-            scalar_pressure=ScalarPressureLogger(n_log_steps),
+-            volume=VolumeLogger(n_log_steps),
+-        ),
+-    )
+-
+-    simulate!(deepcopy(sys), lang, 1_000; n_threads=1, rng=rng)
+-    @time simulate!(sys, lang, n_steps; n_threads=1, rng=rng)
+-
+-    P_iso = [tr(P) / 3 for P in values(sys.loggers.pressure)]
+-    Vir   = [tr(V) for V in values(sys.loggers.virial)]
+-
+-    @test 260.0u"K" < mean(values(sys.loggers.temperature)) < 300.0u"K"
+-    @test 50.0u"kJ * mol^-1" < mean(values(sys.loggers.total_energy  )) < 120.0u"kJ * mol^-1"
+-    @test 50.0u"kJ * mol^-1" < mean(values(sys.loggers.kinetic_energy)) < 120.0u"kJ * mol^-1"
+-    @test mean(values(sys.loggers.potential_energy)) < 0.0u"kJ * mol^-1"
+-    @test -5.0u"kJ * mol^-1" < mean(Vir) < 5.0u"kJ * mol^-1"
+-    @test 1.7u"bar" < mean(P_iso) < 2.2u"bar"
+-    @test 0.1u"bar" < std(P_iso) < 0.5u"bar"
+-    @test all(values(sys.loggers.volume) .== 512.0u"nm^3")
+-    @test sys.boundary == CubicBoundary(8.0u"nm")
+-
+-    P = [1.0u"bar", 1.0u"bar", 1.0u"bar", 1.0u"bar", 1.0u"bar", 1.0u"bar"]
+-
+-    barostat = MonteCarloBarostat(P, temp, boundary; coupling_type = :anisotropic)
++    barostat = MonteCarloBarostat(press, temp, init_boundary; coupling_type = :anisotropic)
+     lang_baro = Langevin(dt=dt, temperature=temp, friction=friction, coupling=(barostat,))
+     vvand_baro = VelocityVerlet(dt=dt, coupling=(AndersenThermostat(temp, 1.0u"ps"), barostat))
+ 
+@@ -695,24 +588,8 @@ end
+             if AT <: AbstractGPUArray && sim == vvand_baro
+                 continue
+             end
+-
+-            sys = System(
+-                atoms=to_device(atoms, AT),
+-                coords=to_device(copy(coords), AT),
+-                boundary=boundary,
+-                pairwise_inters=(LennardJones(),),
+-                loggers=(
+-                    temperature=TemperatureLogger(n_log_steps),
+-                    total_energy=TotalEnergyLogger(n_log_steps),
+-                    kinetic_energy=KineticEnergyLogger(n_log_steps),
+-                    potential_energy=PotentialEnergyLogger(n_log_steps),
+-                    virial=VirialLogger(n_log_steps),
+-                    scalar_virial=ScalarVirialLogger(n_log_steps),
+-                    pressure=PressureLogger(n_log_steps),
+-                    scalar_pressure=ScalarPressureLogger(n_log_steps),
+-                    volume=VolumeLogger(n_log_steps),
+-                ),
+-            )
++            sys, rng = get_argon_sys(AT)
++            random_velocities!(sys, temp; rng=rng)
+ 
+             simulate!(deepcopy(sys), sim, 1_000; n_threads=1, rng=rng)
+             @time simulate!(sys, sim, n_steps; n_threads=1, rng=rng)
+@@ -736,7 +613,7 @@ end
+             @test 0.1u"bar" < std(P_z) < 0.5u"bar"
+             @test 857.0u"nm^3" < mean(values(sys.loggers.volume)) < 1157.0u"nm^3"
+             @test std(values(sys.loggers.volume)) < 300u"nm^3"
+-            @test sys.boundary != CubicBoundary(8.0u"nm")
++            @test sys.boundary != init_boundary
+         end
+     end
+ end
+diff --git a/test/gpu_consistency.jl b/test/gpu_consistency.jl
+index 09f1d6f37..774a32797 100644
+--- a/test/gpu_consistency.jl
++++ b/test/gpu_consistency.jl
+@@ -584,25 +584,32 @@
+             end
+         end
+ 
+-        @testset "Langevin random numbers" begin
++        @testset "Langevin random numbers FT=$FT" for FT in (Float32, Float64)
+             n_atoms = 50_000
+-            boundary = CubicBoundary(50.0u"nm")
+-            atom_mass = 10.0u"g/mol"
+-            temp = 298.0u"K"
++            boundary = CubicBoundary(FT(50.0)u"nm")
++            atom_mass = FT(10.0)u"g/mol"
++            temp = FT(298.0)u"K"
+             AT = CuArray
+-            atoms = [Atom(mass=10.0f0u"g/mol", charge=0.0f0, σ=0.3f0u"nm", ϵ=0.1f0u"kJ * mol^-1")
++            # Some atoms are virtual sites, which must have their velocities
++            #   actively set to zero by random_velocities!.
++            vs_inds = [2, 4, 7]
++            virtual_sites = [
++                OneParticleSite(2, 1, zero(FT)u"nm^-1"),
++                TwoParticleAverageSite(4, 3, 5, FT(0.5), FT(0.5)),
++                ThreeParticleAverageSite(7, 6, 8, 9, FT(0.2), FT(0.3), FT(0.5)),
++            ]
++            atoms = [Atom(mass=(i in vs_inds ? FT(0.0) : FT(10.0))u"g/mol")
+                      for i in 1:n_atoms]
+-            coords = [SVector(1.0f0u"nm", 1.0f0u"nm", 1.0f0u"nm") for _ in 1:n_atoms]
+-            velocities = [random_velocity(atom_mass, temp) for i in 1:n_atoms]
+-            pis = (LennardJones(cutoff=DistanceCutoff(0.9f0u"nm"), use_neighbors=false),)
++            coords = [SVector(FT(1.0)u"nm", FT(1.0)u"nm", FT(1.0)u"nm") for _ in 1:n_atoms]
++            vel_unit = unit(random_velocity(atom_mass, temp)[1])
++            velocities = [zero(SVector{3, FT}) * vel_unit for _ in 1:n_atoms]
+ 
+             sys = System(
+                 atoms=copy(atoms),
+                 coords=copy(coords),
+                 boundary=boundary,
+                 velocities=copy(velocities),
+-                pairwise_inters=pis,
+-                loggers=(temp=TemperatureLogger(100),)
++                virtual_sites=copy(virtual_sites),
+             )
+ 
+             sys2 = System(
+@@ -610,34 +617,61 @@
+                 coords=AT(coords),
+                 boundary=boundary,
+                 velocities=AT(velocities),
+-                pairwise_inters=pis,
+-                loggers=(temp=TemperatureLogger(100),),
++                virtual_sites=AT(virtual_sites),
+             )
+-            velocities_gpu = AT(velocities)
+-
+-            for (temp, mean_vel) in (
+-                    (200.0u"K", 0.65u"nm/ps"),
+-                    (250.0u"K", 0.73u"nm/ps"),
+-                    (298.0u"K", 0.79u"nm/ps"),
+-                )
+-                vels_cpu = copy(velocities)
+-                random_velocities!(vels_cpu, sys, temp)
+-                mean_cpu = mean(mean(vels_cpu))
+-                std_cpu = mean(std(vels_cpu))
+-                mean_norm_cpu = mean(norm, vels_cpu)
+-
+-                vels_gpu = random_velocities!(velocities_gpu, sys2, temp)
+-                mean_gpu = mean(mean(vels_gpu))
+-                std_gpu = mean(std(vels_gpu))
+-                mean_norm_gpu = mean(norm, vels_gpu)
+-
+-                @test -0.005u"nm * ps^-1" <= mean_cpu <= 0.005u"nm * ps^-1"
+-                @test -0.005u"nm * ps^-1" <= mean_gpu <= 0.005u"nm * ps^-1"
+-                @test (mean_vel - 0.02u"nm/ps") <= mean_norm_cpu <= (mean_vel + 0.02u"nm/ps")
+-                @test (mean_vel - 0.02u"nm/ps") <= mean_norm_gpu <= (mean_vel + 0.02u"nm/ps")
+-                @test 0.99 < abs(std_cpu / std_gpu) < 1.01
++            # Start the output buffers filled with non-zero velocities so we test
++            #   that virtual site velocities are actively set to zero, not just
++            #   left as they were.
++            ones_vels = fill(SVector(FT(1), FT(1), FT(1)) * vel_unit, n_atoms)
++            vels_gpu = AT(ones_vels)
++
++            vels_cpu_inplace = copy(ones_vels)
++            random_velocities!(vels_cpu_inplace, sys, temp; rng=Xoshiro(10))
++            vels_cpu = random_velocities(sys, temp; rng=Xoshiro(10))
++            random_velocities!(sys, temp; rng=Xoshiro(10))
++            # These should match exactly
++            @test vels_cpu_inplace == vels_cpu
++            @test sys.velocities == vels_cpu
++
++            random_velocities!(vels_gpu, sys2, temp; rng=Xoshiro(10))
++            vels_gpu_cpu = Array(vels_gpu)
++
++            # With the same rng source the velocities should match down to floating point error.
++            vel_scale = sqrt(sys.k * temp / atom_mass)
++            @test maximum(norm, vels_gpu_cpu .- vels_cpu) < 16 * eps(FT) * vel_scale
++
++            # Virtual site velocities must be actively set to zero on both CPU and GPU.
++            for i in vs_inds
++                @test iszero(vels_cpu[i])
++                @test iszero(vels_gpu_cpu[i])
+             end
+         end
++
++        @testset "langevin_o_step! FT=$FT" for FT in (Float32, Float64)
++            n_atoms = 50_000
++            AT = CuArray
++
++            rng = Xoshiro(15)
++            init_vels = [randn(rng, SVector{3, FT}) for _ in 1:n_atoms]
++
++            vel_scales = fill(FT(0.8), n_atoms)
++            noise_scales = fill(FT(0.3), n_atoms)
++
++            philox_key = 0x1234567890abcdef
++            philox_ctr1 = 0xfedcba0987654321
++
++            vels_cpu = copy(init_vels)
++            vels_gpu = AT(init_vels)
++
++            Molly.langevin_o_step!(vels_cpu, vel_scales, noise_scales,
++                                   philox_ctr1, philox_key, FT)
++            Molly.langevin_o_step!(vels_gpu, AT(vel_scales), AT(noise_scales),
++                                   philox_ctr1, philox_key, FT)
++            vels_gpu_cpu = Array(vels_gpu)
++
++            @test vels_cpu != init_vels
++            @test maximum(norm, vels_gpu_cpu .- vels_cpu) < 16 * eps(FT)
++        end
+     else
+         @warn "CUDA not functional, skipping GPU consistency tests"
+     end
+diff --git a/test/simulation.jl b/test/simulation.jl
+index b4e4c07a5..6a300ad0f 100644
+--- a/test/simulation.jl
++++ b/test/simulation.jl
+@@ -831,7 +831,8 @@ end
+ end
+ 
+ @testset "Temperature REMD" begin
+-    rng = MersenneTwister(1)
++    Random.seed!(1234)
++    rng = Xoshiro(10)
+     n_atoms = 100
+     n_steps = 20_000
+     atom_mass = 10.0u"g/mol"
+@@ -925,7 +926,8 @@ end
+ end
+ 
+ @testset "Hamiltonian REMD" begin
+-    rng = MersenneTwister(2)
++    Random.seed!(1234)
++    rng = Xoshiro(10)
+     n_atoms = 100
+     n_steps = 20_000
+     atom_mass = 10.0u"g/mol"

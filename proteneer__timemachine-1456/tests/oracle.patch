@@ -1,0 +1,650 @@
+diff --git a/tests/test_handlers.py b/tests/test_handlers.py
+index 10e3a11312..ff251dce7d 100644
+--- a/tests/test_handlers.py
++++ b/tests/test_handlers.py
+@@ -1,4 +1,6 @@
++import base64
+ import functools
++import pickle
+ from collections import defaultdict
+ from copy import deepcopy
+ from importlib import resources
+@@ -7,6 +9,7 @@
+ import jax.numpy as jnp
+ import numpy as np
+ import pytest
++from jax import flatten_util
+ from openmm import app
+ from rdkit import Chem
+ from rdkit.Chem import AllChem, rdmolops
+@@ -17,10 +20,108 @@
+ from timemachine.ff import Forcefield
+ from timemachine.ff.charges import AM1CCC_CHARGES
+ from timemachine.ff.handlers import bonded, nonbonded
++from timemachine.ff.handlers import utils as h_utils
+ from timemachine.md import builders
+ 
+ pytestmark = [pytest.mark.nocuda]
+ 
++TEST_FEATURE_SIZE = 16
++
++
++def set_nn_features(mol, seed=2024, feature_size=TEST_FEATURE_SIZE):
++    """
++    Add random NN features to the given mol for testing.
++    """
++    rng = np.random.default_rng(seed)
++    num_atoms = mol.GetNumAtoms()
++    bond_idxs = [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in mol.GetBonds()]
++
++    # the handler expected both directions of each bond to be present
++    bond_idxs_ = []
++    for bond_idx in bond_idxs:
++        bond_idxs_.append(bond_idx)
++        bond_idxs_.append(bond_idx[::-1])
++    bond_idxs = np.array(bond_idxs_)
++    num_bonds = bond_idxs.shape[0]
++
++    # create random features
++    atom_features = rng.random((num_atoms, feature_size))
++    bond_src_features = rng.random((num_bonds, feature_size))
++    bond_dst_features = rng.random((num_bonds, feature_size))
++
++    # symmetrize features using charges as a guide
++    # NOTE: This may not be what we want to do for the actual
++    # features, but is simple enough for testing
++    init_mol_charges = nonbonded.oe_assign_charges(mol, charge_model=nonbonded.AM1)
++    sym_charge_idxs = defaultdict(list)
++    for i, q in enumerate(init_mol_charges):
++        sym_charge_idxs[float(q)].append(i)
++
++    # all atoms in the sym. group should have the same features
++    for sym_group in sym_charge_idxs.values():
++        sym_atom_features = np.mean([atom_features[j] for j in sym_group], axis=0)
++        for j in sym_group:
++            atom_features[j, :] = sym_atom_features
++
++    # all bonds in the paired sym. group should have the same features
++    bond_features_by_sym_idx = defaultdict(list)
++    for i, bond_idx in enumerate(bond_idxs):
++        bond_feature = np.concatenate([bond_src_features[i], bond_dst_features[i]])
++        q0 = float(init_mol_charges[bond_idx[0]])
++        q1 = float(init_mol_charges[bond_idx[1]])
++        bond_features_by_sym_idx[(q0, q1)].append(bond_feature)
++
++    bond_features_ = []
++    for i, bond_idx in enumerate(bond_idxs):
++        q0 = float(init_mol_charges[bond_idx[0]])
++        q1 = float(init_mol_charges[bond_idx[1]])
++        bond_features_.append(np.mean(bond_features_by_sym_idx[(q0, q1)], axis=0))
++    bond_features = np.array(bond_features_)
++
++    bond_src_features = bond_features[:, :feature_size]
++    bond_dst_features = bond_features[:, feature_size:]
++
++    features = {
++        "atom_features": atom_features,
++        "bond_idxs": np.array(bond_idxs, dtype=int),
++        "bond_src_features": bond_src_features,
++        "bond_dst_features": bond_dst_features,
++    }
++    mol.SetProp(nonbonded.NN_FEATURES_PROPNAME, base64.b64encode(pickle.dumps(features)))
++
++
++@pytest.fixture(scope="module")
++def env_nn_args():
++    # Fixture that returns the smirks, params, props for a `EnvironmentNNHandler`.
++    rng = np.random.default_rng(seed=2024)
++    feature_size = TEST_FEATURE_SIZE
++
++    # init params and unflatten function
++    layer_sizes = [feature_size * 4, 8, 1]
++    weight_sizes = list(zip(np.array(layer_sizes)[1:], np.array(layer_sizes[:-1])))
++    full_params = [rng.random(weight_size) for weight_size in weight_sizes]
++    flat_params, unflatten = flatten_util.ravel_pytree(full_params)
++    params = [flat_params]
++    enc_unflatten_str = [base64.b64encode(pickle.dumps(unflatten))]
++
++    # enumerate all supported residues
++    all_res_names = []
++    for res_name in h_utils.SMILES_BY_RES_NAME.keys():
++        all_res_names.append(res_name)
++        if res_name not in ["ACE", "NME"]:
++            all_res_names.append("N" + res_name)
++            all_res_names.append("C" + res_name)
++
++    # set random nn features for each residue
++    res_nn_props = {}
++    for res_name in all_res_names:
++        res_mol = h_utils.make_residue_mol_from_template(res_name)
++        set_nn_features(res_mol, feature_size=feature_size)
++        res_nn_props[res_name] = res_mol.GetProp(nonbonded.NN_FEATURES_PROPNAME)
++    props = [base64.b64encode(pickle.dumps(res_nn_props)).decode("utf-8")]
++
++    return enc_unflatten_str, params, props
++
+ 
+ def test_harmonic_bond():
+     patterns = [
+@@ -1063,6 +1164,38 @@ def test_symmetric_am1ccc():
+     np.testing.assert_array_equal(test_charges, ref_charges)
+ 
+ 
++def test_nn_handler():
++    with resources.path("timemachine.testsystems.data", "ligands_40.sdf") as path_to_ligand:
++        all_mols = utils.read_sdf(path_to_ligand)
++
++    mol = all_mols[0]
++    seed = 2024
++    feature_size = TEST_FEATURE_SIZE
++    rng = np.random.default_rng(seed)
++
++    set_nn_features(mol, feature_size=feature_size)
++
++    # input has the features (atom0, atom1, bond)
++    layer_sizes = [feature_size * 4, 8, 1]
++    weight_sizes = list(zip(np.array(layer_sizes)[1:], np.array(layer_sizes[:-1])))
++    full_params = [rng.random(weight_size) for weight_size in weight_sizes]
++
++    flat_params, unflatten = flatten_util.ravel_pytree(full_params)
++    params = [flat_params]
++    enc_unflatten_str = [base64.b64encode(pickle.dumps(unflatten))]
++    nn = nonbonded.NNHandler(enc_unflatten_str, params, None)
++    charges = nn.static_parameterize(params, enc_unflatten_str, mol)
++    assert np.sum(charges) < 1e-5
++
++    def loss_fn(params):
++        return jnp.sum(jnp.abs(nn.static_parameterize(params, enc_unflatten_str, mol)))
++
++    grad_fn = jax.grad(loss_fn)
++    print("loss", loss_fn(params))  # fast
++    print("grad", grad_fn(params))  # a few seconds
++    print("jit grad", jax.jit(grad_fn)(params))  # also a few seconds
++
++
+ def test_harmonic_bonds_complete():
+     """On a test molecule containing [oxygen] ~ [halogen] bonds,
+     assert that a ValueError is raised."""
+@@ -1077,23 +1210,7 @@ def test_harmonic_bonds_complete():
+     assert "missing bonds" in str(e)
+ 
+ 
+-def make_residue_mol(atoms, bonds):
+-    # Generate an rdkit molecule given a list of atoms and a list of bonds
+-    mw = Chem.RWMol()
+-    mw.BeginBatchEdit()
+-    for atom in atoms:
+-        aa = Chem.Atom(atom)
+-        mw.AddAtom(aa)
+-
+-    for src, dst in bonds:
+-        mw.AddBond(src, dst, Chem.BondType.SINGLE)
+-    mw.CommitBatchEdit()
+-
+-    for atom in mw.GetAtoms():
+-        atom.SetProp("molAtomMapNumber", str(atom.GetIdx()))
+-    return mw
+-
+-
++@pytest.mark.parametrize("is_nn", [True, False])
+ @pytest.mark.parametrize(
+     "protein_path_and_symmetries",
+     [
+@@ -1148,17 +1265,22 @@ def make_residue_mol(atoms, bonds):
+         ),
+     ],
+ )
+-def test_env_bcc_peptide_symmetries(protein_path_and_symmetries):
++def test_env_bcc_peptide_symmetries(protein_path_and_symmetries, is_nn, env_nn_args):
+     """
+     Test that we can compute BCCs to generate per atom charge offsets and that they can be differentiated
+     """
+     protein_path, expected_symmetries = protein_path_and_symmetries
+-    smirks = [x[0] for x in AM1CCC_CHARGES["patterns"]]
+-    params = np.random.rand(len(smirks)) - 0.5
+-
+     with resources.path("timemachine.testsystems.data", protein_path) as path_to_pdb:
+         host_pdb = app.PDBFile(str(path_to_pdb))
+         topology = host_pdb.topology
++
++    rng = np.random.default_rng(seed=2024)
++    if is_nn:
++        smirks, params, props = env_nn_args
++        pbcc = nonbonded.EnvironmentNNHandler(smirks, params, props, DEFAULT_PROTEIN_FF, DEFAULT_WATER_FF, topology)
++    else:
++        smirks = [x[0] for x in AM1CCC_CHARGES["patterns"]]
++        params = rng.random(len(smirks)) - 0.5
+         pbcc = nonbonded.EnvironmentBCCHandler(smirks, params, DEFAULT_PROTEIN_FF, DEFAULT_WATER_FF, topology)
+ 
+     # raw charges are correct are in the order of atoms in the topology
+@@ -1174,7 +1296,7 @@ def test_env_bcc_peptide_symmetries(protein_path_and_symmetries):
+     for src_atom, dst_atom in topology.bonds():
+         bonds.append((src_atom.index, dst_atom.index))
+ 
+-    # mol = make_residue_mol(atoms, bonds)
++    # mol = hutils.make_residue_mol('res', atoms, bonds)
+     # from rdkit.Chem import Draw
+     # with open("debug.svg", "w") as fh:
+     #     svg = Draw.MolsToGridImage([mol], molsPerRow=4, useSVG=True)
+@@ -1190,27 +1312,31 @@ def test_env_bcc_peptide_symmetries(protein_path_and_symmetries):
+             np.testing.assert_almost_equal(raw_charges[other], raw_charges[first])
+ 
+ 
++@pytest.mark.nightly(reason="Slow")
++@pytest.mark.parametrize("is_nn", [True, False])
+ @pytest.mark.parametrize("protein_path", ["5dfr_solv_equil.pdb", "hif2a_nowater_min.pdb"])
+-def test_environment_bcc_full_protein(protein_path):
++def test_environment_bcc_full_protein(protein_path, is_nn, env_nn_args):
+     """
+     Test that we can compute BCCs to generate per atom charge offsets and that they can be differentiated
+     """
+-    patterns = [smirks for (smirks, param) in AM1CCC_CHARGES["patterns"]]
+-    np.random.seed(2024)
+-    params = np.random.rand(len(patterns)) - 0.5
+-
+     with resources.path("timemachine.testsystems.data", protein_path) as path_to_pdb:
+         host_pdb = app.PDBFile(str(path_to_pdb))
+         _, _, _, topology, _ = builders.build_protein_system(host_pdb, DEFAULT_PROTEIN_FF, DEFAULT_WATER_FF)
+ 
+-    pbcc = nonbonded.EnvironmentBCCHandler(patterns, params, DEFAULT_PROTEIN_FF, DEFAULT_WATER_FF, topology)
++    if is_nn:
++        patterns, params, props = env_nn_args
++        pbcc = nonbonded.EnvironmentNNHandler(patterns, params, props, DEFAULT_PROTEIN_FF, DEFAULT_WATER_FF, topology)
++    else:
++        patterns = [smirks for (smirks, param) in AM1CCC_CHARGES["patterns"]]
++        params = np.random.rand(len(patterns)) - 0.5
++        pbcc = nonbonded.EnvironmentBCCHandler(patterns, params, DEFAULT_PROTEIN_FF, DEFAULT_WATER_FF, topology)
+ 
+     # test that we can mechanically parameterize everything
+     final_q_params = pbcc.parameterize(params)
+ 
+     def loss_fn(bcc_params):
+         res = pbcc.parameterize(bcc_params)
+-        return jnp.sum(res)
++        return jnp.sum(res * res)
+ 
+     grad_fn = jax.grad(loss_fn)
+ 
+@@ -1220,13 +1346,17 @@ def loss_fn(bcc_params):
+ 
+     # test that the partial handler gives the same results
+     ff = Forcefield.load_default()
+-    partial_cc = nonbonded.EnvironmentBCCPartialHandler(patterns, params, None)
++    if is_nn:
++        partial_cc = nonbonded.EnvironmentNNPartialHandler(patterns, params, props)
++    else:
++        partial_cc = nonbonded.EnvironmentBCCPartialHandler(patterns, params, None)
++
+     pbcc2 = partial_cc.get_env_handle(topology, ff)
+     np.testing.assert_array_equal(pbcc.parameterize(params), pbcc2.parameterize(params))
+ 
+     def loss_fn2(bcc_params):
+         res = pbcc.parameterize(bcc_params)
+-        return jnp.sum(res)
++        return jnp.sum(res * res)
+ 
+     grad_fn2 = jax.grad(loss_fn2)
+ 
+diff --git a/timemachine/ff/__init__.py b/timemachine/ff/__init__.py
+index 2b60633de3..5bea20f353 100644
+--- a/timemachine/ff/__init__.py
++++ b/timemachine/ff/__init__.py
+@@ -56,6 +56,7 @@ class Forcefield:
+             nonbonded.AM1CCCHandler,
+             nonbonded.AM1BCCCCCHandler,
+             nonbonded.PrecomputedChargeHandler,
++            nonbonded.NNHandler,
+         ]
+     ]
+     q_handle_intra: Optional[
+@@ -65,12 +66,18 @@ class Forcefield:
+             nonbonded.AM1CCCIntraHandler,
+             nonbonded.AM1BCCCCCIntraHandler,
+             nonbonded.PrecomputedChargeHandler,
++            nonbonded.NNHandler,
+         ]
+     ]
+ 
+     lj_handle: Optional[nonbonded.LennardJonesHandler]
+     lj_handle_intra: Optional[nonbonded.LennardJonesIntraHandler]
+-    env_bcc_handle: Optional[nonbonded.EnvironmentBCCPartialHandler]
++    env_bcc_handle: Optional[
++        Union[
++            nonbonded.EnvironmentBCCPartialHandler,
++            nonbonded.EnvironmentNNPartialHandler,
++        ]
++    ]
+ 
+     protein_ff: str
+     water_ff: str
+@@ -159,7 +166,10 @@ def from_handlers(
+         env_bcc_handle = None
+ 
+         for handle in ff_handlers:
+-            if isinstance(handle, nonbonded.EnvironmentBCCPartialHandler):
++            if isinstance(
++                handle,
++                (nonbonded.EnvironmentBCCPartialHandler, nonbonded.EnvironmentNNPartialHandler),
++            ):
+                 assert env_bcc_handle is None
+                 env_bcc_handle = handle
+             elif isinstance(handle, bonded.HarmonicBondHandler):
+@@ -211,6 +221,7 @@ def from_handlers(
+                     nonbonded.AM1BCCHandler,
+                     nonbonded.SimpleChargeHandler,
+                     nonbonded.PrecomputedChargeHandler,
++                    nonbonded.NNHandler,
+                 ),
+             ):
+                 assert q_handle is None
+diff --git a/timemachine/ff/handlers/nonbonded.py b/timemachine/ff/handlers/nonbonded.py
+index 7135e3fba0..02d9944c78 100644
+--- a/timemachine/ff/handlers/nonbonded.py
++++ b/timemachine/ff/handlers/nonbonded.py
+@@ -6,6 +6,7 @@
+ import jax.numpy as jnp
+ import networkx as nx
+ import numpy as np
++from jax import jit, vmap
+ from numpy.typing import NDArray
+ from rdkit import Chem
+ 
+@@ -13,7 +14,12 @@
+ from timemachine.ff.handlers.bcc_aromaticity import AromaticityModel
+ from timemachine.ff.handlers.bcc_aromaticity import match_smirks as oe_match_smirks
+ from timemachine.ff.handlers.serialize import SerializableMixIn
+-from timemachine.ff.handlers.utils import canonicalize_bond, make_residue_mol, make_residue_mol_from_template
++from timemachine.ff.handlers.utils import (
++    canonicalize_bond,
++    get_query_mol,
++    make_residue_mol,
++    make_residue_mol_from_template,
++)
+ from timemachine.ff.handlers.utils import match_smirks as rd_match_smirks
+ from timemachine.ff.handlers.utils import update_mol_topology
+ from timemachine.graph_utils import convert_to_nx
+@@ -24,6 +30,7 @@
+ AM1ELF10_CHARGE_CACHE = "AM1ELF10Cache"
+ AM1BCCELF10_CHARGE_CACHE = "AM1BCCELF10Cache"
+ BOND_SMIRK_MATCH_CACHE = "BondSmirkMatchCache"
++NN_FEATURES_PROPNAME = "NNFeatures"
+ 
+ AM1 = "AM1"
+ AM1ELF10 = "AM1ELF10"
+@@ -499,6 +506,75 @@ def static_parameterize(mol):
+         return compute_or_load_oe_charges(mol, mode=AM1)
+ 
+ 
++@jit
++def eval_nn(features, params_by_layer):
++    def activation(x):
++        return x / (1 + jnp.exp(-x))  # silu
++
++    layers_by_index = list(sorted(params_by_layer.keys()))
++
++    x = features
++    for layer in layers_by_index[:-1]:
++        W = params_by_layer[layer]
++        x = activation(jnp.dot(W, x))
++
++    # last layer skips activation
++    W = params_by_layer[layers_by_index[-1]]
++    return jnp.squeeze(jnp.dot(W, x))  # scalar
++
++
++class NNHandler(SerializableMixIn):
++    def __init__(self, layer_sizes, params, props):
++        assert len(layer_sizes) == 1
++        assert len(params) == 1
++        # TODO: Make SerializableMixIn generic w.r.t. attribute names
++        self.smirks = layer_sizes
++        self.params = np.array(params, dtype=np.float64)
++        self.props = props
++
++    @staticmethod
++    def get_bond_idxs_and_charge_deltas(flat_params, encoded_unflatten_str, mol):
++        expand_params = pickle.loads(base64.b64decode(encoded_unflatten_str[0]))
++        features = pickle.loads(base64.b64decode(mol.GetProp(NN_FEATURES_PROPNAME)))
++        atom_features = features["atom_features"]
++        bond_idx_features = features["bond_idxs"]
++        bond_src_features = features["bond_src_features"]
++        bond_dst_features = features["bond_dst_features"]
++
++        # extract bond features
++        bond_features_by_idx = {}
++        for i, bond_idx in enumerate(bond_idx_features):
++            bond_feature = np.concatenate([bond_src_features[i], bond_dst_features[i]])
++            bond_features_by_idx[tuple(bond_idx)] = bond_feature
++        bond_idxs = np.array(sorted(set(bond_features_by_idx.keys())))
++
++        # expand params
++        reshaped_params = expand_params(flat_params[0])
++        layer_idxs = list(range(len(reshaped_params)))
++        params_by_layer = {int(layer_idx): param for layer_idx, param in zip(layer_idxs, reshaped_params)}
++
++        # evalute on all bonds
++        features_ = []
++        for bond_idx in bond_idxs:
++            bond_idx_tup = tuple(bond_idx)
++            a0 = atom_features[bond_idx[0]]
++            a1 = atom_features[bond_idx[1]]
++            b0 = bond_features_by_idx[bond_idx_tup]
++            features_.append(np.array(np.concatenate([a0, a1, b0])))
++        batched_features = jnp.array(features_)
++        c = np.sqrt(constants.ONE_4PI_EPS0)
++        vmap_fxn = vmap(eval_nn, in_axes=(0, None))
++        deltas = c * vmap_fxn(batched_features, params_by_layer)
++        return bond_idxs, jnp.array(deltas)
++
++    @staticmethod
++    def static_parameterize(flat_params, encoded_unflatten_str, mol):
++        am1_charges = compute_or_load_oe_charges(mol, mode=AM1BCC)
++        bond_idxs, deltas = NNHandler.get_bond_idxs_and_charge_deltas(flat_params, encoded_unflatten_str, mol)
++        final_charges = apply_bond_charge_corrections(am1_charges, bond_idxs, jnp.array(deltas), runtime_validate=False)
++        return final_charges
++
++
+ class AM1BCCHandler(SerializableMixIn):
+     """The AM1BCCHandler generates charges for molecules using OpenEye's AM1BCCELF10[1] protocol. Note that
+     if a single conformer molecular is passed to this handler, the charges appear equivalent with AM1BCC.
+@@ -600,9 +676,12 @@ def __init__(self, patterns, params, protein_ff_name, water_ff_name, topology):
+         self.topology_idx_to_template_idx = {atm.index: j for atm, j in self.data.atomTemplateIndexes.items()}
+ 
+         self.all_res_mols_by_name = {}
++        cur_atom = 0
+         for tfr in self.template_for_residue:
++            n_atoms = len(tfr.atoms)
+             if tfr.name in self.all_res_mols_by_name:
+                 # already processed this residue
++                cur_atom += n_atoms
+                 continue
+ 
+             symbol_list = [atm.element.symbol for atm in tfr.atoms]
+@@ -611,14 +690,18 @@ def __init__(self, patterns, params, protein_ff_name, water_ff_name, topology):
+             template_res_mol = make_residue_mol_from_template(tfr.name)
+             if template_res_mol is None:
+                 # i.e. skip water/ions
++                cur_atom += n_atoms
+                 continue
+ 
+-            # copy the charges and bond types from proper_res to omm_res
++            # copy the charges and bond types from template_res to topology_res_mol
+             update_mol_topology(topology_res_mol, template_res_mol)
+ 
+-            # cache smirks patterns to speed up parameterize
+-            compute_or_load_bond_smirks_matches(topology_res_mol, self.patterns)
++            # cache smirks patterns to speed up parameterize,
++            initial_res_charges = self.initial_charges[cur_atom : cur_atom + n_atoms]
++            self._compute_res_charges(tfr.name, topology_res_mol, initial_res_charges, params)
++
+             self.all_res_mols_by_name[tfr.name] = topology_res_mol
++            cur_atom += n_atoms
+ 
+     def _map_to_topology_order(self, template_charges, cur_atom, n_atoms):
+         # map back from the template ordering to the topology order
+@@ -628,6 +711,16 @@ def _map_to_topology_order(self, template_charges, cur_atom, n_atoms):
+             q_params[i] = template_charges[tmpl_atom_idx]
+         return jnp.array([q_params[i] for i in range(n_atoms)])
+ 
++    def _compute_res_charges(self, res_name, topology_res_mol, initial_res_charges, params):
++        bond_idxs, type_idxs = compute_or_load_bond_smirks_matches(topology_res_mol, self.patterns)
++        deltas = params[type_idxs]
++        return apply_bond_charge_corrections(
++            initial_res_charges,
++            bond_idxs,
++            deltas,
++            runtime_validate=False,  # required for jit
++        )
++
+     def parameterize(self, params):
+         cur_atom = 0
+         final_charges = []
+@@ -656,16 +749,11 @@ def parameterize(self, params):
+             for i in range(n_atoms):
+                 tmpl_atom_idx = self.topology_idx_to_template_idx[cur_atom + i]
+                 topology_res_mol_charges[tmpl_atom_idx] = initial_res_charges[i]
+-            topology_res_mol_charges_ordered = jnp.array([topology_res_mol_charges[i] for i in range(n_atoms)])
+-
+-            # compute smirks on the template residue
+-            bond_idxs, type_idxs = compute_or_load_bond_smirks_matches(topology_res_mol, self.patterns)
+-            deltas = params[type_idxs]
+-            tmpl_q_params = apply_bond_charge_corrections(
+-                topology_res_mol_charges_ordered,
+-                bond_idxs,
+-                deltas,
+-                runtime_validate=False,  # required for jit
++            topology_res_mol_charges_ordered = np.array([topology_res_mol_charges[i] for i in range(n_atoms)])
++
++            # compute the charges on the topology res
++            tmpl_q_params = self._compute_res_charges(
++                tfr.name, topology_res_mol, topology_res_mol_charges_ordered, params
+             )
+ 
+             # map the template charges back to topology order
+@@ -712,6 +800,78 @@ def get_env_handle(self, omm_topology, ff) -> EnvironmentBCCHandler:
+         return EnvironmentBCCHandler(self.smirks, self.params, ff.protein_ff, ff.water_ff, omm_topology)
+ 
+ 
++class EnvironmentNNHandler(EnvironmentBCCHandler):
++    """
++    Applies `NNHandler` to residues in a protein. Needs a concrete openmm topology to use.
++    NOTE: Currently, this only supports the amber99sbildn protein forcefield.
++    """
++
++    def __init__(self, patterns, params, props, protein_ff_name, water_ff_name, topology):
++        self.props = props
++        self.nn_h = NNHandler(patterns, params, None)
++        super().__init__(patterns, params, protein_ff_name, water_ff_name, topology)
++
++    def _compute_res_charges(self, res_name, topology_res_mol, initial_res_charges, params):
++        features_by_res = pickle.loads(base64.b64decode(self.props[0]))
++
++        # NOTE: This is NOT the same template as the OMM template in `EnvironmentBCCHandler`
++        template_res_mol = make_residue_mol_from_template(res_name)
++
++        # features are already encoded
++        template_res_mol.SetProp(NN_FEATURES_PROPNAME, features_by_res[res_name])
++
++        # map bond_idxs back to topology_res_mol
++        match = template_res_mol.GetSubstructMatch(get_query_mol(topology_res_mol))
++
++        # Match maps the topology_res_mol to template_res_mol
++        fwd_map = {i: v for i, v in enumerate(match)}
++
++        # map from template_res_mol to topology_res_mol
++        rev_map = {v: i for i, v in fwd_map.items()}
++
++        # get the bond_idxs, deltas for the template residue
++        bond_idxs, deltas = self.nn_h.get_bond_idxs_and_charge_deltas(params, self.patterns, template_res_mol)
++
++        # map back to the topology residue
++        top_bond_idxs = []
++        top_deltas = []
++        for bond_idx, delta in zip(bond_idxs, deltas):
++            src_idx, dst_idx = bond_idx
++            # May have a bond that is not present in the original topology
++            # so skip these in the BCC
++            if src_idx in rev_map and dst_idx in rev_map:
++                top_src_idx = rev_map[src_idx]
++                top_dst_idx = rev_map[dst_idx]
++                top_bond_idxs.append((top_src_idx, top_dst_idx))
++                top_deltas.append(delta)
++
++        final_charges = apply_bond_charge_corrections(
++            initial_res_charges, np.array(top_bond_idxs), jnp.array(top_deltas), runtime_validate=False
++        )
++        return final_charges
++
++
++class EnvironmentNNPartialHandler(EnvironmentBCCPartialHandler):
++    """
++    Similar to `EnvironmentBCCPartialHandler` but using the NNHandler
++    in place of BCC terms.
++    """
++
++    def get_env_handle(self, omm_topology, ff) -> EnvironmentNNHandler:
++        """
++        Return an initialized `EnvironmentNNHandler` which can be used to
++        get the (possibly updated) environment charges.
++
++        Parameters
++        ----------
++        omm_topology:
++            Openmm topology object for the environment.
++
++        ff: Forcefield
++        """
++        return EnvironmentNNHandler(self.smirks, self.params, self.props, ff.protein_ff, ff.water_ff, omm_topology)
++
++
+ class AM1CCCHandler(SerializableMixIn):
+     """The AM1CCCHandler stands for AM1 Correctable Charge Correction (CCC) which uses OpenEye's AM1 charges[1]
+     along with corrections provided by the Forcefield definition in the form of SMIRKS and charge deltas. The SMIRKS
+diff --git a/timemachine/ff/handlers/utils.py b/timemachine/ff/handlers/utils.py
+index 7cda1dbc96..9e80de76ac 100644
+--- a/timemachine/ff/handlers/utils.py
++++ b/timemachine/ff/handlers/utils.py
+@@ -1,6 +1,7 @@
+ from typing import List, Optional, Tuple, TypeAlias
+ 
+ from rdkit import Chem
++from rdkit.Chem import AllChem
+ 
+ Mol: TypeAlias = Chem.rdchem.Mol
+ 
+@@ -26,7 +27,7 @@
+     "CYM": "N[C@@H](C[S-])C(O)=O",
+     "GLY": "C(C(=O)O)N",
+     "PRO": "C1C[C@H](NC1)C(=O)O",
+-    "ALA": "O=C(O)C(N)C",
++    "ALA": "C[C@H](N)C(=O)O",
+     "VAL": "CC(C)[C@@H](C(=O)O)N",
+     "ILE": "CC[C@H](C)[C@@H](C(=O)O)N",
+     "LEU": "CC(C)C[C@@H](C(=O)O)N",
+@@ -183,6 +184,8 @@ def make_residue_mol_from_template(template_name: str) -> Optional[Mol]:
+     if has_c_cap:
+         mol = add_c_cap(mol)
+ 
++    mol.UpdatePropertyCache()
++    AllChem.EmbedMolecule(mol, randomSeed=2024)
+     return mol
+ 
+ 
+@@ -285,7 +288,7 @@ def add_n_cap(template_res_mol: Mol) -> Mol:
+     n_atom.SetFormalCharge(+1)
+     h_atom = mw.AddAtom(Chem.Atom("H"))
+ 
+-    mw.AddBond(h_atom, n_atom_idx)
++    mw.AddBond(h_atom, n_atom_idx, order=Chem.rdchem.BondType.SINGLE)
+     mw.CommitBatchEdit()
+     return mw
+ 
+@@ -305,7 +308,7 @@ def add_c_cap(template_res_mol: Mol) -> Mol:
+     mw = Chem.RWMol(template_res_mol)
+     mw.BeginBatchEdit()
+ 
+-    oxygen_idx = matches[0][3]
++    oxygen_idx = matches[0][3]  # order from AMIDE_SMILES
+     oxygen_atom = mw.GetAtomWithIdx(oxygen_idx)
+     oxygen_atom.SetFormalCharge(-1)
+     for bond in oxygen_atom.GetBonds():

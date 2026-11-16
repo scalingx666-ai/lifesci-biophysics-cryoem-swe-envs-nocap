@@ -1,0 +1,631 @@
+diff --git a/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py b/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
+index 346528006..fadbdfe59 100644
+--- a/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
++++ b/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
+@@ -1278,6 +1278,263 @@ def execute(self, state: dict) -> dict:
+         return state
+ 
+ 
++def _assign_missing_indices(regimes: list, missing: set, reduction) -> str:
++    """Place spectra the planner left out of every regime.
++
++    Coherent axis (or no reduction): each missing index joins the regime of its
++    NEAREST assigned neighbour along the series axis (spectra are value-sorted,
++    so index distance is axis distance; ties go to the lower neighbour).
++    Incoherent axis: it joins the regime whose members' median PC1 score is
++    closest. Falls back to the first regime only when nothing is assigned at
++    all. Mutates ``spectrum_indices``; returns the rule used (for the log)."""
++    assigned = {i: r for r in regimes for i in r.get("spectrum_indices", [])}
++    if not assigned:
++        regimes[0]["spectrum_indices"] = sorted(set(regimes[0].get("spectrum_indices", [])) | set(missing))
++        return "first regime (no index assigned anywhere)"
++    import numpy as _np
++    ac = (reduction or {}).get("axis_coherence") or {} if isinstance(reduction, dict) else {}
++    scores = (reduction or {}).get("scores_by_index") if isinstance(reduction, dict) else None
++    if ac and not ac.get("coherent", True) and scores:
++        scores = _np.asarray(scores, dtype=float)
++        medians = {id(r): float(_np.median(scores[[i for i in r.get("spectrum_indices", []) if i < scores.size]]))
++                   for r in regimes if r.get("spectrum_indices")}
++        for idx in sorted(missing):
++            if idx >= scores.size:
++                continue
++            best = min((r for r in regimes if id(r) in medians), key=lambda r: abs(scores[idx] - medians[id(r)]))
++            best["spectrum_indices"] = sorted(set(best["spectrum_indices"]) | {idx})
++        return "nearest regime in PC1-score space (axis not coherent)"
++    keys = sorted(assigned)
++    sc = _np.asarray(scores, dtype=float) if scores else None
++    for idx in sorted(missing):
++        d_min = min(abs(k - idx) for k in keys)
++        tied = [k for k in keys if abs(k - idx) == d_min]
++        if len(tied) > 1 and sc is not None and idx < sc.size:
++            # equidistant neighbours in different regimes: let the data decide
++            def _dist(k):
++                m = [i for i in assigned[k].get("spectrum_indices", []) if i < sc.size]
++                return abs(sc[idx] - float(_np.median(sc[m]))) if m else float("inf")
++            nearest = min(tied, key=_dist)
++        else:
++            nearest = tied[0]
++        r = assigned[nearest]
++        r["spectrum_indices"] = sorted(set(r["spectrum_indices"]) | {idx})
++    return "nearest assigned neighbour along the series axis"
++
++
++_MEMBERSHIP_MARGIN_FRACTION = 0.25            # incoherent axis: a "clear misfit"
++_MEMBERSHIP_MARGIN_FRACTION_COHERENT = 0.4    # coherent axis: only an UNAMBIGUOUS misfit
++_MEMBERSHIP_RANGE_PAD_FRACTION = 0.1          # coherent axis: padding of the target regime's score range
++_MEMBERSHIP_MIN_SOURCE_COHERENT = 3           # coherent axis: a source regime needs this many members
++_MEMBERSHIP_MAX_PASSES = 3                    # correction passes (each pass re-evaluates medians)
++_CLUSTER_GAP_FRACTION = 0.3                   # 1-D score gap (of the range) that separates clusters
++
++
++def _correct_regime_membership(regimes: list, reduction) -> list:
++    """Move a spectrum to the regime whose PC1 scores it matches.
++
++    Incoherent axis (interleaved regimes): a clear misfit — farther than
++    ``_MEMBERSHIP_MARGIN_FRACTION`` of the score range from its own regime's
++    median than from another regime's — is moved.
++    Coherent axis: the planner's positional assignment stands unless a
++    spectrum is an UNAMBIGUOUS misfit — the stricter margin AND its score
++    lies inside the other regime's observed score range (a boundary spectrum
++    between two scouts that the planner guessed onto the wrong side). A
++    gradual transition never satisfies both, so a conventional monotone
++    series is left as planned.
++    Returns ``[(index, from_name, to_name), ...]``; mutates ``spectrum_indices``.
++    No-op for a single regime or missing scores."""
++    if not isinstance(reduction, dict):
++        return []
++    ac = reduction.get("axis_coherence") or {}
++    scores = reduction.get("scores_by_index")
++    if not ac or not scores or len(regimes) < 2:
++        return []
++    coherent = bool(ac.get("coherent", True))
++    import numpy as _np
++    scores = _np.asarray(scores, dtype=float)
++    rng = float(scores.max() - scores.min())
++    if rng <= 0:
++        return []
++    margin = (_MEMBERSHIP_MARGIN_FRACTION_COHERENT if coherent else _MEMBERSHIP_MARGIN_FRACTION) * rng
++    moves = []
++    # Cluster consensus first: when the scores fall into well-separated 1-D
++    # clusters (gaps > _CLUSTER_GAP_FRACTION of the range) and there are exactly
++    # as many clusters as planned regimes, membership is read off the clusters
++    # (each regime keeps its name/model, matched to the cluster it overlaps most).
++    # This repairs a scrambled plan that per-spectrum medians cannot. A gradual
++    # series has no separated clusters and is never touched here.
++    # On an incoherent axis a regime must not straddle well-separated clusters
++    # (e.g. opposite-signed steps lumped as one "step" regime): split such a
++    # regime into per-cluster sub-regimes that inherit its model, then let the
++    # consensus below place strays. Never applied on a coherent axis.
++    split_moves = _split_regimes_by_clusters(regimes, scores, rng) if not coherent else []
++    consensus = _cluster_consensus(regimes, scores, rng)
++    if consensus or split_moves:
++        return split_moves + consensus
++    # Iterate to convergence (bounded): moving a spectrum changes its old and new
++    # regime's medians, which can expose a misfit that a single pass would miss.
++    for _pass in range(_MEMBERSHIP_MAX_PASSES):
++        n_before = len(moves)
++        moves.extend(_membership_pass(regimes, scores, rng, margin, coherent))
++        if len(moves) == n_before:
++            break
++    return moves
++
++
++def _cluster_scores_1d(scores, rng: float, gap_fraction: float):
++    """Labels of well-separated 1-D clusters: sort the scores and cut at every
++    gap larger than ``gap_fraction`` of the range. Returns an int label per
++    input index (0..k-1 in ascending score order)."""
++    import numpy as _np
++    order = _np.argsort(scores)
++    lab = _np.zeros(scores.size, dtype=int); k = 0
++    for i, idx in enumerate(order):
++        if i and scores[idx] - scores[order[i - 1]] > gap_fraction * rng:
++            k += 1
++        lab[idx] = k
++    return lab
++
++
++def _split_regimes_by_clusters(regimes: list, scores, rng: float) -> list:
++    """Incoherent axis only: when the scores form more well-separated clusters
++    than there are regimes, split every regime whose members span several
++    clusters into one sub-regime per cluster (same model, name suffixed).
++    Mutates ``regimes`` in place; returns pseudo-moves for the log."""
++    import copy as _copy
++    import numpy as _np
++    labels = _cluster_scores_1d(scores, rng, _CLUSTER_GAP_FRACTION)
++    k = int(labels.max()) + 1
++    live = [r for r in regimes if r.get("spectrum_indices")]
++    if k <= len(live):
++        return []
++    moves = []
++    new_list = []
++    for r in regimes:
++        idxs = [i for i in r.get("spectrum_indices", []) if 0 <= i < scores.size]
++        cl = sorted({int(labels[i]) for i in idxs})
++        if len(cl) <= 1:
++            new_list.append(r)
++            continue
++        for j, c in enumerate(cl):
++            sub = _copy.deepcopy(r)
++            sub["name"] = f"{r.get('name', 'unnamed')} [cluster {j + 1}]"
++            sub["spectrum_indices"] = sorted(i for i in idxs if labels[i] == c)
++            sub["split_from"] = r.get("name", "unnamed")
++            new_list.append(sub)
++            if j:
++                for i in sub["spectrum_indices"]:
++                    moves.append((i, r.get("name", "unnamed"), sub["name"]))
++    # one cluster -> one regime: merge regimes that now share a single cluster
++    # into the largest of them (an original regime wins over a split piece)
++    by_cluster = {}
++    for r in new_list:
++        idxs = [i for i in r.get("spectrum_indices", []) if 0 <= i < scores.size]
++        cl = {int(labels[i]) for i in idxs}
++        if len(cl) == 1:
++            by_cluster.setdefault(cl.pop(), []).append(r)
++    merged = set()
++    for c, rs in by_cluster.items():
++        if len(rs) < 2:
++            continue
++        rs.sort(key=lambda r: (r.get("split_from") is not None, -len(r.get("spectrum_indices", []))))
++        keep = rs[0]
++        for r in rs[1:]:
++            for i in r.get("spectrum_indices", []):
++                moves.append((i, r.get("name", "unnamed"), keep.get("name", "unnamed")))
++            keep["spectrum_indices"] = sorted(set(keep["spectrum_indices"]) | set(r.get("spectrum_indices", [])))
++            merged.add(id(r))
++    regimes[:] = [r for r in new_list if id(r) not in merged]
++    return moves
++
++
++def _cluster_consensus(regimes: list, scores, rng: float) -> list:
++    """Membership from well-separated score clusters when their count equals
++    the number of planned regimes and the cluster->regime matching (by majority
++    overlap) is one-to-one. Returns the moves made ([] when not applicable)."""
++    import numpy as _np
++    labels = _cluster_scores_1d(scores, rng, _CLUSTER_GAP_FRACTION)
++    k = int(labels.max()) + 1
++    live = [r for r in regimes if r.get("spectrum_indices")]
++    if k < 2 or k != len(live):
++        return []
++    # match clusters to regimes by the distance between the cluster centre and
++    # the regime's current median score (overlap count only breaks ties): a
++    # regime's median survives a partly scrambled listing far better than a
++    # head count does.
++    assign = {}
++    used = set()
++    pairs = []
++    def _rmed(r):
++        m = [i for i in r.get("spectrum_indices", []) if i < scores.size]
++        return float(_np.median(scores[m])) if m else float("inf")
++    for c in range(k):
++        idxs = [int(i) for i in _np.where(labels == c)[0]]
++        centre = float(_np.median(scores[idxs]))
++        for r in live:
++            ov = len(set(idxs) & set(r.get("spectrum_indices", [])))
++            pairs.append((abs(centre - _rmed(r)), -ov, c, id(r)))
++    for dist, negov, c, rid in sorted(pairs):
++        if c in assign or rid in used:
++            continue
++        assign[c] = rid; used.add(rid)
++    # leftovers (a cluster no regime overlaps): pair by order — clusters by score,
++    # regimes by the median score of their current members
++    if len(assign) != k:
++        return []
++    by_id = {id(r): r for r in live}
++    old = {id(r): list(r.get("spectrum_indices", [])) for r in live}
++    moves = []
++    for c, rid in assign.items():
++        new_members = sorted(int(i) for i in _np.where(labels == c)[0])
++        for i in new_members:
++            src = next((r for r in live if i in old[id(r)]), None)
++            if src is not None and id(src) != rid:
++                moves.append((i, src.get("name", "unnamed"), by_id[rid].get("name", "unnamed")))
++        by_id[rid]["spectrum_indices"] = new_members
++    return moves
++
++
++def _membership_pass(regimes, scores, rng, margin, coherent):
++    import numpy as _np
++    members = {id(r): [i for i in r.get("spectrum_indices", []) if 0 <= i < scores.size] for r in regimes}
++    medians = {}
++    for r in regimes:
++        m = members[id(r)]
++        if m:
++            medians[id(r)] = float(_np.median(scores[m]))
++    moves = []
++    for r in regimes:
++        if id(r) not in medians:
++            continue
++        if coherent and len(members[id(r)]) < _MEMBERSHIP_MIN_SOURCE_COHERENT:
++            continue      # a 1-2 member regime (a planner's "transition" bin) has no reliable median; leave it
++        for idx in list(members[id(r)]):
++            own = abs(scores[idx] - medians[id(r)])
++            best, best_d = None, None
++            for o in regimes:
++                if o is r or id(o) not in medians:
++                    continue
++                d = abs(scores[idx] - medians[id(o)])
++                if best_d is None or d < best_d:
++                    best, best_d = o, d
++            if best is not None and best_d + margin < own:
++                if len(r.get("spectrum_indices", [])) <= 1:
++                    continue      # never empty a regime
++                if coherent:
++                    others = [i for i in members[id(best)] if i != idx]
++                    if not others:
++                        continue
++                    pad = _MEMBERSHIP_RANGE_PAD_FRACTION * rng     # tight regimes (near-identical members) still count
++                    lo, hi = float(scores[others].min()) - pad, float(scores[others].max()) + pad
++                    if not (lo <= scores[idx] <= hi):
++                        continue
++                moves.append((idx, r.get("name", "unnamed"), best.get("name", "unnamed")))
++                r["spectrum_indices"] = [i for i in r.get("spectrum_indices", []) if i != idx]
++                best["spectrum_indices"] = sorted(set(best.get("spectrum_indices", [])) | {idx})
++    return moves
++
++
+ class SeriesScoutController:
+     """Scout representative spectra across a series before planning.
+ 
+@@ -1296,9 +1553,17 @@ def __init__(
+         self.logger = logger
+         self.plot_fn = plot_fn
+ 
+-    @staticmethod
+-    def _select_scout_indices(num_spectra: int) -> list:
+-        """Select evenly spaced representative indices, capped at 7."""
++    # When the series axis does not order the spectra into contiguous regimes
++    # (interleaved designs along a label axis), the planner must see every
++    # spectrum rather than a positional subsample — up to this many.
++    _SCOUT_ALL_MAX = 16
++
++    @classmethod
++    def _select_scout_indices(cls, num_spectra: int, scout_all: bool = False) -> list:
++        """Select evenly spaced representative indices, capped at 7 — or every
++        spectrum (capped at ``_SCOUT_ALL_MAX``) when ``scout_all`` is set."""
++        if scout_all and num_spectra <= cls._SCOUT_ALL_MAX:
++            return list(range(num_spectra))
+         if num_spectra <= 3:
+             return list(range(num_spectra))
+         if num_spectra <= 6:
+@@ -1449,7 +1714,20 @@ def execute(self, state: dict) -> dict:
+ 
+         self.logger.info("\n🔭 --- Scouting Series ---\n")
+ 
+-        scout_indices = self._select_scout_indices(num_spectra)
++        # Full-series change detection first (additive: the scouts below remain
++        # the visual evidence; this locates WHERE the series changes using every
++        # spectrum, which a <=7-spectrum subsample cannot) — and tells us whether
++        # the series axis orders the spectra into contiguous regimes at all.
++        self._run_series_reduction(state, num_spectra)
++        reduction = state.get("series_reduction") or {}
++        axis_coherent = (reduction.get("axis_coherence") or {}).get("coherent", True)
++        if not axis_coherent:
++            ac = reduction["axis_coherence"]
++            self.logger.info(
++                f"  Series axis is not coherent ({ac['n_large_steps']} large PC1 steps, "
++                f"{ac['n_reversals']} reversals along the axis): regimes interleave, "
++                "so every spectrum is scouted and membership is judged per spectrum.")
++        scout_indices = self._select_scout_indices(num_spectra, scout_all=not axis_coherent)
+         series_metadata = state.get("series_metadata", {})
+         values = series_metadata.get("values", [])
+         variable = series_metadata.get("variable", "index")
+@@ -1501,11 +1779,6 @@ def execute(self, state: dict) -> dict:
+         else:
+             state["scout_overlay_plot"] = None
+ 
+-        # Full-series change detection (additive: the scouts above remain the
+-        # visual evidence; this locates WHERE the series changes using every
+-        # spectrum, which the <=7-spectrum subsample cannot).
+-        self._run_series_reduction(state, num_spectra)
+-
+         state["scout_data"] = scout_data
+         self.logger.info(f"  Scouted {len(scout_data)} of {num_spectra} spectra")
+ 
+@@ -2332,11 +2605,29 @@ def _append_scout_context(self, prompt: list, state: dict, scout_data: list) ->
+                 lines.append(f"- Flags: {', '.join(flag_names)}")
+             if reduction.get("caution"):
+                 lines.append(f"- Caution: {reduction['caution']}")
+-            lines.append(
+-                "Use this to place regime boundaries and to judge whether "
+-                "the scouts straddle a transition; the plots remain the "
+-                "evidence for WHAT changes."
+-            )
++            ac = reduction.get("axis_coherence") or {}
++            if ac and not ac.get("coherent", True):
++                scores = reduction.get("scores_by_index") or []
++                lines.append(
++                    f"- AXIS NOT COHERENT: the PC1 score makes {ac.get('n_large_steps')} large "
++                    f"jumps with {ac.get('n_reversals')} direction reversals along "
++                    f"'{axis}', so this variable does NOT order the spectra into "
++                    "contiguous regimes (regimes interleave — e.g. controls and "
++                    "perturbed runs alternating in file order). Assign regime "
++                    "membership PER SPECTRUM from the data: every spectrum is "
++                    "scouted below, and its PC1 score is listed here. Spectra with "
++                    "similar scores and similar plots belong together; a regime's "
++                    "spectrum_indices may be NON-contiguous. Do not place boundaries "
++                    "by position along the axis."
++                )
++                lines.append("- PC1 score per spectrum index: "
++                             + ", ".join(f"{i}: {v:+.3g}" for i, v in enumerate(scores)))
++            else:
++                lines.append(
++                    "Use this to place regime boundaries and to judge whether "
++                    "the scouts straddle a transition; the plots remain the "
++                    "evidence for WHAT changes."
++                )
+             prompt.append("\n".join(lines))
+             if reduction.get("score_curve_png"):
+                 prompt.append({
+@@ -2416,12 +2707,10 @@ def _extract_series_plan(self, state: dict, result: dict) -> None:
+ 
+         missing = set(range(num_spectra)) - all_indices
+         if missing:
++            rule = _assign_missing_indices(regimes, missing, state.get("series_reduction"))
+             self.logger.warning(
+                 f"  Series plan missing indices {sorted(missing)}, "
+-                f"assigning to first regime"
+-            )
+-            regimes[0]["spectrum_indices"] = sorted(
+-                set(regimes[0]["spectrum_indices"]) | missing
++                f"assigned by {rule}"
+             )
+ 
+         # Drop regimes that ended up fitting no spectra. The LLM sometimes names
+@@ -2454,6 +2743,18 @@ def _extract_series_plan(self, state: dict, result: dict) -> None:
+             if not regime.get("parameters_to_extract"):
+                 regime["parameters_to_extract"] = series_plan.get("parameters_to_extract", [])
+ 
++        # Data-space membership check for an incoherent axis: a spectrum whose
++        # PC1 score sits far from its regime-mates and close to another regime's
++        # is moved there (logged). Only runs when the axis was found incoherent,
++        # so a conventional monotone series keeps the planner's assignment.
++        corrections = _correct_regime_membership(regimes, state.get("series_reduction"))
++        for idx, src, dst in corrections:
++            self.logger.info(f"  Regime membership corrected from data: spectrum {idx} "
++                             f"'{src}' -> '{dst}' (PC1 score far from '{src}', close to '{dst}')")
++        if corrections:
++            series_plan["membership_corrections"] = [
++                {"index": i, "from": a, "to": b} for i, a, b in corrections]
++
+         state["series_analysis_plan"] = series_plan
+         self.logger.info(
+             f"  Series analysis plan: {len(regimes)} regime(s)"
+diff --git a/scilink/skills/_shared/series_reduction.py b/scilink/skills/_shared/series_reduction.py
+index 3e5ee4a22..a7f4c8750 100644
+--- a/scilink/skills/_shared/series_reduction.py
++++ b/scilink/skills/_shared/series_reduction.py
+@@ -37,6 +37,11 @@
+     r"temperature|temp\b|_temp|time|pressure|voltage|potential|field|"
+     r"concentration|dose|current", re.IGNORECASE)
+ _N_GRID = 500
++# Axis-coherence test (see reduce_curves): a 'large' PC1 step is this fraction of
++# the score range; the axis is incoherent once large steps reverse direction this
++# many times (interleaved regimes along a label axis).
++_AXIS_LARGE_STEP_FRACTION = 0.3
++_AXIS_MAX_REVERSALS = 2
+ _SHIFT_R_THRESHOLD = 0.7
+ _DRIFT_R_THRESHOLD = 0.9
+ 
+@@ -205,10 +210,33 @@ def _abs_corr(a, b):
+             "resampled_to_common_grid": not same_grid,
+         }
+ 
++        # Axis coherence: does the control variable ORDER the curves into
++        # contiguous regimes? Along a physical monotone axis the PC1 score is
++        # (piecewise) monotone: at most a couple of large jumps, all in one
++        # direction. Along a mere label axis (file order, sample id) regimes
++        # interleave and the score jumps back and forth. Counted on large
++        # steps only (> 30 % of the score range) so noise never trips it.
++        steps = np.diff(score1)
++        large = np.where(np.abs(steps) > _AXIS_LARGE_STEP_FRACTION * rng)[0] if rng > 0 else np.array([], dtype=int)
++        signs = np.sign(steps[large])
++        n_reversals = int(np.sum(signs[1:] != signs[:-1])) if signs.size > 1 else 0
++        axis_coherence = {
++            "n_large_steps": int(large.size),
++            "n_reversals": n_reversals,
++            "coherent": n_reversals < _AXIS_MAX_REVERSALS,
++        }
++        scores_by_index = np.empty_like(score1)
++        scores_by_index[order] = score1          # back to the caller's input order
++        controls_by_index = np.empty_like(controls)
++        controls_by_index[order] = controls
++
+         out = {
+             "status": "success",
+             "label": label,
+             "n_points": int(len(curves)),
++            "axis_coherence": axis_coherence,
++            "scores_by_index": [round(float(v), 6) for v in scores_by_index],
++            "controls_by_index": [float(v) for v in controls_by_index],
+             "n_channels": int(grid.size),
+             "control_variable": {
+                 "source": source,
+diff --git a/tests/test_series_regime_membership.py b/tests/test_series_regime_membership.py
+new file mode 100644
+index 000000000..87a850c91
+--- /dev/null
++++ b/tests/test_series_regime_membership.py
+@@ -0,0 +1,183 @@
++"""Interleaved series along a label axis: axis coherence, scout-all, prompt
++block, and data-space regime-membership correction — with the conventional
++monotone series left byte-identical."""
++import json
++import numpy as np
++import pytest
++
++from scilink.skills._shared.series_reduction import reduce_curves
++from scilink.agents.exp_agents.controllers.curve_fitting_controllers import (
++    SeriesScoutController, _correct_regime_membership)
++
++X = np.linspace(0, 100, 200)
++
++
++def _curve(step):          # a flat trace with an optional level step at x = 50
++    return X, np.where(X > 50, step, 0.0) + 0.02 * np.sin(X)
++
++
++def _interleaved():        # controls at 0, 3, 8; +/- steps elsewhere (file order axis)
++    steps = [0, 25, -25, 0, 22, -23, 21, -15, 0]
++    return [_curve(s) for s in steps], steps
++
++
++def _monotone(n=12, t0=6):  # conventional: a composition switch along temperature
++    curves = [_curve(0 if i < t0 else 20) for i in range(n)]
++    return curves, [300 + 10 * i for i in range(n)]
++
++
++def test_axis_coherence_flags_interleaved_but_not_monotone():
++    curves, _ = _interleaved()
++    r = reduce_curves(curves, controls=list(range(9)), control_source="role_index")
++    assert r["status"] == "success" and r["axis_coherence"]["coherent"] is False
++    assert r["axis_coherence"]["n_reversals"] >= 2 and len(r["scores_by_index"]) == 9
++    curves, temps = _monotone()
++    r2 = reduce_curves(curves, controls=temps, control_source="temperature")
++    assert r2["axis_coherence"]["coherent"] is True and r2["axis_coherence"]["n_reversals"] == 0
++    assert abs(r2["change_point"] - 355) < 6
++
++
++def test_scores_by_index_follow_input_order_not_sorted_order():
++    curves, temps = _monotone()
++    shuffled = [5, 0, 11, 3, 8, 1, 9, 2, 10, 4, 7, 6]
++    r = reduce_curves([curves[i] for i in shuffled], controls=[temps[i] for i in shuffled])
++    sc = np.asarray(r["scores_by_index"])
++    high = [k for k, i in enumerate(shuffled) if i >= 6]
++    low = [k for k, i in enumerate(shuffled) if i < 6]
++    assert sc[high].min() > sc[low].max()
++
++
++def test_scout_all_only_when_incoherent():
++    assert SeriesScoutController._select_scout_indices(9) == [0, 2, 4, 6, 8]
++    assert SeriesScoutController._select_scout_indices(9, scout_all=True) == list(range(9))
++    assert SeriesScoutController._select_scout_indices(40, scout_all=True) == \
++        SeriesScoutController._select_scout_indices(40)          # above the cap: unchanged
++    assert SeriesScoutController._select_scout_indices(12) == [0, 3, 6, 9, 11]
++
++
++def test_membership_correction_moves_clear_misfit_only_when_incoherent():
++    curves, steps = _interleaved()
++    red = reduce_curves(curves, controls=list(range(9)), control_source="role_index")
++    regimes = [{"name": "control", "spectrum_indices": [0, 1, 3, 8]},          # 1 is wrong (a +25 step)
++               {"name": "insertion", "spectrum_indices": [4, 6]},
++               {"name": "retraction", "spectrum_indices": [2, 5, 7]}]
++    moves = _correct_regime_membership(regimes, red)
++    assert moves == [(1, "control", "insertion")]
++    assert regimes[0]["spectrum_indices"] == [0, 3, 8] and regimes[1]["spectrum_indices"] == [1, 4, 6]
++    # coherent axis, sharp two-level series: a boundary spectrum the planner put on
++    # the wrong side is an UNAMBIGUOUS misfit (score inside the other regime's range)
++    curves, temps = _monotone()
++    red2 = reduce_curves(curves, controls=temps, control_source="temperature")
++    regimes2 = [{"name": "a", "spectrum_indices": [0, 1, 2, 3, 4, 5, 6]}, {"name": "b", "spectrum_indices": [7, 8, 9, 10, 11]}]
++    assert _correct_regime_membership(regimes2, red2) == [(6, "a", "b")]
++    assert regimes2[0]["spectrum_indices"] == [0, 1, 2, 3, 4, 5] and regimes2[1]["spectrum_indices"] == [6, 7, 8, 9, 10, 11]
++    # coherent axis, a control filed into a sharp-step regime: moved even though the
++    # control regime's two members have (near-)identical scores
++    curves = [_curve(s) for s in (0, 0, 0, 25, 25, 25, -25, -25, -25)]
++    red4 = reduce_curves(curves, controls=[0, 0, 0, 1, 1, 1, 2, 2, 2], control_source="magnet_action")
++    regimes5 = [{"name": "ctl", "spectrum_indices": [0, 1]}, {"name": "ins", "spectrum_indices": [2, 3, 4, 5]}, {"name": "ret", "spectrum_indices": [6, 7, 8]}]
++    assert _correct_regime_membership(regimes5, red4) == [(2, "ins", "ctl")]
++    # coherent axis, a planner's 2-member "transition" bin of pure-phase spectra: left alone
++    # (a 1-2 member regime has no reliable median; conventional plans are not restructured)
++    curves, temps = _monotone()
++    red5 = reduce_curves(curves, controls=temps, control_source="temperature")
++    regimes6 = [{"name": "low", "spectrum_indices": [0, 1, 2, 3, 4]}, {"name": "coex", "spectrum_indices": [5, 6]},
++                {"name": "high", "spectrum_indices": [7, 8, 9, 10, 11]}]
++    assert _correct_regime_membership(regimes6, red5) == [] and regimes6[1]["spectrum_indices"] == [5, 6]
++    # coherent axis, GRADUAL transition: nothing is moved (a ramp spectrum is never inside the other regime's range by a wide margin)
++    ramp = [_curve(20.0 * i / 11) for i in range(12)]
++    red3 = reduce_curves(ramp, controls=temps, control_source="temperature")
++    assert red3["axis_coherence"]["coherent"] is True
++    regimes3 = [{"name": "a", "spectrum_indices": [0, 1, 2, 3, 4, 5]}, {"name": "b", "spectrum_indices": [6, 7, 8, 9, 10, 11]}]
++    assert _correct_regime_membership(regimes3, red3) == []
++    regimes4 = [{"name": "a", "spectrum_indices": [0, 1, 2, 3, 4, 5, 6, 7]}, {"name": "b", "spectrum_indices": [8, 9, 10, 11]}]
++    assert _correct_regime_membership(regimes4, red3) == []
++    assert _correct_regime_membership(regimes, None) == []
++
++
++def test_planner_prompt_gets_membership_block_only_when_incoherent(tmp_path):
++    from scilink.agents.exp_agents.controllers import curve_fitting_controllers as cfc
++    src = open(cfc.__file__).read()
++    assert "AXIS NOT COHERENT" in src and "PC1 score per spectrum index" in src
++    i = src.index("AXIS NOT COHERENT"); j = src.index("Use this to place regime boundaries")
++    assert i < j and 'if ac and not ac.get("coherent", True)' in src
++
++
++def test_missing_indices_join_nearest_neighbour_or_nearest_score():
++    from scilink.agents.exp_agents.controllers.curve_fitting_controllers import _assign_missing_indices
++    # coherent (value-sorted) axis: neighbours decide
++    regimes = [{"name": "ret", "spectrum_indices": [0, 2]}, {"name": "ctl", "spectrum_indices": [4]}, {"name": "ins", "spectrum_indices": [6, 8]}]
++    rule = _assign_missing_indices(regimes, {1, 3, 5, 7}, {"axis_coherence": {"coherent": True}})
++    assert "neighbour" in rule                      # no scores: ties (3, 5) go to the lower neighbour
++    assert regimes[0]["spectrum_indices"] == [0, 1, 2, 3] and regimes[1]["spectrum_indices"] == [4, 5] and regimes[2]["spectrum_indices"] == [6, 7, 8]
++    # with scores, an equidistant index follows the data: here 3 and 5 look like the control (score ~0)
++    curves = [_curve(s) for s in (-25, -25, -25, 0, 0, 0, 25, 25, 25)]
++    red = reduce_curves(curves, controls=[-1, -1, -1, 0, 0, 0, 1, 1, 1], control_source="magnet_condition")
++    assert red["axis_coherence"]["coherent"] is True
++    regimes = [{"name": "ret", "spectrum_indices": [0, 2]}, {"name": "ctl", "spectrum_indices": [4]}, {"name": "ins", "spectrum_indices": [6, 8]}]
++    _assign_missing_indices(regimes, {1, 3, 5, 7}, red)
++    assert regimes[0]["spectrum_indices"] == [0, 1, 2] and regimes[1]["spectrum_indices"] == [3, 4, 5] and regimes[2]["spectrum_indices"] == [6, 7, 8]
++    # incoherent axis: PC1 score decides
++    curves, steps = _interleaved()
++    red = reduce_curves(curves, controls=list(range(9)), control_source="role_index")
++    regimes = [{"name": "ctl", "spectrum_indices": [0, 8]}, {"name": "ins", "spectrum_indices": [4]}, {"name": "ret", "spectrum_indices": [2]}]
++    rule = _assign_missing_indices(regimes, {1, 3, 5, 6, 7}, red)
++    assert "PC1" in rule
++    assert regimes[0]["spectrum_indices"] == [0, 3, 8] and regimes[1]["spectrum_indices"] == [1, 4, 6] and regimes[2]["spectrum_indices"] == [2, 5, 7]
++    # nothing assigned at all: first regime, as before
++    regimes = [{"name": "a", "spectrum_indices": []}, {"name": "b", "spectrum_indices": []}]
++    assert "first regime" in _assign_missing_indices(regimes, {0, 1}, None) and regimes[0]["spectrum_indices"] == [0, 1]
++
++
++def test_membership_correction_converges_over_passes():
++    # planner put one control and two retractions into a 3-member 'insertion' bin;
++    # pass 1 moves the two stepped spectra, pass 2 then sees the control as a misfit
++    curves = [_curve(s) for s in (0, 0, 0, 25, 25, 25, -25, -25, -25)]
++    red = reduce_curves(curves, controls=[0, 0, 0, 1, 1, 1, 2, 2, 2], control_source="magnet_action")
++    regimes = [{"name": "ctl", "spectrum_indices": [0, 1]}, {"name": "ins", "spectrum_indices": [2, 4]},
++               {"name": "ret", "spectrum_indices": [3, 5, 6, 7, 8]}]
++    moves = _correct_regime_membership(regimes, red)
++    assert set(m[0] for m in moves) == {2, 3, 5}
++    assert regimes[0]["spectrum_indices"] == [0, 1, 2] and regimes[1]["spectrum_indices"] == [3, 4, 5] and regimes[2]["spectrum_indices"] == [6, 7, 8]
++
++
++def test_cluster_consensus_repairs_a_scrambled_plan_and_leaves_gradual_and_mismatched_counts():
++    curves = [_curve(s) for s in (0, 0, 0, 25, 25, 25, -25, -25, -25)]
++    red = reduce_curves(curves, controls=[0, 0, 0, 1, 1, 1, 2, 2, 2], control_source="magnet_action")
++    regimes = [{"name": "ctl", "spectrum_indices": [0, 1, 7]}, {"name": "ins", "spectrum_indices": [2, 3]},
++               {"name": "ret", "spectrum_indices": [4, 5, 6, 8]}]
++    moves = _correct_regime_membership(regimes, red)
++    assert {m[0] for m in moves} == {2, 4, 5, 7}
++    assert regimes[0]["spectrum_indices"] == [0, 1, 2] and regimes[1]["spectrum_indices"] == [3, 4, 5] and regimes[2]["spectrum_indices"] == [6, 7, 8]
++    # conventional: 3 planned regimes but only 2 score clusters -> consensus not applicable, plan kept
++    curves, temps = _monotone()
++    red2 = reduce_curves(curves, controls=temps, control_source="temperature")
++    regimes2 = [{"name": "low", "spectrum_indices": [0, 1, 2, 3, 4]}, {"name": "coex", "spectrum_indices": [5, 6]},
++                {"name": "high", "spectrum_indices": [7, 8, 9, 10, 11]}]
++    assert _correct_regime_membership(regimes2, red2) == []
++    # gradual ramp: one cluster -> nothing
++    ramp = [_curve(20.0 * i / 11) for i in range(12)]
++    red3 = reduce_curves(ramp, controls=temps, control_source="temperature")
++    regimes3 = [{"name": "a", "spectrum_indices": [0, 1, 2, 3, 4, 5]}, {"name": "b", "spectrum_indices": [6, 7, 8, 9, 10, 11]}]
++    assert _correct_regime_membership(regimes3, red3) == []
++
++
++def test_incoherent_axis_splits_a_regime_that_straddles_clusters():
++    # file-order axis: controls at 0,3,8; insertions (+) and retractions (-) interleaved;
++    # the planner lumped all stepped runs into ONE regime and misfiled control 0 into it
++    curves, steps = _interleaved()
++    red = reduce_curves(curves, controls=list(range(9)), control_source="workflow")
++    assert red["axis_coherence"]["coherent"] is False
++    regimes = [{"name": "flat", "spectrum_indices": [3, 8]},
++               {"name": "step", "spectrum_indices": [0, 1, 2, 4, 5, 6, 7], "physical_model": "two-level step"}]
++    moves = _correct_regime_membership(regimes, red)
++    names = {r["name"]: sorted(r["spectrum_indices"]) for r in regimes}
++    assert len(regimes) == 3 and any(m[0] == 0 for m in moves)
++    groups = sorted(sorted(v) for v in names.values())
++    assert groups == [[0, 3, 8], [1, 4, 6], [2, 5, 7]]
++    assert all(r.get("physical_model") == "two-level step" for r in regimes if "step" in r["name"])
++    # coherent axis: never split
++    curves2, temps = _monotone()
++    red2 = reduce_curves(curves2, controls=temps, control_source="temperature")
++    regimes2 = [{"name": "all", "spectrum_indices": list(range(12))}]
++    assert _correct_regime_membership(regimes2, red2) == [] and len(regimes2) == 1

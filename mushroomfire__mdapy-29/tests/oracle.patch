@@ -1,0 +1,795 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 012779d6..b169c2b4 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -247,3 +247,27 @@ jobs:
+           # Recent kernels randomize mmap with 32 bits, which TSan does not expect.
+           sudo sysctl -w vm.mmap_rnd_bits=28
+           TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 ./thread_checks
++
++  # libFuzzer on the kernels of text files (tests/fuzz): any text is read or
++  # refused without a fault, numbers agree with strtod bit for bit and come back
++  # unchanged when written, tables come back unchanged. A minute for each.
++  fuzz:
++    name: fuzz — text kernels
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v5
++      - name: Clang with libFuzzer
++        run: sudo apt-get update -q && sudo apt-get install -y -q clang-18 libclang-rt-18-dev
++      - name: Build
++        run: |
++          for target in numbers table; do
++            clang++-18 -std=c++17 -O1 -g -fsanitize=fuzzer,address,undefined \
++              -fno-sanitize-recover=undefined -ffp-contract=off -Isrc/cpp \
++              -o fuzz_$target tests/fuzz/fuzz_$target.cpp src/cpp/core/parallel.cpp src/cpp/io/text.cpp
++          done
++      - name: Run
++        run: |
++          for target in numbers table; do
++            mkdir -p corpus_$target
++            ./fuzz_$target -max_total_time=60 -print_final_stats=1 corpus_$target
++          done
+diff --git a/docs/about/contributing.md b/docs/about/contributing.md
+index 61445728..d5dc306e 100644
+--- a/docs/about/contributing.md
++++ b/docs/about/contributing.md
+@@ -155,6 +155,15 @@ nightly wheels of NumPy and the pre-releases of polars, so that a change of thei
+ breaks MDAPY, or warns of one, shows before it reaches users. A new lower bound in
+ `pyproject.toml` is the version the lowest job installs.
+ 
++Files from elsewhere are often damaged. `tests/io/test_damaged_files.py` damages a
++sample of every format at random, from a fixed seed, and requires an error of MDAPY for
++each, never another exception. Below it, `tests/fuzz/` holds two
++[libFuzzer](https://llvm.org/docs/LibFuzzer.html) targets of the C++ kernels of text
++files: any text is read or refused without a fault, numbers agree with `strtod` bit for
++bit and come back unchanged when written, and so do tables. CI runs each for a minute;
++the command to build them is at the top of each file, and a longer run by hand is
++worthwhile after a change to `src/cpp/io/text.cpp`.
++
+ ### What a complete run needs
+ 
+ `pip install -e ".[dev]"` gives everything a plain `pytest` needs: the test
+diff --git a/docs/about/release-notes.md b/docs/about/release-notes.md
+index 939e2804..14d3a9ee 100644
+--- a/docs/about/release-notes.md
++++ b/docs/about/release-notes.md
+@@ -10,6 +10,13 @@
+ - The documentation is published from the tag of each release, so that it describes the
+   version `pip` installs.
+ - `CITATION.cff` gives GitHub's "Cite this repository" the paper to cite.
++- Plain XYZ files read: a comment line without `=` is free text, kept as
++  `info["comment"]`, and each atom line then holds an element symbol and x, y, z.
++- Every NaN is written as `nan` in text files; some systems wrote `-nan(ind)` or
++  `nan(snan)`, which no reader takes back.
++- An atom count too large for 64 bits in a damaged header gives a FileFormatError.
++- Damaged files of every format are tested to give an error of MDAPY, and the text
++  kernels are fuzzed in CI.
+ 
+ ## 2.0.0b1
+ 
+diff --git a/docs/reference/formats/extxyz.md b/docs/reference/formats/extxyz.md
+index dbe1232d..59c8a23e 100644
+--- a/docs/reference/formats/extxyz.md
++++ b/docs/reference/formats/extxyz.md
+@@ -99,6 +99,10 @@ commas), JSON after the prefix `_JSON `, or else text. A key without a value
+ is `True`. Values with blanks are quoted with `""`, `''`, `{}` or `[]`, and a
+ backslash makes the next character literal.
+ 
++A comment line without `=` holds no `key=value` pair: it is the free comment of a
++plain XYZ file, such as `water, relaxed with PBE`, kept whole as `info["comment"]`,
++and its words are not keys. Writing puts it back as `comment="..."`.
++
+ When writing, numbers, booleans, text and 1-dimensional arrays are written
+ as such. Other values (arrays of other shapes, mappings, `None`, and text that
+ would read back as a number) are written as `_JSON` so that they read back
+diff --git a/src/cpp/io/text.cpp b/src/cpp/io/text.cpp
+index 28a55394..1bf1bbcb 100644
+--- a/src/cpp/io/text.cpp
++++ b/src/cpp/io/text.cpp
+@@ -788,6 +788,20 @@ inline char* write_double(char* out, double value) {
+         *out = '0';
+         return out + 1;
+     }
++    // As Python writes them: every NaN as nan, whatever its sign and payload
++    // (std::to_chars writes -nan(ind) or nan(snan) on some systems, which no
++    // reader takes), and the infinities as inf and -inf.
++    if (biased == 0x7ff) {
++        if ((bits & ((std::uint64_t{1} << 52) - 1)) != 0) {
++            std::memcpy(out, "nan", 3);
++            return out + 3;
++        }
++        if (negative) {
++            *out++ = '-';
++        }
++        std::memcpy(out, "inf", 3);
++        return out + 3;
++    }
+     if (!(magnitude < 1e15) || biased < kLowestFastExponent) {
+         return std::to_chars(out, out + 32, value).ptr;
+     }
+diff --git a/src/mdapy/io/_extxyz.py b/src/mdapy/io/_extxyz.py
+index a0f70975..9c7427b0 100644
+--- a/src/mdapy/io/_extxyz.py
++++ b/src/mdapy/io/_extxyz.py
+@@ -242,6 +242,14 @@ def _special(key: str, raw: str | None) -> Any:
+ 
+ 
+ def _parse_comment(reader: TextReader, line: str) -> dict[str, Any]:
++    """The fields of a comment line.
++
++    A line without '=' holds no key=value pair: it is the free comment of a
++    plain XYZ file, kept whole as info["comment"], and its words are not keys.
++    """
++    text = line.strip()
++    if "=" not in text:
++        return {"comment": text} if text else {}
+     fields: dict[str, Any] = {}
+     try:
+         for key, raw in _split_items(line):
+@@ -328,6 +336,7 @@ def _read(source: Source, position: FramePosition) -> System:
+     count = _atom_count(reader, reader.readline())
+     comment_line = reader.line + 1
+     fields = _parse_comment(reader, reader.readline())
++    plain = "properties" not in fields
+     properties = _parse_properties(
+         reader, fields.pop("properties", _DEFAULT_PROPERTIES)
+     )
+@@ -349,25 +358,37 @@ def _read(source: Source, position: FramePosition) -> System:
+         targets.append(target)
+     if "positions" not in targets:
+         raise reader.error("Properties has no pos property", comment_line)
+-    arrays = reader.table(
+-        count,
+-        [
+-            # vel is in Å/fs; the shift converts it to Å/ps exactly.
+-            (_KINDS[t], w, 3 if (name, target) == ("vel", "velocities") else 0)
+-            for (name, t, w), target in zip(properties, targets)
+-        ],
+-    )
+-
+     columns: dict[str, pl.Series | None] = {}
+     momenta = None
+-    for (name, ptype, width), target, values in zip(properties, targets, arrays):
+-        if name == "momenta" and target == "velocities":
+-            columns[target] = None  # filled in below, once masses are known
+-            momenta = values
+-        else:
+-            columns[target] = _column(
+-                reader, target, ptype, width, values, comment_line + 1
+-            )
++    try:
++        arrays = reader.table(
++            count,
++            [
++                # vel is in Å/fs; the shift converts it to Å/ps exactly.
++                (_KINDS[t], w, 3 if (name, target) == ("vel", "velocities") else 0)
++                for (name, t, w), target in zip(properties, targets)
++            ],
++        )
++        for (name, ptype, width), target, values in zip(properties, targets, arrays):
++            if name == "momenta" and target == "velocities":
++                columns[target] = None  # filled in below, once masses are known
++                momenta = values
++            else:
++                columns[target] = _column(
++                    reader, target, ptype, width, values, comment_line + 1
++                )
++    except FileFormatError as e:
++        if not plain:
++            raise
++        # without Properties: say what a line of a plain XYZ file holds
++        location = f"{e.path}:{e.line}: " if e.line is not None else f"{e.path}: "
++        message = str(e).removeprefix(location)
++        raise FileFormatError(
++            f"{message}; without Properties on the comment line, each line holds an "
++            "element symbol and x, y, z",
++            e.path,
++            e.line,
++        ) from None
+     if momenta is not None:
+         if "mass" in columns:
+             masses = columns["mass"].to_numpy()
+diff --git a/src/mdapy/io/_text.py b/src/mdapy/io/_text.py
+index 61634af2..e386c89e 100644
+--- a/src/mdapy/io/_text.py
++++ b/src/mdapy/io/_text.py
+@@ -63,6 +63,9 @@ def readline(self) -> str:
+ 
+     def skip(self, n: int) -> None:
+         """Skips n lines."""
++        # as in table: a count in a damaged header may not even fit in 64 bits
++        if n > len(self.buffer) - self.offset + 1:
++            raise self.error("unexpected end of file", self.line + 1)
+         try:
+             self.offset = _native.skip_lines(self.buffer, self.offset, n)
+         except ValueError as e:
+diff --git a/tests/fuzz/fuzz_numbers.cpp b/tests/fuzz/fuzz_numbers.cpp
+new file mode 100644
+index 00000000..bc7b5bd2
+--- /dev/null
++++ b/tests/fuzz/fuzz_numbers.cpp
+@@ -0,0 +1,151 @@
++// Copyright (c) 2022-2026, Yongchao Wu
++// This Source Code Form is subject to the terms of the Mozilla Public License,
++// v. 2.0. If a copy of the MPL was not distributed with this file, You can
++// obtain one at https://mozilla.org/MPL/2.0/.
++//
++// A libFuzzer target of the number kernels of text files, with clang:
++//
++//   clang++ -std=c++17 -O1 -g -fsanitize=fuzzer,address,undefined -ffp-contract=off
++//       -Isrc/cpp -o fuzz_numbers tests/fuzz/fuzz_numbers.cpp
++//       src/cpp/core/parallel.cpp src/cpp/io/text.cpp
++//   ./fuzz_numbers -max_total_time=600 corpus/
++//
++// Any input must be read without a fault. A plain decimal number must give the
++// double that strtod gives in the C locale, bit for bit. And any double, given
++// as the first eight bytes, must come back unchanged when written and read
++// again, with and without a decimal shift, in no more digits than the shortest
++// text that std::to_chars writes.
++
++#include <charconv>
++#include <clocale>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#if defined(__APPLE__)
++#include <xlocale.h>
++#else
++#include <locale.h>
++#endif
++
++#include "io/text.h"
++
++namespace {
++
++using mdapy::io::Column;
++using mdapy::io::Kind;
++
++[[noreturn]] void fail(const char* what, const std::string& text) {
++    std::fprintf(stderr, "%s: [%s]\n", what, text.c_str());
++    std::abort();
++}
++
++// Digits with an optional sign, decimal point and exponent: the numbers that
++// both Python's float() and strtod read, and read alike.
++bool plain_decimal(const char* p, std::size_t n) {
++    std::size_t i = 0;
++    if (i < n && (p[i] == '+' || p[i] == '-')) ++i;
++    std::size_t digits = 0;
++    while (i < n && p[i] >= '0' && p[i] <= '9') ++i, ++digits;
++    if (i < n && p[i] == '.') {
++        ++i;
++        while (i < n && p[i] >= '0' && p[i] <= '9') ++i, ++digits;
++    }
++    if (digits == 0) return false;
++    if (i < n && (p[i] == 'e' || p[i] == 'E')) {
++        ++i;
++        if (i < n && (p[i] == '+' || p[i] == '-')) ++i;
++        std::size_t exponent = 0;
++        while (i < n && p[i] >= '0' && p[i] <= '9') ++i, ++exponent;
++        if (exponent == 0) return false;
++    }
++    return i == n;
++}
++
++double c_strtod(const std::string& text, bool& whole) {
++    static locale_t c = newlocale(LC_ALL_MASK, "C", nullptr);
++    char* end = nullptr;
++    double value = strtod_l(text.c_str(), &end, c);
++    whole = end == text.c_str() + text.size();
++    return value;
++}
++
++bool same(double a, double b) {
++    if (std::isnan(a) && std::isnan(b)) return true;
++    return std::memcmp(&a, &b, sizeof a) == 0;
++}
++
++// The significant digits of a decimal number written by either writer.
++int significant_digits(const std::string& text) {
++    std::string digits;
++    for (char ch : text) {
++        if (ch == 'e' || ch == 'E') break;
++        if (ch >= '0' && ch <= '9') digits += ch;
++    }
++    std::size_t first = digits.find_first_not_of('0');
++    if (first == std::string::npos) return 1;
++    std::size_t last = digits.find_last_not_of('0');
++    return static_cast<int>(last - first + 1);
++}
++
++std::string written(double value, int shift) {
++    Column column;
++    column.kind = Kind::Float;
++    column.data = &value;
++    column.shift = shift;
++    std::vector<Column> columns{column};
++    std::string text = mdapy::io::format_table(1, columns);
++    if (text.empty() || text.back() != '\n') fail("no line", text);
++    text.pop_back();
++    return text;
++}
++
++void round_trip(double value, int shift) {
++    const std::string text = written(value, shift);
++    double back = 0;
++    if (!mdapy::io::parse_double(text.data(), text.data() + text.size(), back, -shift)) {
++        fail("written text not read", text);
++    }
++    if (!same(value, back)) fail("value changed in a round trip", text);
++    if (shift == 0 && std::isfinite(value)) {
++        char shortest[64];
++        auto result = std::to_chars(shortest, shortest + sizeof shortest, value);
++        const std::string reference(shortest, result.ptr);
++        if (significant_digits(text) > significant_digits(reference)) {
++            fail("more digits than the shortest", text + "] against [" + reference);
++        }
++    }
++}
++
++}  // namespace
++
++extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
++    const char* text = reinterpret_cast<const char*>(data);
++    double value = 0;
++    std::int64_t integer = 0;
++    const bool read = mdapy::io::parse_double(text, text + size, value);
++    mdapy::io::parse_int64(text, text + size, integer);
++    if (size > 0) {
++        double shifted = 0;
++        mdapy::io::parse_double(text + 1, text + size, shifted,
++                                static_cast<int>(static_cast<std::int8_t>(data[0])) % 40);
++    }
++    if (plain_decimal(text, size)) {
++        const std::string number(text, size);
++        bool whole = false;
++        const double reference = c_strtod(number, whole);
++        if (read != whole) fail("accepted differently from strtod", number);
++        if (read && !same(value, reference)) fail("differs from strtod", number);
++    }
++    if (size >= 8) {
++        double bits;
++        std::memcpy(&bits, data, sizeof bits);
++        round_trip(bits, 0);
++        if (size >= 9) round_trip(bits, static_cast<int>(static_cast<std::int8_t>(data[8])) % 8);
++    }
++    return 0;
++}
+diff --git a/tests/fuzz/fuzz_table.cpp b/tests/fuzz/fuzz_table.cpp
+new file mode 100644
+index 00000000..61578df1
+--- /dev/null
++++ b/tests/fuzz/fuzz_table.cpp
+@@ -0,0 +1,170 @@
++// Copyright (c) 2022-2026, Yongchao Wu
++// This Source Code Form is subject to the terms of the Mozilla Public License,
++// v. 2.0. If a copy of the MPL was not distributed with this file, You can
++// obtain one at https://mozilla.org/MPL/2.0/.
++//
++// A libFuzzer target of the text tables, built as fuzz_numbers.cpp is:
++//
++//   clang++ -std=c++17 -O1 -g -fsanitize=fuzzer,address,undefined -ffp-contract=off
++//       -Isrc/cpp -o fuzz_table tests/fuzz/fuzz_table.cpp
++//       src/cpp/core/parallel.cpp src/cpp/io/text.cpp
++//
++// The first bytes choose the columns (kind and width), the rows and the comment
++// character; the rest is the text. Any text must be read or refused with a
++// ParseError, without a fault. A table that was read must be written and read
++// again to the same values.
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "core/parallel.h"
++#include "io/text.h"
++
++namespace {
++
++using mdapy::io::Column;
++using mdapy::io::Kind;
++
++constexpr Kind kKinds[] = {Kind::Float, Kind::Int, Kind::Bool, Kind::String, Kind::Skip};
++
++struct Table {
++    std::vector<Column> columns;
++    std::vector<std::vector<double>> floats;
++    std::vector<std::vector<std::int64_t>> ints;
++    std::vector<std::vector<std::uint8_t>> bools;
++    std::vector<std::vector<std::uint32_t>> codes;
++};
++
++Table make(const std::vector<std::pair<Kind, int>>& layout, std::int64_t rows) {
++    Table table;
++    table.floats.reserve(layout.size());
++    table.ints.reserve(layout.size());
++    table.bools.reserve(layout.size());
++    table.codes.reserve(layout.size());
++    for (const auto& [kind, width] : layout) {
++        Column column;
++        column.kind = kind;
++        column.width = width;
++        const std::size_t n = static_cast<std::size_t>(rows * width);
++        switch (kind) {
++            case Kind::Float:
++                column.data = table.floats.emplace_back(n).data();
++                break;
++            case Kind::Int:
++                column.data = table.ints.emplace_back(n).data();
++                break;
++            case Kind::Bool:
++                column.data = table.bools.emplace_back(n).data();
++                break;
++            case Kind::String:
++                column.data = table.codes.emplace_back(n).data();
++                break;
++            case Kind::Skip:
++                break;
++        }
++        table.columns.push_back(column);
++    }
++    return table;
++}
++
++bool same(double a, double b) {
++    return (std::isnan(a) && std::isnan(b)) || std::memcmp(&a, &b, sizeof a) == 0;
++}
++
++}  // namespace
++
++extern "C" int LLVMFuzzerInitialize(int*, char***) {
++    mdapy::set_num_threads(2);
++    return 0;
++}
++
++extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
++    if (size < 3) return 0;
++    const int count = 1 + data[0] % 4;
++    if (size < static_cast<std::size_t>(count) + 2) return 0;
++    std::vector<std::pair<Kind, int>> layout;
++    for (int c = 0; c < count; ++c) {
++        layout.emplace_back(kKinds[data[1 + c] % 5], 1 + (data[1 + c] / 5) % 3);
++    }
++    const std::int64_t rows = data[1 + count] % 16;
++    const char comment = (data[0] & 0x80) != 0 ? '#' : '\0';
++    const std::size_t head = static_cast<std::size_t>(count) + 2;
++    const char* text = reinterpret_cast<const char*>(data) + head;
++    const auto length = static_cast<std::int64_t>(size - head);
++
++    try {
++        mdapy::io::skip_lines(text, length, 0, rows);
++    } catch (const mdapy::io::ParseError&) {
++    }
++    Table table = make(layout, rows);
++    try {
++        mdapy::io::parse_table(text, length, 0, rows, table.columns, comment);
++    } catch (const mdapy::io::ParseError&) {
++        return 0;
++    }
++
++    // Written and read again: the same values and the same categories.
++    std::vector<std::pair<Kind, int>> kept;
++    for (const auto& item : layout) {
++        if (item.first != Kind::Skip) kept.push_back(item);
++    }
++    if (kept.empty()) return 0;
++    Table first = make(kept, rows);
++    std::size_t f = 0, i = 0, b = 0, s = 0;
++    for (std::size_t c = 0, k = 0; c < layout.size(); ++c) {
++        const Column& column = table.columns[c];
++        if (column.kind == Kind::Skip) continue;
++        Column& copy = first.columns[k++];
++        switch (column.kind) {
++            case Kind::Float:
++                first.floats[f] = table.floats[f];
++                copy.data = first.floats[f++].data();
++                break;
++            case Kind::Int:
++                first.ints[i] = table.ints[i];
++                copy.data = first.ints[i++].data();
++                break;
++            case Kind::Bool:
++                first.bools[b] = table.bools[b];
++                copy.data = first.bools[b++].data();
++                break;
++            case Kind::String:
++                first.codes[s] = table.codes[s];
++                copy.data = first.codes[s++].data();
++                copy.categories = column.categories;
++                break;
++            case Kind::Skip:
++                break;
++        }
++    }
++    const std::string written = mdapy::io::format_table(rows, first.columns);
++    Table again = make(kept, rows);
++    try {
++        mdapy::io::parse_table(written.data(), static_cast<std::int64_t>(written.size()), 0, rows,
++                               again.columns, '\0');
++    } catch (const mdapy::io::ParseError& error) {
++        std::fprintf(stderr, "written table not read: %s\n[%s]\n", error.what(), written.c_str());
++        std::abort();
++    }
++    for (std::size_t k = 0; k < first.floats.size(); ++k) {
++        for (std::size_t n = 0; n < first.floats[k].size(); ++n) {
++            if (!same(first.floats[k][n], again.floats[k][n])) std::abort();
++        }
++    }
++    if (first.ints != again.ints || first.bools != again.bools) std::abort();
++    for (std::size_t c = 0, k = 0; c < kept.size(); ++c) {
++        if (kept[c].first != Kind::String) continue;
++        const Column& a = first.columns[c];
++        const Column& z = again.columns[c];
++        for (std::size_t n = 0; n < first.codes[k].size(); ++n) {
++            if (a.categories[first.codes[k][n]] != z.categories[again.codes[k][n]]) std::abort();
++        }
++        ++k;
++    }
++    return 0;
++}
+diff --git a/tests/io/test_damaged_files.py b/tests/io/test_damaged_files.py
+new file mode 100644
+index 00000000..7f91c8b5
+--- /dev/null
++++ b/tests/io/test_damaged_files.py
+@@ -0,0 +1,142 @@
++# Copyright (c) 2022-2026, Yongchao Wu
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""Damaged files of every format give an error of MDAPY, never another one.
++
++Each sample file is damaged at random, from a fixed seed, as files are: cut short,
++lines lost or doubled, bytes changed, numbers replaced by others. Reading the result
++must give a system or an MdapyError (FileFormatError for most), for one frame and for
++a whole trajectory.
++"""
++
++import random
++
++import numpy as np
++import pytest
++
++import mdapy
++from mdapy.build import build_crystal
++from mdapy.errors import MdapyError
++
++TOKENS = [
++    b"nan", b"inf", b"-1", b"0", b"1e308", b"99999999999999999999", b"x", b"", b"T",
++    b"1.5", b"-0", b"2147483648", b"-9223372036854775809",
++]  # fmt: skip
++INSERTS = [b"\n", b"\r\n", b"\t", b"  ", b"#", b'"', b"=", b"\x00"]
++
++
++def damaged(data: bytes, r: random.Random) -> bytes:
++    """data with one to eight random kinds of damage."""
++    b = bytearray(data)
++    for _ in range(r.choice([1, 1, 1, 2, 3, 8])):
++        if not b:
++            break
++        i = r.randrange(len(b))
++        lines = bytes(b).split(b"\n")
++        kind = r.randrange(9)
++        if kind == 0:
++            b[i] = r.randrange(256)
++        elif kind == 1:
++            del b[i:]
++        elif kind == 2:
++            b[i:i] = bytes(r.randrange(256) for _ in range(r.randrange(1, 8)))
++        elif kind == 3 and len(lines) > 1:
++            del lines[r.randrange(len(lines))]
++            b = bytearray(b"\n".join(lines))
++        elif kind == 4 and len(lines) > 1:
++            k = r.randrange(len(lines))
++            lines.insert(k, lines[k])
++            b = bytearray(b"\n".join(lines))
++        elif kind == 5:
++            tokens = bytes(b).split(b" ")
++            tokens[r.randrange(len(tokens))] = r.choice(TOKENS)
++            b = bytearray(b" ".join(tokens))
++        elif kind == 6:
++            del b[i : i + r.randrange(1, 40)]
++        elif kind == 7:
++            j = r.randrange(len(b))
++            b[i], b[j] = b[j], b[i]
++        else:
++            b[i:i] = r.choice(INSERTS)
++    return bytes(b)
++
++
++def samples(tmp_path) -> dict[str, tuple[str, str, bytes]]:
++    rng = np.random.default_rng(1)
++    system = build_crystal("fcc", 3.6, elements="Cu", repeat=(2, 2, 2))
++    system = system.with_columns(
++        velocities=rng.normal(size=(len(system), 3)),
++        forces=rng.normal(size=(len(system), 3)),
++        charge=rng.normal(size=len(system)),
++    ).with_info(energy=-12.5)
++    files = {}
++    for fmt, name, frames in [
++        ("extxyz", "a.xyz", [system, system]),
++        ("lammps-data", "a.data", system),
++        ("lammps-dump", "a.dump", [system, system]),
++        ("poscar", "POSCAR", system),
++        ("mdapy", "a.mdapy", [system, system]),
++    ]:
++        mdapy.io.write(tmp_path / name, frames, fmt)
++        files[fmt] = (fmt, name, (tmp_path / name).read_bytes())
++    files["plain xyz"] = (
++        "extxyz",
++        "b.xyz",
++        b"3\nMMM12 made of C atoms; MMM12 logo\nC 0 0 0\nH 1.0 0 0\nH 0 1.0 0\n",
++    )
++    files["cif"] = (
++        "cif",
++        "a.cif",
++        b"data_x\n_cell_length_a 3.6\n_cell_length_b 3.6\n_cell_length_c 3.6\n"
++        b"_cell_angle_alpha 90\n_cell_angle_beta 90\n_cell_angle_gamma 90\n"
++        b"_symmetry_space_group_name_H-M 'F m -3 m'\nloop_\n_atom_site_label\n"
++        b"_atom_site_type_symbol\n_atom_site_fract_x\n_atom_site_fract_y\n"
++        b"_atom_site_fract_z\nCu1 Cu 0 0 0\n",
++    )
++    files["pdb"] = (
++        "pdb",
++        "a.pdb",
++        b"CRYST1    3.600    3.600    3.600  90.00  90.00  90.00 P 1           1\n"
++        b"ATOM      1  CU  CU  A   1       0.000   0.000   0.000  1.00  0.00          CU\n"
++        b"ATOM      2  CU  CU  A   1       1.800   1.800   0.000  1.00  0.00          CU\n"
++        b"END\n",
++    )
++    return files
++
++
++@pytest.mark.parametrize(
++    "sample",
++    [
++        "extxyz",
++        "plain xyz",
++        "lammps-data",
++        "lammps-dump",
++        "poscar",
++        "mdapy",
++        "cif",
++        "pdb",
++    ],
++)
++def test_damaged_files_give_errors_of_mdapy(tmp_path, sample):
++    fmt, name, data = samples(tmp_path)[sample]
++    r = random.Random(f"{sample} 20261106")
++    path = tmp_path / ("damaged-" + name)
++    for _ in range(120):
++        text = damaged(data, r)
++        path.write_bytes(text)
++        try:
++            mdapy.io.read(path, fmt)
++        except MdapyError:
++            pass
++        except Exception as e:
++            pytest.fail(f"{type(e).__name__}: {e} reading {text[:200]!r}")
++        try:
++            with mdapy.io.read_trajectory(path, fmt) as trajectory:
++                for _frame in trajectory:
++                    pass
++        except MdapyError:
++            pass
++        except Exception as e:
++            pytest.fail(f"{type(e).__name__}: {e} reading frames of {text[:200]!r}")
+diff --git a/tests/io/test_extxyz.py b/tests/io/test_extxyz.py
+index 4d0607ba..2556177e 100644
+--- a/tests/io/test_extxyz.py
++++ b/tests/io/test_extxyz.py
+@@ -224,7 +224,50 @@ def test_default_properties_and_no_lattice(tmp_path):
+     system = read_text(tmp_path, "2\nplain xyz comment\nC 0 0 0\nO 1.2 0 0\n")
+     assert system.table.columns == ["element", "positions"]
+     assert not system.box.pbc.any()
+-    assert system.info == {"plain": True, "xyz": True, "comment": True}
++    assert system.info == {"comment": "plain xyz comment"}
++
++
++@pytest.mark.parametrize(
++    "comment",
++    [
++        # free text that repeats a word, or holds words that are keys of the format
++        "MMM12 made of C atoms on grid; generated for MMM12 logo + H atoms",
++        "water in a box with pbc, energy from PBE",
++        "  Properties of a molecule  ",
++        "it's a test",
++    ],
++)
++def test_a_comment_without_keys_is_plain_text(tmp_path, comment):
++    text = f"3\n{comment}\nC 0.000 0.000 0.000\nH 6 0 0\nH 40.5 -9 1.100"
++    system = read_text(tmp_path, text)
++    assert system.info == {"comment": comment.strip()}
++    assert system["element"].tolist() == ["C", "H", "H"]
++    np.testing.assert_array_equal(system["positions"][2], [40.5, -9.0, 1.1])
++    assert not system.box.pbc.any()
++    back = round_trip(tmp_path, system)
++    assert back.info == system.info
++
++
++@pytest.mark.parametrize(
++    "line, message",
++    [
++        ("C 0 0 0 1.5", "expected 4 values, found 5"),
++        ("C 0 0", "expected 4 values, found 3"),
++        ("6 0 0 0", "unknown element '6'"),
++    ],
++)
++def test_a_plain_xyz_line_holds_an_element_and_three_coordinates(
++    tmp_path, line, message
++):
++    with pytest.raises(FileFormatError, match=message) as info:
++        read_text(tmp_path, f"2\nplain comment\nH 1 0 0\n{line}\n")
++    assert info.value.line == 4
++    assert str(info.value).endswith("each line holds an element symbol and x, y, z")
++    assert str(info.value).count(str(tmp_path)) == 1
++
++
++def test_an_empty_comment_gives_no_info(tmp_path):
++    assert read_text(tmp_path, "1\n   \nH 0 0 0\n").info == {}
+ 
+ 
+ def test_six_component_tensors_are_voigt_ordered(tmp_path):
+@@ -435,6 +478,8 @@ def test_trailing_blank_lines(tmp_path):
+         ("x\n", 1, "expected the number of atoms, found 'x'"),
+         ("2\n\nH 0 0 0\n", 4, "the frame has 2 atoms, but the file ends after 1"),
+         ("2\n", 2, "the frame has 2 atoms, but the file ends after 0"),
++        # a count beyond 64 bits, as in a damaged file
++        ("99999999999999999999\n\nH 0 0 0\n", 2, "the frame has 99999999999999999999 "),
+         ("1\n\nH 0 0\n", 3, "expected 4 values, found 3"),
+         ("1\n\nH 0 x 0\n", 3, "cannot read 'x' as a number"),
+         ("1\n\nH 0 0 0\n\n1\n\nH 0 0 0\n", 5, "a frame follows a blank line"),
+@@ -453,7 +498,7 @@ def test_trailing_blank_lines(tmp_path):
+         ("1\nenergy=abc\nH 0 0 0\n", 2, "energy must have 1 numbers"),
+         ('1\nvirial="1 2"\nH 0 0 0\n', 2, "virial must have 9 or 6 numbers"),
+         ('1\nstress="x"\nH 0 0 0\n', 2, "stress must have 9 or 6 numbers"),
+-        ("1\nProperties\nH 0 0 0\n", 2, "Properties needs a value"),
++        ("1\nProperties energy=1\nH 0 0 0\n", 2, "Properties needs a value"),
+         ('1\na="_JSON {"\nH 0 0 0\n', 2, "Expecting"),
+         ("1\nProperties=species:S:1:pos:R\nH 0 0 0\n", 2, "name:type:width triples"),
+         ("1\nProperties=species:S:1:pos:Q:3\nH 0 0 0\n", 2, "invalid property pos:Q:3"),
+diff --git a/tests/io/test_text.py b/tests/io/test_text.py
+index ab9cf04a..6630d9cb 100644
+--- a/tests/io/test_text.py
++++ b/tests/io/test_text.py
+@@ -775,6 +775,29 @@ def test_nan_is_written_as_nan():
+     assert b"nan" in native.format_table([("f", np.array([float("nan")]), [])])
+ 
+ 
++def test_every_nan_is_written_as_python_writes_it():
++    # a NaN with the sign bit, as x86 computes 0/0, and quiet and signaling NaNs
++    # with payloads: std::to_chars writes -nan(ind) or nan(snan) for some of them
++    bits = np.array(
++        [
++            0xFFF8000000000000,
++            0x7FF8000000000001,
++            0x7FF0000000000001,
++            0xFFF4000000000123,
++        ],
++        dtype=np.uint64,
++    )
++    values = np.concatenate([bits.view(np.float64), [math.inf, -math.inf]])
++    for shift in (0, 3):
++        text = native.format_table([("f", values, [], shift)]).decode()
++        assert text.split() == ["nan"] * 4 + ["inf", "-inf"]
++        (back,), _ = native.parse_table(
++            text.encode(), 0, len(values), [("f", 1, -shift)]
++        )
++        assert np.isnan(back[:4]).all()
++        assert list(back[4:]) == [math.inf, -math.inf]
++
++
+ def longest_rows(rows):
+     """Every value as long as it can be, in columns that fill any place they get."""
+     return [

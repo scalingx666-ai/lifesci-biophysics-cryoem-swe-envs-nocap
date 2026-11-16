@@ -1,0 +1,160 @@
+diff --git a/src/core/io/writer/h5md_core.cpp b/src/core/io/writer/h5md_core.cpp
+index eb48a61d96..6ab2f2c8a0 100644
+--- a/src/core/io/writer/h5md_core.cpp
++++ b/src/core/io/writer/h5md_core.cpp
+@@ -369,6 +369,12 @@ void File::create_file() {
+ }
+ 
+ void File::close() {
++  // release datasets first, since they reference the open file
++  m_datasets.clear();
++  // close the file in parallel (this also flushes the superblock)
++  m_h5md_file.reset();
++  // wait for all ranks to be successful before deleting the backup file
++  m_comm.barrier();
+   if (m_comm.rank() == 0) {
+     std::filesystem::remove(m_backup_path);
+   }
+@@ -719,8 +725,9 @@ File::File(std::filesystem::path file_path, std::filesystem::path script_path,
+ }
+ 
+ File::~File() {
+-  m_datasets.clear();
+-  m_h5md_file.reset();
++  if (m_h5md_file) {
++    close();
++  }
+ }
+ 
+ } /* namespace H5md */
+diff --git a/src/core/io/writer/h5md_core.hpp b/src/core/io/writer/h5md_core.hpp
+index eaf66695fe..db75dd53ca 100644
+--- a/src/core/io/writer/h5md_core.hpp
++++ b/src/core/io/writer/h5md_core.hpp
+@@ -170,6 +170,11 @@ class File {
+ 
+   /**
+    * @brief Method to enforce flushing the buffer to disk.
++   * This pushes all buffers to the Virtual File Driver (VFD) layer.
++   * However, the file superblock, which contains the address space information
++   * (End of Allocation, EOA), won't be flushed. Therefore, the file won't
++   * necessarily be in a guaranteed consistent state for a read operation
++   * by another HDF5 parser. Only the @ref close() method can flush the EOA.
+    */
+   void flush();
+ 
+diff --git a/src/python/espressomd/io/writer/h5md.py b/src/python/espressomd/io/writer/h5md.py
+index b863556d4b..5a33c22ac1 100644
+--- a/src/python/espressomd/io/writer/h5md.py
++++ b/src/python/espressomd/io/writer/h5md.py
+@@ -90,10 +90,16 @@ class H5md(ScriptInterfaceHelper):
+         Call the H5md write method.
+ 
+     flush()
+-        Call the H5md flush method.
++        Call the H5md flush method. Only the dataset buffers will be flushed.
++        The file superblock, which contains the datasets and metadata address
++        space information (End of Allocation, EOA), won't be flushed. Only the
++        H5md close method can flush the superblock. A file that was manually
++        flushed via this method but not properly closed might have a stale EOA
++        and thus be unreadable. This can happen when a simulation receives a
++        termination signal and doesn't have time to release all file handles.
+ 
+     close()
+-        Close the H5md file.
++        Close the H5md file and flush both the data and superblock.
+ 
+     Attributes
+     ----------
+diff --git a/src/script_interface/h5md/h5md.cpp b/src/script_interface/h5md/h5md.cpp
+index 8fc751fedf..b608c3c8dd 100644
+--- a/src/script_interface/h5md/h5md.cpp
++++ b/src/script_interface/h5md/h5md.cpp
+@@ -66,6 +66,7 @@ void H5md::do_construct(VariantMap const &params) {
+           "charge_unit", "chunk_size");
+   // MPI communicator is needed to close parallel file handles
+   m_mpi_env_lock = ::communication_environment->get_mpi_env();
++  is_file_closed = false;
+ }
+ 
+ H5md::~H5md() {
+@@ -74,8 +75,18 @@ H5md::~H5md() {
+   m_mpi_env_lock.reset();
+ }
+ 
++void H5md::sanity_check_is_file_closed(std::string const &name) const {
++  if (is_file_closed) {
++    if (context()->is_head_node()) {
++      throw std::runtime_error("cannot call '" + name + "' on a closed file");
++    }
++    throw Exception("");
++  }
++}
++
+ Variant H5md::do_call_method(std::string const &name, VariantMap const &) {
+   if (name == "write") {
++    sanity_check_is_file_closed(name);
+     auto const &system = ::System::get_system();
+     auto const particles = system.cell_structure->local_particles();
+     auto const sim_time = system.get_sim_time();
+@@ -83,9 +94,12 @@ Variant H5md::do_call_method(std::string const &name, VariantMap const &) {
+     auto const n_steps = static_cast<int>(std::round(sim_time / time_step));
+     m_h5md->write(particles, sim_time, n_steps, *system.box_geo);
+   } else if (name == "flush") {
++    sanity_check_is_file_closed(name);
+     m_h5md->flush();
+   } else if (name == "close") {
++    sanity_check_is_file_closed(name);
+     m_h5md->close();
++    is_file_closed = true;
+   } else if (name == "valid_fields") {
+     return make_vector_of_variants(m_h5md->valid_fields());
+   }
+diff --git a/src/script_interface/h5md/h5md.hpp b/src/script_interface/h5md/h5md.hpp
+index 5926c14756..28de960f9c 100644
+--- a/src/script_interface/h5md/h5md.hpp
++++ b/src/script_interface/h5md/h5md.hpp
+@@ -56,6 +56,8 @@ class H5md : public AutoParameters<H5md> {
+   std::shared_ptr<boost::mpi::environment> m_mpi_env_lock;
+   std::shared_ptr<::Writer::H5md::File> m_h5md;
+   std::vector<std::string> m_output_fields;
++  bool is_file_closed;
++  void sanity_check_is_file_closed(std::string const &name) const;
+ };
+ 
+ } // namespace Writer
+diff --git a/testsuite/python/h5md.py b/testsuite/python/h5md.py
+index eb824e522d..0472d171f1 100644
+--- a/testsuite/python/h5md.py
++++ b/testsuite/python/h5md.py
+@@ -122,8 +122,6 @@ def test_opening(self):
+         h5 = espressomd.io.writer.h5md.H5md(file_path=str(self.temp_file))
+         h5.close()
+ 
+-    # doesn't always work in parallel: https://github.com/h5py/h5py/issues/736
+-    @ut.skipIf(n_nodes > 1, "only runs for 1 MPI rank")
+     def test_appending(self):
+         import time
+         # write one frame to the file
+@@ -184,6 +182,21 @@ def test_exceptions(self):
+         h5.close()
+         with self.assertRaisesRegex(RuntimeError, "The given .h5 file does not match the specifications in 'fields'"):
+             h5md.H5md(file_path=temp_file, fields='all')
++        # cannot operate on a closed file
++        temp_file = self.temp_path / 'closed.h5'
++        h5 = espressomd.io.writer.h5md.H5md(
++            file_path=temp_file, unit_system=h5_units)
++        h5.write()
++        h5.flush()
++        h5.close()
++        self.assertIn("all", h5.valid_fields())
++        self.assertIsNone(h5.call_method("unknown"))
++        with self.assertRaisesRegex(RuntimeError, "cannot call 'write' on a closed file"):
++            h5.write()
++        with self.assertRaisesRegex(RuntimeError, "cannot call 'flush' on a closed file"):
++            h5.flush()
++        with self.assertRaisesRegex(RuntimeError, "cannot call 'close' on a closed file"):
++            h5.close()
+         # open a file with invalid specifications
+         with self.assertRaisesRegex(ValueError, "Unknown field 'lb'"):
+             h5md.H5md(file_path=temp_file, fields='lb')

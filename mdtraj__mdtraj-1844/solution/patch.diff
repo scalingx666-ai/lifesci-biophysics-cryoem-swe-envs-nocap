@@ -1,0 +1,239 @@
+diff --git a/mdtraj/geometry/include/sasa.h b/mdtraj/geometry/include/sasa.h
+index 42a519df3..cc3983671 100644
+--- a/mdtraj/geometry/include/sasa.h
++++ b/mdtraj/geometry/include/sasa.h
+@@ -6,7 +6,7 @@ extern "C" {
+ 
+ void sasa(const int n_frames, const int n_atoms, const float* xyzlist,
+           const float* atom_radii, const int n_sphere_points,
+-          const int* atom_mapping, const int n_groups, float* out);
++          const int* atom_mapping, const int* atom_selection_mask, const int n_groups, float* out);
+ 
+ 
+ #ifdef __cplusplus
+diff --git a/mdtraj/geometry/sasa.py b/mdtraj/geometry/sasa.py
+index 23bf71365..affc7c2b8 100644
+--- a/mdtraj/geometry/sasa.py
++++ b/mdtraj/geometry/sasa.py
+@@ -183,6 +183,7 @@ def shrake_rupley(
+     mode="atom",
+     change_radii=None,
+     get_mapping=False,
++    atom_indices=None
+ ):
+     """Compute the solvent accessible surface area of each atom or residue in each simulation frame.
+ 
+@@ -207,6 +208,15 @@ def shrake_rupley(
+         Instead of returning only the areas, also return the indices of the
+         atoms or the residue-to-atom mapping. If True, will return a tuple
+         that contains the areas and the mapping (np.array, shape=(n_atoms)).
++    atom_indices : iterable, optional
++        Selection of atoms indices for which the SASA will be computed.
++        Default is all atoms, but a sub-selection of atoms can be
++        passed here. This selection doesn't affect what
++        atoms are considered accessibility blockers, it only affects
++        for what atoms the SASA is computed. E.g. you can pass a lipid-embedded
++        protein (s.t. the lipids are considered blockers) but only compute
++        SASA for the protein using atom_selection = traj.top.select("protein").
++        The excluded atoms/residues get a SASA value -1.
+ 
+     Returns
+     -------
+@@ -272,9 +282,16 @@ def shrake_rupley(
+                 "residues must have contiguous integer indices " "starting from zero",
+             )
+     else:
+-        raise ValueError(
+-            'mode must be one of "residue", "atom". "%s" supplied' % mode,
+-        )
++        raise ValueError('mode must be one of "residue", "atom". "%s" supplied' %
++                         mode)
++
++    if atom_indices is None:
++        atom_selection_mask = np.ones(traj.n_atoms, dtype=np.int32)
++        out = np.zeros((xyz.shape[0], dim1), dtype=np.float32)
++    else:
++        atom_selection_mask = np.array([[1 if ii in atom_indices else 0][0] for ii in range(traj.n_atoms)], dtype=np.int32)
++        out = np.full((xyz.shape[0], dim1), -1, dtype=np.float32)
++        out[:,atom_mapping[atom_indices]]=0
+ 
+     modified_radii = {}
+     if change_radii is not None:
+@@ -284,14 +301,13 @@ def shrake_rupley(
+         for k, v in change_radii.items():
+             modified_radii[k] = v
+ 
+-    out = np.zeros((xyz.shape[0], dim1), dtype=np.float32)
+     if bool(modified_radii):
+         atom_radii = [modified_radii[atom.element.symbol] for atom in traj.topology.atoms]
+     else:
+         atom_radii = [_ATOMIC_RADII[atom.element.symbol] for atom in traj.topology.atoms]
+     radii = np.array(atom_radii, np.float32) + probe_radius
+ 
+-    _geometry._sasa(xyz, radii, int(n_sphere_points), atom_mapping, out)
++    _geometry._sasa(xyz, radii, int(n_sphere_points), atom_mapping, atom_selection_mask, out)
+ 
+     if get_mapping is True:
+         return out, atom_mapping
+diff --git a/mdtraj/geometry/src/_geometry.pyx b/mdtraj/geometry/src/_geometry.pyx
+index 87d4789b7..f7960212d 100644
+--- a/mdtraj/geometry/src/_geometry.pyx
++++ b/mdtraj/geometry/src/_geometry.pyx
+@@ -86,7 +86,7 @@ cdef extern from "geometry.h" nogil:
+ cdef extern from "sasa.h":
+     void sasa(const int n_frames, const int n_atoms, const float* xyzlist,
+               const float* atom_radii, const int n_sphere_points,
+-              const int* atom_mapping, const int n_groups, float* out) nogil
++              const int* atom_mapping, const int* atom_selection, const int n_groups, float* out) nogil
+ 
+ 
+ ##############################################################################
+@@ -228,11 +228,12 @@ def _sasa(float[:, :, ::1] xyz,
+           float[::1] atom_radii,
+           int n_sphere_points,
+           int[::1] atom_outmapping,
++          int[::1] atom_selection_mask,
+           float[:, ::1] out):
+     cdef int n_frames = xyz.shape[0]
+     cdef int n_atoms = xyz.shape[1]
+     sasa(n_frames, n_atoms, &xyz[0,0,0], &atom_radii[0], n_sphere_points,
+-         &atom_outmapping[0], out.shape[1], &out[0,0])
++         &atom_outmapping[0], &atom_selection_mask[0], out.shape[1], &out[0,0])
+ 
+ 
+ def _dssp(float[:, :, ::1] xyz,
+diff --git a/mdtraj/geometry/src/sasa.cpp b/mdtraj/geometry/src/sasa.cpp
+index 7a7e801c2..4c6565eec 100644
+--- a/mdtraj/geometry/src/sasa.cpp
++++ b/mdtraj/geometry/src/sasa.cpp
+@@ -48,7 +48,10 @@
+  *     a bunch of uniformly distributed points on a sphere
+  * n_sphere_points : int
+  *    the number of sphere points
+- *
++ * atom_selection_mask : 1d array, shape[n_atoms]
++ *    one index per atom indicating whether the SASA
++ *    should be computed for this atom (`atom_selection_mask[i] = 1'
++ *    or or not (`atom_selection_mask[i] = 0`)
+  * centered_sphere_points : WORK BUFFER 2d array, shape=[n_sphere_points, 3]
+  *    empty memory that intermediate calculations can be stored in
+  * neighbor_indices : WORK BUFFER 2d array, shape=[n_atoms]
+@@ -63,11 +66,16 @@
+  */
+ static void asa_frame(const float* frame, const int n_atoms, const float* atom_radii,
+                       const float* sphere_points, const int n_sphere_points,
+-                      int* neighbor_indices, float* centered_sphere_points, float* areas)
++                      int* neighbor_indices, float* centered_sphere_points, const int* atom_selection_mask, float* areas)
+ {
+     float constant = 4.0 * M_PI / n_sphere_points;
+ 
+     for (int i = 0; i < n_atoms; i++) {
++        // Skip atom if not in selection
++        int in_selection = atom_selection_mask[i];
++        if (in_selection == 0)
++            continue;
++
+         float atom_radius_i = atom_radii[i];
+         fvec4 r_i(frame[i*3], frame[i*3+1], frame[i*3+2], 0);
+ 
+@@ -170,7 +178,7 @@ static void generate_sphere_points(float* sphere_points, int n_points)
+ 
+ void sasa(const int n_frames, const int n_atoms, const float* xyzlist,
+           const float* atom_radii, const int n_sphere_points,
+-          const int* atom_mapping, const int n_groups, float* out)
++          const int* atom_mapping, const int* atom_selection_mask, const int n_groups, float* out)
+ {
+   /*
+   // Calculate the accessible surface area of each atom in each frame of
+@@ -193,6 +201,10 @@ void sasa(const int n_frames, const int n_atoms, const float* xyzlist,
+   //     mapping from atoms onto groups, over which to accumulate the sasa.
+   //     If `atom_mapping[i] = j`, that means that the ith atom is in group
+   //     j. The groups must be contiguous integers starting from 0 to n_groups-1.
++  // atom_selection_mask : 1d array, shape[n_atoms]
++  //     one index per atom indicating whether the SASA
++  //     should be computed for this atom (`atom_selection_mask[i] = 1'
++  //     or or not (`atom_selection_mask[i] = 0`)
+   // out : 2d array, shape=[n_frames, n_groups]
+   //     the output buffer to place the results in. this array must be
+   //     initialized with all zeros. out[i*n_groups + j] gives, in the `i`th frame
+@@ -227,7 +239,7 @@ void sasa(const int n_frames, const int n_atoms, const float* xyzlist,
+ #endif
+   for (i = 0; i < n_frames; i++) {
+     asa_frame(xyzlist + i*n_atoms*3, n_atoms, atom_radii, sphere_points,
+-	      n_sphere_points, wb1, wb2, outframebuffer);
++	      n_sphere_points, wb1, wb2, atom_selection_mask, outframebuffer);
+     outframe = out + (n_groups * i);
+     for (j = 0; j < n_atoms; j++) {
+         outframe[atom_mapping[j]] += outframebuffer[j];
+diff --git a/tests/test_sasa.py b/tests/test_sasa.py
+index 994e61605..339c87461 100644
+--- a/tests/test_sasa.py
++++ b/tests/test_sasa.py
+@@ -170,3 +170,66 @@ def test_sasa_5():
+     np.testing.assert_approx_equal(calc_area_sulfur, true_area_sulfur)
+     # Finally, ensure that we are not changing _ATOMIC_RADII
+     assert prev_area_chlorine != calc_area_chlorine
++
++def test_sasa_6(get_fn):
++    #Test the atom selection
++    t = md.load(get_fn('frame0.h5'))
++    atoms_resid1 = t.top.select("resid 1").astype(int)
++    atoms_resid0_2 = t.top.select("resid 0 2").astype(int)
++
++    # Mode="atom"
++    sasa_all_atoms = md.geometry.shrake_rupley(t)
++    sasa_all_atoms_w_selection = md.geometry.shrake_rupley(t, atom_indices=atoms_resid1)
++
++    # The computed SASA values are the same as in "normal" mode
++    np.testing.assert_array_almost_equal(sasa_all_atoms[:,atoms_resid1],
++                                         sasa_all_atoms_w_selection[:,atoms_resid1])
++    # The uncomputed SASA values are all -1
++    np.testing.assert_equal(np.unique(sasa_all_atoms_w_selection[:,atoms_resid0_2]),-1)
++
++    # Mode="residues"
++    sasa_all_residues = md.geometry.shrake_rupley(t, mode="residue")
++    sasa_all_residues_w_selection = md.geometry.shrake_rupley(t, atom_indices=atoms_resid1, mode="residue")
++
++    # The computed SASA values are the same as in "normal" mode
++    np.testing.assert_array_almost_equal(sasa_all_residues[:,1],
++                                         sasa_all_residues_w_selection[:,1])
++    # The uncomputed SASA values are all -1
++    np.testing.assert_equal(np.unique(sasa_all_residues_w_selection[:, [0,2]]), -1)
++
++    #Test the non sequential selection
++    # Mode="atom"
++    sasa_all_atoms_w_selection = md.geometry.shrake_rupley(t, atom_indices=atoms_resid0_2)
++
++    # The computed SASA values are the same as in "normal" mode
++    np.testing.assert_array_almost_equal(sasa_all_atoms[:, atoms_resid0_2],
++                                         sasa_all_atoms_w_selection[:, atoms_resid0_2])
++
++    # The uncomputed SASA values are all -1
++    np.testing.assert_equal(np.unique(sasa_all_atoms_w_selection[:,atoms_resid1]),-1)
++
++    # Mode="residues"
++    sasa_all_residues_w_selection = md.geometry.shrake_rupley(t, atom_indices=atoms_resid0_2, mode="residue")
++
++    # The computed SASA values are the same as in "normal" mode
++    np.testing.assert_array_almost_equal(sasa_all_residues[:, [0,2]],
++                                         sasa_all_residues_w_selection[:, [0,2]])
++    # The uncomputed SASA values are all -1
++    np.testing.assert_equal(np.unique(sasa_all_residues_w_selection[:, 1]), -1)
++
++def test_sasa_7(get_fn):
++    #Test the atom selection with specific atoms within residues
++    t = md.load(get_fn('frame0.h5'))
++    atoms_resid1_HB3 = t.top.select("resid 1 and name HB3").astype(int)
++    atoms_not_resid1_HB3 = t.top.select("not (resid 1 and name HB3)").astype(int)
++
++    # Just one CA-atom's SASA has the right value and everybody else has 0
++    SASA_resid1_HB3_per_atom = md.geometry.shrake_rupley(t,atom_indices=atoms_resid1_HB3)
++    sasa_all_atoms = md.geometry.shrake_rupley(t)
++    np.testing.assert_equal(sasa_all_atoms[:,atoms_resid1_HB3], SASA_resid1_HB3_per_atom[:,atoms_resid1_HB3])
++    assert all(SASA_resid1_HB3_per_atom[:,atoms_resid1_HB3]>0)
++    np.testing.assert_equal(SASA_resid1_HB3_per_atom[:,atoms_not_resid1_HB3], -1)
++
++    # Nothing changes if you do "residue" mode bc only one atom is contributing
++    SASA_resid1_HB3_per_residue = md.geometry.shrake_rupley(t, atom_indices=atoms_resid1_HB3, mode="residue")
++    np.testing.assert_equal(SASA_resid1_HB3_per_atom[:, atoms_resid1_HB3[0]], SASA_resid1_HB3_per_residue[:, 1])
+\ No newline at end of file

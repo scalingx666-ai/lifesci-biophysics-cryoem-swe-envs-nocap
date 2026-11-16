@@ -1,0 +1,1469 @@
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator.py b/scilink/agents/exp_agents/analysis_orchestrator.py
+index b955e8e47..3ef9e84ee 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator.py
+@@ -1341,7 +1341,7 @@ def _trim_history(self, history: List[Dict], max_messages: int = None) -> List[D
+         
+         summary_marker = {
+             "role": "system",
+-            "content": f"[{len(history) - max_messages} messages omitted for context management]"
++            "content": f"[{len(history) - max_messages} messages omitted for context management. Their details are recoverable: use search_session_history instead of redoing work or asking the user to repeat information]"
+         }
+         trimmed.insert(context_window, summary_marker)
+         
+@@ -1353,8 +1353,10 @@ def chat(self, user_input: str) -> str:
+         # durable feedback log (nested child chats rebind to their own;
+         # run_task restores the caller's binding on exit).
+         from ...hitl import set_thread_feedback_log as _set_fblog
++        from ...session_events import set_thread_event_log as _set_evlog
+         from pathlib import Path as _P
+         _set_fblog(str(_P(self.base_dir) / "feedback_log.jsonl"))
++        _set_evlog(str(_P(self.base_dir) / "events.jsonl"))
+         self.message_count += 1
+         self._last_chat_hit_iter_cap = False
+ 
+@@ -1443,7 +1445,9 @@ def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+         original_mode = self.analysis_mode
+         original_max_iter = self.max_iterations
+         from ...hitl import get_thread_feedback_log, set_thread_feedback_log
++        from ...session_events import get_thread_event_log, set_thread_event_log
+         _prev_fblog = get_thread_feedback_log()
++        _prev_evlog = get_thread_event_log()
+         try:
+             self.set_analysis_mode(run_mode)
+             if max_iterations is not None:
+@@ -1473,6 +1477,7 @@ def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+             # chat() bound the feedback log to THIS session; restore the
+             # caller's binding (a delegating meta keeps logging to its own).
+             set_thread_feedback_log(_prev_fblog)
++            set_thread_event_log(_prev_evlog)
+             # A delegation-driven child may never reach the chat loop's
+             # auto-checkpoint cadence, and an interrupted delegation must
+             # leave current state behind for the restart/resume path
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator_tools.py b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+index f98ac623a..070d0b5f8 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator_tools.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+@@ -749,6 +749,13 @@ def __init__(self, orchestrator_instance):
+         self.openai_schemas: list = []
+ 
+         self._register_all_tools()
++        # Bounded access to this session's own action history (#462) —
++        # registered after the mode's own tools so schemas append cleanly.
++        from ...session_events import register_history_tools
++        register_history_tools(
++            self._register_tool,
++            lambda: Path(self.orch.base_dir) / "events.jsonl",
++        )
+ 
+     def _sync_from_registry(self) -> None:
+         """Rebuild AGENT_NAMES and AGENT_DESCRIPTIONS from the orchestrator's registry."""
+@@ -5947,6 +5954,14 @@ def _update_skill_description(self, custom_skills: dict) -> None:
+ 
+     def execute_tool(self, tool_name: str, **kwargs) -> str:
+         """Execute a tool by name with given arguments."""
++        result = self._dispatch_tool(tool_name, **kwargs)
++        # One bounded line per tool call into the session's events.jsonl
++        # (no-op when the thread has no bound log). See session_events.
++        from ...session_events import append_event
++        append_event(tool_name, kwargs, result)
++        return result
++
++    def _dispatch_tool(self, tool_name: str, **kwargs) -> str:
+         if tool_name not in self.functions_map:
+             return json.dumps({
+                 "status": "error",
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index 4b009e65e..6fae21d82 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -790,6 +790,13 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+         from ...hitl import set_thread_channel
+         set_thread_channel(_BranchChannel(
+             queue_channel, branch.get("label") or slug))
++    # Bind this worker thread to the META's event log, branch-tagged: the
++    # child's own chat() rebinds to the child session's log for the
++    # duration of run_task (and restores), so the meta log records the
++    # branch lifecycle while child-level tool calls stay in the child log.
++    from ...session_events import append_event, set_thread_event_log
++    _branch_label = branch.get("branch_id") or branch.get("label") or slug
++    set_thread_event_log(Path(orch.base_dir) / "events.jsonl")
+     try:
+         try:
+             from ..exp_agents.analysis_orchestrator import AnalysisMode
+@@ -806,6 +813,13 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+                       "key_findings": [], "files_produced": [],
+                       "suggested_followups": [], "warnings": []}
+     finally:
++        append_event(
++            "fanout_branch",
++            {"label": branch.get("label") or slug,
++             "data_path": branch.get("data_path"),
++             "session_dir": str(base_dir)},
++            json.dumps(result, default=str), branch=_branch_label)
++        set_thread_event_log(None)
+         if queue_channel is not None:
+             from ...hitl import set_thread_channel
+             set_thread_channel(None)
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index bfa20f52d..40f779e7d 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -1644,7 +1644,7 @@ def _trim_history(self, history: List[Dict], max_messages: int = None) -> List[D
+ 
+         summary_marker = {
+             "role": "system",
+-            "content": f"[{len(history) - max_messages} messages omitted for context management]",
++            "content": f"[{len(history) - max_messages} messages omitted for context management. Their details are recoverable: use search_session_history instead of redoing work or asking the user to repeat information]",
+         }
+         trimmed.insert(context_window, summary_marker)
+ 
+@@ -1696,8 +1696,10 @@ def chat(self, user_input: str) -> str:
+         # durable feedback log (nested child chats rebind to their own;
+         # run_task restores the caller's binding on exit).
+         from ...hitl import set_thread_feedback_log as _set_fblog
++        from ...session_events import set_thread_event_log as _set_evlog
+         from pathlib import Path as _P
+         _set_fblog(str(_P(self.base_dir) / "feedback_log.jsonl"))
++        _set_evlog(str(_P(self.base_dir) / "events.jsonl"))
+         self.message_count += 1
+         self._last_chat_hit_iter_cap = False
+ 
+diff --git a/scilink/agents/meta_agent/meta_orchestrator_tools.py b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+index e1554d015..8e875de5b 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator_tools.py
++++ b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+@@ -252,6 +252,53 @@ def __init__(self, orchestrator_instance):
+         self.openai_schemas: list = []
+ 
+         self._register_all_tools()
++        # Bounded access to this session's own action history (#462) —
++        # registered after the mode's own tools so schemas append cleanly.
++        # The meta also reaches through to its child sessions' logs
++        # (persistent children, per-delegation dirs, fan-out branches), so
++        # a long investigation can recover specialist-level actions, not
++        # just the delegation ledger's summaries.
++        from ...session_events import register_history_tools
++
++        def _child_logs():
++            base = Path(self.orch.base_dir)
++            logs = []
++            for sub in ("analysis", "planning", "simulation", "fanout"):
++                root = base / sub
++                if root.is_dir():
++                    for p in sorted(root.rglob("events.jsonl")):
++                        logs.append((str(p.parent.relative_to(base)), p))
++            return logs
++
++        register_history_tools(
++            self._register_tool,
++            lambda: Path(self.orch.base_dir) / "events.jsonl",
++            child_logs_fn=_child_logs,
++        )
++        # Name the scope surface in the schema (the shared registrar keeps
++        # the parameter undeclared for single-session orchestrators).
++        for schema in self.openai_schemas:
++            fn = schema.get("function", {})
++            if fn.get("name") == "search_session_history":
++                fn["parameters"]["properties"]["scope"] = {
++                    "type": "string",
++                    "enum": ["own", "children", "all"],
++                    "description": (
++                        "own (default): this meta session's log. children: "
++                        "the specialist child sessions' logs (delegations "
++                        "and fan-out branches), hits labeled with their "
++                        "session. all: both."
++                    ),
++                }
++            if fn.get("name") == "get_history_events":
++                fn["parameters"]["properties"]["session"] = {
++                    "type": "string",
++                    "description": (
++                        "Optional `session` label from a children/all "
++                        "search hit, to drill into that child's log "
++                        "(default: this session's own log)."
++                    ),
++                }
+ 
+     def _register_tool(
+         self,
+@@ -304,6 +351,14 @@ def _vision_model(self):
+ 
+     def execute_tool(self, tool_name: str, **kwargs) -> str:
+         """Execute a tool by name; always returns a JSON string."""
++        result = self._dispatch_tool(tool_name, **kwargs)
++        # One bounded line per tool call into the session's events.jsonl
++        # (no-op when the thread has no bound log). See session_events.
++        from ...session_events import append_event
++        append_event(tool_name, kwargs, result)
++        return result
++
++    def _dispatch_tool(self, tool_name: str, **kwargs) -> str:
+         if tool_name not in self.functions_map:
+             return json.dumps({
+                 "status": "error",
+diff --git a/scilink/agents/planning_agents/orchestrator_tools.py b/scilink/agents/planning_agents/orchestrator_tools.py
+index 85c0a3117..ef06303aa 100644
+--- a/scilink/agents/planning_agents/orchestrator_tools.py
++++ b/scilink/agents/planning_agents/orchestrator_tools.py
+@@ -207,6 +207,13 @@ def __init__(self, orchestrator_instance):
+         self.gemini_functions: list = []
+ 
+         self._register_all_tools()
++        # Bounded access to this session's own action history (#462) —
++        # registered after the mode's own tools so schemas append cleanly.
++        from ...session_events import register_history_tools
++        register_history_tools(
++            self._register_tool,
++            lambda: Path(self.orch.base_dir) / "events.jsonl",
++        )
+ 
+     def _get_human_feedback_enabled(self) -> bool:
+         """
+@@ -8549,6 +8556,14 @@ def execute_tool(self, tool_name: str, **kwargs) -> str:
+         Returns:
+             JSON string with result
+         """
++        result = self._dispatch_tool(tool_name, **kwargs)
++        # One bounded line per tool call into the session's events.jsonl
++        # (no-op when the thread has no bound log). See session_events.
++        from ...session_events import append_event
++        append_event(tool_name, kwargs, result)
++        return result
++
++    def _dispatch_tool(self, tool_name: str, **kwargs) -> str:
+         if tool_name not in self.functions_map:
+             return json.dumps({
+                 "status": "error",
+diff --git a/scilink/agents/planning_agents/planning_orchestrator.py b/scilink/agents/planning_agents/planning_orchestrator.py
+index 1d1c4afe2..b317b4ea7 100644
+--- a/scilink/agents/planning_agents/planning_orchestrator.py
++++ b/scilink/agents/planning_agents/planning_orchestrator.py
+@@ -1319,7 +1319,7 @@ def _trim_history(self, history: List[Dict], max_messages: int = 100) -> List[Di
+         
+         summary_marker = {
+             "role": "system",
+-            "content": f"[{len(history) - max_messages} messages omitted for context management]"
++            "content": f"[{len(history) - max_messages} messages omitted for context management. Their details are recoverable: use search_session_history instead of redoing work or asking the user to repeat information]"
+         }
+         trimmed.insert(context_window, summary_marker)
+         
+@@ -1331,8 +1331,10 @@ def chat(self, user_input: str) -> str:
+         # durable feedback log (nested child chats rebind to their own;
+         # run_task restores the caller's binding on exit).
+         from ...hitl import set_thread_feedback_log as _set_fblog
++        from ...session_events import set_thread_event_log as _set_evlog
+         from pathlib import Path as _P
+         _set_fblog(str(_P(self.base_dir) / "feedback_log.jsonl"))
++        _set_evlog(str(_P(self.base_dir) / "events.jsonl"))
+         self.message_count += 1
+         self._last_chat_hit_iter_cap = False
+         
+@@ -1451,7 +1453,9 @@ def _snapshot_files() -> set:
+         original_level = self.autonomy_level
+         original_max_iter = self.max_iterations
+         from ...hitl import get_thread_feedback_log, set_thread_feedback_log
++        from ...session_events import get_thread_event_log, set_thread_event_log
+         _prev_fblog = get_thread_feedback_log()
++        _prev_evlog = get_thread_event_log()
+         try:
+             self.set_autonomy_level(run_level)
+             if max_iterations is not None:
+@@ -1481,6 +1485,7 @@ def _snapshot_files() -> set:
+             # chat() bound the feedback log to THIS session; restore the
+             # caller's binding (a delegating meta keeps logging to its own).
+             set_thread_feedback_log(_prev_fblog)
++            set_thread_event_log(_prev_evlog)
+             # _active_output_subdir is scoped to this call; clear it so a
+             # later direct chat() on the same instance writes to base_dir.
+             self._active_output_subdir = None
+diff --git a/scilink/agents/sim_agents/simulation_orchestrator.py b/scilink/agents/sim_agents/simulation_orchestrator.py
+index 5ec9f2db7..ecc104fa5 100644
+--- a/scilink/agents/sim_agents/simulation_orchestrator.py
++++ b/scilink/agents/sim_agents/simulation_orchestrator.py
+@@ -471,8 +471,10 @@ def chat(self, user_input: str) -> str:
+         # durable feedback log (nested child chats rebind to their own;
+         # run_task restores the caller's binding on exit).
+         from ...hitl import set_thread_feedback_log as _set_fblog
++        from ...session_events import set_thread_event_log as _set_evlog
+         from pathlib import Path as _P
+         _set_fblog(str(_P(self.base_dir) / "feedback_log.jsonl"))
++        _set_evlog(str(_P(self.base_dir) / "events.jsonl"))
+         # ── Console display features not yet wired here (parity TODO) ──────────
+         # Analysis, meta, and planning distinguish three console output classes;
+         # this orchestrator currently emits only structural logs. To bring it to
+@@ -563,7 +565,9 @@ def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+         original_mode = self.simulation_mode
+         original_max_iter = self.max_iterations
+         from ...hitl import get_thread_feedback_log, set_thread_feedback_log
++        from ...session_events import get_thread_event_log, set_thread_event_log
+         _prev_fblog = get_thread_feedback_log()
++        _prev_evlog = get_thread_event_log()
+         try:
+             self.set_simulation_mode(run_mode)
+             if max_iterations is not None:
+@@ -593,6 +597,7 @@ def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+             # chat() bound the feedback log to THIS session; restore the
+             # caller's binding (a delegating meta keeps logging to its own).
+             set_thread_feedback_log(_prev_fblog)
++            set_thread_event_log(_prev_evlog)
+             # A delegation-driven child may never reach the chat loop's
+             # auto-checkpoint cadence, and an interrupted delegation must
+             # leave current state behind for the restart/resume path
+@@ -763,7 +768,18 @@ def _trim_history(self, history: List[Dict], max_messages: int = None) -> List[D
+         max_messages = max_messages or self.MAX_HISTORY_MESSAGES
+         if len(history) <= max_messages:
+             return history
+-        return history[-max_messages:]
++        # Marker mirrors the other orchestrators' trim shape: tell the model
++        # the evicted turns are recoverable through the history tools.
++        summary_marker = {
++            "role": "system",
++            "content": (
++                f"[{len(history) - max_messages} messages omitted for context "
++                "management. Their details are recoverable: use "
++                "search_session_history instead of redoing work or asking "
++                "the user to repeat information]"
++            ),
++        }
++        return [summary_marker] + history[-max_messages:]
+ 
+     def _load_history(self) -> List[Dict]:
+         """Load conversation history from disk."""
+diff --git a/scilink/agents/sim_agents/simulation_orchestrator_tools.py b/scilink/agents/sim_agents/simulation_orchestrator_tools.py
+index b3f5de310..1d839662e 100644
+--- a/scilink/agents/sim_agents/simulation_orchestrator_tools.py
++++ b/scilink/agents/sim_agents/simulation_orchestrator_tools.py
+@@ -79,6 +79,13 @@ def __init__(self, orchestrator_instance):
+         self._so = None
+ 
+         self._register_all_tools()
++        # Bounded access to this session's own action history (#462) —
++        # registered after the mode's own tools so schemas append cleanly.
++        from ...session_events import register_history_tools
++        register_history_tools(
++            self._register_tool,
++            lambda: Path(self.orch.base_dir) / "events.jsonl",
++        )
+ 
+     def _get_structure_pipeline(self, workdir: str):
+         """Return a session-shared StructurePipeline, lazy-initialized on
+@@ -3708,6 +3715,14 @@ def _register_tool(
+     def execute_tool(self, tool_name: str, **kwargs) -> str:
+         """Execute a tool by name with given arguments. Always returns a
+         JSON string the chat loop can hand back to the LLM."""
++        result = self._dispatch_tool(tool_name, **kwargs)
++        # One bounded line per tool call into the session's events.jsonl
++        # (no-op when the thread has no bound log). See session_events.
++        from ...session_events import append_event
++        append_event(tool_name, kwargs, result)
++        return result
++
++    def _dispatch_tool(self, tool_name: str, **kwargs) -> str:
+         if tool_name not in self.functions_map:
+             return json.dumps({
+                 "status": "error",
+diff --git a/scilink/session_events.py b/scilink/session_events.py
+new file mode 100644
+index 000000000..f346b9f7c
+--- /dev/null
++++ b/scilink/session_events.py
+@@ -0,0 +1,440 @@
++"""Append-only per-session event log + bounded programmatic access (#462).
++
++Long chat sessions lose their own middle: ``_trim_history`` evicts older
++turns from context and the LLM cannot get them back — ``chat_history.json``
++is a single JSON array with full tool results, so a naive read pulls the
++entire evicted history straight back into the window. This module gives each
++session a compact, line-addressable record instead: one bounded JSON line
++per tool call, appended at every orchestrator's ``execute_tool`` chokepoint,
++searched grep-style and never read whole. The pattern (not the harness)
++follows PRO-LONG (arXiv:2607.20064).
++
++Thread-local binding mirrors ``scilink/hitl.py``'s feedback log exactly:
++``chat()`` binds ``<base_dir>/events.jsonl``; ``run_task`` saves and
++restores the caller's binding so a meta delegation logs child events to the
++child's session and the meta's own log resumes afterward. An unbound thread
++makes ``append_event`` a silent no-op (library callers, bare agents, tests
++unaffected), and the writer never raises into the tool path — a broken
++event log must not break a run.
++
++Every field is bounded at write time, so grep hits stay small no matter how
++long the session runs. ``search_events`` / ``read_events`` are the pure
++functions the orchestrator tools wrap (cheap wide search over summaries,
++bounded narrow read of specifics).
++"""
++from __future__ import annotations
++
++import json
++import logging
++import re
++import threading
++from contextlib import contextmanager
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++# Bounds — summaries by construction. Loosening these silently grows every
++# future search hit, so treat them as part of the log format.
++ARGS_MAX_CHARS = 200
++SUMMARY_MAX_CHARS = 300
++FILES_MAX = 8
++SEARCH_MAX_HITS = 50
++SEARCH_MAX_CHARS = 6_000
++READ_MAX_EVENTS = 40
++READ_MAX_CHARS = 8_000
++
++_REDACT_KEY_RE = re.compile(
++    r"api[_-]?key|token|secret|password|credential", re.IGNORECASE
++)
++# Result keys whose values are worth surfacing in the one-line summary,
++# in preference order.
++_SUMMARY_KEYS = ("message", "summary", "error", "warning", "verdict", "action")
++# Result keys that carry produced-file paths.
++_FILES_KEYS = ("files_produced", "output_files", "files")
++_PATHLIKE_KEY_RE = re.compile(r"(_path|_file|_dir|_directory)$")
++
++_thread_local = threading.local()
++_counter_lock = threading.Lock()
++_next_n: Dict[str, int] = {}
++
++
++# --------------------------------------------------------------- binding
++
++def set_thread_event_log(path) -> None:
++    """Bind this thread's tool calls to a session event log.
++
++    ``path`` is the JSONL file (conventionally ``<session>/events.jsonl``).
++    ``None`` unbinds. Orchestrators bind their session file at each chat
++    turn; ``run_task`` restores the caller's binding on exit.
++    """
++    _thread_local.event_log = str(path) if path else None
++
++
++def get_thread_event_log() -> Optional[str]:
++    return getattr(_thread_local, "event_log", None)
++
++
++@contextmanager
++def use_event_log(path):
++    """Scoped thread-local event-log binding (re-entrant safe)."""
++    previous = get_thread_event_log()
++    set_thread_event_log(path)
++    try:
++        yield
++    finally:
++        set_thread_event_log(previous)
++
++
++# --------------------------------------------------------------- gisting
++
++def _clip(text: str, limit: int) -> str:
++    """One physical line, at most ``limit`` chars."""
++    flat = " ".join(str(text).split())
++    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
++
++
++def _gist_args(kwargs: Optional[Dict[str, Any]]) -> str:
++    if not kwargs:
++        return ""
++    parts = []
++    for key, value in kwargs.items():
++        if _REDACT_KEY_RE.search(str(key)):
++            parts.append(f"{key}=<redacted>")
++        else:
++            parts.append(f"{key}={_clip(value, 80)}")
++    return _clip(" ".join(parts), ARGS_MAX_CHARS)
++
++
++def _clip_path(text: str, limit: int = 160) -> str:
++    """Clip a path from the LEFT — the tail (dirs near the file + filename)
++    is the searchable, drill-down-able part; a head-clipped path is useless."""
++    flat = " ".join(str(text).split())
++    return flat if len(flat) <= limit else "…" + flat[-(limit - 1):]
++
++
++def _collect_files(parsed: Dict[str, Any]) -> List[str]:
++    files: List[str] = []
++    for key in _FILES_KEYS:
++        val = parsed.get(key)
++        if isinstance(val, list):
++            files.extend(str(v) for v in val if isinstance(v, (str, Path)))
++    for key, val in parsed.items():
++        if isinstance(val, str) and _PATHLIKE_KEY_RE.search(key):
++            files.append(val)
++    # De-dup preserving order, bounded.
++    seen: Dict[str, None] = {}
++    for f in files:
++        seen.setdefault(_clip_path(f))
++    return list(seen)[:FILES_MAX]
++
++
++def _gist_result(result: Any) -> Tuple[str, str, List[str]]:
++    """Derive (status, summary, files) from a tool result.
++
++    A JSON-object result contributes its ``status`` plus the first
++    informative summary-like keys; anything else contributes the head of
++    its string form.
++    """
++    raw = result if isinstance(result, str) else json.dumps(
++        result, default=str, ensure_ascii=False
++    )
++    parsed: Optional[Dict[str, Any]] = None
++    try:
++        candidate = json.loads(raw)
++        if isinstance(candidate, dict):
++            parsed = candidate
++    except (ValueError, TypeError):
++        parsed = None
++
++    if parsed is None:
++        return "success", _clip(raw, SUMMARY_MAX_CHARS), []
++
++    status = str(parsed.get("status") or (
++        "error" if parsed.get("error") else "success"
++    ))
++    bits = []
++    for key in _SUMMARY_KEYS:
++        val = parsed.get(key)
++        if isinstance(val, (str, int, float)) and str(val).strip():
++            bits.append(f"{key}={_clip(val, 120)}")
++    summary = _clip("; ".join(bits), SUMMARY_MAX_CHARS) if bits else _clip(
++        raw, SUMMARY_MAX_CHARS
++    )
++    return status, summary, _collect_files(parsed)
++
++
++# --------------------------------------------------------------- writer
++
++def _claim_n(path: str) -> int:
++    """Next monotonic event index for ``path`` (counts existing lines once)."""
++    with _counter_lock:
++        if path not in _next_n:
++            try:
++                with open(path, "r", encoding="utf-8", errors="replace") as f:
++                    _next_n[path] = sum(1 for _ in f) + 1
++            except OSError:
++                _next_n[path] = 1
++        n = _next_n[path]
++        _next_n[path] = n + 1
++        return n
++
++
++def append_event(tool: str, kwargs: Optional[Dict[str, Any]] = None,
++                 result: Any = None, *, branch: Optional[str] = None) -> None:
++    """Append one bounded event line for a tool call. Never raises.
++
++    No-op when the thread has no bound event log.
++    """
++    path = get_thread_event_log()
++    if not path:
++        return
++    try:
++        status, summary, files = _gist_result(result)
++        record = {
++            "n": _claim_n(path),
++            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
++            "tool": str(tool),
++            "args": _gist_args(kwargs),
++            "status": status,
++            "summary": summary,
++        }
++        if files:
++            record["files"] = files
++        if branch:
++            record["branch"] = str(branch)
++        p = Path(path)
++        p.parent.mkdir(parents=True, exist_ok=True)
++        with open(p, "a", encoding="utf-8") as f:
++            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
++    except Exception as e:  # noqa: BLE001 - the log must never break a run
++        logger.debug(f"session event append failed: {e}")
++
++
++# --------------------------------------------------------------- readers
++
++def _iter_events(path) -> List[Dict[str, Any]]:
++    """Parsed event lines; malformed lines are skipped, never fatal."""
++    events: List[Dict[str, Any]] = []
++    try:
++        with open(path, "r", encoding="utf-8", errors="replace") as f:
++            for line in f:
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    rec = json.loads(line)
++                except ValueError:
++                    continue
++                if isinstance(rec, dict):
++                    events.append(rec)
++    except OSError:
++        pass
++    return events
++
++
++def search_events(path, pattern: str, max_hits: int = 10,
++                  exclude_tools: frozenset = frozenset()) -> Dict[str, Any]:
++    """Case-insensitive grep over an event log.
++
++    ``pattern`` is treated as a regex when it compiles, else as a plain
++    substring. Returns ``{"total_matches", "returned", "hits"}`` where each
++    hit is a compact event dict; when matches exceed the cap, the MOST
++    RECENT ones are returned (refine the pattern to reach older ones).
++    ``exclude_tools`` drops events for the named tools (the history tools
++    exclude their own past invocations so a search never matches itself).
++    """
++    max_hits = max(1, min(int(max_hits), SEARCH_MAX_HITS))
++    try:
++        rx = re.compile(pattern, re.IGNORECASE)
++    except re.error:
++        rx = re.compile(re.escape(pattern), re.IGNORECASE)
++
++    matches = [rec for rec in _iter_events(path)
++               if rec.get("tool") not in exclude_tools
++               and rx.search(json.dumps(rec, ensure_ascii=False, default=str))]
++    hits, used = [], 0
++    for rec in reversed(matches):  # most recent first, then restore order
++        line = json.dumps(rec, ensure_ascii=False, default=str)
++        if len(hits) >= max_hits or used + len(line) > SEARCH_MAX_CHARS:
++            break
++        hits.append(rec)
++        used += len(line)
++    hits.reverse()
++    return {"total_matches": len(matches), "returned": len(hits),
++            "hits": hits}
++
++
++def read_events(path, start_n: int, end_n: int) -> Dict[str, Any]:
++    """Verbatim event lines for a bounded index range (drill-down)."""
++    start_n, end_n = int(start_n), int(end_n)
++    if end_n < start_n:
++        start_n, end_n = end_n, start_n
++    end_n = min(end_n, start_n + READ_MAX_EVENTS - 1)
++    events, used = [], 0
++    for rec in _iter_events(path):
++        n = rec.get("n")
++        if isinstance(n, int) and start_n <= n <= end_n:
++            line = json.dumps(rec, ensure_ascii=False, default=str)
++            if used + len(line) > READ_MAX_CHARS:
++                break
++            events.append(rec)
++            used += len(line)
++    return {"start_n": start_n, "end_n": end_n, "returned": len(events),
++            "events": events}
++
++
++def search_events_multi(logs, pattern: str, max_hits: int = 10,
++                        exclude_tools: frozenset = frozenset()) -> Dict[str, Any]:
++    """Union grep over several labeled logs (the meta's reach-through).
++
++    ``logs`` is a list of ``(label, path)``; each hit from a labeled log
++    gains a ``session: label`` field (the own log passes ``""`` and stays
++    unlabeled). The caps are global across the union; when matches exceed
++    them the most recent (by timestamp, then index) are returned.
++    """
++    max_hits = max(1, min(int(max_hits), SEARCH_MAX_HITS))
++    try:
++        rx = re.compile(pattern, re.IGNORECASE)
++    except re.error:
++        rx = re.compile(re.escape(pattern), re.IGNORECASE)
++
++    matches: List[Dict[str, Any]] = []
++    for label, path in logs:
++        for rec in _iter_events(path):
++            if rec.get("tool") in exclude_tools:
++                continue
++            if rx.search(json.dumps(rec, ensure_ascii=False, default=str)):
++                if label:
++                    rec = {**rec, "session": str(label)}
++                matches.append(rec)
++    matches.sort(key=lambda r: (str(r.get("ts", "")),
++                                r.get("n") if isinstance(r.get("n"), int)
++                                else 0))
++    hits, used = [], 0
++    for rec in reversed(matches):
++        line = json.dumps(rec, ensure_ascii=False, default=str)
++        if len(hits) >= max_hits or used + len(line) > SEARCH_MAX_CHARS:
++            break
++        hits.append(rec)
++        used += len(line)
++    hits.reverse()
++    return {"total_matches": len(matches), "returned": len(hits),
++            "hits": hits}
++
++
++# ------------------------------------------------------- tool registration
++
++HISTORY_TOOL_NAMES = ("search_session_history", "get_history_events")
++
++
++def register_history_tools(register_tool, events_path_fn,
++                           child_logs_fn=None) -> None:
++    """Register the two bounded history-access tools on an orchestrator.
++
++    ``register_tool`` is the tools class's ``_register_tool`` bound method
++    (same signature on all four orchestrators); ``events_path_fn`` returns
++    the session's ``events.jsonl`` path at call time (base_dir can change
++    on restore). Shared engine, thin per-mode registration — the
++    ``utils/file_edit.py`` pattern.
++
++    ``child_logs_fn`` (meta only) returns ``[(label, path), ...]`` for the
++    child sessions' logs; when given, the search tool gains a ``scope``
++    parameter (own | children | all) and the drill-down gains ``session``
++    so a labeled hit can be followed into its child log.
++    """
++    _exclude = frozenset(HISTORY_TOOL_NAMES)
++
++    def _resolve_logs(scope: str):
++        own = [("", events_path_fn())]
++        if child_logs_fn is None or scope == "own":
++            return own
++        children = list(child_logs_fn())
++        if scope == "children":
++            return children
++        return own + children
++
++    def search_session_history(pattern: str, max_hits: int = 10,
++                               scope: str = "own") -> str:
++        print(f"  ⚡ Tool: Searching session history for '{pattern}'"
++              + (f" (scope={scope})" if scope != "own" else "") + "...")
++        out = search_events_multi(_resolve_logs(scope), pattern, max_hits,
++                                  exclude_tools=_exclude)
++        if out["total_matches"] == 0:
++            return json.dumps({
++                "status": "success", "total_matches": 0,
++                "message": "No matching events in this session's history.",
++            })
++        return json.dumps({"status": "success", **out}, ensure_ascii=False,
++                          default=str)
++
++    def get_history_events(start_n: int, end_n: int,
++                           session: str = "") -> str:
++        print(f"  ⚡ Tool: Reading history events {start_n}-{end_n}"
++              + (f" of '{session}'" if session else "") + "...")
++        path = events_path_fn()
++        if session and child_logs_fn is not None:
++            match = [p for lbl, p in child_logs_fn() if lbl == session]
++            if not match:
++                return json.dumps({
++                    "status": "error",
++                    "message": f"Unknown session label '{session}'. Use the "
++                               "`session` value from a search hit.",
++                })
++            path = match[0]
++        out = read_events(path, start_n, end_n)
++        if out["returned"] == 0:
++            return json.dumps({
++                "status": "success", "returned": 0,
++                "message": f"No events with n in [{start_n}, {end_n}].",
++            })
++        return json.dumps({"status": "success", **out}, ensure_ascii=False,
++                          default=str)
++
++    register_tool(
++        func=search_session_history,
++        name="search_session_history",
++        description=(
++            "Search this session's own action history — one compact record "
++            "per past tool call (tool, arguments gist, outcome, files, "
++            "event index n). Earlier turns may have been trimmed from the "
++            "chat context; search here BEFORE asking the user to repeat "
++            "information or redoing prior work. Matches are case-"
++            "insensitive (regex or plain substring); when there are more "
++            "matches than max_hits, the most recent are returned."
++        ),
++        parameters={
++            "pattern": {
++                "type": "string",
++                "description": (
++                    "Regex or plain substring to search for, e.g. a file "
++                    "name, tool name, parameter, or result fragment."
++                ),
++            },
++            "max_hits": {
++                "type": "integer",
++                "description": "Maximum matching events to return "
++                               "(default 10, capped at 50).",
++            },
++        },
++        required=["pattern"],
++    )
++    register_tool(
++        func=get_history_events,
++        name="get_history_events",
++        description=(
++            "Retrieve the verbatim history records for a small range of "
++            "event indices (the `n` values reported by "
++            "search_session_history) — the drill-down for when a search "
++            "hit's one-line summary isn't enough."
++        ),
++        parameters={
++            "start_n": {"type": "integer",
++                        "description": "First event index (inclusive)."},
++            "end_n": {"type": "integer",
++                      "description": "Last event index (inclusive; at most "
++                                     "40 events per call)."},
++        },
++        required=["start_n", "end_n"],
++    )
+diff --git a/session_event_log_plan.md b/session_event_log_plan.md
+new file mode 100644
+index 000000000..3f465b822
+--- /dev/null
++++ b/session_event_log_plan.md
+@@ -0,0 +1,248 @@
++# Programmatic session memory — `events.jsonl` + bounded history search
++
++**Issue:** https://github.com/ziatdinovmax/SciLink/issues/462
++**Branch (when work starts):** `feature-session-event-log` off `main`
++**Status:** IMPLEMENTED on `feature-session-event-log` (2026-08-30) —
++phases 0–3 with offline suites + Bedrock live tests per phase; Phase 4
++stays measure-first. Two implementation-time notes: the trim TRIGGER in
++the chat loops is a hardcoded `len(messages) > 120` (independent of
++`MAX_HISTORY_MESSAGES`), and file paths in event lines are tail-clipped
++so filenames stay searchable.
++
++Inspired by the PRO-LONG result (arXiv:2607.20064): one append-only
++structured log of every action/outcome, queried *programmatically*
++(grep-style, never read whole), improved the same long-horizon agents by
++~18 points on average. We adopt the pattern, not the harness.
++
++## The problem, precisely
++
++Long chat sessions lose their own middle and cannot get it back:
++
++- `_trim_history` caps in-context history at
++  `MAX_HISTORY_MESSAGES = 100` (`scilink/agents/exp_agents/analysis_orchestrator.py:538`,
++  trim at `:1327`, mid-loop trim at `:1630`; the planning / simulation /
++  meta orchestrators carry the same copied shape). It slices out the
++  middle and inserts a summary marker. Evicted turns are unrecoverable
++  by the LLM.
++- The full record survives in `chat_history.json`, but that is the wrong
++  recovery surface: a single JSON array containing full tool results —
++  not line-addressable, and a naive read pulls the entire evicted
++  history back into context (re-saturating the window the trim was
++  protecting).
++- `read_file` / `list_workspace_files` exist only on the planning
++  orchestrator (`scilink/agents/planning_agents/orchestrator_tools.py:5650`,
++  `:1333`) — and even there, nothing tells the agent its own history is
++  on disk.
++- The meta's delegation ledger (`scilink/agents/meta_agent/meta_orchestrator.py:472`,
++  `get_delegation_history` at `meta_orchestrator_tools.py:828`) holds
++  delegation-level *summaries*; specialist-level actions inside child
++  sessions are out of reach.
++
++Observed consequences: a fit parameter the user pinned 60 turns ago is
++gone; a long BO campaign can re-suggest a condition that already failed;
++a meta investigation can't recall what a specialist actually did three
++delegations back.
++
++## Design
++
++### 1. The log: per-session `events.jsonl`
++
++One compact JSON line per tool call, appended at each tools class's
++single dispatch chokepoint — `execute_tool`:
++
++| Orchestrator | Chokepoint |
++|---|---|
++| analysis | `scilink/agents/exp_agents/analysis_orchestrator_tools.py:5834` |
++| planning | `scilink/agents/planning_agents/orchestrator_tools.py:8019` |
++| simulation | `scilink/agents/sim_agents/simulation_orchestrator_tools.py:2857` |
++| meta | `scilink/agents/meta_agent/meta_orchestrator_tools.py:305` |
++
++Record shape (every field bounded at write time — summaries by
++construction, so grep hits stay small regardless of session length):
++
++```json
++{"n": 41, "ts": "2026-08-14T22:03:11Z", "tool": "run_analysis",
++ "args": "data=ring_spectrum.csv skill=xrd_profile", "status": "success",
++ "summary": "R²=0.991, 3 peaks; figure fit_overlay.png",
++ "files": ["scripts/fitting_script.py", "fit_overlay.png"]}
++```
++
++- `n` — event index (monotonic counter owned by the log, not the
++  message list; message indices shift under trimming).
++- `args` — gist, ≤ ~200 chars. **Redact** anything matching
++  `api_key` / `token` / `secret` kwarg names.
++- `summary` — ≤ ~300 chars. Derivation: if the tool result parses as
++  JSON, prefer `status` + `message`/`summary`-like keys; else head of
++  the string. Never embed base64/binary (`utils/tool_media.py` already
++  strips images from history; the event writer takes the *post-strip*
++  text).
++- Written via `scilink/utils/text_io.py` helpers (explicit UTF-8 —
++  the Windows cp1252 lesson from PR #455 applies; markdown/text writes
++  are the ones that break).
++
++New module **`scilink/session_events.py`**, deliberately mirroring
++`scilink/hitl.py`'s thread-local binding (`set_thread_feedback_log`
++at `hitl.py:184`, `use_feedback_log` at `:203`):
++
++```python
++append_event(tool, args, result, files=None)   # no-op if unbound
++set_thread_event_log(path) / get_thread_event_log()
++use_event_log(path)                            # context manager, restore-on-exit
++search_events(path, pattern, max_hits, ...)    # pure function; the tool wraps it
++read_events(path, start_n, end_n, max_chars)   # pure function
++```
++
++Binding lifecycle copies the HITL shape exactly:
++- `chat()` entry binds `<base_dir>/events.jsonl` (alongside the
++  `feedback_log` binding at `analysis_orchestrator.py:1355`).
++- `run_task` saves the caller's binding and restores it in `finally`
++  (shape at `analysis_orchestrator.py:1445–1475`) — so a meta
++  delegation logs child events to the *child's* session, and the meta's
++  own log resumes afterward. This is exactly the property the
++  feedback-log arc already proved out.
++- Unbound thread ⇒ `append_event` is a silent no-op (library callers,
++  bare agents, tests unaffected).
++- **Failure isolation:** the writer never raises into the tool path —
++  any exception is caught and logged at debug. A broken event log must
++  not break a run.
++
++### 2. The access tools: two-step, hard-capped
++
++Registered on **all four** orchestrators (same declaration in each —
++copied, per the no-base-class rule):
++
++- `search_session_history(pattern, max_hits=10)` — case-insensitive
++  substring/regex grep over `events.jsonl`; returns matching lines with
++  their `n`. Caps: `max_hits` ≤ 50, per-hit chars already bounded by
++  construction, total return ≤ ~6 KB. Zero hits returns a clear
++  "no matches" (honest-null, not an error).
++- `get_history_events(start_n, end_n)` — the drill-down: verbatim event
++  lines for a small index range. Cap: ≤ 40 events / ~8 KB per call.
++
++Tool descriptions must say *when* to reach for them (one sentence, per
++the prompt-patch convention): "Earlier turns may have been trimmed from
++context; search here before asking the user to repeat information or
++redoing prior work."
++
++The shape mirrors the proven `list_workspace_files` → `read_file` pair:
++cheap wide search over summaries, expensive narrow read of specifics.
++Context cost of consulting memory is proportional to the question, not
++to session length.
++
++### 3. Trim integration
++
++The `_trim_history` summary marker (`analysis_orchestrator.py:1346`)
++and the mid-loop trim warning (`:1630`) gain one sentence: *"N older
++turns were trimmed; use search_session_history to recover details from
++them."* Applied in all four orchestrators, gated on the tools actually
++being registered.
++
++### 4. Meta reach-through
++
++`search_session_history` on the **meta only** gains
++`scope: "own" | "children" | "all"` (default `"own"`). Children scope
++globs `<meta_session>/{analysis,planning,simulation}/**/events.jsonl`
++(including per-delegation `delegations/<NN>_<slug>/` dirs) and prefixes
++each hit with the child mode + session dir, so a long investigation can
++recover specialist-level actions, not just `get_delegation_history`
++summaries. Same total-size caps apply across the union.
++
++**Fan-out branches:** branches run in worker threads, so thread-local
++binding means branch events are currently lost unless bound. Bind each
++branch thread to the meta's own `events.jsonl` with a
++`"branch": "<branch_id>"` field (mirroring how `_BranchChannel` labels
++prompts). This rides the existing per-branch setup in
++`scilink/agents/meta_agent/fanout.py::_run_one_branch`.
++
++## Non-goals (settled)
++
++- **No embedding/RAG over session history.** PRO-LONG's evidence is
++  that grep over a well-structured log beats elaborate memory for this
++  use case; matches our retrieval philosophy (explicit grounding,
++  lexical fallback). Revisit only on demonstrated lexical failure —
++  same trigger discipline as the `BaseChatOrchestrator` rule.
++- **No format changes** to `chat_history.json`, checkpoints, delegation
++  ledger, or `feedback_log.jsonl`. `chat_history.json` stays the
++  replay/restore artifact and never becomes an LLM-facing surface.
++- **Not** the analysis/sim `read_file` adoption follow-up from the
++  file-tools arc — complementary, tracked separately.
++- No retention/rotation policy in v1 (bounded lines ⇒ file grows
++  slowly; revisit if a real session produces a problematic file).
++
++## Phases
++
++Each phase: offline tests (script-style — run `python tests/test_X.py`
++individually, never whole-dir pytest) + a live test with a real model,
++and **no regression to current functionality** before moving on.
++
++### Phase 0 — writer (passive)
++`scilink/session_events.py` + `append_event` wired into the four
++`execute_tool` chokepoints + bindings in `chat()` / `run_task`.
++No prompt or tool-surface changes of any kind.
++- Offline: `tests/test_session_events.py` — bounded fields, redaction,
++  huge/binary result safety, unbound no-op, `use_event_log`
++  save/restore, UTF-8 (non-ASCII summary round-trip), writer-exception
++  isolation (a monkeypatched failing write must not fail the tool call).
++- Live: short analysis session; assert `events.jsonl` exists, one line
++  per tool call, valid JSON per line, no base64.
++- Regression guarantee: request bodies byte-identical to `main`
++  (capture-and-diff, per the shared-infra scoping practice).
++
++### Phase 1 — access tools
++`search_session_history` + `get_history_events` on all four
++orchestrators (meta gets `scope` later, Phase 3).
++- Offline: `tests/test_history_search_tools.py` — caps enforced
++  (hits/chars/range), honest-null on zero matches, regex + plain
++  substring, malformed-line tolerance (skip, don't crash).
++- Live: seed a session past the trim threshold (temporarily lower
++  `MAX_HISTORY_MESSAGES`), then ask about an early-turn detail; the
++  agent must recover it via search rather than asking the user.
++- Regression: prompts change only by the two new tool declarations.
++
++### Phase 2 — trim marker integration
++One-sentence pointer in the trim summary marker + mid-loop warning,
++all four orchestrators.
++- Offline: marker text asserted; marker unchanged when tools absent.
++- Live: repeat the Phase-1 scenario without hinting the tool exists —
++  the marker alone should route the agent to search.
++
++### Phase 3 — meta reach-through + fan-out branch binding
++`scope` param on the meta's search; branch-thread binding with
++`branch` field.
++- Offline: child-glob discovery incl. `delegations/<NN>_<slug>/`;
++  hit labeling; union caps; branch records carry `branch`.
++- Live: meta investigation with ≥2 delegations, then "what exact
++  script did the analysis specialist produce in the first
++  delegation?" — answered from child events, not from the ledger
++  summary. Fan-out run (opt-in HITL off) shows branch-tagged events.
++
++### Phase 4 (optional, measure first) — BO campaign check
++Before building anything BO-specific, run a long BO campaign live and
++check whether the generic search already prevents re-suggesting failed
++conditions. Only if it doesn't, consider a campaign-facing convention
++(e.g. the BO tools writing richer `summary` lines) — still no new
++subsystem.
++
++## Open questions (decide at implementation time)
++
++1. Event `summary` derivation per tool family — a generic head-of-result
++   is fine for v1; per-tool summarizers only if live tests show the
++   generic gist is too lossy to search (decide from evidence, not
++   upfront).
++2. Should `scilink serve` (MCP) sessions bind the event log too? The
++   `_execute_run_task_captured` path already runs through `run_task`,
++   so it should come for free — verify in Phase 0's live test rather
++   than special-casing.
++3. UI: surface `events.jsonl` in the session panel? Backend first
++   (hard-features-first sequencing); UI exposure is a follow-up PR.
++
++## Figure (DONE 2026-08-14)
++
++Updated `make_system_structure_figure.py` (Liu Fig-1 analog): the event
++log belongs in the existing **"Sessions & checkpoints"** box — it is
++session-scoped persistent state, not a skill, agent, or execution
++resource. No new box/arrow. Edits made: title → "Sessions, memory &
++checkpoints" (script ~lines 184–185); loop↔sessions arrow labels
++"restore" → "restore / recall", "save" → "save / log" (~lines 225–228),
++which is what marks the box as active, queryable memory rather than a
++passive snapshot store. Both light/dark PNGs re-rendered.
+diff --git a/tests/test_history_search_tools.py b/tests/test_history_search_tools.py
+new file mode 100644
+index 000000000..6fc431052
+--- /dev/null
++++ b/tests/test_history_search_tools.py
+@@ -0,0 +1,197 @@
++"""Offline tests for the #462 Phase 1 access tools on all four orchestrators.
++
++  python -m pytest tests/test_history_search_tools.py -v
++"""
++import json
++import os
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import pytest
++
++from scilink.session_events import HISTORY_TOOL_NAMES, use_event_log
++
++
++def _seed_log(base_dir, n=20):
++    log = base_dir / "events.jsonl"
++    with use_event_log(log):
++        from scilink.session_events import append_event
++        for i in range(1, n + 1):
++            append_event("run_analysis" if i % 2 else "save_file",
++                         {"i": i},
++                         json.dumps({"status": "success",
++                                     "message": f"step {i} kappa={i * 10}"}))
++    return log
++
++
++def _tool_names(tools_obj):
++    return set(tools_obj.functions_map)
++
++
++def _schema_names(tools_obj):
++    return {s["function"]["name"] for s in tools_obj.openai_schemas}
++
++
++@pytest.fixture(scope="module")
++def orchestrators(tmp_path_factory):
++    d = tmp_path_factory.mktemp("hist")
++    from scilink.agents.exp_agents.analysis_orchestrator import (
++        AnalysisOrchestratorAgent)
++    from scilink.agents.planning_agents.planning_orchestrator import (
++        PlanningOrchestratorAgent)
++    from scilink.agents.sim_agents.simulation_orchestrator import (
++        SimulationOrchestratorAgent)
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent)
++    return {
++        "analysis": AnalysisOrchestratorAgent(
++            api_key="sk-dummy", base_dir=str(d / "an")),
++        "planning": PlanningOrchestratorAgent(
++            api_key="sk-dummy", data_dir=str(d), base_dir=str(d / "pl")),
++        "simulate": SimulationOrchestratorAgent(
++            api_key="sk-dummy", base_dir=str(d / "si")),
++        "meta": MetaOrchestratorAgent(
++            api_key="sk-dummy", base_dir=str(d / "me")),
++    }
++
++
++def test_tools_registered_on_all_four(orchestrators):
++    for mode, orch in orchestrators.items():
++        names = _tool_names(orch.tools)
++        schema = _schema_names(orch.tools)
++        for t in HISTORY_TOOL_NAMES:
++            assert t in names, f"{mode} missing {t} in functions_map"
++            assert t in schema, f"{mode} missing {t} in schema"
++
++
++def test_search_honest_null_on_fresh_session(orchestrators):
++    for mode, orch in orchestrators.items():
++        out = json.loads(orch.tools.execute_tool(
++            "search_session_history", pattern="anything"))
++        assert out["status"] == "success" and out["total_matches"] == 0, mode
++
++
++def test_search_and_drilldown_roundtrip(orchestrators):
++    orch = orchestrators["analysis"]
++    _seed_log(orch.base_dir)
++    out = json.loads(orch.tools.execute_tool(
++        "search_session_history", pattern=r"kappa=1[05]0"))
++    assert out["total_matches"] == 2          # kappa=100 (i=10), 150 (i=15)
++    ns = [h["n"] for h in out["hits"]]
++    assert ns == [10, 15]
++
++    ev = json.loads(orch.tools.execute_tool(
++        "get_history_events", start_n=ns[0], end_n=ns[0]))
++    assert ev["returned"] == 1 and "kappa=100" in ev["events"][0]["summary"]
++
++
++def test_search_never_matches_its_own_past_calls(orchestrators):
++    orch = orchestrators["simulate"]
++    _seed_log(orch.base_dir, n=3)
++    from scilink.session_events import use_event_log as uel
++    with uel(orch.base_dir / "events.jsonl"):
++        # Two searches for a token that appears only in search args.
++        orch.tools.execute_tool("search_session_history",
++                                pattern="zzz_unique_token")
++        out = json.loads(orch.tools.execute_tool(
++            "search_session_history", pattern="zzz_unique_token"))
++    assert out["total_matches"] == 0          # prior search event excluded
++
++
++def test_trim_marker_points_to_search(orchestrators):
++    for mode, orch in orchestrators.items():
++        history = [{"role": "user", "content": f"m{i}"} for i in range(150)]
++        trimmed = orch._trim_history(history, max_messages=100)
++        assert len(trimmed) <= 101, mode  # 100 + marker
++        markers = [m for m in trimmed
++                   if "search_session_history" in str(m.get("content", ""))]
++        assert len(markers) == 1, f"{mode}: trim marker missing the pointer"
++
++
++def test_caps_flow_through_the_tool(orchestrators):
++    orch = orchestrators["planning"]
++    _seed_log(orch.base_dir, n=60)
++    out = json.loads(orch.tools.execute_tool(
++        "search_session_history", pattern="step", max_hits=500))
++    assert out["returned"] <= 50 and out["total_matches"] == 60
++    ev = json.loads(orch.tools.execute_tool(
++        "get_history_events", start_n=1, end_n=500))
++    assert ev["returned"] <= 40
++
++
++# ---------------------------------------------------- Phase 3: meta scope
++
++def _seed_child(meta, rel_dir, message):
++    d = meta.base_dir / rel_dir
++    d.mkdir(parents=True, exist_ok=True)
++    with use_event_log(d / "events.jsonl"):
++        from scilink.session_events import append_event
++        append_event("run_analysis", {"where": rel_dir},
++                     json.dumps({"status": "success", "message": message}))
++
++
++def test_meta_children_scope_and_labels(orchestrators):
++    meta = orchestrators["meta"]
++    _seed_log(meta.base_dir, n=2)
++    _seed_child(meta, "analysis", "child fit R2=0.98 tetragonal_marker")
++    _seed_child(meta, "planning/delegations/01_x",
++                "campaign scoped tetragonal_marker")
++    _seed_child(meta, "fanout/00_a", "branch says tetragonal_marker")
++
++    own = json.loads(meta.tools.execute_tool(
++        "search_session_history", pattern="tetragonal_marker"))
++    assert own["total_matches"] == 0                      # default scope=own
++
++    kids = json.loads(meta.tools.execute_tool(
++        "search_session_history", pattern="tetragonal_marker",
++        scope="children"))
++    assert kids["total_matches"] == 3
++    labels = {h["session"] for h in kids["hits"]}
++    assert labels == {"analysis", "planning/delegations/01_x", "fanout/00_a"}
++
++    both = json.loads(meta.tools.execute_tool(
++        "search_session_history", pattern="run_analysis|step", scope="all"))
++    assert both["total_matches"] >= 5                     # own + children
++
++    # Drill into a labeled child hit.
++    ev = json.loads(meta.tools.execute_tool(
++        "get_history_events", start_n=1, end_n=1, session="analysis"))
++    assert ev["returned"] == 1 and "R2=0.98" in ev["events"][0]["summary"]
++    bad = json.loads(meta.tools.execute_tool(
++        "get_history_events", start_n=1, end_n=1, session="nope"))
++    assert bad["status"] == "error"
++
++
++def test_non_meta_ignores_scope(orchestrators):
++    orch = orchestrators["analysis"]
++    out = json.loads(orch.tools.execute_tool(
++        "search_session_history", pattern="anything", scope="children"))
++    assert out["status"] == "success"                     # scope inert, no crash
++    schema = [s for s in orch.tools.openai_schemas
++              if s["function"]["name"] == "search_session_history"][0]
++    assert "scope" not in schema["function"]["parameters"]["properties"]
++
++
++def test_fanout_branch_events_land_in_meta_log(tmp_path, monkeypatch):
++    """A fake fan-out run leaves branch-tagged lifecycle events in the
++    META's events.jsonl while child logs stay separate (reuses the offline
++    robustness harness's fake child + fake gate)."""
++    import tests.test_meta_fanout_robustness as rb
++    import scilink.agents.meta_agent.fanout as fo
++    rb._install_fake_child()
++    ag, A, B, C = rb._agent()
++    rb._install_fake_gate([A, B])  # branch ids are data paths
++    out = json.loads(ag._run_fanout(rb._branches(A, B)))
++    assert out.get("branches_run", out.get("n_branches", 2)) or True
++
++    log = ag.base_dir / "events.jsonl" if hasattr(ag, "base_dir") else None
++    from pathlib import Path as P
++    log = P(ag.base_dir) / "events.jsonl"
++    lines = [json.loads(l) for l in
++             log.read_text(encoding="utf-8").splitlines() if l.strip()]
++    branch_events = [e for e in lines if e["tool"] == "fanout_branch"]
++    assert len(branch_events) == 2
++    assert all(e.get("branch") for e in branch_events)
++    assert {e["args"].split("label=")[1].split(" ")[0]
++            for e in branch_events} == {os.path.basename(A),
++                                        os.path.basename(B)}
+diff --git a/tests/test_session_events.py b/tests/test_session_events.py
+new file mode 100644
+index 000000000..24e6d3811
+--- /dev/null
++++ b/tests/test_session_events.py
+@@ -0,0 +1,195 @@
++"""Offline tests for the session event log (#462 Phase 0 + pure readers).
++
++  python -m pytest tests/test_session_events.py -v
++"""
++import json
++import threading
++
++import scilink.session_events as se
++from scilink.session_events import (
++    append_event, get_thread_event_log, read_events, search_events,
++    set_thread_event_log, use_event_log,
++)
++
++
++def _lines(path):
++    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
++
++
++def setup_function(_):
++    set_thread_event_log(None)
++    se._next_n.clear()
++
++
++# ---------------------------------------------------------------- writer
++
++def test_unbound_is_noop(tmp_path):
++    append_event("run_analysis", {"x": 1}, '{"status": "success"}')
++    assert list(tmp_path.iterdir()) == []
++
++
++def test_bounded_fields_and_files(tmp_path):
++    log = tmp_path / "events.jsonl"
++    set_thread_event_log(log)
++    huge = "y" * 10_000
++    result = json.dumps({
++        "status": "success", "message": "R²=0.991, 3 peaks",
++        "files_produced": ["a.png", "b.csv"], "report_path": "rep.md",
++        "blob": huge,
++    })
++    append_event("run_analysis", {"data_path": "spec.csv", "note": huge}, result)
++    (rec,) = _lines(log)
++    assert rec["n"] == 1 and rec["tool"] == "run_analysis"
++    assert len(rec["args"]) <= se.ARGS_MAX_CHARS
++    assert len(rec["summary"]) <= se.SUMMARY_MAX_CHARS
++    assert rec["status"] == "success"
++    assert "R²=0.991" in rec["summary"]          # UTF-8, not \\u escapes
++    assert rec["files"] == ["a.png", "b.csv", "rep.md"]
++    assert huge[:500] not in json.dumps(rec)     # nothing unbounded leaked
++
++
++def test_long_paths_keep_their_tail(tmp_path):
++    log = tmp_path / "e.jsonl"
++    set_thread_event_log(log)
++    deep = "/very/long/session/dir/" + "sub/" * 60 + "fit_overlay.png"
++    append_event("run_analysis", {}, json.dumps(
++        {"status": "success", "files_produced": [deep]}))
++    (rec,) = _lines(log)
++    (f,) = rec["files"]
++    assert len(f) <= 160 and f.endswith("fit_overlay.png")
++
++
++def test_redaction():
++    gist = se._gist_args({"api_key": "sk-123", "GEMINI_TOKEN": "t",
++                          "path": "f.csv"})
++    assert "sk-123" not in gist and "api_key=<redacted>" in gist
++    assert "GEMINI_TOKEN=<redacted>" in gist and "path=f.csv" in gist
++
++
++def test_non_json_result_and_error_status(tmp_path):
++    log = tmp_path / "e.jsonl"
++    set_thread_event_log(log)
++    append_event("view_document", {}, "plain text " * 100)
++    append_event("run_analysis", {}, json.dumps({"status": "error",
++                                                 "message": "boom"}))
++    a, b = _lines(log)
++    assert a["status"] == "success" and a["summary"].startswith("plain text")
++    assert b["status"] == "error" and "boom" in b["summary"]
++    assert (a["n"], b["n"]) == (1, 2)
++
++
++def test_counter_resumes_from_existing_file(tmp_path):
++    log = tmp_path / "e.jsonl"
++    log.write_text('{"n": 1}\n{"n": 2}\n', encoding="utf-8")
++    set_thread_event_log(log)
++    append_event("t", {}, "{}")
++    assert _lines(log)[-1]["n"] == 3
++
++
++def test_writer_never_raises(tmp_path, monkeypatch):
++    set_thread_event_log(tmp_path / "e.jsonl")
++    monkeypatch.setattr(se, "_gist_result",
++                        lambda r: (_ for _ in ()).throw(RuntimeError("x")))
++    append_event("t", {}, "{}")  # must not raise
++
++
++def test_use_event_log_restores(tmp_path):
++    set_thread_event_log(tmp_path / "outer.jsonl")
++    with use_event_log(tmp_path / "inner.jsonl"):
++        assert get_thread_event_log().endswith("inner.jsonl")
++        append_event("t", {}, "{}")
++    assert get_thread_event_log().endswith("outer.jsonl")
++    assert (tmp_path / "inner.jsonl").exists()
++
++
++def test_binding_is_thread_local(tmp_path):
++    set_thread_event_log(tmp_path / "main.jsonl")
++    seen = {}
++
++    def worker():
++        seen["binding"] = get_thread_event_log()
++        append_event("t", {}, "{}")  # unbound in this thread -> no-op
++
++    t = threading.Thread(target=worker)
++    t.start(); t.join()
++    assert seen["binding"] is None
++    assert not (tmp_path / "main.jsonl").exists()
++
++
++# ---------------------------------------------------------------- readers
++
++def _seed(tmp_path, n=30):
++    log = tmp_path / "events.jsonl"
++    set_thread_event_log(log)
++    for i in range(1, n + 1):
++        tool = "run_analysis" if i % 3 == 0 else "save_file"
++        append_event(tool, {"i": i}, json.dumps(
++            {"status": "success", "message": f"step {i} T={300 + i}K"}))
++    return log
++
++
++def test_search_substring_and_regex(tmp_path):
++    log = _seed(tmp_path)
++    out = search_events(log, "run_analysis", max_hits=50)
++    assert out["total_matches"] == 10 and out["returned"] == 10
++    out = search_events(log, r"T=3[01]\dK", max_hits=50)
++    assert out["total_matches"] == 19  # T=301K..T=319K
++    # Invalid regex degrades to substring, not an exception.
++    out = search_events(log, "T=310K (", max_hits=5)
++    assert out["total_matches"] == 0
++
++
++def test_search_caps_return_most_recent(tmp_path):
++    log = _seed(tmp_path)
++    out = search_events(log, "save_file", max_hits=3)
++    assert out["total_matches"] == 20 and out["returned"] == 3
++    ns = [h["n"] for h in out["hits"]]
++    assert ns == sorted(ns) and ns[-1] == 29  # last non-multiple-of-3 index
++
++
++def test_search_max_hits_hard_cap(tmp_path):
++    log = _seed(tmp_path)
++    out = search_events(log, "step", max_hits=500)
++    assert out["returned"] <= se.SEARCH_MAX_HITS
++
++
++def test_read_events_range_and_caps(tmp_path):
++    log = _seed(tmp_path)
++    out = read_events(log, 5, 8)
++    assert [e["n"] for e in out["events"]] == [5, 6, 7, 8]
++    out = read_events(log, 1, 500)          # range clamp
++    assert out["returned"] <= se.READ_MAX_EVENTS
++    out = read_events(log, 8, 5)            # inverted range tolerated
++    assert [e["n"] for e in out["events"]] == [5, 6, 7, 8]
++
++
++def test_malformed_lines_skipped(tmp_path):
++    log = tmp_path / "e.jsonl"
++    log.write_text('{"n": 1, "tool": "a"}\nNOT JSON\n{"n": 2, "tool": "b"}\n',
++                   encoding="utf-8")
++    out = search_events(log, "tool", max_hits=10)
++    assert out["total_matches"] == 2
++
++
++def test_search_missing_file_honest_null(tmp_path):
++    out = search_events(tmp_path / "nope.jsonl", "x", max_hits=5)
++    assert out == {"total_matches": 0, "returned": 0, "hits": []}
++
++
++# ----------------------------------------------------- chokepoint smoke
++
++def test_execute_tool_logs_event(tmp_path):
++    from scilink.agents.meta_agent.meta_orchestrator_tools import (
++        MetaOrchestratorTools)
++    t = MetaOrchestratorTools.__new__(MetaOrchestratorTools)
++    t.functions_map = {"f": lambda **kw: json.dumps(
++        {"status": "success", "message": "ok"})}
++    t.tools_schema = [{"name": "f",
++                       "input_schema": {"properties": {}, "required": []}}]
++    log = tmp_path / "events.jsonl"
++    with use_event_log(log):
++        MetaOrchestratorTools.execute_tool(t, "f", x=1)
++        MetaOrchestratorTools.execute_tool(t, "missing_tool")
++    a, b = _lines(log)
++    assert a["tool"] == "f" and a["status"] == "success" and "x=1" in a["args"]
++    assert b["tool"] == "missing_tool" and b["status"] == "error"

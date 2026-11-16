@@ -1,0 +1,290 @@
+diff --git a/tests/test_benchmark_free_energy.py b/tests/test_benchmark_free_energy.py
+index ce4de0d1fa..d2206036f5 100644
+--- a/tests/test_benchmark_free_energy.py
++++ b/tests/test_benchmark_free_energy.py
+@@ -113,7 +113,7 @@ def run_benchmark_hif2a_single_topology(hif2a_single_topology_leg, mode, enable_
+         run = partial(run_sims_sequential, initial_states, md_params, temperature=temperature)
+     elif mode == "bisection":
+         # Bisection is expected to use a slightly different initial schedule to reduce
+-        # amount of minimization. The additional logic it to emulate estimate_relative_free_energy_bisection
++        # the amount of minimization. Benchmark intends to emulate estimate_relative_free_energy_bisection
+         lambda_grid = bisection_lambda_schedule(
+             n_windows, lambda_interval=(initial_states[0].lamb, initial_states[-1].lamb)
+         )
+@@ -142,8 +142,8 @@ def run_benchmark_hif2a_single_topology(hif2a_single_topology_leg, mode, enable_
+         )
+ 
+         make_optimized_initial_state = lambda lamb: optimize_initial_state_fn(make_initial_state_fn(lamb))
+-        # Bisection is a bit different since it has to generate new windows, but still good to benchmark
+-        # as it is done upfront before HREX in practice
++        # Bisection is a bit different, since it has to generate new windows. The lambda schedule from bisection
++        # is used as the schedule for HREX in practice, making it important to benchmark.
+         run = partial(
+             run_sims_bisection,
+             [initial_states[0].lamb, initial_states[-1].lamb],
+diff --git a/tests/test_hrex_rbfe.py b/tests/test_hrex_rbfe.py
+index 49fdffb141..719faba9ce 100644
+--- a/tests/test_hrex_rbfe.py
++++ b/tests/test_hrex_rbfe.py
+@@ -12,6 +12,7 @@
+ from psutil import Process
+ from scipy import stats
+ 
++from timemachine.fe.energy_decomposition import EnergyDecomposedState, compute_energy_decomposed_u_kln, get_batch_u_fns
+ from timemachine.fe.free_energy import (
+     HostConfig,
+     HREXParams,
+@@ -19,6 +20,7 @@
+     MDParams,
+     RESTParams,
+     WaterSamplingParams,
++    estimate_free_energy_bar,
+     sample_with_context_iter,
+ )
+ from timemachine.fe.plots import (
+@@ -221,6 +223,30 @@ def time_lagged_rmsd(traj):
+     assert result.hrex_plots.swap_acceptance_rates_convergence_png
+     assert result.hrex_plots.replica_state_distribution_heatmap_png
+ 
++    # Verify that the Bar results match to the reference implementation
++    samples = result.trajectories
++    initial_states = result.final_result.initial_states
++    unbound_impls = [p.potential.to_gpu(np.float32).unbound_impl for p in initial_states[0].potentials]
++    temperature = initial_states[0].integrator.temperature
++    comp_bar_results = result.final_result.bar_results
++    # Compute the reference bar results
++    assert len(samples) == len(samples)
++    energy_decomp_states = []
++    for state, traj in zip(initial_states, samples):
++        batch_u_fns = get_batch_u_fns(unbound_impls, [p.params for p in state.potentials], temperature)
++        energy_decomp_states.append(EnergyDecomposedState(traj.frames, traj.boxes, batch_u_fns))
++
++    ref_bar_results = []
++    for state_a, state_b in zip(energy_decomp_states, energy_decomp_states[1:]):
++        u_kln_by_component = compute_energy_decomposed_u_kln([state_a, state_b])
++        ref_bar_results.append(estimate_free_energy_bar(u_kln_by_component, temperature))
++    for ref_res, comp_res in zip(ref_bar_results, comp_bar_results):
++        assert ref_res.overlap == comp_res.overlap
++        np.testing.assert_array_equal(ref_res.dG_err_by_component, comp_res.dG_err_by_component)
++        np.testing.assert_array_equal(ref_res.overlap_by_component, comp_res.overlap_by_component)
++        np.testing.assert_array_equal(ref_res.dG_err_by_component, comp_res.dG_err_by_component)
++        np.testing.assert_array_equal(ref_res.u_kln_by_component, comp_res.u_kln_by_component)
++
+ 
+ def plot_hrex_rbfe_hif2a(result: HREXSimulationResult):
+     plot_hrex_swap_acceptance_rates_convergence(result.hrex_diagnostics.cumulative_swap_acceptance_rates)
+diff --git a/timemachine/fe/energy_decomposition.py b/timemachine/fe/energy_decomposition.py
+index 3a222ade0c..f88a76b8ee 100644
+--- a/timemachine/fe/energy_decomposition.py
++++ b/timemachine/fe/energy_decomposition.py
+@@ -54,7 +54,7 @@ def batch_u_fn(xs: Frames, boxes: Boxes, pot_impl, pot_params) -> ReducedEnergie
+             _, _, Us = pot_impl.execute_batch(
+                 coords,
+                 pot_params,
+-                np.array(boxes),
++                np.asarray(boxes),
+                 compute_du_dx=False,
+                 compute_du_dp=False,
+                 compute_u=True,
+diff --git a/timemachine/fe/free_energy.py b/timemachine/fe/free_energy.py
+index 4058084c85..7122589fe9 100644
+--- a/timemachine/fe/free_energy.py
++++ b/timemachine/fe/free_energy.py
+@@ -46,7 +46,7 @@
+     make_summed_potential,
+ )
+ from timemachine.potentials.potential import get_bound_potential_by_type
+-from timemachine.utils import batches, pairwise_transform_and_combine
++from timemachine.utils import batches
+ 
+ WATER_SAMPLER_MOVERS = (
+     custom_ops.TIBDExchangeMove_f32,
+@@ -931,12 +931,6 @@ def run_sims_sequential(
+     """
+     stored_trajectories = []
+ 
+-    # keep no more than 2 states in memory at once
+-    prev_state: Optional[EnergyDecomposedState] = None
+-
+-    # u_kln matrix (2, 2, n_frames) for each pair of adjacent lambda windows and energy term
+-    u_kln_by_component_by_lambda = []
+-
+     # Ensure that states differ only in their parameters so that we can safely instantiate potentials from the first
+     # state and use set_params for efficiency
+     for s in initial_states[1:]:
+@@ -951,23 +945,15 @@ def run_sims_sequential(
+         # keep samples from any requested states in memory
+         stored_trajectories.append(traj)
+ 
+-        cur_batch_U_fns = get_batch_u_fns(unbound_impls, [p.params for p in initial_state.potentials], temperature)
+-
+-        state = EnergyDecomposedState(traj.frames, traj.boxes, cur_batch_U_fns)
+-
+-        # analysis that depends on current and previous state
+-        if prev_state:
+-            state_pair = [prev_state, state]
+-            u_kln_by_component = compute_energy_decomposed_u_kln(state_pair)
+-            u_kln_by_component_by_lambda.append(u_kln_by_component)
+-
+-        prev_state = state
++    neighbor_ulkns_by_component = generate_pair_bar_ulkns(
++        initial_states, stored_trajectories, temperature, unbound_impls=unbound_impls
++    )
+ 
+-    bar_results = [
+-        estimate_free_energy_bar(u_kln_by_component, temperature) for u_kln_by_component in u_kln_by_component_by_lambda
++    pair_bar_results = [
++        estimate_free_energy_bar(u_kln_by_component, temperature) for u_kln_by_component in neighbor_ulkns_by_component
+     ]
+ 
+-    return PairBarResult(list(initial_states), bar_results), stored_trajectories
++    return PairBarResult(list(initial_states), pair_bar_results), stored_trajectories
+ 
+ 
+ class MinOverlapWarning(UserWarning):
+@@ -1279,6 +1265,72 @@ def compute_u_kn(trajs, initial_states) -> tuple[NDArray, NDArray]:
+     return u_kn, np.array(N_k)
+ 
+ 
++def generate_pair_bar_ulkns(
++    initial_states: Sequence[InitialState],
++    samples_by_state: Sequence[Trajectory],
++    temperature: float,
++    unbound_impls: Sequence[custom_ops.Potential] | None,
++) -> NDArray:
++    """Generate pair bair u_klns.
++    This is a specialized variant of generating u_klns, only loading each set of frames into memory once.
++    Each set of frames is loaded once then all of the parameters of interest are run in a batch.
++    This improves throughput for potentials that use Neighborlists, as there are at most len(frames) neighborlist
++    rebuilds, rather than 3 * len(frames).
++
++    Returns
++    -------
++        u_klns: np.array[len(initial_states) - 1, len(unbound_impls), 2, 2, n_frames]
++    """
++
++    assert len(initial_states) > 0
++    assert len(initial_states) == len(samples_by_state)
++    if unbound_impls is None:
++        unbound_impls = [pot.potential.to_gpu(np.float32).unbound_impl for pot in initial_states[0].potentials]
++    assert len(unbound_impls) == len(initial_states[0].potentials)
++    kBT = temperature * BOLTZ
++    # Construct an empty array
++    energies_by_frames_by_params = np.zeros(
++        (len(initial_states), len(initial_states), len(unbound_impls)), dtype=object
++    )
++    for i, state in enumerate(initial_states):
++        frames = np.array(samples_by_state[i].frames)
++        boxes = np.asarray(samples_by_state[i].boxes)
++
++        state_idxs = []
++        if i > 0:
++            state_idxs.append(i - 1)
++        state_idxs.append(i)
++        if i < len(initial_states) - 1:
++            state_idxs.append(i + 1)
++        for j, pot in enumerate(state.potentials):
++            params = np.array([initial_states[idx].potentials[j].params for idx in state_idxs])
++            _, _, Us = unbound_impls[j].execute_batch(
++                frames,
++                params,
++                boxes,
++                compute_du_dx=False,
++                compute_du_dp=False,
++                compute_u=True,
++            )
++
++            Us = Us.T  # Transpose to get energies by params
++            us = Us.reshape(len(state_idxs), -1) / kBT
++            for p_idx, p_us in zip(state_idxs, us):
++                energies_by_frames_by_params[i, p_idx, j] = p_us
++
++    u_kln_by_component_by_lambda = np.empty(
++        (len(initial_states) - 1, len(unbound_impls), 2, 2, len(energies_by_frames_by_params[0][0][0]))
++    )
++    for i, states in enumerate(zip(range(len(initial_states)), range(1, len(initial_states)))):
++        assert len(states) == 2
++        for j in range(len(unbound_impls)):
++            for l in range(2):
++                for k in range(2):
++                    # energies_by_frames_by_params is frames of state l to params of k
++                    u_kln_by_component_by_lambda[i, j, k, l] = energies_by_frames_by_params[states[l]][states[k]][j]
++    return u_kln_by_component_by_lambda
++
++
+ def run_sims_hrex(
+     initial_states: Sequence[InitialState],
+     md_params: MDParams,
+@@ -1480,30 +1532,14 @@ def format_rates(rs):
+     assert isinstance(potential, custom_ops.SummedPotential)
+     unbound_impls = potential.get_potentials()
+ 
+-    def make_energy_decomposed_state(
+-        results: tuple[StoredArrays, list[NDArray], InitialState],
+-    ) -> EnergyDecomposedState[StoredArrays]:
+-        frames, boxes, initial_state = results
+-        # Reuse the existing unbound potentials already constructed to make a batch Us fn
+-        return EnergyDecomposedState(
+-            frames,
+-            boxes,
+-            get_batch_u_fns(unbound_impls, [p.params for p in initial_state.potentials], temperature),
+-        )
++    neighbor_ulkns_by_component = generate_pair_bar_ulkns(
++        initial_states, samples_by_state, temperature, unbound_impls=unbound_impls
++    )
+ 
+-    results_by_state = [
+-        (samples.frames, samples.boxes, initial_state)
+-        for samples, initial_state in zip(samples_by_state, initial_states)
++    pair_bar_results = [
++        estimate_free_energy_bar(u_kln_by_component, temperature) for u_kln_by_component in neighbor_ulkns_by_component
+     ]
+ 
+-    bar_results = list(
+-        pairwise_transform_and_combine(
+-            results_by_state,
+-            make_energy_decomposed_state,
+-            lambda s1, s2: estimate_free_energy_bar(compute_energy_decomposed_u_kln([s1, s2]), temperature),
+-        )
+-    )
+-
+     diagnostics = HREXDiagnostics(replica_idx_by_state_by_iter, fraction_accepted_by_pair_by_iter)
+ 
+-    return PairBarResult(list(initial_states), bar_results), samples_by_state, diagnostics
++    return PairBarResult(list(initial_states), pair_bar_results), samples_by_state, diagnostics
+diff --git a/timemachine/utils.py b/timemachine/utils.py
+index 4390fa9894..83d8a6b798 100644
+--- a/timemachine/utils.py
++++ b/timemachine/utils.py
+@@ -1,5 +1,4 @@
+-from collections.abc import Iterable, Iterator, Sequence
+-from typing import Callable, Optional, TypeVar
++from collections.abc import Iterator, Sequence
+ 
+ 
+ def batches(n: int, batch_size: int) -> Iterator[int]:
+@@ -12,24 +11,5 @@ def batches(n: int, batch_size: int) -> Iterator[int]:
+         yield rem
+ 
+ 
+-A = TypeVar("A")
+-B = TypeVar("B")
+-C = TypeVar("C")
+-
+-
+ def not_ragged(xss: Sequence[Sequence]) -> bool:
+     return all(len(xs) == len(xss[0]) for xs in xss)
+-
+-
+-def pairwise_transform_and_combine(xs: Iterable[A], f: Callable[[A], B], g: Callable[[B, B], C]) -> Iterator[C]:
+-    """Transforms an iterable using function `f` and combines adjacent transformed elements using function `g`."""
+-
+-    prev_b: Optional[B] = None
+-
+-    for a in xs:
+-        b = f(a)
+-
+-        if prev_b is not None:
+-            yield g(prev_b, b)
+-
+-        prev_b = b

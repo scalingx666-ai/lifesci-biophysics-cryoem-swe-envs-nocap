@@ -1,0 +1,2003 @@
+diff --git a/iodata/formats/qchemlog.py b/iodata/formats/qchemlog.py
+index 1b919a15c..893a1e95d 100644
+--- a/iodata/formats/qchemlog.py
++++ b/iodata/formats/qchemlog.py
+@@ -21,24 +21,24 @@
+ This module will load Q-Chem log file into IODATA.
+ """
+ 
+-
+-import re
+ from typing import Tuple
++from distutils.util import strtobool
+ 
+ import numpy as np
+ 
+ from ..docstrings import document_load_one
+ from ..orbitals import MolecularOrbitals
+ from ..periodic import sym2num
+-from ..utils import LineIterator, kcalmol, calmol
++from ..utils import LineIterator, angstrom, kcalmol, calmol, kjmol
+ 
+ __all__ = []
+ 
+ PATTERNS = ['*.qchemlog']
+ 
+ 
+-@document_load_one("qchemlog", ['atcoords', 'atmasses', 'atnums', 'energy', 'g_rot',
+-                                'mo', 'lot', 'obasis_name', 'run_type', 'extra'],
++@document_load_one("qchemlog",
++                   ['atcoords', 'atmasses', 'atnums', 'energy', 'g_rot', 'mo',
++                    'lot', 'obasis_name', 'run_type', 'extra'],
+                    ['athessian'])
+ def load_one(lit: LineIterator) -> dict:
+     """Do not edit this docstring. It will be overwritten."""
+@@ -55,26 +55,28 @@ def load_one(lit: LineIterator) -> dict:
+ 
+     # build molecular orbitals
+     # ------------------------
+-    # restricted case
+-    if not data['unrestricted']:
+-        mo_energies = np.concatenate((data['mo_a_occ'], data['mo_a_vir']), axis=0)
+-        mo_occs = np.zeros(data['norba'])
+-        mo_occs[:data['alpha_elec']] = 1.0
+-        mo_occs[:data['beta_elec']] += 1.0
+-        mo = MolecularOrbitals("restricted", data['norba'], data['norba'],
+-                               occs=mo_occs, energies=mo_energies)
+-    # unrestricted case
+-    else:
++    if data['unrestricted']:
++        # unrestricted case
+         mo_energies = np.concatenate((data['mo_a_occ'], data['mo_a_vir'],
+                                       data['mo_b_occ'], data['mo_b_vir']), axis=0)
+-        mo_occs = np.zeros(data['norba'] + data['norbb'])
++        mo_coeffs = np.full((data['nbasis'], data['norba'] + data['norbb']), np.nan)
++        mo_occs = np.zeros(mo_coeffs.shape[1])
+         # number of alpha & beta electrons and number of alpha molecular orbitals
+         na, nb = data['alpha_elec'], data['beta_elec']
+         na_mo = len(data['mo_a_occ']) + len(data['mo_a_vir'])
+         mo_occs[:na] = 1.0
+         mo_occs[na_mo: na_mo + nb] = 1.0
+         mo = MolecularOrbitals("unrestricted", data['norba'], data['norbb'],
+-                               occs=mo_occs, energies=mo_energies)
++                               mo_occs, mo_coeffs, mo_energies, None)
++    else:
++        # restricted case
++        mo_energies = np.concatenate((data['mo_a_occ'], data['mo_a_vir']), axis=0)
++        mo_coeffs = np.full((data['nbasis'], data['norba']), np.nan)
++        mo_occs = np.zeros(mo_coeffs.shape[1])
++        mo_occs[:data['alpha_elec']] = 1.0
++        mo_occs[:data['beta_elec']] += 1.0
++        mo = MolecularOrbitals("restricted", data['norba'], data['norba'],
++                               mo_occs, mo_coeffs, mo_energies, None)
+     result['mo'] = mo
+ 
+     # moments
+@@ -84,14 +86,18 @@ def load_one(lit: LineIterator) -> dict:
+     if 'quadrupole' in data:
+         # Convert to alphabetical ordering: xx, xy, xz, yy, yz, zz
+         moments[(2, 'c')] = data['quadrupole'][[0, 1, 3, 2, 4, 5]]
++    # check total dipole parsed
++    if 'dipole_tol' in data and 'dipole' in data:
++        assert abs(np.linalg.norm(data['dipole']) - data['dipole_tol']) < 1.0e-4
+     if moments:
+         result['moments'] = moments
+ 
+     # extra dictionary
+     # ----------------
+     # add labels to extra dictionary if they are loaded
+-    extra_labels = ['spin_multi', 'nuclear_repulsion_energy',
+-                    'polarizability_tensor', 'imaginary_freq', 'vib_energy']
++    extra_labels = ['nuclear_repulsion_energy', 'polarizability_tensor', 'imaginary_freq',
++                    'vib_energy', 'eda2', 'frags']
++
+     extra = {label: data[label] for label in extra_labels if data.get(label) is not None}
+     # if present, convert vibrational energy from kcal/mol to "atomic units + K"
+     if 'vib_energy' in extra:
+@@ -105,11 +111,15 @@ def load_one(lit: LineIterator) -> dict:
+     if 'entropy_dict' in data:
+         extra['entropy_dict'] = {k: v * calmol for k, v in data['entropy_dict'].items()}
+ 
++    # if present, convert eda terms from kj/mol to atomic units
++    if 'eda2' in data:
++        extra['eda2'] = {k: v * kjmol for k, v in data['eda2'].items()}
++
+     result['extra'] = extra
+     return result
+ 
+ 
+-def load_qchemlog_low(lit: LineIterator) -> dict:
++def load_qchemlog_low(lit: LineIterator) -> dict:  # pylint: disable=too-many-branches
+     """Load the information from Q-Chem log file."""
+     data = {}
+     while True:
+@@ -119,67 +129,79 @@ def load_qchemlog_low(lit: LineIterator) -> dict:
+             # Read until the end of the file.
+             break
+ 
+-        # get the atomic information
+-        if line.startswith('$molecule'):
+-            data['atnums'], data['atcoords'] = _helper_atoms(lit)
+-            data['natom'] = len(data['atnums'])
+         # job specifications
+-        elif line.startswith('$rem'):
+-            data.update(_helper_job(lit))
+-        # standard nuclear orientation
++        if line.startswith('$rem') and 'run_type' not in data:
++            data.update(_helper_rem_job(lit))
++
++        # standard nuclear orientation (make sure multi-step jobs does not over-write this)
++        elif line.startswith('Standard Nuclear Orientation (Angstroms)') and 'atcoords' not in data:
++            data.update(_helper_structure(lit))
++
++        # standard nuclear orientation for fragments in EDA jobs
+         elif line.startswith('Standard Nuclear Orientation (Angstroms)'):
+-            # atnums, alpha_elec, beta_elec, nbasis, nuclear_replusion_energy, energy, atcoords
+-            _, data['alpha_elec'], data['beta_elec'], data['nbasis'], \
+-                data['nuclear_repulsion_energy'], data['energy'], _ = _helper_electron(lit)
+-        # orbital energies
+-        elif line.startswith('Orbital Energies (a.u.)'):
+-            result = _helper_orbital_energies(lit)
+-            data['mo_a_occ'], data['mo_b_occ'], data['mo_a_vir'], data['mo_b_vir'] = result
++            if 'frags' not in data:
++                data['frags'] = []
++            data['frags'].append(_helper_structure(lit))
++
++        # energy (the last energy in a multi-step job)
++        elif line.startswith('Total energy in the final basis set'):
++            data['energy'] = float(line.split()[-1])
++        elif line.startswith('the SCF tolerance is set'):
++            data['energy'] = _helper_energy(lit)
++
++        # orbital energies (the last orbital energies in a multi-step job)
++        elif line.startswith('Orbital Energies (a.u.)') and not data['unrestricted']:
++            result = _helper_orbital_energies_restricted(lit)
++            data['mo_a_occ'], data['mo_a_vir'] = result
++            # compute number of alpha
++            data['norba'] = len(data['mo_a_occ']) + len(data['mo_a_vir'])
++
++        # orbital energies (the last orbital energies in a multi-step job)
++        elif line.startswith('Orbital Energies (a.u.)') and data['unrestricted']:
++            data.update(_helper_orbital_energies_unrestricted(lit))
+             # compute number of alpha and beta molecular orbitals
+             data['norba'] = len(data['mo_a_occ']) + len(data['mo_a_vir'])
+             data['norbb'] = len(data['mo_b_occ']) + len(data['mo_b_vir'])
+-        # mulliken charges
++
++        # mulliken charges (the last charges in a multi-step job)
+         elif line.startswith('Ground-State Mulliken Net Atomic Charges'):
+             data['mulliken_charges'] = _helper_mulliken(lit)
+-        #  cartesian multipole moments
++
++        # cartesian multipole moments (the last mutipole moments in a multi-step job)
+         elif line.startswith('Cartesian Multipole Moments'):
+             data['dipole'], data['quadrupole'], data['dipole_tol'] = _helper_dipole_moments(lit)
++
+         # polarizability matrix
+         elif line.startswith('Polarizability Matrix (a.u.)'):
+             data['polarizability_tensor'] = _helper_polar(lit)
++
+         # hessian matrix
+         elif line.startswith('Hessian of the SCF Energy'):
+-            data['athessian'] = _helper_hessian(lit, data['natom'])
++            data['athessian'] = _helper_hessian(lit, len(data['atnums']))
++
+         # vibrational analysis
+         elif line.startswith('**                       VIBRATIONAL ANALYSIS'):
+             data['imaginary_freq'], data['vib_energy'], data['atmasses'] = _helper_vibrational(lit)
++
+         # rotational symmetry number
+         elif line.startswith('Rotational Symmetry Number'):
+             data['g_rot'] = int(line.split()[-1])
+             data['enthalpy_dict'], data['entropy_dict'] = _helper_thermo(lit)
+ 
+-    return data
++        # energy decomposition analysis 2 (EDA2)
++        elif line.startswith('Results of EDA2'):
++            eda2 = _helper_eda2(lit)
++            # add fragment energies to frags
++            energies = eda2.pop('energies')
++            for index, energy in enumerate(energies):
++                data['frags'][index]['energy'] = energy
++            data['eda2'] = eda2
+ 
+-
+-def _helper_atoms(lit: LineIterator) -> Tuple:
+-    """Load list of coordinates from an Q-Chem log output file format."""
+-    # Skip line with net charge and spin multiplicity
+-    next(lit)
+-    # atomic numbers and atomic coordinates (in Angstrom)
+-    atom_symbols = []
+-    atcoords = []
+-    for line in lit:
+-        if line.strip() == '$end':
+-            break
+-        atom_symbols.append(line.strip().split()[0])
+-        atcoords.append([float(i) for i in line.strip().split()[1:]])
+-    atnums = np.array([sym2num[i] for i in atom_symbols])
+-    atcoords = np.array(atcoords)
+-    return atnums, atcoords
++    return data
+ 
+ 
+-def _helper_job(lit: LineIterator) -> Tuple:
+-    """Load job specifications from Q-Chem log out file format."""
++def _helper_rem_job(lit: LineIterator) -> Tuple:
++    """Load job specifications from Q-Chem output file format."""
+     data_rem = {}
+     for line in lit:
+         if line.strip() == '$end':
+@@ -191,54 +213,69 @@ def _helper_job(lit: LineIterator) -> Tuple:
+         elif line.lower().startswith('method'):
+             data_rem['lot'] = line.split()[1].lower()
+         elif line.lower().startswith('unrestricted'):
+-            data_rem['unrestricted'] = int(line.split()[1])
+-        elif line.lower().startswith('basis'):
++            data_rem['unrestricted'] = bool(strtobool(line.split()[1]))
++        elif line.split()[0].lower() == 'basis':
+             data_rem['obasis_name'] = line.split()[1].lower()
+         elif line.lower().startswith('symmetry'):
+-            data_rem['symm'] = int(line.split()[1])
++            data_rem['symm'] = bool(strtobool(line.split()[1]))
+     return data_rem
+ 
+ 
+-def _helper_electron(lit: LineIterator) -> Tuple:
+-    """Load electron information from Q-Chem log out file format."""
++def _helper_structure(lit: LineIterator):
++    """Load electron information from Q-Chem output file format."""
+     next(lit)
+     next(lit)
+-    atom_symbols = []
++    # atomic numbers and atomic coordinates (converted to A.U)
++    atsymbols = []
+     atcoords = []
+     for line in lit:
+         if line.strip().startswith('-------------'):
+             break
+-        # print(line.strip())
+-        atom_symbols.append(line.strip().split()[1])
+-        atcoords.append([float(i) for i in line.strip().split()[2:]])
+-    atnums = np.array([sym2num[i] for i in atom_symbols])
+-    atcoords = np.array(atcoords)
+-    # nuclear_replusion_energy = float(re.findall('\d+\.\d+', next(line).strip())[-2])
+-    nuclear_replusion_energy = float(next(lit).strip().split()[-2])
+-    # number of num alpha electron and beta elections
+-    alpha_elec, beta_elec = [int(i) for i in re.findall(r'\d', next(lit).strip())]
+-    # number of basis
++        atsymbols.append(line.split()[1])
++        atcoords.append([float(i) for i in line.split()[2:]])
++    subdata = {"atnums": np.array([sym2num[i] for i in atsymbols]),
++               "atcoords": np.array(atcoords) * angstrom,
++               "nuclear_repulsion_energy": float(next(lit).split()[-2])}
++    # number of alpha and beta elections
++    line = next(lit).split()
++    subdata["alpha_elec"] = int(line[2])
++    subdata["beta_elec"] = int(line[5])
++    # number of basis functions
+     next(lit)
+-    nbasis = int(next(lit).strip().split()[-3])
+-    # total energy
++    subdata["nbasis"] = int(next(lit).split()[-3])
++
++    return subdata
++
++
++def _helper_energy(lit: LineIterator):
+     for line in lit:
+-        if line.strip().startswith('Total energy in the final basis set'):
++        if line.strip().endswith('Convergence criterion met'):
++            energy = float(line.split()[1])
+             break
+-    energy = float(line.strip().split()[-1])
+-    return atnums, alpha_elec, beta_elec, nbasis, nuclear_replusion_energy, energy, atcoords
++    return energy
+ 
+ 
+-def _helper_orbital_energies(lit: LineIterator) -> Tuple:
+-    """Load occupied and virtual orbital energies."""
++def _helper_orbital_energies_restricted(lit: LineIterator) -> Tuple:
++    """Load occupied and virtual orbital energies for restricted calculation."""
+     # alpha occupied MOs
+     mo_a_occupied = _helper_section('-- Occupied --', '-- Virtual --', lit, backward=True)
+     # alpha unoccupied MOs
+-    mo_a_unoccupied = _helper_section('-- Virtual --', '', lit, backward=False)
++    mo_a_unoccupied = _helper_section('-- Virtual --', '-' * 62, lit, backward=False)
++    return mo_a_occupied, mo_a_unoccupied
++
++
++def _helper_orbital_energies_unrestricted(lit: LineIterator) -> Tuple:
++    """Load occupied and virtual orbital energies for unrestricted calculation."""
++    subdata = dict()
++    # alpha occupied MOs
++    subdata['mo_a_occ'] = _helper_section('-- Occupied --', '-- Virtual --', lit, backward=True)
++    # alpha unoccupied MOs
++    subdata['mo_a_vir'] = _helper_section('-- Virtual --', '', lit, backward=False)
+     # beta occupied MOs
+-    mo_b_occupied = _helper_section('-- Occupied --', '-- Virtual --', lit, backward=True)
++    subdata['mo_b_occ'] = _helper_section('-- Occupied --', '-- Virtual --', lit, backward=True)
+     # beta unoccupied MOs
+-    mo_b_unoccupied = _helper_section('-- Virtual --', '-' * 62, lit, backward=False)
+-    return mo_a_occupied, mo_b_occupied, mo_a_unoccupied, mo_b_unoccupied
++    subdata['mo_b_vir'] = _helper_section('-- Virtual --', '-' * 62, lit, backward=False)
++    return subdata
+ 
+ 
+ def _helper_section(start: str, end: str, lit: LineIterator, backward: bool = False) -> np.ndarray:
+@@ -250,26 +287,28 @@ def _helper_section(start: str, end: str, lit: LineIterator, backward: bool = Fa
+             break
+     for line in lit:
+         if line.strip() != end:
+-            data.extend(line.strip().split())
++            data.extend(line.split())
+         else:
+             break
+     if backward:
+         lit.back(line)
+-    return np.array(data, dtype=np.float)
++    return np.array(data, dtype=float)
+ 
+ 
+ def _helper_mulliken(lit: LineIterator) -> np.ndarray:
+     """Load mulliken net atomic charges."""
++    # skip line between 'Ground-State Mulliken Net Atomic Charges' line & atomic charge entries
+     while True:
+         line = next(lit).strip()
+         if line.startswith('------'):
+             break
++    # store atomic charges until enf of table is reached
+     mulliken_charges = []
+     for line in lit:
+         if line.strip().startswith('--------'):
+             break
+-        mulliken_charges.append(line.strip().split()[-2])
+-    return np.array(mulliken_charges, dtype=np.float)
++        mulliken_charges.append(line.split()[2])
++    return np.array(mulliken_charges, dtype=float)
+ 
+ 
+ def _helper_dipole_moments(lit: LineIterator) -> Tuple:
+@@ -278,14 +317,14 @@ def _helper_dipole_moments(lit: LineIterator) -> Tuple:
+         if line.strip().startswith('Dipole Moment (Debye)'):
+             break
+     # parse dipole moment (only load the float numbers)
+-    dipole = next(lit).strip().split()
++    dipole = next(lit).split()
+     dipole = np.array([float(dipole) for idx, dipole in enumerate(dipole) if idx % 2 != 0])
+     # parse total dipole moment
+-    dipole_tol = float(next(lit).strip().split()[-1])
+-    # parse quadrupole moment
++    dipole_tol = float(next(lit).split()[-1])
++    # parse quadrupole moment (xx, xy, yy, xz, yz, zz)
+     next(lit)
+-    quadrupole = next(lit).strip().split()
+-    quadrupole.extend(next(lit).strip().split())
++    quadrupole = next(lit).split()
++    quadrupole.extend(next(lit).split())
+     quadrupole = np.array([float(dipole) for idx, dipole in enumerate(quadrupole) if idx % 2 != 0])
+     return dipole, quadrupole, dipole_tol
+ 
+@@ -297,25 +336,25 @@ def _helper_polar(lit: LineIterator) -> np.ndarray:
+     for line in lit:
+         if line.strip().startswith('Calculating analytic Hessian'):
+             break
+-        polarizability_tensor.append(line.strip().split()[1:])
+-    return np.array(polarizability_tensor, dtype=np.float)
++        polarizability_tensor.append(line.split()[1:])
++    return np.array(polarizability_tensor, dtype=float)
+ 
+ 
+-def _helper_hessian(lit: LineIterator, natoms: int) -> np.ndarray:
++def _helper_hessian(lit: LineIterator, natom: int) -> np.ndarray:
+     """Load hessian matrix."""
+     # hessian in Cartesian coordinates, shape(3 * natom, 3 * natom)
+-    col_idx = [int(i) for i in next(lit).strip().split()]
+-    hessian = np.empty((natoms * 3, natoms * 3), dtype=object)
++    col_idx = [int(i) for i in next(lit).split()]
++    hessian = np.empty((natom * 3, natom * 3), dtype=object)
+     for line in lit:
+         if line.strip().startswith('****************'):
+             break
+-        if not line.startswith('            '):
+-            line_list = line.strip().split()
++        if line.startswith('            '):
++            col_idx = [int(i) for i in line.split()]
++        else:
++            line_list = line.split()
+             row_idx = int(line_list[0]) - 1
+             hessian[row_idx, col_idx[0] - 1:col_idx[-1]] = line_list[1:]
+-        else:
+-            col_idx = [int(i) for i in line.strip().split()]
+-    return hessian.astype(np.float)
++    return hessian.astype(float)
+ 
+ 
+ def _helper_vibrational(lit: LineIterator) -> Tuple:
+@@ -324,15 +363,15 @@ def _helper_vibrational(lit: LineIterator) -> Tuple:
+         if line.strip().startswith('This Molecule has'):
+             break
+     # pylint: disable= W0631
+-    imaginary_freq = int(line.strip().split()[3])
+-    vib_energy = float(next(lit).strip().split()[-2])
++    imaginary_freq = int(line.split()[3])
++    vib_energy = float(next(lit).split()[-2])
+     next(lit)
+     atmasses = []
+     for line in lit:
+         if line.strip().startswith('Molecular Mass:'):
+             break
+-        atmasses.append(line.strip().split()[-1])
+-    atmasses = np.array(atmasses, dtype=np.float)
++        atmasses.append(line.split()[-1])
++    atmasses = np.array(atmasses, dtype=float)
+     return imaginary_freq, vib_energy, atmasses
+ 
+ 
+@@ -361,3 +400,63 @@ def _helper_thermo(lit: LineIterator) -> Tuple:
+         elif line_str.startswith('Total Entropy'):
+             entropy_dict['entropy_total'] = float(line_str.split()[-2])
+     return enthalpy_dict, entropy_dict
++
++
++def _helper_eda2(lit: LineIterator) -> dict:  # pylint: disable=too-many-branches
++    """Load Energy decomposition information."""
++    next(lit)
++    eda2 = {}
++    for line in lit:
++
++        if line.strip().startswith('Fragment Energies'):
++            for line_2 in lit:
++                if line_2.strip().startswith('-----'):
++                    break
++                eda2.setdefault('energies', []).append(float(line_2.split()[-1]))
++
++        if line.strip().startswith('Orthogonal Fragment Subspace Decomposition'):
++            next(lit)
++            for line_2 in lit:
++                if line_2.strip().startswith('-----'):
++                    break
++                info = line_2.split()
++                if info[0] in ['E_elec', 'E_pauli', 'E_disp']:
++                    eda2[info[0].lower()] = float(info[-1])
++
++        elif line.strip().startswith('Terms summing to E_pauli'):
++            next(lit)
++            for line_2 in lit:
++                if line_2.strip().startswith('-----'):
++                    break
++                info = line_2.split()
++                if info[0] in ['E_kep_pauli', 'E_disp_free_pauli']:
++                    eda2[info[0].lower()] = float(info[-1])
++
++        elif line.strip().startswith('Classical Frozen Decomposition'):
++            next(lit)
++            for line_2 in lit:
++                if line_2.strip().startswith('-----'):
++                    break
++                info = line_2.split()
++                if info[0] in ['E_cls_elec', 'E_cls_pauli']:
++                    eda2[info[0].lower()] = float(info[5])
++                elif info[0].split("[")[1] == 'E_mod_pauli':
++                    eda2[info[0].split("[")[1].lower()] = float(info[5])
++
++        elif line.strip().startswith('Simplified EDA Summary'):
++            next(lit)
++            for line_2 in lit:
++                if line_2.strip().startswith('-----'):
++                    break
++                info = line_2.split()
++                if info[0] in ['PREPARATION', 'FROZEN', 'DISPERSION', 'POLARIZATION', 'TOTAL']:
++                    eda2[info[0].lower()] = float(info[1])
++                elif info[0].split("[")[-1] == 'PAULI':
++                    eda2[info[0].split("[")[-1].lower()] = float(info[1].split("]")[0])
++                elif info[0] == 'CHARGE':
++                    eda2[info[0].lower() + ' ' + info[1].lower()] = float(info[2])
++
++        elif line.strip().startswith('-------------------------------------------------------'):
++            break
++
++    return eda2
+diff --git a/iodata/test/data/h2o_dimer_eda_qchem5.3.out b/iodata/test/data/h2o_dimer_eda_qchem5.3.out
+new file mode 100644
+index 000000000..c2641d6f0
+--- /dev/null
++++ b/iodata/test/data/h2o_dimer_eda_qchem5.3.out
+@@ -0,0 +1,1100 @@
++You are running Q-Chem version: 5.3.0
++
++#
++# job setting
++#
++local host:  cori02
++current dir: /global/homes/f/farnazhz/test_iodata/eda_h2o_dimer
++input file:  qchem.in
++output file: 
++nprocs     : 0
++nthreads   : 16
++#
++# qchem installation setting
++#
++QC:          /global/common/cori_cle7/software/qchem/5.3
++QCAUX:       /global/common/cori_cle7/software/qchem/5.3/qcaux
++QCPROG:      /global/common/cori_cle7/software/qchem/5.3/exe/qcprog.exe_s
++QCPROG_S:    /global/common/cori_cle7/software/qchem/5.3/exe/qcprog.exe_s
++PARALLEL:    -DSERIAL
++QCMPI:       mpich3
++#
++# qchem directory setting
++#
++qcrun:       qchem313
++QCSCRATCH:   /global/cscratch1/sd/farnazhz
++QCLOCALSCR:  /tmp
++QCTMPDIR:    /tmp
++QCFILEPREF:  /tmp/qchem313
++QCSAVEDIR:   
++workdirs:    /tmp/qchem313
++workdir0:    /tmp/qchem313
++partmpdirs =  
++#
++# parallel setting
++#
++QCRSH:           ssh
++QCMPI:           mpich3
++QCMPIRUN:        mpirun
++QCMACHINEFILE:   
++
++#
++# env setting
++#
++exported envs:   QC QCAUX QCSCRATCH QCRUNNAME QCFILEPREF QCPROG QCPROG_S GUIFILE
++
++Running Job 1 of 1 qchem.in
++qchem qchem.in_313.0 /tmp/qchem313/ 0
++/global/common/cori_cle7/software/qchem/5.3/exe/qcprog.exe_s qchem.in_313.0 /tmp/qchem313/
++                  Welcome to Q-Chem
++     A Quantum Leap Into The Future Of Chemistry
++
++
++ Q-Chem 5.3, Q-Chem, Inc., Pleasanton, CA (2020)
++
++ License issued to: National Energy Research Scientific Computing Center
++
++ Yihan Shao,  Zhengting Gan,  E. Epifanovsky,  A. T. B. Gilbert,  M. Wormit,  
++ J. Kussmann,  A. W. Lange,  A. Behn,  Jia Deng,  Xintian Feng,  D. Ghosh,  
++ M. Goldey,  P. R. Horn,  L. D. Jacobson,  I. Kaliman,  T. Kus,  A. Landau,  
++ Jie Liu,  E. I. Proynov,  R. M. Richard,  R. P. Steele,  E. J. Sundstrom,  
++ H. L. Woodcock III,  P. M. Zimmerman,  D. Zuev,  B. Alam,  B. Albrecht,  
++ A. Aldossary,  E. Alguire,  S. A. Baeppler,  D. Barton,  Z. Benda,  
++ Y. A. Bernard,  E. J. Berquist,  K. B. Bravaya,  H. Burton,  K. Carter-Fenk,  
++ D. Casanova,  Chun-Min Chang,  Yunqing Chen,  A. Chien,  K. D. Closser,  
++ M. P. Coons,  S. Coriani,  S. Dasgupta,  A. L. Dempwolff,  M. Diedenhofen,  
++ Hainam Do,  R. G. Edgar,  Po-Tung Fang,  S. Faraji,  S. Fatehi,  
++ Qingguo Feng,  J. Fosso-Tande,  J. Gayvert,  Qinghui Ge,  A. Ghysels,  
++ G. Gidofalvi,  J. Gomes,  J. Gonthier,  S. Gulania,  A. Gunina,  D. Hait,  
++ M. W. D. Hanson-Heine,  S. Hammes-Schiffer,  P. H. P. Harbach,  
++ A. W. Hauser,  M. F. Herbst,  J. E. Herr,  E. G. Hohenstein,  Z. C. Holden,  
++ S. Houck,  Kerwin Hui,  B. C. Huynh,  M. Ivanov,  T.-C. Jagau,  Hyunjun Ji,  
++ B. Kaduk,  K. Khistyaev,  Jaehoon Kim,  P. Klunzinger,  K. Koh,  
++ D. Kosenkov,  L. Koulias,  T. Kowalczyk,  C. M. Krauter,  A. Kunitsa,  
++ Ka Un Lao,  A. Laurent,  K. V. Lawler,  Joonho Lee,  D. Lefrancois,  
++ S. Lehtola,  D. S. Levine,  Yi-Pei Li,  You-Sheng Lin,  Fenglai Liu,  
++ Kuan-Yu Liu,  E. Livshits,  M. Loipersberger,  A. Luenser,  P. Manohar,  
++ E. Mansoor,  S. F. Manzer,  Shan-Ping Mao,  Yuezhi Mao,  N. Mardirossian,  
++ A. V. Marenich,  T. Markovich,  L. A. Martinez-Martinez,  S. A. Maurer,  
++ N. J. Mayhall,  S. C. McKenzie,  J.-M. Mewes,  P. Morgante,  A. F. Morrison,  
++ J. W. Mullinax,  K. Nanda,  T. S. Nguyen-Beck,  R. Olivares-Amaya,  
++ K. J. Oosterbaan,  J. A. Parkhill,  S. K. Paul,  F. Pavosevic,  Zheng Pei,  
++ T. M. Perrine,  F. Plasser,  P. Pokhilko,  S. Prager,  A. Prociuk,  
++ E. Ramos,  B. Rana,  D. R. Rehn,  F. Rob,  E. Rossomme,  M. Scheurer,  
++ M. Schneider,  N. Sergueev,  S. M. Sharada,  S. Sharma,  W. Skomorowski,  
++ D. W. Small,  T. Stauch,  C. J. Stein,  T. Stein,  Yu-Chuan Su,  
++ S. P. Veccham,  Zhen Tao,  A. J. W. Thom,  A. Tkatchenko,  T. Tsuchimochi,  
++ N. M. Tubman,  L. Vogt,  M. L. Vidal,  O. Vydrov,  M. A. Watson,  J. Wenzel,  
++ M. de Wergifosse,  T. A. Wesolowski,  A. White,  J. Witte,  A. Yamada,  
++ Jun Yang,  K. Yao,  S. Yeganeh,  S. R. Yost,  Zhi-Qiang You,  A. Zech,  
++ Igor Ying Zhang,  Xing Zhang,  Yan Zhao,  Ying Zhu,  B. R. Brooks,  
++ G. K. L. Chan,  C. J. Cramer,  M. S. Gordon,  W. J. Hehre,  A. Klamt,  
++ M. W. Schmidt,  C. D. Sherrill,  D. G. Truhlar,  A. Aspuru-Guzik,  R. Baer,  
++ A. T. Bell,  N. A. Besley,  Jeng-Da Chai,  A. E. DePrince, III,  
++ R. A. DiStasio Jr.,  A. Dreuw,  B. D. Dunietz,  T. R. Furlani,  
++ Chao-Ping Hsu,  Yousung Jung,  Jing Kong,  D. S. Lambrecht,  WanZhen Liang,  
++ C. Ochsenfeld,  V. A. Rassolov,  L. V. Slipchenko,  J. E. Subotnik,  
++ T. Van Voorhis,  J. M. Herbert,  A. I. Krylov,  P. M. W. Gill,  M. Head-Gordon
++
++ Contributors to earlier versions of Q-Chem not listed above: 
++ R. D. Adamson,  B. Austin,  J. Baker,  G. J. O. Beran,  K. Brandhorst,  
++ S. T. Brown,  E. F. C. Byrd,  A. K. Chakraborty,  C.-L. Cheng,  
++ Siu Hung Chien,  D. M. Chipman,  D. L. Crittenden,  H. Dachsel,  
++ R. J. Doerksen,  A. D. Dutoi,  L. Fusti-Molnar,  W. A. Goddard III,  
++ A. Golubeva-Zadorozhnaya,  S. R. Gwaltney,  G. Hawkins,  A. Heyden,  
++ S. Hirata,  G. Kedziora,  F. J. Keil,  C. Kelley,  Jihan Kim,  R. A. King,  
++ R. Z. Khaliullin,  P. P. Korambath,  W. Kurlancheek,  A. M. Lee,  M. S. Lee,  
++ S. V. Levchenko,  Ching Yeh Lin,  D. Liotard,  R. C. Lochan,  I. Lotan,  
++ P. E. Maslen,  N. Nair,  D. P. O'Neill,  D. Neuhauser,  E. Neuscamman,  
++ C. M. Oana,  R. Olson,  B. Peters,  R. Peverati,  P. A. Pieniazek,  
++ Y. M. Rhee,  J. Ritchie,  M. A. Rohrdanz,  E. Rosta,  N. J. Russ,  
++ H. F. Schaefer III,  N. E. Schultz,  N. Shenvi,  A. C. Simmonett,  A. Sodt,  
++ D. Stuck,  K. S. Thanthiriwatte,  V. Vanovschi,  Tao Wang,  A. Warshel,  
++ C. F. Williams,  Q. Wu,  X. Xu,  W. Zhang
++
++ Please cite Q-Chem as follows:
++ Y. Shao et al., Mol. Phys. 113, 184-215 (2015)
++ DOI: 10.1080/00268976.2014.952696
++
++ Q-Chem 5.3.0 for Intel X86 EM64T Linux
++
++ Parts of Q-Chem use Armadillo 9.800.1 (Horizon Scraper).
++ http://arma.sourceforge.net/
++
++ Q-Chem begins on Thu Aug 13 10:31:59 2020  
++
++Host: cori02
++0
++
++     Scratch files written to /tmp/qchem313//
++ Jun1620 |scratch|qcdevops|jenkins|workspace|build_RNUM 7035   
++Processing $rem in /global/common/cori_cle7/software/qchem/5.3/config/preferences:
++Processing $rem in /global/homes/f/farnazhz/.qchemrc:
++
++ Q-Chem warning in module libgen/rem_setup.C, line 2895:
++
++ Neither GIA nor STOLL is specified by user. Use STOLL as the default
++
++
++Checking the input file for inconsistencies... 	...done.
++
++--------------------------------------------------------------
++User input:
++--------------------------------------------------------------
++$molecule
++0 1
++--
++0 1
++O  -1.551007  -0.114520   0.000000
++H  -1.934259   0.762503   0.000000
++H  -0.599677   0.040712   0.000000
++--
++0 1
++O   1.350625   0.111469   0.000000
++H   1.680398  -0.373741  -0.758561
++H   1.680398  -0.373741   0.758561
++$end
++$rem
++JOBTYPE			EDA
++EDA2			1
++method			wB97X-V
++BASIS			def2-TZVPD
++XC_GRID			000099000590
++NL_GRID			1
++UNRESTRICTED		FALSE
++MAX_SCF_CYCLES		200
++SYMMETRY		FALSE
++SYM_IGNORE		TRUE
++MEM_STATIC		2000
++BASIS_LIN_DEP_THRESH 	6
++THRESH 			14
++SCF_CONVERGENCE 	8
++SCF_PRINT_FRGM 		TRUE
++$end
++--------------------------------------------------------------
++ ----------------------------------------------------------------
++             Standard Nuclear Orientation (Angstroms)
++    I     Atom           X                Y                Z
++ ----------------------------------------------------------------
++    1      O      -1.5510070000    -0.1145200000     0.0000000000
++    2      H      -1.9342590000     0.7625030000     0.0000000000
++    3      H      -0.5996770000     0.0407120000     0.0000000000
++    4      O       1.3506250000     0.1114690000     0.0000000000
++    5      H       1.6803980000    -0.3737410000    -0.7585610000
++    6      H       1.6803980000    -0.3737410000     0.7585610000
++ ----------------------------------------------------------------
++ Nuclear Repulsion Energy =          36.66284801 hartrees
++ There are       10 alpha and       10 beta electrons
++ Requested basis set is def2-TZVPD
++ There are 48 shells and 116 basis functions
++
++ Total QAlloc Memory Limit  96000 MB
++ Mega-Array Size      1956 MB
++ MEM_STATIC part      2000 MB
++
++                       Distance Matrix (Angstroms)
++             O (  1)   H (  2)   H (  3)   O (  4)   H (  5)
++   H (  2)  0.957106
++   H (  3)  0.963912  1.517264
++   O (  4)  2.910419  3.348777  1.951585
++   H (  5)  3.329353  3.864222  2.438427  0.958955
++   H (  6)  3.329353  3.864222  2.438427  0.958955  1.517122
++ 
++ A cutoff of  1.0D-14 yielded   1152 shell pairs
++ There are      6864 function pairs (      8396 Cartesian)
++ Smallest overlap matrix eigenvalue = 4.60E-04
++
++ Scale SEOQF with 1.000000e-01/1.000000e-01/1.000000e-01
++
++ Standard Electronic Orientation quadrupole field applied
++ Nucleus-field energy     =     0.0000000015 hartrees
++
++ -----------------------------------------------------------------------
++  General SCF calculation program by
++  Eric Jon Sundstrom, Paul Horn, Yuezhi Mao, Dmitri Zuev, Alec White,
++  David Stuck, Shaama M.S., Shane Yost, Joonho Lee, David Small,
++  Daniel Levine, Susi Lehtola, Hugh Burton, Evgeny Epifanovsky,
++  Bang C. Huynh
++ -----------------------------------------------------------------------
++================================================================
++                 ALMO-EDA with the EDA2 driver                  
++================================================================
++ The second-generation ALMO-EDA (for DFT):                      
++ P. R. Horn, Y. Mao and M. Head-Gordon, PCCP, 18, 23067 (2016)  
++ Decomposition of the frozen energy:                            
++ P. R. Horn, Y. Mao and M. Head-Gordon, JCP, 144, 114107 (2016) 
++ FERF model for polarization:                                   
++ P. R. Horn and M. Head-Gordon, JCP, 143, 114111 (2015)         
++Using eda2 option set 1
++Option set summary: Frozen orbital wavefunction, initial wavefunction decomposition, and nDQ polarization.
++--------------------------------
++Printing EDA Options
++--------------------------------
++eda_child_super_basis      0
++fragmo_guess_mode          0
++child_mp                   1
++child_mp_orders            232
++cls_elec                   1
++cls_disp                   0
++scfmi_mode                 1
++scfmi_occs                 0
++scfmi_virts                0
++frz_relax                  0
++frz_relax_method           0
++dc_pen_start               0
++dc_pen_conv                0
++dc_pen_increment           0
++dc_pen_steps               0
++dc_pen_thresh_factor       0
++dc_pen_pre_newton_thresh   0
++frz_ortho_decomp           1
++frz_ortho_decomp_conv      6
++plot_mo_ortho_frz          0
++frgm_method                2
++scfmi_freeze_ss            0
++separate_rehyb             0
++plot_diff_den              0
++eda_nocv                   0
++eda_vct_relax              1
++disp_free_x                0
++disp_free_c                0
++eda_bsse                   0
++eda_pct_a                  0
++eda_covp                   0
++--------------------------------
++Attempting to make child job directory: /tmp/qchem313//Frg1/
++Attempting to make child job directory: /tmp/qchem313//Frg2/
++Creating input file /tmp/qchem313/Frg1.input
++using default PutDataFrgm: nothing
++calling putenv with: QCSCRATCH=/tmp/qchem313/ 
++calling putenv with: QCLOCALSCR=/tmp/qchem313/ 
++Spawning Job For Fragment 0
++                  Welcome to Q-Chem
++     A Quantum Leap Into The Future Of Chemistry
++
++
++ Q-Chem 5.3, Q-Chem, Inc., Pleasanton, CA (2020)
++
++ License issued to: National Energy Research Scientific Computing Center
++
++ Yihan Shao,  Zhengting Gan,  E. Epifanovsky,  A. T. B. Gilbert,  M. Wormit,  
++ J. Kussmann,  A. W. Lange,  A. Behn,  Jia Deng,  Xintian Feng,  D. Ghosh,  
++ M. Goldey,  P. R. Horn,  L. D. Jacobson,  I. Kaliman,  T. Kus,  A. Landau,  
++ Jie Liu,  E. I. Proynov,  R. M. Richard,  R. P. Steele,  E. J. Sundstrom,  
++ H. L. Woodcock III,  P. M. Zimmerman,  D. Zuev,  B. Alam,  B. Albrecht,  
++ A. Aldossary,  E. Alguire,  S. A. Baeppler,  D. Barton,  Z. Benda,  
++ Y. A. Bernard,  E. J. Berquist,  K. B. Bravaya,  H. Burton,  K. Carter-Fenk,  
++ D. Casanova,  Chun-Min Chang,  Yunqing Chen,  A. Chien,  K. D. Closser,  
++ M. P. Coons,  S. Coriani,  S. Dasgupta,  A. L. Dempwolff,  M. Diedenhofen,  
++ Hainam Do,  R. G. Edgar,  Po-Tung Fang,  S. Faraji,  S. Fatehi,  
++ Qingguo Feng,  J. Fosso-Tande,  J. Gayvert,  Qinghui Ge,  A. Ghysels,  
++ G. Gidofalvi,  J. Gomes,  J. Gonthier,  S. Gulania,  A. Gunina,  D. Hait,  
++ M. W. D. Hanson-Heine,  S. Hammes-Schiffer,  P. H. P. Harbach,  
++ A. W. Hauser,  M. F. Herbst,  J. E. Herr,  E. G. Hohenstein,  Z. C. Holden,  
++ S. Houck,  Kerwin Hui,  B. C. Huynh,  M. Ivanov,  T.-C. Jagau,  Hyunjun Ji,  
++ B. Kaduk,  K. Khistyaev,  Jaehoon Kim,  P. Klunzinger,  K. Koh,  
++ D. Kosenkov,  L. Koulias,  T. Kowalczyk,  C. M. Krauter,  A. Kunitsa,  
++ Ka Un Lao,  A. Laurent,  K. V. Lawler,  Joonho Lee,  D. Lefrancois,  
++ S. Lehtola,  D. S. Levine,  Yi-Pei Li,  You-Sheng Lin,  Fenglai Liu,  
++ Kuan-Yu Liu,  E. Livshits,  M. Loipersberger,  A. Luenser,  P. Manohar,  
++ E. Mansoor,  S. F. Manzer,  Shan-Ping Mao,  Yuezhi Mao,  N. Mardirossian,  
++ A. V. Marenich,  T. Markovich,  L. A. Martinez-Martinez,  S. A. Maurer,  
++ N. J. Mayhall,  S. C. McKenzie,  J.-M. Mewes,  P. Morgante,  A. F. Morrison,  
++ J. W. Mullinax,  K. Nanda,  T. S. Nguyen-Beck,  R. Olivares-Amaya,  
++ K. J. Oosterbaan,  J. A. Parkhill,  S. K. Paul,  F. Pavosevic,  Zheng Pei,  
++ T. M. Perrine,  F. Plasser,  P. Pokhilko,  S. Prager,  A. Prociuk,  
++ E. Ramos,  B. Rana,  D. R. Rehn,  F. Rob,  E. Rossomme,  M. Scheurer,  
++ M. Schneider,  N. Sergueev,  S. M. Sharada,  S. Sharma,  W. Skomorowski,  
++ D. W. Small,  T. Stauch,  C. J. Stein,  T. Stein,  Yu-Chuan Su,  
++ S. P. Veccham,  Zhen Tao,  A. J. W. Thom,  A. Tkatchenko,  T. Tsuchimochi,  
++ N. M. Tubman,  L. Vogt,  M. L. Vidal,  O. Vydrov,  M. A. Watson,  J. Wenzel,  
++ M. de Wergifosse,  T. A. Wesolowski,  A. White,  J. Witte,  A. Yamada,  
++ Jun Yang,  K. Yao,  S. Yeganeh,  S. R. Yost,  Zhi-Qiang You,  A. Zech,  
++ Igor Ying Zhang,  Xing Zhang,  Yan Zhao,  Ying Zhu,  B. R. Brooks,  
++ G. K. L. Chan,  C. J. Cramer,  M. S. Gordon,  W. J. Hehre,  A. Klamt,  
++ M. W. Schmidt,  C. D. Sherrill,  D. G. Truhlar,  A. Aspuru-Guzik,  R. Baer,  
++ A. T. Bell,  N. A. Besley,  Jeng-Da Chai,  A. E. DePrince, III,  
++ R. A. DiStasio Jr.,  A. Dreuw,  B. D. Dunietz,  T. R. Furlani,  
++ Chao-Ping Hsu,  Yousung Jung,  Jing Kong,  D. S. Lambrecht,  WanZhen Liang,  
++ C. Ochsenfeld,  V. A. Rassolov,  L. V. Slipchenko,  J. E. Subotnik,  
++ T. Van Voorhis,  J. M. Herbert,  A. I. Krylov,  P. M. W. Gill,  M. Head-Gordon
++
++ Contributors to earlier versions of Q-Chem not listed above: 
++ R. D. Adamson,  B. Austin,  J. Baker,  G. J. O. Beran,  K. Brandhorst,  
++ S. T. Brown,  E. F. C. Byrd,  A. K. Chakraborty,  C.-L. Cheng,  
++ Siu Hung Chien,  D. M. Chipman,  D. L. Crittenden,  H. Dachsel,  
++ R. J. Doerksen,  A. D. Dutoi,  L. Fusti-Molnar,  W. A. Goddard III,  
++ A. Golubeva-Zadorozhnaya,  S. R. Gwaltney,  G. Hawkins,  A. Heyden,  
++ S. Hirata,  G. Kedziora,  F. J. Keil,  C. Kelley,  Jihan Kim,  R. A. King,  
++ R. Z. Khaliullin,  P. P. Korambath,  W. Kurlancheek,  A. M. Lee,  M. S. Lee,  
++ S. V. Levchenko,  Ching Yeh Lin,  D. Liotard,  R. C. Lochan,  I. Lotan,  
++ P. E. Maslen,  N. Nair,  D. P. O'Neill,  D. Neuhauser,  E. Neuscamman,  
++ C. M. Oana,  R. Olson,  B. Peters,  R. Peverati,  P. A. Pieniazek,  
++ Y. M. Rhee,  J. Ritchie,  M. A. Rohrdanz,  E. Rosta,  N. J. Russ,  
++ H. F. Schaefer III,  N. E. Schultz,  N. Shenvi,  A. C. Simmonett,  A. Sodt,  
++ D. Stuck,  K. S. Thanthiriwatte,  V. Vanovschi,  Tao Wang,  A. Warshel,  
++ C. F. Williams,  Q. Wu,  X. Xu,  W. Zhang
++
++ Please cite Q-Chem as follows:
++ Y. Shao et al., Mol. Phys. 113, 184-215 (2015)
++ DOI: 10.1080/00268976.2014.952696
++
++ Q-Chem 5.3.0 for Intel X86 EM64T Linux
++
++ Parts of Q-Chem use Armadillo 9.800.1 (Horizon Scraper).
++ http://arma.sourceforge.net/
++
++ Q-Chem begins on Thu Aug 13 10:32:01 2020  
++
++Host: cori02
++0
++
++     Scratch files written to /tmp/qchem313//Frg1//
++ Jun1620 |scratch|qcdevops|jenkins|workspace|build_RNUM 7035   
++Processing $rem in /global/common/cori_cle7/software/qchem/5.3/config/preferences:
++Processing $rem in /global/homes/f/farnazhz/.qchemrc:
++
++Checking the input file for inconsistencies... 	...done.
++
++--------------------------------------------------------------
++User input:
++--------------------------------------------------------------
++$molecule
++0 1
++ 8	-1.5510070000	-0.1145200000	0.0000000000
++ 1	-1.9342590000	0.7625030000	0.0000000000
++ 1	-0.5996770000	0.0407120000	0.0000000000
++$end
++$rem
++EDA2		1
++METHOD		WB97X-V
++BASIS		DEF2-TZVPD
++XC_GRID		000099000590
++NL_GRID		1
++UNRESTRICTED		FALSE
++MAX_SCF_CYCLES		200
++SYMMETRY		FALSE
++SYM_IGNORE		TRUE
++BASIS_LIN_DEP_THRESH		6
++THRESH		14
++SCF_CONVERGENCE		8
++SCF_PRINT_FRGM		TRUE
++!required keywords
++JOBTYPE		SP
++SYM_IGNORE		TRUE
++SUBSYSTEM		TRUE
++GEN_SCFMAN		TRUE
++CHILD_INSTRUCTION		2
++SYM_IGNORE		TRUE
++SCFMI		0
++RI_K 0		
++PARI_K 0		
++MIN_PARI_K 0		
++IARI_K 0		
++OCC_RI_K 0		
++PURECART		1111
++MEM_STATIC		2000
++MEM_TOTAL		96000
++GUI		0
++CHILD_MP		1
++CHILD_MP_ORDERS		232
++FRZ_RELAX		0
++FRZ_RELAX_METHOD		0
++EDA_CLS_ELEC		1
++EDA_CLS_DISP		0
++FRZ_ORTHO_DECOMP		1
++EDA2		FALSE
++FRGM_METHOD		FALSE
++CIS_N_ROOTS  0
++LOCAL_CIS    0
++CIS_RLX_DNS  1
++ECP		0
++$end
++--------------------------------------------------------------
++ ----------------------------------------------------------------
++             Standard Nuclear Orientation (Angstroms)
++    I     Atom           X                Y                Z
++ ----------------------------------------------------------------
++    1      O      -1.5510070000    -0.1145200000     0.0000000000
++    2      H      -1.9342590000     0.7625030000     0.0000000000
++    3      H      -0.5996770000     0.0407120000     0.0000000000
++ ----------------------------------------------------------------
++ Nuclear Repulsion Energy =           9.16383018 hartrees
++ There are        5 alpha and        5 beta electrons
++ Requested basis set is def2-TZVPD
++ There are 24 shells and 58 basis functions
++
++ Total QAlloc Memory Limit  96000 MB
++ Mega-Array Size      1956 MB
++ MEM_STATIC part      2000 MB
++
++                       Distance Matrix (Angstroms)
++             O (  1)   H (  2)
++   H (  2)  0.957106
++   H (  3)  0.963912  1.517264
++ 
++ A cutoff of  1.0D-14 yielded    300 shell pairs
++ There are      1786 function pairs (      2194 Cartesian)
++ Smallest overlap matrix eigenvalue = 1.93E-03
++
++ Scale SEOQF with 1.000000e-01/1.000000e-01/1.000000e-01
++
++ Standard Electronic Orientation quadrupole field applied
++ Nucleus-field energy     =     0.0000000009 hartrees
++ Guess from superposition of atomic densities
++ Warning:  Energy on first SCF cycle will be non-variational
++ SAD guess density has 10.000000 electrons
++
++ -----------------------------------------------------------------------
++  General SCF calculation program by
++  Eric Jon Sundstrom, Paul Horn, Yuezhi Mao, Dmitri Zuev, Alec White,
++  David Stuck, Shaama M.S., Shane Yost, Joonho Lee, David Small,
++  Daniel Levine, Susi Lehtola, Hugh Burton, Evgeny Epifanovsky,
++  Bang C. Huynh
++ -----------------------------------------------------------------------
++ Exchange:     0.1670 Hartree-Fock + 1.0000 wB97X-V + LR-HF
++ Correlation:  1.0000 wB97X-V
++ Using Euler-Maclaurin-Lebedev (99,590) quadrature formula
++ Nonlocal Correlation:  VV10 with C = 0.0100 and b = 6.00 and scale = 1.00000
++ Grid used for NLC:  SG-1 standard quadrature
++Energy prior to optimization (guess energy) = -76.380726891457
++Begin Timing: Total SCF Calculation
++begin iterations for algorithm: DIIS         
++the SCF tolerance is set to 1.00e-08
++    1     -76.3807268915      1.29e-02     00000 
++    2     -76.3820178300      1.40e-02     00000 
++    3     -76.4344810576      5.88e-04     00000 
++    4     -76.4345882123      1.48e-04     00000 
++    5     -76.4345990811      1.87e-05     00000 
++    6     -76.4345994030      2.54e-06     00000 
++    7     -76.4345994138      4.59e-07     00000 
++    8     -76.4345994141      6.56e-08     00000 
++    9     -76.4345994141      1.26e-08     00000 
++   10     -76.4345994141      2.58e-09     00000 Convergence criterion met
++Timing for Total SCF: 4.00s (wall), 53.81s (cpu)
++Multipole orders to be included
++        2
++        3
++computing dipole RHS
++computing quadrupole RHS
++total number of RHS in solve_reponses: 8
++RHS batch sizes
++        8
++Beginning Block Conjugate Gradient Iterations. Batch Number: 0
++computing hessian-vector products by finite difference
++              1      4.62e-01     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              2      1.32e-01     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              3      2.17e-02     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              4      3.52e-03     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              5      4.68e-04     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              6      4.51e-05     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              7      3.52e-06     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              8      2.07e-07     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              9      1.62e-08     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++             10      1.44e-09     00000 CG Converged
++batch 0 complete
++Done Calculating Responses
++TESTING ORTHOGONALIZATION OF MULTIPOLE BASIS
++Max deviation in metric = 8.15e-12
++Multipole virts passed orthogonality test
++Virts Per Order
++        15
++        24
++ 
++ --------------------------------------------------------------
++ 
++                    Orbital Energies (a.u.)
++ --------------------------------------------------------------
++ 
++ Alpha MOs
++ -- Occupied --
++-19.2196  -1.1455  -0.6466  -0.5068  -0.4301
++ -- Virtual --
++  0.0616   0.1015   0.1296   0.1309   0.2053   0.2307   0.2576   0.2745
++  0.2887   0.3306   0.3434   0.3858   0.4968   0.5050   0.5346   0.5847
++  0.5960   0.7328   0.7845   0.7905   0.7983   0.9784   1.0608   1.6018
++  1.6755   1.6933   1.8179   1.8428   1.9475   2.2004   2.2585   2.3800
++  2.5961   2.6424   2.8464   2.9053   2.9211   3.1948   3.8835   4.0946
++  5.2016   5.3475   5.5130   5.5647   5.5835   6.1775   6.3989   6.5504
++  6.6100   6.6253   7.0491   7.1647  43.7264
++ --------------------------------------------------------------
++ 
++          Ground-State Mulliken Net Atomic Charges
++
++     Atom                 Charge (a.u.)
++  ----------------------------------------
++      1 O                    -0.604700
++      2 H                     0.301508
++      3 H                     0.303192
++  ----------------------------------------
++  Sum of atomic charges =     0.000000
++
++ -----------------------------------------------------------------
++                    Cartesian Multipole Moments
++ -----------------------------------------------------------------
++    Charge (ESU x 10^10)
++                -0.0000
++    Dipole Moment (Debye)
++         X       0.9043      Y       1.6499      Z       0.0000
++       Tot       1.8815
++    Quadrupole Moments (Debye-Ang)
++        XX      -7.5832     XY      -3.2967     YY      -6.0013
++        XZ       0.0000     YZ      -0.0000     ZZ      -7.8312
++    Octopole Moments (Debye-Ang^2)
++       XXX      29.5155    XXY       6.7914    XYY       8.5331
++       YYY       1.6785    XXZ      -0.0000    XYZ       0.0000
++       YYZ       0.0000    XZZ      11.7986    YZZ       0.2725
++       ZZZ       0.0000
++    Hexadecapole Moments (Debye-Ang^3)
++      XXXX     -93.4160   XXXY     -13.9505   XXYY     -14.5390
++      XYYY      -2.9828   YYYY      -7.2946   XXXZ       0.0000
++      XXYZ      -0.0000   XYYZ       0.0000   YYYZ      -0.0000
++      XXZZ     -20.4711   XYZZ      -0.3971   YYZZ      -2.6760
++      XZZZ      -0.0000   YZZZ      -0.0000   ZZZZ      -7.8356
++ -----------------------------------------------------------------
++Archival summary:
++1\1\cori02\SP\ProcedureUnspecified\BasisUnspecified\12\farnazhz\ThuAug1310:33:132020ThuAug1310:33:132020\0\\#,ProcedureUnspecified,BasisUnspecified,\\0,1\O\H,1,0.957106\H,1,0.963912,2,104.337\\\@
++
++ Total job time:  71.48s(wall), 1079.84s(cpu) 
++ Thu Aug 13 10:33:13 2020
++
++        *************************************************************
++        *                                                           *
++        *  Thank you very much for using Q-Chem.  Have a nice day.  *
++        *                                                           *
++        *************************************************************
++
++
++Done Job For Fragment 0
++calling putenv with: QCSCRATCH=/global/cscratch1/sd/farnazhz 
++calling putenv with: QCLOCALSCR=/tmp 
++calling putenv with: QCTHREADS=16 
++Creating input file /tmp/qchem313/Frg2.input
++using default PutDataFrgm: nothing
++calling putenv with: QCSCRATCH=/tmp/qchem313/ 
++calling putenv with: QCLOCALSCR=/tmp/qchem313/ 
++Spawning Job For Fragment 1
++                  Welcome to Q-Chem
++     A Quantum Leap Into The Future Of Chemistry
++
++
++ Q-Chem 5.3, Q-Chem, Inc., Pleasanton, CA (2020)
++
++ License issued to: National Energy Research Scientific Computing Center
++
++ Yihan Shao,  Zhengting Gan,  E. Epifanovsky,  A. T. B. Gilbert,  M. Wormit,  
++ J. Kussmann,  A. W. Lange,  A. Behn,  Jia Deng,  Xintian Feng,  D. Ghosh,  
++ M. Goldey,  P. R. Horn,  L. D. Jacobson,  I. Kaliman,  T. Kus,  A. Landau,  
++ Jie Liu,  E. I. Proynov,  R. M. Richard,  R. P. Steele,  E. J. Sundstrom,  
++ H. L. Woodcock III,  P. M. Zimmerman,  D. Zuev,  B. Alam,  B. Albrecht,  
++ A. Aldossary,  E. Alguire,  S. A. Baeppler,  D. Barton,  Z. Benda,  
++ Y. A. Bernard,  E. J. Berquist,  K. B. Bravaya,  H. Burton,  K. Carter-Fenk,  
++ D. Casanova,  Chun-Min Chang,  Yunqing Chen,  A. Chien,  K. D. Closser,  
++ M. P. Coons,  S. Coriani,  S. Dasgupta,  A. L. Dempwolff,  M. Diedenhofen,  
++ Hainam Do,  R. G. Edgar,  Po-Tung Fang,  S. Faraji,  S. Fatehi,  
++ Qingguo Feng,  J. Fosso-Tande,  J. Gayvert,  Qinghui Ge,  A. Ghysels,  
++ G. Gidofalvi,  J. Gomes,  J. Gonthier,  S. Gulania,  A. Gunina,  D. Hait,  
++ M. W. D. Hanson-Heine,  S. Hammes-Schiffer,  P. H. P. Harbach,  
++ A. W. Hauser,  M. F. Herbst,  J. E. Herr,  E. G. Hohenstein,  Z. C. Holden,  
++ S. Houck,  Kerwin Hui,  B. C. Huynh,  M. Ivanov,  T.-C. Jagau,  Hyunjun Ji,  
++ B. Kaduk,  K. Khistyaev,  Jaehoon Kim,  P. Klunzinger,  K. Koh,  
++ D. Kosenkov,  L. Koulias,  T. Kowalczyk,  C. M. Krauter,  A. Kunitsa,  
++ Ka Un Lao,  A. Laurent,  K. V. Lawler,  Joonho Lee,  D. Lefrancois,  
++ S. Lehtola,  D. S. Levine,  Yi-Pei Li,  You-Sheng Lin,  Fenglai Liu,  
++ Kuan-Yu Liu,  E. Livshits,  M. Loipersberger,  A. Luenser,  P. Manohar,  
++ E. Mansoor,  S. F. Manzer,  Shan-Ping Mao,  Yuezhi Mao,  N. Mardirossian,  
++ A. V. Marenich,  T. Markovich,  L. A. Martinez-Martinez,  S. A. Maurer,  
++ N. J. Mayhall,  S. C. McKenzie,  J.-M. Mewes,  P. Morgante,  A. F. Morrison,  
++ J. W. Mullinax,  K. Nanda,  T. S. Nguyen-Beck,  R. Olivares-Amaya,  
++ K. J. Oosterbaan,  J. A. Parkhill,  S. K. Paul,  F. Pavosevic,  Zheng Pei,  
++ T. M. Perrine,  F. Plasser,  P. Pokhilko,  S. Prager,  A. Prociuk,  
++ E. Ramos,  B. Rana,  D. R. Rehn,  F. Rob,  E. Rossomme,  M. Scheurer,  
++ M. Schneider,  N. Sergueev,  S. M. Sharada,  S. Sharma,  W. Skomorowski,  
++ D. W. Small,  T. Stauch,  C. J. Stein,  T. Stein,  Yu-Chuan Su,  
++ S. P. Veccham,  Zhen Tao,  A. J. W. Thom,  A. Tkatchenko,  T. Tsuchimochi,  
++ N. M. Tubman,  L. Vogt,  M. L. Vidal,  O. Vydrov,  M. A. Watson,  J. Wenzel,  
++ M. de Wergifosse,  T. A. Wesolowski,  A. White,  J. Witte,  A. Yamada,  
++ Jun Yang,  K. Yao,  S. Yeganeh,  S. R. Yost,  Zhi-Qiang You,  A. Zech,  
++ Igor Ying Zhang,  Xing Zhang,  Yan Zhao,  Ying Zhu,  B. R. Brooks,  
++ G. K. L. Chan,  C. J. Cramer,  M. S. Gordon,  W. J. Hehre,  A. Klamt,  
++ M. W. Schmidt,  C. D. Sherrill,  D. G. Truhlar,  A. Aspuru-Guzik,  R. Baer,  
++ A. T. Bell,  N. A. Besley,  Jeng-Da Chai,  A. E. DePrince, III,  
++ R. A. DiStasio Jr.,  A. Dreuw,  B. D. Dunietz,  T. R. Furlani,  
++ Chao-Ping Hsu,  Yousung Jung,  Jing Kong,  D. S. Lambrecht,  WanZhen Liang,  
++ C. Ochsenfeld,  V. A. Rassolov,  L. V. Slipchenko,  J. E. Subotnik,  
++ T. Van Voorhis,  J. M. Herbert,  A. I. Krylov,  P. M. W. Gill,  M. Head-Gordon
++
++ Contributors to earlier versions of Q-Chem not listed above: 
++ R. D. Adamson,  B. Austin,  J. Baker,  G. J. O. Beran,  K. Brandhorst,  
++ S. T. Brown,  E. F. C. Byrd,  A. K. Chakraborty,  C.-L. Cheng,  
++ Siu Hung Chien,  D. M. Chipman,  D. L. Crittenden,  H. Dachsel,  
++ R. J. Doerksen,  A. D. Dutoi,  L. Fusti-Molnar,  W. A. Goddard III,  
++ A. Golubeva-Zadorozhnaya,  S. R. Gwaltney,  G. Hawkins,  A. Heyden,  
++ S. Hirata,  G. Kedziora,  F. J. Keil,  C. Kelley,  Jihan Kim,  R. A. King,  
++ R. Z. Khaliullin,  P. P. Korambath,  W. Kurlancheek,  A. M. Lee,  M. S. Lee,  
++ S. V. Levchenko,  Ching Yeh Lin,  D. Liotard,  R. C. Lochan,  I. Lotan,  
++ P. E. Maslen,  N. Nair,  D. P. O'Neill,  D. Neuhauser,  E. Neuscamman,  
++ C. M. Oana,  R. Olson,  B. Peters,  R. Peverati,  P. A. Pieniazek,  
++ Y. M. Rhee,  J. Ritchie,  M. A. Rohrdanz,  E. Rosta,  N. J. Russ,  
++ H. F. Schaefer III,  N. E. Schultz,  N. Shenvi,  A. C. Simmonett,  A. Sodt,  
++ D. Stuck,  K. S. Thanthiriwatte,  V. Vanovschi,  Tao Wang,  A. Warshel,  
++ C. F. Williams,  Q. Wu,  X. Xu,  W. Zhang
++
++ Please cite Q-Chem as follows:
++ Y. Shao et al., Mol. Phys. 113, 184-215 (2015)
++ DOI: 10.1080/00268976.2014.952696
++
++ Q-Chem 5.3.0 for Intel X86 EM64T Linux
++
++ Parts of Q-Chem use Armadillo 9.800.1 (Horizon Scraper).
++ http://arma.sourceforge.net/
++
++ Q-Chem begins on Thu Aug 13 10:33:13 2020  
++
++Host: cori02
++0
++
++     Scratch files written to /tmp/qchem313//Frg2//
++ Jun1620 |scratch|qcdevops|jenkins|workspace|build_RNUM 7035   
++Processing $rem in /global/common/cori_cle7/software/qchem/5.3/config/preferences:
++Processing $rem in /global/homes/f/farnazhz/.qchemrc:
++
++Checking the input file for inconsistencies... 	...done.
++
++--------------------------------------------------------------
++User input:
++--------------------------------------------------------------
++$molecule
++0 1
++ 8	1.3506250000	0.1114690000	0.0000000000
++ 1	1.6803980000	-0.3737410000	-0.7585610000
++ 1	1.6803980000	-0.3737410000	0.7585610000
++$end
++$rem
++EDA2		1
++METHOD		WB97X-V
++BASIS		DEF2-TZVPD
++XC_GRID		000099000590
++NL_GRID		1
++UNRESTRICTED		FALSE
++MAX_SCF_CYCLES		200
++SYMMETRY		FALSE
++SYM_IGNORE		TRUE
++BASIS_LIN_DEP_THRESH		6
++THRESH		14
++SCF_CONVERGENCE		8
++SCF_PRINT_FRGM		TRUE
++!required keywords
++JOBTYPE		SP
++SYM_IGNORE		TRUE
++SUBSYSTEM		TRUE
++GEN_SCFMAN		TRUE
++CHILD_INSTRUCTION		2
++SYM_IGNORE		TRUE
++SCFMI		0
++RI_K 0		
++PARI_K 0		
++MIN_PARI_K 0		
++IARI_K 0		
++OCC_RI_K 0		
++PURECART		1111
++MEM_STATIC		2000
++MEM_TOTAL		96000
++GUI		0
++CHILD_MP		1
++CHILD_MP_ORDERS		232
++FRZ_RELAX		0
++FRZ_RELAX_METHOD		0
++EDA_CLS_ELEC		1
++EDA_CLS_DISP		0
++FRZ_ORTHO_DECOMP		1
++EDA2		FALSE
++FRGM_METHOD		FALSE
++CIS_N_ROOTS  0
++LOCAL_CIS    0
++CIS_RLX_DNS  1
++ECP		0
++$end
++--------------------------------------------------------------
++ ----------------------------------------------------------------
++             Standard Nuclear Orientation (Angstroms)
++    I     Atom           X                Y                Z
++ ----------------------------------------------------------------
++    1      O       1.3506250000     0.1114690000     0.0000000000
++    2      H       1.6803980000    -0.3737410000    -0.7585610000
++    3      H       1.6803980000    -0.3737410000     0.7585610000
++ ----------------------------------------------------------------
++ Nuclear Repulsion Energy =           9.17803894 hartrees
++ There are        5 alpha and        5 beta electrons
++ Requested basis set is def2-TZVPD
++ There are 24 shells and 58 basis functions
++
++ Total QAlloc Memory Limit  96000 MB
++ Mega-Array Size      1956 MB
++ MEM_STATIC part      2000 MB
++
++                       Distance Matrix (Angstroms)
++             O (  1)   H (  2)
++   H (  2)  0.958955
++   H (  3)  0.958955  1.517122
++ 
++ A cutoff of  1.0D-14 yielded    300 shell pairs
++ There are      1786 function pairs (      2194 Cartesian)
++ Smallest overlap matrix eigenvalue = 1.92E-03
++
++ Scale SEOQF with 1.000000e-01/1.000000e-01/1.000000e-01
++
++ Standard Electronic Orientation quadrupole field applied
++ Nucleus-field energy     =     0.0000000006 hartrees
++ Guess from superposition of atomic densities
++ Warning:  Energy on first SCF cycle will be non-variational
++ SAD guess density has 10.000000 electrons
++
++ -----------------------------------------------------------------------
++  General SCF calculation program by
++  Eric Jon Sundstrom, Paul Horn, Yuezhi Mao, Dmitri Zuev, Alec White,
++  David Stuck, Shaama M.S., Shane Yost, Joonho Lee, David Small,
++  Daniel Levine, Susi Lehtola, Hugh Burton, Evgeny Epifanovsky,
++  Bang C. Huynh
++ -----------------------------------------------------------------------
++ Exchange:     0.1670 Hartree-Fock + 1.0000 wB97X-V + LR-HF
++ Correlation:  1.0000 wB97X-V
++ Using Euler-Maclaurin-Lebedev (99,590) quadrature formula
++ Nonlocal Correlation:  VV10 with C = 0.0100 and b = 6.00 and scale = 1.00000
++ Grid used for NLC:  SG-1 standard quadrature
++Energy prior to optimization (guess energy) = -76.380743471562
++Begin Timing: Total SCF Calculation
++begin iterations for algorithm: DIIS         
++the SCF tolerance is set to 1.00e-08
++    1     -76.3807434716      1.29e-02     00000 
++    2     -76.3821692036      1.40e-02     00000 
++    3     -76.4344955630      5.86e-04     00000 
++    4     -76.4346025081      1.48e-04     00000 
++    5     -76.4346133543      1.87e-05     00000 
++    6     -76.4346136772      2.54e-06     00000 
++    7     -76.4346136880      4.57e-07     00000 
++    8     -76.4346136883      6.38e-08     00000 
++    9     -76.4346136883      8.81e-09     00000 Convergence criterion met
++Timing for Total SCF: 3.00s (wall), 45.04s (cpu)
++Multipole orders to be included
++        2
++        3
++computing dipole RHS
++computing quadrupole RHS
++total number of RHS in solve_reponses: 8
++RHS batch sizes
++        8
++Beginning Block Conjugate Gradient Iterations. Batch Number: 0
++computing hessian-vector products by finite difference
++              1      4.53e-01     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              2      1.35e-01     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              3      2.32e-02     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              4      3.47e-03     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              5      4.73e-04     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              6      4.69e-05     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              7      3.57e-06     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              8      2.16e-07     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++              9      1.55e-08     00000 Conjugate Gradient Iteration
++computing hessian-vector products by finite difference
++             10      4.02e-09     00000 CG Converged
++batch 0 complete
++Done Calculating Responses
++TESTING ORTHOGONALIZATION OF MULTIPOLE BASIS
++Max deviation in metric = 1.28e-11
++Multipole virts passed orthogonality test
++Virts Per Order
++        15
++        24
++ 
++ --------------------------------------------------------------
++ 
++                    Orbital Energies (a.u.)
++ --------------------------------------------------------------
++ 
++ Alpha MOs
++ -- Occupied --
++-19.2193  -1.1460  -0.6477  -0.5066  -0.4301
++ -- Virtual --
++  0.0617   0.1015   0.1295   0.1308   0.2057   0.2307   0.2576   0.2749
++  0.2891   0.3308   0.3434   0.3861   0.4971   0.5049   0.5342   0.5845
++  0.5962   0.7334   0.7855   0.7911   0.7988   0.9783   1.0612   1.6022
++  1.6763   1.6937   1.8178   1.8423   1.9475   2.2005   2.2603   2.3783
++  2.6001   2.6404   2.8500   2.9072   2.9218   3.1962   3.8832   4.0987
++  5.2016   5.3463   5.5149   5.5656   5.5879   6.1832   6.4025   6.5502
++  6.6106   6.6246   7.0567   7.1630  43.7269
++ --------------------------------------------------------------
++ 
++          Ground-State Mulliken Net Atomic Charges
++
++     Atom                 Charge (a.u.)
++  ----------------------------------------
++      1 O                    -0.603967
++      2 H                     0.301984
++      3 H                     0.301984
++  ----------------------------------------
++  Sum of atomic charges =     0.000000
++
++ -----------------------------------------------------------------
++                    Cartesian Multipole Moments
++ -----------------------------------------------------------------
++    Charge (ESU x 10^10)
++                -0.0000
++    Dipole Moment (Debye)
++         X       1.0552      Y      -1.5526      Z      -0.0000
++       Tot       1.8772
++    Quadrupole Moments (Debye-Ang)
++        XX      -4.3909     XY      -2.8422     YY      -6.9042
++        XZ      -0.0000     YZ       0.0000     ZZ      -4.4324
++    Octopole Moments (Debye-Ang^2)
++       XXX     -24.5916    XXY      -5.3168    XYY      -9.5336
++       YYY      -1.0342    XXZ      -0.0000    XYZ       0.0000
++       YYZ       0.0000    XZZ      -5.5386    YZZ      -1.1532
++       ZZZ       0.0000
++    Hexadecapole Moments (Debye-Ang^3)
++      XXXX     -82.3805   XXXY      -9.8613   XXYY     -15.7639
++      XYYY      -1.4744   YYYY      -7.9610   XXXZ      -0.0000
++      XXYZ       0.0000   XYYZ      -0.0000   YYYZ       0.0000
++      XXZZ      -9.3019   XYZZ      -1.9046   YYZZ      -2.3141
++      XZZZ      -0.0000   YZZZ       0.0000   ZZZZ      -6.5318
++ -----------------------------------------------------------------
++Archival summary:
++1\1\cori02\SP\ProcedureUnspecified\BasisUnspecified\12\farnazhz\ThuAug1310:34:182020ThuAug1310:34:182020\0\\#,ProcedureUnspecified,BasisUnspecified,\\0,1\O\H,1,0.958955\H,1,0.958955,2,104.564\\\@
++
++ Total job time:  64.99s(wall), 1018.10s(cpu) 
++ Thu Aug 13 10:34:18 2020
++
++        *************************************************************
++        *                                                           *
++        *  Thank you very much for using Q-Chem.  Have a nice day.  *
++        *                                                           *
++        *************************************************************
++
++
++Done Job For Fragment 1
++calling putenv with: QCSCRATCH=/global/cscratch1/sd/farnazhz 
++calling putenv with: QCLOCALSCR=/tmp 
++calling putenv with: QCTHREADS=16 
++Doing General SCFMI
++ Exchange:     0.1670 Hartree-Fock + 1.0000 wB97X-V + LR-HF
++ Correlation:  1.0000 wB97X-V
++ Using Euler-Maclaurin-Lebedev (99,590) quadrature formula
++ Nonlocal Correlation:  VV10 with C = 0.0100 and b = 6.00 and scale = 1.00000
++ Grid used for NLC:  SG-1 standard quadrature
++performing fock build before subrot guess so that all methods have access
++Printing subrot_rss_gen Method Specification:
++Occupied Subspace Method is 0
++Virtual Subspace Method is 0
++Energy of the unrelaxed supersystem initial determinant -152.872795839463
++write pseudocanon occs and virts to disk
++write pseudocanon orbital energies to disk
++Tolerance of ortho_decomp_scf: 1.00e-06
++GDM subspace size: 20
++Beginning the Orthogonal Decomposition of the Initial Supersystem Wavefunction
++    1    -152.8355542801      2.12e-01     ortho_decomp Preconditoned Steepest Descent
++    2    -152.8392810991      3.59e-03     ortho_decomp BFGS Step
++    3    -152.8392877001      2.71e-04     ortho_decomp BFGS Step
++    4    -152.8392877142      9.04e-06     ortho_decomp BFGS Step
++    5    -152.8392877142      2.66e-07     ortho_decomp 00000 Convergence criterion met
++ Hartree-Fock
++ Hartree-Fock
++ Hartree-Fock
++Doing General SCFMI
++ Exchange:     0.1670 Hartree-Fock + 1.0000 wB97X-V + LR-HF
++ Correlation:  1.0000 wB97X-V
++ Using Euler-Maclaurin-Lebedev (99,590) quadrature formula
++ Nonlocal Correlation:  VV10 with C = 0.0100 and b = 6.00 and scale = 1.00000
++ Grid used for NLC:  SG-1 standard quadrature
++performing fock build at end of subrot_r(subrot) constructor so that all methods have access
++<S^2> of initial wavefunction before polarization iterations 0.0000000000
++Beginning iterations for the determination of the polarized wavefunction
++Energy prior to optimization (guess energy) = -152.872795839463
++Begin Timing: Total SCF Calculation
++begin iterations for algorithm: DIIS         
++the SCF tolerance is set to 1.00e-08
++    1    -152.8727958395      6.42e-04     00000 
++    2    -152.8744092413      1.72e-04     00000 
++    3    -152.8745406509      7.15e-05     00000 
++    4    -152.8745576357      3.96e-05     00000 
++    5    -152.8745613240      1.04e-05     00000 
++    6    -152.8745619601      2.24e-06     00000 
++    7    -152.8745619917      1.52e-06     00000 
++    8    -152.8745619958      2.12e-07     00000 
++    9    -152.8745619961      4.56e-08     00000 
++   10    -152.8745619961      1.31e-08     00000 
++   11    -152.8745619961      2.15e-09     00000 Convergence criterion met
++write pseudocanon occs and virts to disk
++write pseudocanon orbital energies to disk
++Timing for Total SCF: 8.00s (wall), 89.02s (cpu)
++<S^2> of polarized wavefunction after polarization iterations 0.0000000000
++relaxing scfmi constraint to allow all rotations in the entire AO span
++Doing General SCFMI
++ Exchange:     0.1670 Hartree-Fock + 1.0000 wB97X-V + LR-HF
++ Correlation:  1.0000 wB97X-V
++ Using Euler-Maclaurin-Lebedev (99,590) quadrature formula
++ Nonlocal Correlation:  VV10 with C = 0.0100 and b = 6.00 and scale = 1.00000
++ Grid used for NLC:  SG-1 standard quadrature
++performing fock build at end of subrot_r(subrot) constructor so that all methods have access
++<S^2> of polarized wavefunction before ct-allowed iterations 0.0000000000
++Beginning iterations for the determination of the CT-Allowed wavefunction
++Energy prior to optimization (guess energy) = -152.874561996135
++Begin Timing: Total SCF Calculation
++begin iterations for algorithm: DIIS         
++the SCF tolerance is set to 1.00e-08
++    1    -152.8745619961      5.73e-04     00000 
++    2    -152.8771516888      8.97e-05     00000 
++    3    -152.8772477197      3.50e-05     00000 
++    4    -152.8772529147      1.66e-05     00000 
++    5    -152.8772543518      1.35e-06     00000 
++    6    -152.8772543699      6.30e-07     00000 
++    7    -152.8772543723      2.61e-07     00000 
++    8    -152.8772543726      2.54e-08     00000 
++    9    -152.8772543727      4.25e-09     00000 Convergence criterion met
++write pseudocanon occs and virts to disk
++write pseudocanon orbital energies to disk
++Timing for Total SCF: 7.00s (wall), 82.62s (cpu)
++<S^2> of ct_allowed wavefunction after ct-allowed iterations 0.0000000000
++
++================================
++        Results of EDA2         
++================================
++Basic EDA Quantities
++--------------------
++Fragment Energies (Ha):
++1  -76.4345994141
++2  -76.4346136883
++--------------------
++  E_prp (kJ/mol) = 0.0000
++  E_frz (kJ/mol) = -9.4066
++  E_pol (kJ/mol) = -4.6371
++  E_vct (kJ/mol) = -7.0689
++  E_int (kJ/mol) = -21.1126
++--------------------
++
++
++Initial Wavefunction Decomposition
++--------------------
++  --------------------
++  Orthogonal Fragment Subspace Decomposition:
++  --------------------
++     E_elec   (ELEC)   (kJ/mol) = -65.9887
++     E_pauli  (PAULI)  (kJ/mol) = 64.3205
++     E_disp   (DISP)   (kJ/mol) = -7.7384
++     --------------------
++     Terms summing to E_pauli:
++     --------------------
++        E_kep_pauli       (kJ/mol) = 78.5700
++        E_disp_free_pauli (kJ/mol) = -14.2495
++  --------------------
++  Classical Frozen Decomposition:
++  --------------------
++     E_cls_elec  (CLS ELEC)  (kJ/mol) = -35.1257
++     E_cls_pauli (CLS PAULI) (kJ/mol) = 25.7192
++    [E_mod_pauli (MOD PAULI) (kJ/mol) = 33.4576 (CLS PAULI - DISP from orthogonal decomposition) ]
++  --------------------
++--------------------
++
++Simplified EDA Summary (kJ/mol)
++--------------------
++ PREPARATION     0.0000
++ FROZEN          -1.6681      (does not include dispersion)
++[PAULI           64.3205]     (if this is negligible, then frozen describes electrostatics)
++ DISPERSION      -7.7384
++ POLARIZATION    -4.6371
++ CHARGE TRANSFER -7.0689
++ TOTAL           -21.1126     (PRP + FRZ + DISP + POL + CT)
++--------------------
++ 
++ --------------------------------------------------------------
++ 
++                    Orbital Energies (a.u.)
++ --------------------------------------------------------------
++ 
++ Alpha MOs
++ -- Occupied --
++-19.2455 -19.1897  -1.1734  -1.1173  -0.6729  -0.6242  -0.5373  -0.4825
++ -0.4530  -0.4045
++ -- Virtual --
++  0.0485   0.0863   0.0927   0.1035   0.1344   0.1474   0.1539   0.1880
++  0.1982   0.2280   0.2507   0.2532   0.2732   0.2865   0.2992   0.3216
++  0.3260   0.3454   0.3542   0.3850   0.3991   0.4016   0.4155   0.4831
++  0.5016   0.5133   0.5502   0.5505   0.5745   0.5992   0.6275   0.6454
++  0.6664   0.6869   0.7423   0.7874   0.8039   0.8204   0.8457   0.9021
++  0.9149   0.9749   1.0168   1.0490   1.1274   1.2009   1.6233   1.6642
++  1.6723   1.6877   1.7314   1.7347   1.8246   1.8635   1.8877   1.9254
++  2.0091   2.1339   2.2139   2.2489   2.2799   2.3420   2.3777   2.5255
++  2.6135   2.6373   2.6727   2.7228   2.8765   2.8841   2.9076   2.9624
++  3.0377   3.0978   3.2509   3.3613   3.8767   3.9603   4.0824   4.1424
++  5.1826   5.2283   5.3319   5.3817   5.4919   5.5386   5.5584   5.5648
++  5.6049   5.6226   6.1591   6.2079   6.3862   6.4446   6.5805   6.5926
++  6.6092   6.6315   6.6557   6.6703   7.0400   7.1334   7.1456   7.2547
++ 43.7457  43.9166
++ --------------------------------------------------------------
++ 
++          Ground-State Mulliken Net Atomic Charges
++
++     Atom                 Charge (a.u.)
++  ----------------------------------------
++      1 O                    -0.610250
++      2 H                     0.304021
++      3 H                     0.337060
++      4 O                    -0.663525
++      5 H                     0.316347
++      6 H                     0.316347
++  ----------------------------------------
++  Sum of atomic charges =     0.000000
++
++ -----------------------------------------------------------------
++                    Cartesian Multipole Moments
++ -----------------------------------------------------------------
++    Charge (ESU x 10^10)
++                -0.0000
++    Dipole Moment (Debye)
++         X       2.5689      Y       0.0770      Z       0.0000
++       Tot       2.5701
++    Quadrupole Moments (Debye-Ang)
++        XX     -12.0581     XY      -6.2544     YY     -12.8954
++        XZ      -0.0000     YZ      -0.0000     ZZ     -12.2310
++    Octopole Moments (Debye-Ang^2)
++       XXX       8.7928    XXY       1.4737    XYY      -0.5294
++       YYY       0.6200    XXZ       0.0000    XYZ       0.0000
++       YYZ       0.0000    XZZ       6.7663    YZZ      -0.9055
++       ZZZ       0.0000
++    Hexadecapole Moments (Debye-Ang^3)
++      XXXX    -175.9581   XXXY     -24.0617   XXYY     -30.3857
++      XYYY      -4.6186   YYYY     -15.2403   XXXZ      -0.0000
++      XXYZ      -0.0000   XYYZ      -0.0000   YYYZ      -0.0000
++      XXZZ     -29.7656   XYZZ      -2.4227   YYZZ      -4.9825
++      XZZZ      -0.0000   YZZZ      -0.0000   ZZZZ     -14.4177
++ -----------------------------------------------------------------
++Archival summary:
++1\1\cori02\SP\ProcedureUnspecified\BasisUnspecified\24\farnazhz\ThuAug1310:34:432020ThuAug1310:34:432020\0\\#,ProcedureUnspecified,BasisUnspecified,\\0,1\O\H,1,0.958955\H,1,0.958955,2,104.564\H,1,1.95159,2,108.985,3,116.413,0\O,4,0.963912,1,172.81,2,-56.7757,0\H,5,0.957106,4,104.337,1,-180,0\\\@
++
++ Total job time:  164.42s(wall), 293.07s(cpu) 
++ Thu Aug 13 10:34:43 2020
++
++        *************************************************************
++        *                                                           *
++        *  Thank you very much for using Q-Chem.  Have a nice day.  *
++        *                                                           *
++        *************************************************************
++
++
++remove work dirs /tmp/qchem313.0 -- /tmp/qchem313.-1
++rm -rf /tmp/qchem313
+diff --git a/iodata/test/test_qchemlog.py b/iodata/test/test_qchemlog.py
+index cc9a7cf5a..2f2775816 100644
+--- a/iodata/test/test_qchemlog.py
++++ b/iodata/test/test_qchemlog.py
+@@ -23,7 +23,7 @@
+ 
+ from ..api import load_one
+ from ..formats.qchemlog import load_qchemlog_low
+-from ..utils import LineIterator
++from ..utils import LineIterator, angstrom, kjmol
+ 
+ try:
+     from importlib_resources import path
+@@ -31,18 +31,12 @@
+     from importlib.resources import path
+ 
+ 
+-def helper_load_data_qchemlog_helper(fn_qchemlog):
+-    """Load a testing Q-Chem log file with iodata.formats.wfx.load_qchemlog_low."""
+-    with path('iodata.test.data', fn_qchemlog) as fq:
+-        lit = LineIterator(str(fq))
+-        return load_qchemlog_low(lit)
+-
+-
+-def test_load_data_qchemlog_h2o():
++def test_load_qchemlog_low_h2o():
+     """Test load_qchemlog_low with water_hf_ccpvtz_freq_qchem.out."""
+-    data = helper_load_data_qchemlog_helper('water_hf_ccpvtz_freq_qchem.out')
++    with path('iodata.test.data', 'water_hf_ccpvtz_freq_qchem.out') as fq:
++        data = load_qchemlog_low(LineIterator(str(fq)))
++
+     # check loaded data
+-    assert data['natom'] == 3
+     assert data['run_type'] == 'freq'
+     assert data['lot'] == 'hf'
+     assert data['obasis_name'] == 'cc-pvtz'
+@@ -51,26 +45,26 @@ def test_load_data_qchemlog_h2o():
+     assert data['g_rot'] == 1
+     assert data['alpha_elec'] == 5
+     assert data['beta_elec'] == 5
+-    assert data['nuclear_repulsion_energy'] == 9.19775748
+-    assert data['energy'] == -76.0571936393
++    assert_allclose(data['nuclear_repulsion_energy'], 9.19775748)
++    assert_allclose(data['energy'], -76.0571936393)
+     assert data['norba'] == 58
+     assert data['norbb'] == 58
+     assert data['dipole_tol'] == 2.0231
+-    assert data['enthalpy_dict']['trans_enthalpy'] == 0.889
+-    assert data['enthalpy_dict']['rot_enthalpy'] == 0.889
+-    assert data['enthalpy_dict']['vib_enthalpy'] == 13.883
+-    assert data['enthalpy_dict']['enthalpy_total'] == 16.253
+-    assert data['entropy_dict']['trans_entropy'] == 34.608
+-    assert data['entropy_dict']['rot_entropy'] == 11.82
+-    assert data['entropy_dict']['vib_entropy'] == 0.003
+-    assert data['entropy_dict']['entropy_total'] == 46.432
++    assert_allclose(data['enthalpy_dict']['trans_enthalpy'], 0.889)
++    assert_allclose(data['enthalpy_dict']['rot_enthalpy'], 0.889)
++    assert_allclose(data['enthalpy_dict']['vib_enthalpy'], 13.883)
++    assert_allclose(data['enthalpy_dict']['enthalpy_total'], 16.253)
++    assert_allclose(data['entropy_dict']['trans_entropy'], 34.608)
++    assert_allclose(data['entropy_dict']['rot_entropy'], 11.82)
++    assert_allclose(data['entropy_dict']['vib_entropy'], 0.003)
++    assert_allclose(data['entropy_dict']['entropy_total'], 46.432)
+     assert data['imaginary_freq'] == 0
+-    assert data['vib_energy'] == 13.882
++    assert_allclose(data['vib_energy'], 13.882)
+     assert_equal(data['atnums'], np.array([8, 1, 1]))
+     assert_equal(data['atmasses'], [15.99491, 1.00783, 1.00783])
+     atcoords = np.array([[0.00575, 0.00426, -0.00301],
+                          [0.27588, 0.88612, 0.25191],
+-                         [0.60257, -0.23578, -0.7114]])
++                         [0.60257, -0.23578, -0.7114]]) * angstrom
+     assert_equal(data['atcoords'], atcoords)
+     assert_equal(data['mo_a_occ'], np.array([-20.5546, -1.3458, -0.7102, -0.5776, -0.5045]))
+     assert_equal(data['mo_b_occ'], np.array([-20.5546, -1.3458, -0.7102, -0.5776, -0.5045]))
+@@ -82,7 +76,7 @@ def test_load_data_qchemlog_h2o():
+                                     4.6857, 4.8666, 5.1595, 5.2529, 5.5288, 6.0522, 6.5707,
+                                     6.9264, 6.9442, 7.0027, 7.0224, 7.068, 7.1668, 7.2377,
+                                     7.4574, 7.7953, 8.2906, 12.8843])
+-    assert_equal(data['mo_a_vir'], alpha_mo_unoccupied)
++    assert_allclose(data['mo_a_vir'], alpha_mo_unoccupied)
+     beta_mo_unoccupied = np.array([0.1423, 0.2041, 0.5445, 0.6021, 0.6682, 0.7874, 0.8014,
+                                    0.8052, 0.861, 0.9557, 1.1314, 1.197, 1.5276, 1.5667,
+                                    2.0366, 2.052, 2.0664, 2.1712, 2.2342, 2.591, 2.9639,
+@@ -91,49 +85,38 @@ def test_load_data_qchemlog_h2o():
+                                    4.6857, 4.8666, 5.1595, 5.2529, 5.5288, 6.0522, 6.5707,
+                                    6.9264, 6.9442, 7.0027, 7.0224, 7.068, 7.1668, 7.2377,
+                                    7.4574, 7.7953, 8.2906, 12.8843])
+-    assert_equal(data['mo_b_vir'], beta_mo_unoccupied)
+-    assert_equal(data['mulliken_charges'], np.array([-0.482641, 0.241321, 0.241321]))
+-    assert_equal(data['dipole'], np.array([1.4989, 1.1097, -0.784]))
+-    assert_equal(data['quadrupole'],
+-                 np.array([-6.1922, 0.2058, -5.0469, -0.9308, 1.1096, -5.762]))
+-    assert_equal(data['polarizability_tensor'], np.array([[-6.1256608, -0.1911917, 0.8593603],
+-                                                          [-0.1911917, -7.180854, -1.0224452],
+-                                                          [0.8593603, -1.0224452, -6.52088]]))
++    assert_allclose(data['mo_b_vir'], beta_mo_unoccupied)
++    assert_allclose(data['mulliken_charges'], np.array([-0.482641, 0.241321, 0.241321]))
++    assert_allclose(data['dipole'], np.array([1.4989, 1.1097, -0.784]))
++    assert_allclose(data['quadrupole'], [-6.1922, 0.2058, -5.0469, -0.9308, 1.1096, -5.762])
++    assert_allclose(data['polarizability_tensor'], [[-6.1256608, -0.1911917, 0.8593603],
++                                                    [-0.1911917, -7.180854, -1.0224452],
++                                                    [0.8593603, -1.0224452, -6.52088]])
+     hessian = np.array([[3.162861e-01, 8.366060e-02, -2.326701e-01, -8.253820e-02,
+-                         -1.226155e-01, -2.676000e-03, -2.337479e-01, 3.895480e-02,
+-                         2.353461e-01],
++                         -1.226155e-01, -2.676000e-03, -2.337479e-01, 3.895480e-02, 2.353461e-01],
+                         [8.366060e-02, 5.460341e-01, 2.252114e-01, -1.647100e-01,
+-                         -4.652302e-01, -1.071603e-01, 8.104940e-02, -8.080390e-02,
+-                         -1.180510e-01],
++                         -4.652302e-01, -1.071603e-01, 8.104940e-02, -8.080390e-02, -1.180510e-01],
+                         [-2.326701e-01, 2.252114e-01, 3.738573e-01, -2.713570e-02,
+-                         -1.472865e-01, -7.031900e-02, 2.598057e-01, -7.792490e-02,
+-                         -3.035382e-01],
++                         -1.472865e-01, -7.031900e-02, 2.598057e-01, -7.792490e-02, -3.035382e-01],
+                         [-8.253820e-02, -1.647100e-01, -2.713570e-02, 7.455040e-02,
+-                         1.315365e-01, 1.474740e-02, 7.987800e-03, 3.317350e-02,
+-                         1.238830e-02],
++                         1.315365e-01, 1.474740e-02, 7.987800e-03, 3.317350e-02, 1.238830e-02],
+                         [-1.226155e-01, -4.652302e-01, -1.472865e-01, 1.315365e-01,
+-                         4.787640e-01, 1.470895e-01, -8.921000e-03, -1.353380e-02,
+-                         1.970000e-04],
++                         4.787640e-01, 1.470895e-01, -8.921000e-03, -1.353380e-02, 1.970000e-04],
+                         [-2.676000e-03, -1.071603e-01, -7.031900e-02, 1.474740e-02,
+-                         1.470895e-01, 8.125140e-02, -1.207140e-02, -3.992910e-02,
+-                         -1.093230e-02],
++                         1.470895e-01, 8.125140e-02, -1.207140e-02, -3.992910e-02, -1.093230e-02],
+                         [-2.337479e-01, 8.104940e-02, 2.598057e-01, 7.987800e-03,
+-                         -8.921000e-03, -1.207140e-02, 2.257601e-01, -7.212840e-02,
+-                         -2.477343e-01],
++                         -8.921000e-03, -1.207140e-02, 2.257601e-01, -7.212840e-02, -2.477343e-01],
+                         [3.895480e-02, -8.080390e-02, -7.792490e-02, 3.317350e-02,
+-                         -1.353380e-02, -3.992910e-02, -7.212840e-02, 9.433770e-02,
+-                         1.178541e-01],
++                         -1.353380e-02, -3.992910e-02, -7.212840e-02, 9.433770e-02, 1.178541e-01],
+                         [2.353461e-01, -1.180510e-01, -3.035382e-01, 1.238830e-02,
+-                         1.970000e-04, -1.093230e-02, -2.477343e-01, 1.178541e-01,
+-                         3.144706e-01]])
+-    assert_equal(data['athessian'], hessian)
++                         1.970000e-04, -1.093230e-02, -2.477343e-01, 1.178541e-01, 3.144706e-01]])
++    assert_allclose(data['athessian'], hessian)
+ 
+ 
+-def test_load_one_qchemlog():
++def test_load_one_qchemlog_freq():
+     with path('iodata.test.data', 'water_hf_ccpvtz_freq_qchem.out') as fn_qchemlog:
+         mol = load_one(str(fn_qchemlog), fmt='qchemlog')
+-    assert mol.charge == 0
+-    assert mol.energy == -76.0571936393
++    assert_allclose(mol.energy, -76.0571936393)
+     assert mol.g_rot == 1
+     assert mol.nelec == 10
+     assert mol.run_type == 'freq'
+@@ -144,32 +127,23 @@ def test_load_one_qchemlog():
+     assert_equal(mol.moments[(2, 'c')],
+                  np.array([-6.1922, 0.2058, -0.9308, -5.0469, 1.1096, -5.762]))
+     hessian = np.array([[3.162861e-01, 8.366060e-02, -2.326701e-01, -8.253820e-02,
+-                         -1.226155e-01, -2.676000e-03, -2.337479e-01, 3.895480e-02,
+-                         2.353461e-01],
++                         -1.226155e-01, -2.676000e-03, -2.337479e-01, 3.895480e-02, 2.353461e-01],
+                         [8.366060e-02, 5.460341e-01, 2.252114e-01, -1.647100e-01,
+-                         -4.652302e-01, -1.071603e-01, 8.104940e-02, -8.080390e-02,
+-                         -1.180510e-01],
++                         -4.652302e-01, -1.071603e-01, 8.104940e-02, -8.080390e-02, -1.180510e-01],
+                         [-2.326701e-01, 2.252114e-01, 3.738573e-01, -2.713570e-02,
+-                         -1.472865e-01, -7.031900e-02, 2.598057e-01, -7.792490e-02,
+-                         -3.035382e-01],
++                         -1.472865e-01, -7.031900e-02, 2.598057e-01, -7.792490e-02, -3.035382e-01],
+                         [-8.253820e-02, -1.647100e-01, -2.713570e-02, 7.455040e-02,
+-                         1.315365e-01, 1.474740e-02, 7.987800e-03, 3.317350e-02,
+-                         1.238830e-02],
++                         1.315365e-01, 1.474740e-02, 7.987800e-03, 3.317350e-02, 1.238830e-02],
+                         [-1.226155e-01, -4.652302e-01, -1.472865e-01, 1.315365e-01,
+-                         4.787640e-01, 1.470895e-01, -8.921000e-03, -1.353380e-02,
+-                         1.970000e-04],
++                         4.787640e-01, 1.470895e-01, -8.921000e-03, -1.353380e-02, 1.970000e-04],
+                         [-2.676000e-03, -1.071603e-01, -7.031900e-02, 1.474740e-02,
+-                         1.470895e-01, 8.125140e-02, -1.207140e-02, -3.992910e-02,
+-                         -1.093230e-02],
++                         1.470895e-01, 8.125140e-02, -1.207140e-02, -3.992910e-02, -1.093230e-02],
+                         [-2.337479e-01, 8.104940e-02, 2.598057e-01, 7.987800e-03,
+-                         -8.921000e-03, -1.207140e-02, 2.257601e-01, -7.212840e-02,
+-                         -2.477343e-01],
++                         -8.921000e-03, -1.207140e-02, 2.257601e-01, -7.212840e-02, -2.477343e-01],
+                         [3.895480e-02, -8.080390e-02, -7.792490e-02, 3.317350e-02,
+-                         -1.353380e-02, -3.992910e-02, -7.212840e-02, 9.433770e-02,
+-                         1.178541e-01],
++                         -1.353380e-02, -3.992910e-02, -7.212840e-02, 9.433770e-02, 1.178541e-01],
+                         [2.353461e-01, -1.180510e-01, -3.035382e-01, 1.238830e-02,
+-                         1.970000e-04, -1.093230e-02, -2.477343e-01, 1.178541e-01,
+-                         3.144706e-01]])
++                         1.970000e-04, -1.093230e-02, -2.477343e-01, 1.178541e-01, 3.144706e-01]])
+     assert_equal(mol.athessian, hessian)
+     assert mol.extra['nuclear_repulsion_energy'] == 9.19775748
+     assert mol.extra['imaginary_freq'] == 0
+@@ -189,7 +163,7 @@ def test_load_one_qchemlog():
+     assert_equal(mol.extra['polarizability_tensor'], polarizability_tensor)
+     atcoords = np.array([[0.00575, 0.00426, -0.00301],
+                          [0.27588, 0.88612, 0.25191],
+-                         [0.60257, -0.23578, -0.7114]])
++                         [0.60257, -0.23578, -0.7114]]) * angstrom
+     assert_equal(mol.atcoords, atcoords)
+     assert_equal(mol.atmasses, np.array([15.99491, 1.00783, 1.00783]))
+     assert_equal(mol.atnums, np.array([8, 1, 1]))
+@@ -217,3 +191,181 @@ def test_load_one_qchemlog():
+     assert_allclose(mol.mo.energies[5:58], virtual)
+     # beta virtual orbital energies
+     assert_allclose(mol.mo.energies[63:], virtual)
++
++
++def test_load_qchemlog_low_qchemlog_h2o_dimer_eda2():
++    """Test load_qchemlog_low with h2o_dimer_eda_qchem5.3.out."""
++    # pylint: disable=too-many-statements
++    with path('iodata.test.data', 'h2o_dimer_eda_qchem5.3.out') as fq:
++        data = load_qchemlog_low(LineIterator(str(fq)))
++
++    # check loaded data
++    assert data['run_type'] == 'eda'
++    assert data['lot'] == 'wb97x-v'
++    assert data['obasis_name'] == 'def2-tzvpd'
++    assert not data['unrestricted']
++    assert not data['symm']
++    assert data['alpha_elec'] == 10
++    assert data['beta_elec'] == 10
++    assert_allclose(data['nuclear_repulsion_energy'], 36.66284801)
++    assert_allclose(data['energy'], -152.8772543727)
++    assert data['norba'] == 116
++    assert_allclose(data['dipole_tol'], 2.5701)
++    assert_equal(data['atnums'], np.array([8, 1, 1, 8, 1, 1]))
++    atcoords = np.array([[-1.5510070000, -0.1145200000, 0.0000000000],
++                         [-1.9342590000, 0.7625030000, 0.0000000000],
++                         [-0.5996770000, 0.0407120000, 0.0000000000],
++                         [1.3506250000, 0.1114690000, 0.0000000000],
++                         [1.6803980000, -0.3737410000, -0.7585610000],
++                         [1.6803980000, -0.3737410000, 0.7585610000]]) * angstrom
++    assert_allclose(data['atcoords'], atcoords)
++    assert_allclose(data['mo_a_occ'], np.array([-19.2455, -19.1897, -1.1734, -1.1173, -0.6729,
++                                                -0.6242, -0.5373, -0.4825, -0.4530, -0.4045]))
++
++    alpha_mo_unoccupied = np.array([0.0485, 0.0863, 0.0927, 0.1035, 0.1344, 0.1474, 0.1539, 0.1880,
++                                    0.1982, 0.2280, 0.2507, 0.2532, 0.2732, 0.2865, 0.2992, 0.3216,
++                                    0.3260, 0.3454, 0.3542, 0.3850, 0.3991, 0.4016, 0.4155, 0.4831,
++                                    0.5016, 0.5133, 0.5502, 0.5505, 0.5745, 0.5992, 0.6275, 0.6454,
++                                    0.6664, 0.6869, 0.7423, 0.7874, 0.8039, 0.8204, 0.8457, 0.9021,
++                                    0.9149, 0.9749, 1.0168, 1.0490, 1.1274, 1.2009, 1.6233, 1.6642,
++                                    1.6723, 1.6877, 1.7314, 1.7347, 1.8246, 1.8635, 1.8877, 1.9254,
++                                    2.0091, 2.1339, 2.2139, 2.2489, 2.2799, 2.3420, 2.3777, 2.5255,
++                                    2.6135, 2.6373, 2.6727, 2.7228, 2.8765, 2.8841, 2.9076, 2.9624,
++                                    3.0377, 3.0978, 3.2509, 3.3613, 3.8767, 3.9603, 4.0824, 4.1424,
++                                    5.1826, 5.2283, 5.3319, 5.3817, 5.4919, 5.5386, 5.5584, 5.5648,
++                                    5.6049, 5.6226, 6.1591, 6.2079, 6.3862, 6.4446, 6.5805, 6.5926,
++                                    6.6092, 6.6315, 6.6557, 6.6703, 7.0400, 7.1334, 7.1456, 7.2547,
++                                    43.7457, 43.9166])
++    assert_allclose(data['mo_a_vir'], alpha_mo_unoccupied)
++    assert_allclose(data['mulliken_charges'], np.array([-0.610250, 0.304021, 0.337060,
++                                                        -0.663525, 0.316347, 0.316347]))
++    assert_allclose(data['dipole'], np.array([2.5689, 0.0770, 0.0000]))
++    assert_allclose(data['quadrupole'], [-12.0581, -6.2544, -12.8954, -0.0000, -0.0000, -12.2310])
++    # check eda2 info
++    assert_allclose(data['eda2']['e_elec'], -65.9887)
++    assert_allclose(data['eda2']['e_kep_pauli'], 78.5700)
++    assert_allclose(data['eda2']['e_disp_free_pauli'], -14.2495)
++    assert_allclose(data['eda2']['e_disp'], -7.7384)
++    assert_allclose(data['eda2']['e_cls_elec'], -35.1257)
++    assert_allclose(data['eda2']['e_cls_pauli'], 25.7192)
++    assert_allclose(data['eda2']['e_mod_pauli'], 33.4576)
++    assert_allclose(data['eda2']['preparation'], 0.0000)
++    assert_allclose(data['eda2']['frozen'], -1.6681)
++    assert_allclose(data['eda2']['pauli'], 64.3205)
++    assert_allclose(data['eda2']['dispersion'], -7.7384)
++    assert_allclose(data['eda2']['polarization'], -4.6371)
++    assert_allclose(data['eda2']['charge transfer'], -7.0689)
++    assert_allclose(data['eda2']['total'], -21.1126)
++
++    # check fragments
++    coords1 = [[-1.551007, -0.11452, 0.0], [-1.934259, 0.762503, 0.0], [-0.599677, 0.040712, 0.0]]
++    coords2 = [[1.350625, 0.111469, 0.0], [1.680398, -0.373741, -0.758561],
++               [1.680398, -0.373741, 0.758561]]
++    assert_equal(len(data['frags']), 2)
++
++    assert_equal(data['frags'][0]['atnums'], [8, 1, 1])
++    assert_equal(data['frags'][0]['alpha_elec'], 5)
++    assert_equal(data['frags'][0]['beta_elec'], 5)
++    assert_equal(data['frags'][0]['nbasis'], 58)
++    assert_allclose(data['frags'][0]['atcoords'], np.array(coords1) * angstrom)
++    assert_allclose(data['frags'][0]['nuclear_repulsion_energy'], 9.16383018)
++    assert_allclose(data['frags'][0]['energy'], -76.4345994141)
++
++    assert_equal(data['frags'][1]['atnums'], [8, 1, 1])
++    assert_equal(data['frags'][1]['alpha_elec'], 5)
++    assert_equal(data['frags'][1]['beta_elec'], 5)
++    assert_equal(data['frags'][1]['nbasis'], 58)
++    assert_allclose(data['frags'][1]['atcoords'], np.array(coords2) * angstrom)
++    assert_allclose(data['frags'][1]['nuclear_repulsion_energy'], 9.17803894)
++    assert_allclose(data['frags'][1]['energy'], -76.4346136883)
++
++
++def test_load_one_h2o_dimer_eda2():
++    """Test load_one with h2o_dimer_eda_qchem5.3.out."""
++    # pylint: disable=too-many-statements
++    with path('iodata.test.data', 'h2o_dimer_eda_qchem5.3.out') as fn_qchemlog:
++        mol = load_one(str(fn_qchemlog), fmt='qchemlog')
++
++    # check loaded data
++    assert mol.run_type == 'eda'
++    assert mol.lot == 'wb97x-v'
++    assert mol.obasis_name == 'def2-tzvpd'
++    assert mol.mo.kind == 'restricted'
++    # assert not data['symm']
++    # # assert data['g_rot'] == 1
++    # assert data['alpha_elec'] == 10
++    # assert data['beta_elec'] == 10
++    assert_allclose(mol.extra['nuclear_repulsion_energy'], 36.66284801)
++    assert_allclose(mol.energy, -152.8772543727)
++    assert mol.mo.norba == 116
++    assert mol.mo.norbb == 116
++    assert_equal(mol.atnums, np.array([8, 1, 1, 8, 1, 1]))
++    # assert_equal(data['atmasses'], [15.99491, 1.00783, 1.00783])
++    atcoords = np.array([[-1.5510070000, -0.1145200000, 0.0000000000],
++                         [-1.9342590000, 0.7625030000, 0.0000000000],
++                         [-0.5996770000, 0.0407120000, 0.0000000000],
++                         [1.3506250000, 0.1114690000, 0.0000000000],
++                         [1.6803980000, -0.3737410000, -0.7585610000],
++                         [1.6803980000, -0.3737410000, 0.7585610000]]) * angstrom
++    assert_equal(mol.atcoords, atcoords)
++
++    # check MO energies
++    mo_energies_a = [-19.2455, -19.1897, -1.1734, -1.1173, -0.6729, -0.6242, -0.5373, -0.4825,
++                     -0.4530, -0.4045, 0.0485, 0.0863, 0.0927, 0.1035, 0.1344, 0.1474, 0.1539,
++                     0.1880, 0.1982, 0.2280, 0.2507, 0.2532, 0.2732, 0.2865, 0.2992, 0.3216,
++                     0.3260, 0.3454, 0.3542, 0.3850, 0.3991, 0.4016, 0.4155, 0.4831, 0.5016,
++                     0.5133, 0.5502, 0.5505, 0.5745, 0.5992, 0.6275, 0.6454, 0.6664, 0.6869,
++                     0.7423, 0.7874, 0.8039, 0.8204, 0.8457, 0.9021, 0.9149, 0.9749, 1.0168,
++                     1.0490, 1.1274, 1.2009, 1.6233, 1.6642, 1.6723, 1.6877, 1.7314, 1.7347,
++                     1.8246, 1.8635, 1.8877, 1.9254, 2.0091, 2.1339, 2.2139, 2.2489, 2.2799,
++                     2.3420, 2.3777, 2.5255, 2.6135, 2.6373, 2.6727, 2.7228, 2.8765, 2.8841,
++                     2.9076, 2.9624, 3.0377, 3.0978, 3.2509, 3.3613, 3.8767, 3.9603, 4.0824,
++                     4.1424, 5.1826, 5.2283, 5.3319, 5.3817, 5.4919, 5.5386, 5.5584, 5.5648,
++                     5.6049, 5.6226, 6.1591, 6.2079, 6.3862, 6.4446, 6.5805, 6.5926, 6.6092,
++                     6.6315, 6.6557, 6.6703, 7.0400, 7.1334, 7.1456, 7.2547, 43.7457, 43.9166]
++    assert_allclose(mol.mo.energiesa, mo_energies_a)
++    assert_allclose(mol.mo.energiesb, mo_energies_a)
++
++    assert_equal(mol.atcharges['mulliken'], np.array([-0.610250, 0.304021, 0.337060,
++                                                      -0.663525, 0.316347, 0.316347]))
++    assert_allclose(mol.moments[(1, 'c')], np.array([2.5689, 0.0770, 0.0000]))
++    assert_allclose(mol.moments[(2, 'c')],
++                    [-12.0581, -6.2544, -0.0000, -12.8954, -0.0000, -12.2310])
++
++    # check eda2 info
++    assert_equal(mol.extra['eda2']['e_elec'], -65.9887 * kjmol)
++    assert_equal(mol.extra['eda2']['e_kep_pauli'], 78.5700 * kjmol)
++    assert_equal(mol.extra['eda2']['e_disp_free_pauli'], -14.2495 * kjmol)
++    assert_equal(mol.extra['eda2']['e_disp'], -7.7384 * kjmol)
++    assert_equal(mol.extra['eda2']['e_cls_elec'], -35.1257 * kjmol)
++    assert_equal(mol.extra['eda2']['e_cls_pauli'], 25.7192 * kjmol)
++    assert_equal(mol.extra['eda2']['e_mod_pauli'], 33.4576 * kjmol)
++    assert_equal(mol.extra['eda2']['preparation'], 0.0000)
++    assert_equal(mol.extra['eda2']['frozen'], -1.6681 * kjmol)
++    assert_equal(mol.extra['eda2']['pauli'], 64.3205 * kjmol)
++    assert_equal(mol.extra['eda2']['dispersion'], -7.7384 * kjmol)
++    assert_equal(mol.extra['eda2']['polarization'], -4.6371 * kjmol)
++    assert_equal(mol.extra['eda2']['charge transfer'], -7.0689 * kjmol)
++    assert_equal(mol.extra['eda2']['total'], -21.1126 * kjmol)
++
++    # check fragments
++    coords1 = [[-1.551007, -0.11452, 0.0], [-1.934259, 0.762503, 0.0], [-0.599677, 0.040712, 0.0]]
++    coords2 = [[1.350625, 0.111469, 0.0], [1.680398, -0.373741, -0.758561],
++               [1.680398, -0.373741, 0.758561]]
++    assert_equal(len(mol.extra['frags']), 2)
++
++    assert_equal(mol.extra['frags'][0]['atnums'], [8, 1, 1])
++    assert_equal(mol.extra['frags'][0]['alpha_elec'], 5)
++    assert_equal(mol.extra['frags'][0]['beta_elec'], 5)
++    assert_equal(mol.extra['frags'][0]['nbasis'], 58)
++    assert_allclose(mol.extra['frags'][0]['atcoords'], np.array(coords1) * angstrom)
++    assert_allclose(mol.extra['frags'][0]['nuclear_repulsion_energy'], 9.16383018)
++    assert_allclose(mol.extra['frags'][0]['energy'], -76.4345994141)
++
++    assert_equal(mol.extra['frags'][1]['atnums'], [8, 1, 1])
++    assert_equal(mol.extra['frags'][1]['alpha_elec'], 5)
++    assert_equal(mol.extra['frags'][1]['beta_elec'], 5)
++    assert_equal(mol.extra['frags'][1]['nbasis'], 58)
++    assert_allclose(mol.extra['frags'][1]['atcoords'], np.array(coords2) * angstrom)
++    assert_allclose(mol.extra['frags'][1]['nuclear_repulsion_energy'], 9.17803894)
++    assert_allclose(mol.extra['frags'][1]['energy'], -76.4346136883)
+diff --git a/iodata/utils.py b/iodata/utils.py
+index 827543468..10156c8da 100644
+--- a/iodata/utils.py
++++ b/iodata/utils.py
+@@ -48,6 +48,7 @@
+ amu: float = 1e-3 / (spc.value(u'electron mass') * spc.value(u'Avogadro constant'))
+ kcalmol: float = 1e3 * spc.calorie / spc.value('Avogadro constant') / spc.value('Hartree energy')
+ calmol: float = spc.calorie / spc.value('Avogadro constant') / spc.value('Hartree energy')
++kjmol: float = 1e3 / spc.value('Avogadro constant') / spc.value('Hartree energy')
+ 
+ 
+ class FileFormatError(IOError):

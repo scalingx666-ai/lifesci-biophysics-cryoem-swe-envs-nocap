@@ -1,0 +1,1544 @@
+diff --git a/.bumpversion.cfg b/.bumpversion.cfg
+index 15feb8d..d8e68da 100644
+--- a/.bumpversion.cfg
++++ b/.bumpversion.cfg
+@@ -1,5 +1,5 @@
+ [bumpversion]
+-current_version = 1.8.5
++current_version = 2.0.1
+ commit = True
+ tag = True
+ 
+diff --git a/calphy/__init__.py b/calphy/__init__.py
+index e63adb6..66e9f72 100644
+--- a/calphy/__init__.py
++++ b/calphy/__init__.py
+@@ -4,7 +4,7 @@
+ from calphy.alchemy import Alchemy
+ from calphy.routines import MeltingTemp
+ 
+-__version__ = "2.0.0"
++__version__ = "2.0.1"
+ 
+ def addtest(a,b):
+     return a+b
+diff --git a/calphy/input.py b/calphy/input.py
+index 25bd03a..29dea26 100644
+--- a/calphy/input.py
++++ b/calphy/input.py
+@@ -51,7 +51,7 @@
+ from ase.io import read, write
+ import shutil
+ 
+-__version__ = "2.0.0"
++__version__ = "2.0.1"
+ 
+ 
+ def _check_equal(val):
+@@ -347,14 +347,30 @@ class Queue(_StrictInput, title="Options for configuring queue"):
+ class Tolerance(_StrictInput, title="Tolerance settings for convergence"):
+     lattice_constant: Annotated[float, Field(default=0.0002, ge=0)]
+     spring_constant: Annotated[float, Field(default=0.1, gt=0)]
+-    # Structural phase-stability checks during equilibration are OFF by
+-    # default: solid_fraction=0 means the melt check (solid_fraction < this)
+-    # never fires, and liquid_fraction=1.0 means the solidify check
+-    # (solid_fraction > this) never fires.  Set solid_fraction > 0 (e.g. 0.7)
+-    # to re-enable melt detection for a solid run, or liquid_fraction < 1
+-    # (e.g. 0.05) to re-enable solidification detection for a liquid run.
++    # Structural phase-stability checks during equilibration.  The melt check
++    # fires when the measured solid fraction drops below solid_fraction; the
++    # solidify check fires when it rises above liquid_fraction.  Because the
++    # fraction is bounded to [0, 1], solid_fraction=0 makes the melt check
++    # unreachable and liquid_fraction=1 makes the solidify check unreachable
++    # -- that is how each check is disabled, and both are OFF by default.
++    #
++    # Phase.__init__ logs a warning whenever the check relevant to a run's
++    # reference phase is disabled.  mode "melting_temperature" is the one
++    # exception: its temperature bracket is advanced only by the resulting
++    # MeltedError/SolidifiedError, so MeltingTemp re-enables them (see
++    # MeltingTemp._enable_phase_detection) rather than report an unvalidated
++    # Tm.  Set solid_fraction > 0 (e.g. 0.7) or liquid_fraction < 1
++    # (e.g. 0.05) to enable them for any other mode.
+     solid_fraction: Annotated[float, Field(default=0.0, ge=0)]
+     liquid_fraction: Annotated[float, Field(default=1.0, ge=0)]
++    # Irreversible work per atom above which a switching path is called into
++    # question, in eV/atom; 0 disables the check.  Dissipation enters the free
++    # energy directly, so for a melting point it converts to a temperature
++    # error of roughly dissipation / dS_fus -- at a typical dS_fus of ~1.2 kB
++    # the default of 1 meV/atom is about 10 K.  A clean sweep sits one to two
++    # orders of magnitude below it; a sweep whose structure changed partway
++    # (the forward and backward integrals then cannot match) sits well above.
++    dissipation: Annotated[float, Field(default=0.001, ge=0)]
+     pressure: Annotated[float, Field(default=10.0, ge=0)]
+ 
+ 
+diff --git a/calphy/phase.py b/calphy/phase.py
+index 1ed7343..5b76e95 100644
+--- a/calphy/phase.py
++++ b/calphy/phase.py
+@@ -105,6 +105,8 @@ def __init__(self, calculation=None, simfolder=None, log_to_screen=False):
+             else:
+                 self.logger.info("Melting cycle is turned off")
+ 
++        self._log_phase_detection_state()
++
+         # now thermostat and barostat damping process
+         if self.calc.equilibration_control is None:
+             self.logger.info(
+@@ -275,6 +277,10 @@ def __init__(self, calculation=None, simfolder=None, log_to_screen=False):
+         #: Max energy dissipation along a ts/tscale reversible-scaling sweep
+         #: [eV/atom]; written to report.yaml as results.ts_dissipation.
+         self.ediss = 0
++        #: Whether that sweep exceeded tolerance.dissipation, i.e. whether the
++        #: path was irreversible enough to doubt the free energy it produced.
++        #: Written to report.yaml as results.ts_dissipation_high.
++        self.ediss_high = False
+ 
+         # box dimensions that need to be stored
+         self.lx = None
+@@ -442,6 +448,104 @@ def get_structures(self, stage="fe", direction="forward", n_iteration=1):
+ 
+         return structures
+ 
++    def check_dissipation(self, value, stage):
++        """
++        Judge the irreversibility of a switching path and log the verdict.
++
++        Dissipation is the work the path threw away by not staying in
++        equilibrium, and it enters the free energy directly.  A path that is
++        merely fast dissipates a little; a path whose structure changed partway
++        (a solid that melted at the top of a ts sweep, say) dissipates orders
++        of magnitude more, because the forward and backward integrals no longer
++        describe the same system.  The free energy is then wrong in a way no
++        amount of averaging fixes, so it is worth saying out loud.
++
++        Parameters
++        ----------
++        value : float
++            Dissipation in eV/atom.
++        stage : str
++            Human-readable name of the path, used in the message.
++
++        Returns
++        -------
++        bool
++            True if the dissipation exceeds ``tolerance.dissipation``.  False
++            when it does not, and whenever the check is disabled.
++        """
++        threshold = self.calc.tolerance.dissipation
++        value = float(np.abs(value))
++        self.logger.info("%s dissipation: %.3e eV/atom" % (stage, value))
++
++        if threshold <= 0:
++            self.logger.info(
++                "Dissipation check disabled (tolerance.dissipation = 0)"
++            )
++            return False
++        if value <= threshold:
++            return False
++
++        # rough Tm impact, for a typical entropy of fusion of ~1.2 kB/atom
++        t_equiv = value / (1.2 * kb)
++        self.logger.warning(
++            "%s dissipation is %.3e eV/atom, %.0fx the tolerance of %.3e "
++            "(tolerance.dissipation). The path is far from reversible, which "
++            "usually means the structure changed partway through it -- a solid "
++            "that melted or a liquid that froze during the sweep. The free "
++            "energy from this path is unreliable: on a melting point this much "
++            "dissipation is worth roughly %.0f K. Check "
++            "traj.temp.dat / the equilibration trajectories, and consider "
++            "enabling the structural checks (tolerance.solid_fraction > 0, "
++            "tolerance.liquid_fraction < 1) or narrowing the temperature range."
++            % (stage, value, value / threshold, threshold, t_equiv)
++        )
++        return True
++
++    def _log_phase_detection_state(self):
++        """
++        Record whether the structural phase-stability check that applies to
++        this run's reference phase is actually reachable.
++
++        The measured solid fraction is bounded to [0, 1], so
++        ``tolerance.solid_fraction = 0`` makes the melt check impossible to
++        trigger and ``tolerance.liquid_fraction = 1`` does the same for the
++        solidification check.  Both are off by default, which means a run can
++        silently report a free energy for a structure that changed phase
++        during equilibration -- worth a warning in the log so the condition is
++        visible after the fact.
++        """
++        if self.calc.reference_phase == "solid":
++            threshold = self.calc.tolerance.solid_fraction
++            if threshold <= 0:
++                self.logger.warning(
++                    "Melt detection is DISABLED (tolerance.solid_fraction = "
++                    "%g): if this solid melts during equilibration the run "
++                    "will continue and report a free energy for the melted "
++                    "structure. Set tolerance.solid_fraction > 0 (e.g. 0.7) "
++                    "to enable it." % threshold
++                )
++            else:
++                self.logger.info(
++                    "Melt detection enabled at tolerance.solid_fraction = %g"
++                    % threshold
++                )
++        else:
++            threshold = self.calc.tolerance.liquid_fraction
++            if threshold >= 1:
++                self.logger.warning(
++                    "Solidification detection is DISABLED "
++                    "(tolerance.liquid_fraction = %g): if this liquid freezes "
++                    "during equilibration the run will continue and report a "
++                    "free energy for the frozen structure. Set "
++                    "tolerance.liquid_fraction < 1 (e.g. 0.05) to enable it."
++                    % threshold
++                )
++            else:
++                self.logger.info(
++                    "Solidification detection enabled at "
++                    "tolerance.liquid_fraction = %g" % threshold
++                )
++
+     def check_if_melted(self, lmp, filename):
+         """
+         Check whether the solid has melted, using a structural solid-fraction
+@@ -803,6 +907,19 @@ def run_pressure_convergence(self, lmp):
+         pv_history = []  # [(vol_per_atom, mean_pressure), ...]
+         n_fit_warmup = 5  # run this many cycles before attempting linear P-V fit
+         n_skip = 1  # drop first cycle(s) from averaging (transient)
++        # Index of the first avg.dat sample that belongs to the *current* box.
++        # A change_box below resizes the cell discontinuously, so every sample
++        # recorded before it describes a different thermodynamic state and must
++        # not enter the mean pressure, the stored box dimensions, or the P-V
++        # fit.  We slice rather than truncate the file: avg.dat may be spread
++        # over per-segment parts that the runner concatenates on read, and
++        # driver code does not own those paths.
++        reset_index = 0
++        # True for the single cycle directly after a rescale.  Unlike cycle 1
++        # of the loop -- which follows a full equilibration run -- that cycle
++        # has no prior equilibration at the new box, so it is pure transient
++        # and may neither declare convergence nor feed the P-V fit.
++        just_rescaled = False
+ 
+         for i in range(int(self.calc.md.n_cycles)):
+             lmp.command("run              %d" % int(self.calc.md.n_small_steps))
+@@ -811,6 +928,21 @@ def run_pressure_convergence(self, lmp):
+             lx, ly, lz, ipress = lmp.read_timeseries(
+                 "avg.dat", usecols=(1, 2, 3, 4)
+             ).T
++            n_samples_total = len(ipress)
++            # keep only what was sampled at the box we are currently in
++            lx = lx[reset_index:]
++            ly = ly[reset_index:]
++            lz = lz[reset_index:]
++            ipress = ipress[reset_index:]
++
++            if just_rescaled:
++                just_rescaled = False
++                self.logger.info(
++                    "At count %d discarding transient cycle after box rescale"
++                    % (i + 1)
++                )
++                continue
++
+             # Average over all data after dropping the first cycle
+             skip_samples = n_skip * ncount
+             if len(ipress) <= skip_samples:
+@@ -855,16 +987,25 @@ def run_pressure_convergence(self, lmp):
+             else:
+                 # After enough warmup cycles, fit P(V) linearly and rescale box
+                 if len(pv_history) >= n_fit_warmup:
+-                    scale = self._fit_volume_scale(pv_history, target_pressure)
++                    # change_box scales the box as it stands *now*, so the
++                    # scale factor has to be referred to the current volume,
++                    # not to the windowed mean volume that went into the fit.
++                    current_volatom = float(lx[-1] * ly[-1] * lz[-1]) / self.natoms
++                    scale = self._fit_volume_scale(
++                        pv_history, target_pressure, current_volatom
++                    )
+                     if scale is not None:
+                         self.logger.info(
+-                            "Applying linear P-V fit correction — scale factor %.6f"
+-                            % scale
++                            "Applying linear P-V fit correction — scale factor "
++                            "%.6f (from vol/atom %.4f)" % (scale, current_volatom)
+                         )
+                         lmp.command(
+                             "change_box       all x scale %f y scale %f z scale %f remap"
+                             % (scale, scale, scale)
+                         )
++                        # everything sampled so far belongs to the old box
++                        reset_index = n_samples_total
++                        just_rescaled = True
+ 
+         if not converged:
+             self.lammps_close(lmp=lmp)
+@@ -884,7 +1025,7 @@ def run_pressure_convergence(self, lmp):
+         lmp.command("unfix            2")
+ 
+     @staticmethod
+-    def _fit_volume_scale(pv_history, target_pressure):
++    def _fit_volume_scale(pv_history, target_pressure, current_volume=None):
+         """
+         Estimate a box scale factor by fitting a linear P(V) model to the
+         accumulated volume/pressure history and predicting the volume at
+@@ -895,6 +1036,13 @@ def _fit_volume_scale(pv_history, target_pressure):
+         pv_history : list of (vol_per_atom, pressure) tuples
+         target_pressure : float
+             Target pressure in bar.
++        current_volume : float, optional
++            Volume per atom of the box as it stands right now.  The returned
++            factor is applied by ``change_box ... scale``, which acts on the
++            current box, so the prediction must be referred to that volume.
++            Defaults to the most recent entry of ``pv_history`` -- a windowed
++            mean that lags the box whenever it is still moving, so callers
++            driving a live box should pass the current value explicitly.
+ 
+         Returns
+         -------
+@@ -921,9 +1069,9 @@ def _fit_volume_scale(pv_history, target_pressure):
+             return None
+ 
+         V_target = (target_pressure - intercept) / slope
+-        V_curr = vols[-1]
++        V_curr = vols[-1] if current_volume is None else current_volume
+ 
+-        if V_target <= 0:
++        if V_target <= 0 or V_curr <= 0:
+             return None
+ 
+         scale = (V_target / V_curr) ** (1.0 / 3.0)
+@@ -1678,18 +1826,23 @@ def integrate_reversible_scaling(self, scale_energy=True, return_values=False):
+         # contaminated.
+         self.ediss = float(ediss)
+ 
++        self.ediss_high = self.check_dissipation(
++            self.ediss, "Reversible-scaling sweep (%s)" % self.calc.reference_phase
++        )
++
+         # Fold the sweep dissipation into report.yaml.  routine_fe() (called by
+         # routine_ts/tscale before the sweep) has already written the report, so
+-        # amend it in place rather than rewriting the whole thing.
+-        self._amend_report({"results": {"ts_dissipation": self.ediss}})
+-
+-        self.logger.info(
+-            f"Maximum energy dissipation along the temperature scaling part: {ediss} eV/atom"
++        # amend it in place rather than rewriting the whole thing.  The verdict
++        # travels with the number so a harvested frame can be filtered on it
++        # without re-deriving the threshold.
++        self._amend_report(
++            {
++                "results": {
++                    "ts_dissipation": self.ediss,
++                    "ts_dissipation_high": bool(self.ediss_high),
++                }
++            }
+         )
+-        if np.abs(ediss) > 1e-4:
+-            self.logger.warning(
+-                f"Found max energy dissipation of {ediss} along the temperature scaling path. Please ensure there are no structural changes!"
+-            )
+ 
+         if return_values:
+             return res
+diff --git a/calphy/postprocessing.py b/calphy/postprocessing.py
+index 1269ab3..152715a 100644
+--- a/calphy/postprocessing.py
++++ b/calphy/postprocessing.py
+@@ -44,7 +44,64 @@ def _extract_error(errfile):
+     return error_code
+ 
+ 
+-def gather_results(mainfolder, reduce_composition=True, extract_phase_prefix=False):
++def _read_sweep_data(folder, stride=1):
++    """
++    Read the per-lambda switching data of every reversible-scaling replica.
++
++    Parameters
++    ----------
++    folder : str
++        Calculation folder holding ``ts.forward_<i>.dat`` /
++        ``ts.backward_<i>.dat``.
++    stride : int, optional
++        Keep every n-th sample.
++
++    Returns
++    -------
++    dict
++        ``forward_energy_diff`` / ``backward_energy_diff`` (energy differential
++        per lambda) and ``forward_lambda`` / ``backward_lambda``, each a list
++        with one array per replica, or None where no replica was found.
++
++    Raises
++    ------
++    Exception
++        Propagates any read/parse failure; the caller decides whether one bad
++        calculation should be fatal.
++    """
++    f_ediffs, b_ediffs, f_lambdas, b_lambdas = [], [], [], []
++    i = 1
++    while True:
++        fwdfile = os.path.join(folder, f"ts.forward_{i}.dat")
++        bkdfile = os.path.join(folder, f"ts.backward_{i}.dat")
++        if not (os.path.exists(fwdfile) and os.path.exists(bkdfile)):
++            break
++        # ndmin=2 so a single-row sweep still unpacks as columns
++        fwd = np.loadtxt(fwdfile, comments="#", ndmin=2)[::stride]
++        bkd = np.loadtxt(bkdfile, comments="#", ndmin=2)[::stride]
++        fdx, flambda = fwd[:, 0], fwd[:, 3]
++        bdx, blambda = bkd[:, 0], bkd[:, 3]
++        f_ediffs.append(fdx / flambda)
++        b_ediffs.append(bdx / blambda)
++        f_lambdas.append(flambda)
++        b_lambdas.append(blambda)
++        i += 1
++
++    return {
++        "forward_energy_diff": f_ediffs or None,
++        "backward_energy_diff": b_ediffs or None,
++        "forward_lambda": f_lambdas or None,
++        "backward_lambda": b_lambdas or None,
++    }
++
++
++def gather_results(
++    mainfolder,
++    reduce_composition=True,
++    extract_phase_prefix=False,
++    include_sweep_data=False,
++    sweep_data_stride=1,
++):
+     """
+     Gather results from all subfolders in a given folder into a Pandas DataFrame
+ 
+@@ -61,6 +118,22 @@ def gather_results(mainfolder, reduce_composition=True, extract_phase_prefix=Fal
+         Should be used in conjuction with phase diagram mode.
+         Extracts the prefix and add it as a phase_name column.
+ 
++    include_sweep_data: bool, optional, default False
++        Load the raw per-lambda switching data of every reversible-scaling
++        replica into the frame.  Off by default because it is expensive:
++        ``ts.forward_*.dat`` / ``ts.backward_*.dat`` are written by
++        ``fix print 1``, i.e. one row per MD step, so a sweep of
++        ``n_switching_steps`` keeps roughly ``n_switching_steps * 32`` bytes
++        per replica per calculation resident in the frame (~1.6 MB per
++        calculation for a 50000-step sweep, scaling with ``n_iterations``).
++        Enable it when diagnosing *where* along a sweep forward and backward
++        diverge; leave it off to gather free energies.
++
++    sweep_data_stride: int, optional, default 1
++        Keep only every n-th sample of the sweep data.  Only meaningful with
++        ``include_sweep_data=True``; a stride of 10--100 preserves the shape
++        of the hysteresis while cutting the memory cost proportionally.
++
+     Returns
+     -------
+     df: pandas DataFrame
+@@ -72,13 +145,27 @@ def gather_results(mainfolder, reduce_composition=True, extract_phase_prefix=Fal
+           standard error of the mean free energy, not a hysteresis check.
+         - dissipation: mean switching dissipation (fe/alchemy) or NaN (ts/tscale)
+         - ts_dissipation: max hysteresis over a ts/tscale sweep, or NaN otherwise
++        - ts_dissipation_high: True where that hysteresis exceeded
++          tolerance.dissipation, i.e. the sweep did not stay reversible and the
++          free energy it produced should not be trusted; False when it was
++          within tolerance, NaN where no verdict was recorded
+         - forward_energy_diff / backward_energy_diff: list of arrays, one per
+           reversible-scaling replica (ts/tscale only, else None); the raw
+           per-lambda energy differential, useful to see *where* along the
+           sweep forward/backward diverge (phase-transition diagnostic).
++          Populated only when ``include_sweep_data`` is True, else None.
+         - forward_lambda / backward_lambda: matching lambda arrays for the
+           above (ts/tscale only, else None)
++
++    Notes
++    -----
++    A calculation whose sweep files are unreadable (a job killed mid-sweep
++    leaves a ragged final row) does not abort the gather: its sweep columns
++    stay None and the reason is recorded in ``error_code``.
+     """
++    if sweep_data_stride < 1:
++        raise ValueError("sweep_data_stride must be >= 1")
++
+     try:
+         import pandas as pd
+     except ImportError:
+@@ -94,6 +181,7 @@ def gather_results(mainfolder, reduce_composition=True, extract_phase_prefix=Fal
+     datadict["free_energy_error"] = []
+     datadict["dissipation"] = []
+     datadict["ts_dissipation"] = []
++    datadict["ts_dissipation_high"] = []
+     datadict["reference_phase"] = []
+     datadict["error_code"] = []
+     datadict["composition"] = []
+@@ -142,6 +230,7 @@ def gather_results(mainfolder, reduce_composition=True, extract_phase_prefix=Fal
+         datadict["free_energy_error"].append(np.nan)
+         datadict["dissipation"].append(np.nan)
+         datadict["ts_dissipation"].append(np.nan)
++        datadict["ts_dissipation_high"].append(np.nan)
+         datadict["forward_energy_diff"].append(None)
+         datadict["backward_energy_diff"].append(None)
+         datadict["forward_lambda"].append(None)
+@@ -169,6 +258,9 @@ def gather_results(mainfolder, reduce_composition=True, extract_phase_prefix=Fal
+         # dissipation, fe/alchemy) and max hysteresis over a ts/tscale sweep
+         datadict["dissipation"][-1] = out["results"].get("dissipation", np.nan)
+         datadict["ts_dissipation"][-1] = out["results"].get("ts_dissipation", np.nan)
++        datadict["ts_dissipation_high"][-1] = out["results"].get(
++            "ts_dissipation_high", np.nan
++        )
+ 
+         # add normal composition
+         el_arr = np.array(out["input"]["element"].split(" ")).astype(str)
+@@ -207,40 +299,33 @@ def gather_results(mainfolder, reduce_composition=True, extract_phase_prefix=Fal
+                 datadict["free_energy"][-1] = f
+                 datadict["free_energy_error"][-1] = ferr
+ 
+-                # raw per-lambda energy differential of each forward/backward
++                # Raw per-lambda energy differential of each forward/backward
+                 # switching replica; diverging forward vs. backward curves
+                 # signal hysteresis/a structural change during the sweep
+-                # (ts_dissipation above is just the max of this difference)
+-                f_ediffs = []
+-                b_ediffs = []
+-                f_lambdas = []
+-                b_lambdas = []
+-                i = 1
+-                while True:
+-                    fwdfile = os.path.join(
+-                        mainfolder, folder, f"ts.forward_{i}.dat"
+-                    )
+-                    bkdfile = os.path.join(
+-                        mainfolder, folder, f"ts.backward_{i}.dat"
+-                    )
+-                    if not (os.path.exists(fwdfile) and os.path.exists(bkdfile)):
+-                        break
+-                    fdx, _fp, _fvol, flambda = np.loadtxt(
+-                        fwdfile, unpack=True, comments="#"
+-                    )
+-                    bdx, _bp, _bvol, blambda = np.loadtxt(
+-                        bkdfile, unpack=True, comments="#"
+-                    )
+-                    f_ediffs.append(fdx / flambda)
+-                    b_ediffs.append(bdx / blambda)
+-                    f_lambdas.append(flambda)
+-                    b_lambdas.append(blambda)
+-                    i += 1
+-
+-                datadict["forward_energy_diff"][-1] = f_ediffs if f_ediffs else None
+-                datadict["backward_energy_diff"][-1] = b_ediffs if b_ediffs else None
+-                datadict["forward_lambda"][-1] = f_lambdas if f_lambdas else None
+-                datadict["backward_lambda"][-1] = b_lambdas if b_lambdas else None
++                # (ts_dissipation above is just the max of this difference).
++                #
++                # Opt-in: these files carry one row per MD step, so loading
++                # them for every calculation dominates both the runtime and
++                # the size of the returned frame.
++                if include_sweep_data:
++                    try:
++                        sweeps = _read_sweep_data(
++                            os.path.join(mainfolder, folder), sweep_data_stride
++                        )
++                    except Exception as exc:
++                        # a job killed mid-sweep leaves a ragged final row;
++                        # that must not cost us every other calculation
++                        warnings.warn(
++                            "could not read switching data in %s: %s: %s"
++                            % (folder, type(exc).__name__, exc),
++                            RuntimeWarning,
++                        )
++                        datadict["error_code"][-1] = "unreadable switching data: %s" % (
++                            type(exc).__name__,
++                        )
++                    else:
++                        for key, val in sweeps.items():
++                            datadict[key][-1] = val
+             else:
+                 datadict["status"].append("False")
+                 errfile = os.path.join(os.getcwd(), mainfolder, folder + ".sub.err")
+diff --git a/calphy/routines.py b/calphy/routines.py
+index 61984f9..688399d 100644
+--- a/calphy/routines.py
++++ b/calphy/routines.py
+@@ -71,6 +71,54 @@ def __init__(self, calculation=None, simfolder=None, log_to_screen=False):
+         logfile = os.path.join(os.getcwd(), f"{self.calc.create_identifier()}.log")
+         self.logger = ph.prepare_log(logfile, screen=log_to_screen)
+ 
++    # Values used when melting_temperature has to switch the structural
++    # phase-stability checks back on for its sub-calculations.
++    DETECTION_SOLID_FRACTION = 0.7
++    DETECTION_LIQUID_FRACTION = 0.05
++
++    def _enable_phase_detection(self, calc):
++        """
++        Force the structural phase-stability checks on for a sub-calculation.
++
++        ``run_jobs`` signals "solid melted" / "liquid froze" purely through
++        MeltedError / SolidifiedError, and ``start_calculation`` walks the
++        temperature bracket on those signals alone.  The measured solid
++        fraction is bounded to [0, 1], so the shipped defaults
++        (``solid_fraction = 0``, ``liquid_fraction = 1``) make both checks
++        unreachable -- the bracket would never be corrected and Tm would be
++        reported without ever verifying that the solid stayed solid and the
++        liquid stayed liquid.
++
++        The checks are therefore enabled here for this mode only, leaving the
++        global defaults alone.  An explicit user setting is always respected.
++
++        Parameters
++        ----------
++        calc : dict
++            Raw sub-calculation dict, mutated in place before it is parsed.
++        """
++        tolerance = calc.setdefault("tolerance", {})
++        if not isinstance(tolerance, dict):
++            return
++        if tolerance.get("solid_fraction") is None:
++            tolerance["solid_fraction"] = self.DETECTION_SOLID_FRACTION
++            self.logger.warning(
++                "mode melting_temperature: enabling melt detection with "
++                "tolerance.solid_fraction = %g (the default of 0 makes the "
++                "check unreachable, and the temperature bracket is advanced "
++                "only when it fires). Set tolerance.solid_fraction "
++                "explicitly to override." % self.DETECTION_SOLID_FRACTION
++            )
++        if tolerance.get("liquid_fraction") is None:
++            tolerance["liquid_fraction"] = self.DETECTION_LIQUID_FRACTION
++            self.logger.warning(
++                "mode melting_temperature: enabling solidification detection "
++                "with tolerance.liquid_fraction = %g (the default of 1 makes "
++                "the check unreachable, and the temperature bracket is "
++                "advanced only when it fires). Set tolerance.liquid_fraction "
++                "explicitly to override." % self.DETECTION_LIQUID_FRACTION
++            )
++
+     def prepare_calcs(self):
+         """
+         Prepare calculations list from given object
+@@ -101,6 +149,7 @@ def prepare_calcs(self):
+             calc["n_iterations"] = data["calculations"][int(self.calc.kernel)][
+                 "n_iterations"
+             ]
++        self._enable_phase_detection(calc)
+         calculations["calculations"].append(calc)
+ 
+         with open(self.calc.inputfile, "r") as fin:
+@@ -115,6 +164,7 @@ def prepare_calcs(self):
+             calc["n_iterations"] = data["calculations"][int(self.calc.kernel)][
+                 "n_iterations"
+             ]
++        self._enable_phase_detection(calc)
+         calculations["calculations"].append(calc)
+ 
+         outfile = f"{self.calc.create_identifier()}.{self.attempts}.yaml"
+@@ -219,6 +269,38 @@ def run_jobs(self):
+             scale_energy=True, return_values=True
+         )
+ 
++        self._report_sweep_quality()
++
++    def _report_sweep_quality(self):
++        """
++        Repeat any dissipation warning from the two sub-calculations here.
++
++        The solid and liquid sweeps log into their own simfolders, which nobody
++        reads when the point of the mode is a single number at the end.  A
++        sweep that dissipated heavily produces a free energy that is wrong by
++        an amount no averaging removes, and the crossing of two such curves is
++        wrong with it -- so the warning has to reach the melting-temperature
++        log, where it will actually be seen.
++        """
++        offenders = [
++            (job.calc.reference_phase, job.ediss)
++            for job in (self.soljob, self.lqdjob)
++            if getattr(job, "ediss_high", False)
++        ]
++        if not offenders:
++            return
++        detail = ", ".join(
++            "%s %.3e eV/atom" % (phase, value) for phase, value in offenders
++        )
++        self.logger.warning(
++            "Melting temperature is being extrapolated from a sweep that did "
++            "not stay reversible (%s; tolerance.dissipation = %.3e). The phase "
++            "very likely changed during the sweep, so treat the reported Tm as "
++            "unreliable rather than as an answer -- see the warnings in the "
++            "sub-calculation logs." % (detail, self.calc.tolerance.dissipation)
++        )
++        self.logger.warning("STATE: Tm unreliable, sweep dissipation too high")
++
+     def start_calculation(self):
+         """
+         Start calculation
+@@ -285,6 +367,68 @@ def extrapolate_tm(self, arg):
+         self.logger.info("STATE: Predicted Tm from extrapolation: %f K" % tpred)
+         return tpred
+ 
++    # Half-width of the finite-difference stencil used to take the local
++    # dF/dT on either side of the crossing, in samples.  Capped against the
++    # sweep length so a short sweep cannot index past either end.
++    CROSSING_STENCIL = 50
++
++    def _crossing_error(self, arg, suberr):
++        """
++        Propagate the free-energy uncertainty at the crossing into an
++        uncertainty on Tm.
++
++        The two curves cross at index ``arg``; converting a free-energy error
++        into a temperature error needs the rate at which they separate there,
++        i.e. the difference of their local slopes.  That slope is taken from a
++        symmetric finite difference around ``arg``.
++
++        The stencil is clamped to the array: ``find_tm`` only rejects
++        ``arg == 0`` and ``arg == len - 1``, so a crossing near either end
++        would otherwise read ``arg + 50`` past the end (IndexError, raised in
++        postprocessing after all the MD has been paid for) or ``arg - 50`` as
++        a negative index, which numpy silently wraps to the far end of the
++        sweep and turns the local slope into a chord across the whole
++        temperature range.
++
++        Parameters
++        ----------
++        arg : int
++            Index of the crossing.
++        suberr : float
++            Combined free-energy uncertainty at the crossing, in eV/atom.
++
++        Returns
++        -------
++        tmerr : float
++            Uncertainty on Tm in K, or ``np.nan`` if the local slopes are too
++            close to distinguish (parallel curves give no crossing scale).
++        """
++        n = len(self.solres[1])
++        half = max(1, min(self.CROSSING_STENCIL, n // 20))
++        lo = max(arg - half, 0)
++        hi = min(arg + half, n - 1)
++        if hi <= lo:
++            self.logger.warning(
++                "Sweep has too few samples (%d) to estimate a slope at the "
++                "crossing; reporting Tm without an error estimate." % n
++            )
++            return np.nan
++
++        def _slope(res):
++            dt = res[0][hi] - res[0][lo]
++            if dt == 0:
++                return np.nan
++            return (res[1][hi] - res[1][lo]) / dt
++
++        slope_diff = _slope(self.solres) - _slope(self.lqdres)
++        if not np.isfinite(slope_diff) or slope_diff == 0:
++            self.logger.warning(
++                "Solid and liquid free-energy curves are parallel at the "
++                "crossing; reporting Tm without an error estimate."
++            )
++            return np.nan
++        return suberr / slope_diff
++
+     def find_tm(self):
+         """
+         Find melting temperature
+@@ -327,15 +471,7 @@ def find_tm(self):
+                 self.calc_tm = self.solres[0][arg]
+                 # get errors
+                 suberr = np.sqrt(self.solres[2][arg] ** 2 + self.lqdres[2][arg] ** 2)
+-                sol_slope = (self.solres[1][arg + 50] - self.solres[1][arg - 50]) / (
+-                    self.solres[0][arg + 50] - self.solres[0][arg - 50]
+-                )
+-                lqd_slope = (self.lqdres[1][arg + 50] - self.lqdres[1][arg - 50]) / (
+-                    self.lqdres[0][arg + 50] - self.lqdres[0][arg - 50]
+-                )
+-                slope_diff = sol_slope - lqd_slope
+-                tmerr = suberr / slope_diff
+-                self.tmerr = tmerr
++                self.tmerr = self._crossing_error(arg, suberr)
+                 return self.calc_tm, self.tmerr
+ 
+             self.attempts += 1
+diff --git a/pyproject.toml b/pyproject.toml
+index e0b4d1c..1ae02be 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "calphy"
+-version = "2.0.0"
++version = "2.0.1"
+ description = "free energy calculation for python"
+ readme = "README.md"
+ license = { file = "LICENSE" }
+diff --git a/tests/test_dissipation_check.py b/tests/test_dissipation_check.py
+new file mode 100644
+index 0000000..6185cdd
+--- /dev/null
++++ b/tests/test_dissipation_check.py
+@@ -0,0 +1,159 @@
++"""
++Irreversibility check on switching paths.
++
++Dissipation enters the free energy directly, and a path whose structure changed
++partway through it dissipates orders of magnitude more than one that merely ran
++fast.  The numbers below are the real ones from a Ag ``melting_temperature``
++run: a clean reversible-scaling sweep sat at 1.7e-4 eV/atom, while the same
++sweep with the solid melting near the top sat at 2.3e-2 -- so the threshold has
++to separate those two without crying wolf on the clean one.
++"""
++import logging
++import os
++
++import numpy as np
++import pytest
++
++from calphy.routines import MeltingTemp
++from calphy.solid import Solid
++
++CLEAN = 1.7e-4      # measured: reversible sweep
++MELTED = 2.3e-2     # measured: solid melted during the sweep
++
++
++def _log_text(tmp_path, job):
++    for handler in job.logger.handlers:
++        handler.flush()
++    with open(os.path.join(str(tmp_path), "calphy.log")) as fh:
++        return fh.read()
++
++
++def test_clean_sweep_is_not_flagged(make_calc, recorded_job, tmp_path):
++    """A reversible sweep must pass silently -- otherwise the warning is noise."""
++    calc = make_calc("B1")
++    job, _ = recorded_job(Solid, calc)
++    assert job.check_dissipation(CLEAN, "sweep") is False
++    assert "WARNING" not in _log_text(tmp_path, job).split("dissipation:")[-1]
++
++
++def test_melted_sweep_is_flagged(make_calc, recorded_job, tmp_path):
++    """The dissipation of a sweep that melted must be called out."""
++    calc = make_calc("B1")
++    job, _ = recorded_job(Solid, calc)
++    assert job.check_dissipation(MELTED, "sweep") is True
++    log = _log_text(tmp_path, job)
++    assert "WARNING" in log
++    assert "far from reversible" in log
++
++
++def test_threshold_separates_the_two_measured_cases(make_calc, recorded_job):
++    """The shipped default sits between the clean and the melted measurement."""
++    calc = make_calc("B1")
++    default = calc.tolerance.dissipation
++    assert CLEAN < default < MELTED, (
++        "default tolerance.dissipation=%r does not separate a clean sweep "
++        "(%.1e) from a melted one (%.1e)" % (default, CLEAN, MELTED)
++    )
++
++
++def test_check_can_be_disabled(make_calc, recorded_job):
++    calc = make_calc("B1", tolerance={"dissipation": 0})
++    job, _ = recorded_job(Solid, calc)
++    assert job.check_dissipation(MELTED, "sweep") is False
++
++
++def test_sign_is_ignored(make_calc, recorded_job):
++    """Dissipation is a magnitude; a negative value is just as irreversible."""
++    calc = make_calc("B1")
++    job, _ = recorded_job(Solid, calc)
++    assert job.check_dissipation(-MELTED, "sweep") is True
++
++
++# --------------------------------------------------------------------------- #
++# MeltingTemp surfacing
++# --------------------------------------------------------------------------- #
++class _Job:
++    def __init__(self, phase, ediss, high):
++        self.calc = type("C", (), {"reference_phase": phase})()
++        self.ediss = ediss
++        self.ediss_high = high
++
++
++def _melting_temp(sol, lqd, threshold=1e-3):
++    job = object.__new__(MeltingTemp)
++    job.logger = logging.getLogger("test_dissipation_check")
++    job.logger.handlers = []
++    job.logger.propagate = True
++    job.soljob, job.lqdjob = sol, lqd
++    job.calc = type("C", (), {"tolerance": type("T", (), {"dissipation": threshold})()})()
++    return job
++
++
++def test_melting_temp_repeats_the_warning(caplog):
++    """
++    The sub-calculations log into their own folders, which nobody reads when
++    the point of the mode is one number at the end.
++    """
++    job = _melting_temp(_Job("solid", MELTED, True), _Job("liquid", 3e-4, False))
++    with caplog.at_level(logging.WARNING):
++        job._report_sweep_quality()
++    text = " ".join(r.message for r in caplog.records)
++    assert "unreliable" in text
++    assert "solid" in text
++    assert "liquid" not in text.split("tolerance.dissipation")[0]
++
++
++def test_melting_temp_silent_when_both_sweeps_are_clean(caplog):
++    job = _melting_temp(_Job("solid", CLEAN, False), _Job("liquid", 3e-4, False))
++    with caplog.at_level(logging.WARNING):
++        job._report_sweep_quality()
++    assert not [r for r in caplog.records if r.levelname == "WARNING"]
++
++
++def test_melting_temp_survives_jobs_without_the_attribute(caplog):
++    """A job that never ran a sweep has no verdict; that is not an error."""
++    sol = _Job("solid", 0, False)
++    del sol.ediss_high
++    job = _melting_temp(sol, _Job("liquid", 3e-4, False))
++    job._report_sweep_quality()  # must not raise
++
++
++# --------------------------------------------------------------------------- #
++# harvest
++# --------------------------------------------------------------------------- #
++def test_gather_results_surfaces_the_verdict(tmp_path):
++    """A harvested frame can be filtered on the flag without re-deriving it."""
++    import yaml
++    from calphy.postprocessing import gather_results
++
++    root = str(tmp_path)
++    for name, high in (("run_ok", False), ("run_bad", True)):
++        d = os.path.join(root, name)
++        os.makedirs(d)
++        with open(os.path.join(d, "input_file.yaml"), "w") as fh:
++            yaml.safe_dump({"calculations": [{
++                "mode": "ts", "temperature": 900, "pressure": 0,
++                "reference_phase": "solid", "phase_name": "",
++                "element": ["Ag"], "reference_composition": 0.0,
++            }]}, fh)
++        with open(os.path.join(d, "report.yaml"), "w") as fh:
++            yaml.safe_dump({
++                "results": {
++                    "free_energy": -3.4,
++                    "ts_dissipation": MELTED if high else CLEAN,
++                    "ts_dissipation_high": high,
++                },
++                "input": {"element": "Ag", "concentration": "1.0"},
++            }, fh)
++        t = np.linspace(850, 1250, 20)
++        np.savetxt(os.path.join(d, "temperature_sweep.dat"),
++                   np.column_stack((t, np.full(20, -3.4), np.full(20, 1e-5))))
++
++    df = gather_results(root).set_index("calculation")
++    # pandas may hand these back as numpy bools; compare by value
++    assert bool(df.loc["run_bad"]["ts_dissipation_high"]) is True
++    assert bool(df.loc["run_ok"]["ts_dissipation_high"]) is False
++    assert df.loc["run_bad"]["ts_dissipation"] == pytest.approx(MELTED)
++    # the flag is usable as a filter, which is the point of surfacing it
++    flagged = df[df["ts_dissipation_high"] == True]  # noqa: E712
++    assert list(flagged.index) == ["run_bad"]
+diff --git a/tests/test_find_tm_crossing_error.py b/tests/test_find_tm_crossing_error.py
+new file mode 100644
+index 0000000..2581238
+--- /dev/null
++++ b/tests/test_find_tm_crossing_error.py
+@@ -0,0 +1,114 @@
++"""
++Tm uncertainty from the solid/liquid free-energy crossing.
++
++``find_tm`` rejects only ``arg == 0`` and ``arg == len - 1``, so the local
++slope stencil around the crossing has to survive a crossing that lands close
++to either end of the sweep: past the top it would raise IndexError in
++postprocessing (after all the MD has been paid for), and below the bottom a
++negative index is silently wrapped by numpy to the far end, turning the local
++slope into a chord across the whole temperature range.
++"""
++import logging
++
++import numpy as np
++import pytest
++
++from calphy.routines import MeltingTemp
++
++
++def _job():
++    """A MeltingTemp with just enough state to exercise _crossing_error."""
++    job = object.__new__(MeltingTemp)
++    job.logger = logging.getLogger("test_find_tm_crossing_error")
++    job.logger.addHandler(logging.NullHandler())
++    return job
++
++
++def _curves(n, t0=850.0, t1=1250.0):
++    """Curved F(T) for both phases -- S grows with T, so the curves are not
++    straight and a wrapped chord is measurably different from a local slope."""
++    T = np.linspace(t0, t1, n)
++    f_sol = -2.10 - 2.0e-4 * T - 9.0e-5 * T * np.log(T)
++    f_lqd = -2.06 - 2.4e-4 * T - 9.6e-5 * T * np.log(T)
++    err = np.full(n, 1.0e-4)
++    return (T, f_sol, err), (T, f_lqd, err)
++
++
++def _reference_tmerr(job, arg, suberr, half):
++    """Local, correctly-clamped slope difference computed independently."""
++    n = len(job.solres[1])
++    lo, hi = max(arg - half, 0), min(arg + half, n - 1)
++    ss = (job.solres[1][hi] - job.solres[1][lo]) / (job.solres[0][hi] - job.solres[0][lo])
++    ls = (job.lqdres[1][hi] - job.lqdres[1][lo]) / (job.lqdres[0][hi] - job.lqdres[0][lo])
++    return suberr / (ss - ls)
++
++
++@pytest.mark.parametrize("arg", [1, 5, 25, 49])
++def test_low_edge_crossing_does_not_wrap(arg):
++    """A crossing inside the stencil width must still use a *local* slope."""
++    job = _job()
++    n = 50000
++    job.solres, job.lqdres = _curves(n)
++    suberr = 1.0e-4
++
++    got = job._crossing_error(arg, suberr)
++    expected = _reference_tmerr(job, arg, suberr, MeltingTemp.CROSSING_STENCIL)
++    assert got == pytest.approx(expected, rel=1e-12)
++
++    # and it must differ from what the wrapped (negative-index) read gives
++    lo_wrapped = arg - MeltingTemp.CROSSING_STENCIL
++    hi = arg + MeltingTemp.CROSSING_STENCIL
++    ss = (job.solres[1][hi] - job.solres[1][lo_wrapped]) / (
++        job.solres[0][hi] - job.solres[0][lo_wrapped]
++    )
++    ls = (job.lqdres[1][hi] - job.lqdres[1][lo_wrapped]) / (
++        job.lqdres[0][hi] - job.lqdres[0][lo_wrapped]
++    )
++    wrapped = suberr / (ss - ls)
++    assert got != pytest.approx(wrapped, rel=1e-6)
++
++
++@pytest.mark.parametrize("offset", [2, 10, 50])
++def test_high_edge_crossing_does_not_raise(offset):
++    """A crossing near the top of the sweep must not IndexError."""
++    job = _job()
++    n = 50000
++    job.solres, job.lqdres = _curves(n)
++    arg = n - offset
++    tmerr = job._crossing_error(arg, 1.0e-4)
++    assert np.isfinite(tmerr)
++
++
++@pytest.mark.parametrize("n", [12, 40, 101, 500])
++def test_short_sweep_is_safe_at_every_interior_index(n):
++    """
++    The stencil scales with the sweep, so no interior crossing can index out
++    of bounds however short the sweep is.
++    """
++    job = _job()
++    job.solres, job.lqdres = _curves(n)
++    for arg in range(1, n - 1):
++        tmerr = job._crossing_error(arg, 1.0e-4)
++        assert np.isfinite(tmerr), f"n={n} arg={arg}"
++
++
++def test_parallel_curves_report_no_error_instead_of_dividing_by_zero():
++    """Identical slopes give no crossing scale; report nan, do not blow up."""
++    job = _job()
++    n = 1000
++    T = np.linspace(850.0, 1250.0, n)
++    f = -2.10 - 2.0e-4 * T
++    err = np.full(n, 1.0e-4)
++    job.solres = (T, f, err)
++    job.lqdres = (T, f + 0.01, err)  # parallel, offset
++    assert np.isnan(job._crossing_error(n // 2, 1.0e-4))
++
++
++def test_degenerate_sweep_reports_no_error():
++    """Too few samples to form any stencil at all."""
++    job = _job()
++    T = np.array([900.0, 901.0])
++    job.solres = (T, np.array([-3.0, -3.001]), np.array([1e-4, 1e-4]))
++    job.lqdres = (T, np.array([-3.0, -3.002]), np.array([1e-4, 1e-4]))
++    # n // 20 == 0 -> half clamps to 1, lo=0, hi=1 -> still usable
++    assert np.isfinite(job._crossing_error(1, 1.0e-4))
+diff --git a/tests/test_gather_results_sweep_data.py b/tests/test_gather_results_sweep_data.py
+new file mode 100644
+index 0000000..67d4bf4
+--- /dev/null
++++ b/tests/test_gather_results_sweep_data.py
+@@ -0,0 +1,151 @@
++"""
++gather_results and the raw reversible-scaling switching data.
++
++``ts.forward_*.dat`` / ``ts.backward_*.dat`` are written by ``fix print 1`` --
++one row per MD step -- so loading them for every calculation dominates both the
++runtime and the size of the returned frame.  They are therefore opt-in, and a
++calculation whose sweep files are damaged (a job killed mid-sweep leaves a
++ragged final row) must not take the whole gather down with it.
++"""
++import os
++
++import numpy as np
++import pytest
++import yaml
++
++from calphy.postprocessing import gather_results
++
++NSTEPS = 200
++SWEEP_COLS = [
++    "forward_energy_diff",
++    "backward_energy_diff",
++    "forward_lambda",
++    "backward_lambda",
++]
++
++
++def _make_folders(root, n_folders=3, n_replicas=1, nsteps=NSTEPS):
++    """Write n_folders finished ts calculations under root."""
++    lam = np.linspace(1.0, 0.68, nsteps)
++    dU = -3.48 + 0.01 * np.sin(np.linspace(0, 20, nsteps))
++    press = 600 * np.cos(np.linspace(0, 30, nsteps))
++    vol = 6015 + np.linspace(0, 40, nsteps)
++    hdr = "dU[eV/atom] press[bar] vol[A^3] lambda"
++
++    names = []
++    for k in range(n_folders):
++        name = f"ts-fcc-{900 + k}-0"
++        d = os.path.join(root, name)
++        os.makedirs(d)
++        names.append(name)
++        with open(os.path.join(d, "input_file.yaml"), "w") as fh:
++            yaml.safe_dump({"calculations": [{
++                "mode": "ts", "temperature": 900 + k, "pressure": 0,
++                "reference_phase": "solid", "phase_name": "",
++                "element": ["Ag"], "reference_composition": 0.0,
++            }]}, fh)
++        with open(os.path.join(d, "report.yaml"), "w") as fh:
++            yaml.safe_dump({
++                "results": {"free_energy": -3.4, "dissipation": 1e-4},
++                "input": {"element": "Ag", "concentration": "1.0"},
++            }, fh)
++        t = np.linspace(850, 1250, nsteps)
++        np.savetxt(os.path.join(d, "temperature_sweep.dat"),
++                   np.column_stack((t, dU, np.full(nsteps, 1e-5))))
++        for r in range(1, n_replicas + 1):
++            np.savetxt(os.path.join(d, f"ts.forward_{r}.dat"),
++                       np.column_stack((dU, press, vol, lam)), header=hdr)
++            np.savetxt(os.path.join(d, f"ts.backward_{r}.dat"),
++                       np.column_stack((dU[::-1], press, vol, lam[::-1])),
++                       header=hdr)
++    return names
++
++
++def _corrupt(root, name):
++    """Truncate a replica mid-row, as a job killed mid-sweep would."""
++    path = os.path.join(root, name, "ts.forward_1.dat")
++    text = open(path).read()
++    with open(path, "w") as fh:
++        fh.write(text[: int(len(text) * 0.5)] + "\n-3.48 12.0\n")
++
++
++def test_sweep_data_is_off_by_default(tmp_path):
++    """The expensive columns exist but stay empty unless asked for."""
++    root = str(tmp_path)
++    _make_folders(root)
++    df = gather_results(root)
++    assert len(df) == 3
++    for col in SWEEP_COLS:
++        assert col in df.columns, f"{col} disappeared from the schema"
++        assert df[col].isna().all() or all(v is None for v in df[col])
++
++
++def test_default_gather_ignores_damaged_sweep_files(tmp_path):
++    """
++    With sweep data off, a damaged switching file is irrelevant -- it is never
++    opened, so the gather is unaffected.
++    """
++    root = str(tmp_path)
++    names = _make_folders(root)
++    _corrupt(root, names[1])
++    df = gather_results(root)
++    assert len(df) == 3
++    assert df["error_code"].isna().all() or all(
++        e is None for e in df["error_code"]
++    )
++
++
++def test_sweep_data_loads_when_requested(tmp_path):
++    root = str(tmp_path)
++    _make_folders(root, n_folders=2, n_replicas=2)
++    df = gather_results(root, include_sweep_data=True)
++    for col in SWEEP_COLS:
++        for cell in df[col]:
++            assert cell is not None
++            assert len(cell) == 2, "one array per replica expected"
++            assert all(len(a) == NSTEPS for a in cell)
++    # energy differential is dU/lambda
++    fd = df["forward_energy_diff"].iloc[0][0]
++    fl = df["forward_lambda"].iloc[0][0]
++    assert np.all(np.isfinite(fd))
++    assert fl[0] == pytest.approx(1.0)
++
++
++@pytest.mark.parametrize("stride", [2, 10, 50])
++def test_sweep_data_stride_reduces_samples(tmp_path, stride):
++    root = str(tmp_path)
++    _make_folders(root, n_folders=1)
++    df = gather_results(root, include_sweep_data=True, sweep_data_stride=stride)
++    expected = len(range(0, NSTEPS, stride))
++    for col in SWEEP_COLS:
++        assert len(df[col].iloc[0][0]) == expected
++
++
++def test_damaged_sweep_file_does_not_abort_the_gather(tmp_path):
++    """
++    One unreadable calculation must cost only itself: every other folder still
++    comes back, and the failure is recorded rather than raised.
++    """
++    root = str(tmp_path)
++    names = _make_folders(root, n_folders=3)
++    _corrupt(root, names[1])
++
++    with pytest.warns(RuntimeWarning, match="could not read switching data"):
++        df = gather_results(root, include_sweep_data=True)
++
++    assert len(df) == 3, "a damaged folder took the whole gather down"
++    df = df.set_index("calculation")
++    bad = df.loc[names[1]]
++    assert bad["forward_energy_diff"] is None
++    assert "unreadable switching data" in str(bad["error_code"])
++    # the intact folders are untouched
++    for good in (names[0], names[2]):
++        assert df.loc[good]["forward_energy_diff"] is not None
++        assert df.loc[good]["error_code"] is None
++    # free energies survive everywhere, including the damaged calculation
++    assert all(len(f) == NSTEPS for f in df["free_energy"])
++
++
++def test_invalid_stride_rejected(tmp_path):
++    with pytest.raises(ValueError, match="sweep_data_stride"):
++        gather_results(str(tmp_path), sweep_data_stride=0)
+diff --git a/tests/test_phase_detection_defaults.py b/tests/test_phase_detection_defaults.py
+new file mode 100644
+index 0000000..c9139fb
+--- /dev/null
++++ b/tests/test_phase_detection_defaults.py
+@@ -0,0 +1,148 @@
++"""
++Structural phase-stability detection defaults.
++
++The melt / solidification checks stay OFF by default -- every mode except
++``melting_temperature`` merely warns -- while ``melting_temperature``, whose
++temperature bracket is advanced *only* by MeltedError / SolidifiedError, turns
++them on for its own sub-calculations.
++"""
++
++import os
++import tempfile
++
++import numpy as np
++import pytest
++import yaml
++
++from calphy.input import read_inputfile
++from calphy.routines import MeltingTemp
++from calphy.solid import Solid
++
++
++# --------------------------------------------------------------------------- #
++# detection defaults
++# --------------------------------------------------------------------------- #
++STRUCTURE = """LAMMPS data file
++
++1 atoms
++1 atom types
++
++0.0 4.05 xlo xhi
++0.0 4.05 ylo yhi
++0.0 4.05 zlo zhi
++
++Masses
++
++1 26.98
++
++Atoms
++
++1 1 0.0 0.0 0.0
++"""
++
++
++def _melting_temp_job(tmpdir, tolerance=None):
++    """Build a MeltingTemp whose sub-calculations are ready to inspect."""
++    structure_file = os.path.join(tmpdir, "conf.data")
++    with open(structure_file, "w") as fh:
++        fh.write(STRUCTURE)
++
++    calc = {
++        "mode": "melting_temperature",
++        "lattice": structure_file,
++        "reference_phase": "solid",
++        "temperature": 1000,
++        "pressure": 0,
++        "element": ["Al"],
++        "mass": [26.98],
++        "pair_style": ["eam/alloy"],
++        "pair_coeff": ["* * Al.eam.alloy Al"],
++    }
++    if tolerance is not None:
++        calc["tolerance"] = tolerance
++
++    inputfile = os.path.join(tmpdir, "input.yaml")
++    with open(inputfile, "w") as fh:
++        yaml.safe_dump({"calculations": [calc]}, fh)
++
++    calculations = read_inputfile(inputfile)
++    prev = os.getcwd()
++    os.chdir(tmpdir)
++    try:
++        job = MeltingTemp(calculation=calculations[0], simfolder=tmpdir)
++        job.prepare_calcs()
++    finally:
++        os.chdir(prev)
++    return job
++
++
++def test_detection_off_by_default():
++    """Every other mode keeps the checks unreachable -- the shipped default."""
++    from calphy.input import Tolerance
++
++    tol = Tolerance()
++    assert tol.solid_fraction == 0.0, "melt check must stay off by default"
++    assert tol.liquid_fraction == 1.0, "solidify check must stay off by default"
++
++
++def test_melting_temperature_enables_detection():
++    """
++    melting_temperature cannot bracket Tm without the checks: run_jobs signals
++    'melted'/'froze' only via the exceptions, so they must be live for both
++    sub-calculations.
++    """
++    with tempfile.TemporaryDirectory() as tmpdir:
++        job = _melting_temp_job(tmpdir)
++
++        assert len(job.calculations) == 2
++        for sub in job.calculations:
++            assert sub.tolerance.solid_fraction > 0, (
++                "melt detection unreachable for the %s sub-calculation"
++                % sub.reference_phase
++            )
++            assert sub.tolerance.liquid_fraction < 1, (
++                "solidify detection unreachable for the %s sub-calculation"
++                % sub.reference_phase
++            )
++
++
++def test_melting_temperature_respects_explicit_tolerance():
++    """An explicit user setting is never overridden, including a deliberate off."""
++    with tempfile.TemporaryDirectory() as tmpdir:
++        job = _melting_temp_job(
++            tmpdir, tolerance={"solid_fraction": 0.42, "liquid_fraction": 0.11}
++        )
++        for sub in job.calculations:
++            assert sub.tolerance.solid_fraction == pytest.approx(0.42)
++            assert sub.tolerance.liquid_fraction == pytest.approx(0.11)
++
++
++@pytest.mark.parametrize(
++    "phase, tolerance, expect_warning",
++    [
++        ("solid", {"solid_fraction": 0.0}, True),
++        ("solid", {"solid_fraction": 0.7}, False),
++        ("liquid", {"liquid_fraction": 1.0}, True),
++        ("liquid", {"liquid_fraction": 0.05}, False),
++    ],
++)
++def test_disabled_detection_is_warned(make_calc, recorded_job, tmp_path,
++                                      phase, tolerance, expect_warning):
++    """A disabled check must be visible in the log after the fact.
++
++    calphy's loggers write to their own file handler and do not propagate, so
++    assert against the log file the job actually produces.
++    """
++    from calphy.liquid import Liquid
++
++    scenario = "B1" if phase == "solid" else "B4"
++    calc = make_calc(scenario, tolerance=tolerance)
++    job, _ = recorded_job(Solid if phase == "solid" else Liquid, calc)
++
++    for handler in job.logger.handlers:
++        handler.flush()
++    with open(os.path.join(str(tmp_path), "calphy.log")) as fh:
++        log = fh.read()
++
++    warned = "WARNING" in log and "DISABLED" in log
++    assert warned is expect_warning, log
+diff --git a/tests/test_postprocessing.py b/tests/test_postprocessing.py
+index 3676e97..617b699 100644
+--- a/tests/test_postprocessing.py
++++ b/tests/test_postprocessing.py
+@@ -95,12 +95,13 @@ def _make_fe_calc(folder, with_report=True):
+ 
+ 
+ def test_gather_results_ts_mode_with_replicas(tmp_path):
+-    """ts mode picks up free_energy_error, ts_dissipation, and per-replica
+-    forward/backward energy-diff + lambda arrays."""
++    """ts mode picks up free_energy_error, ts_dissipation, and -- when the
++    switching data is asked for -- per-replica forward/backward energy-diff +
++    lambda arrays."""
+     mainfolder = tmp_path / "calcs"
+     t, f, ferr, lam = _make_ts_calc(str(mainfolder / "run1"))
+ 
+-    df = gather_results(str(mainfolder))
++    df = gather_results(str(mainfolder), include_sweep_data=True)
+     row = df.loc[df.calculation == "run1"].iloc[0]
+ 
+     assert row.status == "True"
+diff --git a/tests/test_pressure_convergence_pv_fit.py b/tests/test_pressure_convergence_pv_fit.py
+new file mode 100644
+index 0000000..b92e3ce
+--- /dev/null
++++ b/tests/test_pressure_convergence_pv_fit.py
+@@ -0,0 +1,153 @@
++"""
++The P-V fit / box-rescale path of ``Phase.run_pressure_convergence``.
++
++Samples recorded before a ``change_box`` must never leak into the mean
++pressure, the stored box, or the P-V fit, and the scale factor must be referred
++to the volume the box actually has when ``change_box`` runs.
++"""
++import numpy as np
++import pytest
++
++from calphy.phase import Phase
++from calphy.solid import Solid
++
++
++def test_fit_volume_scale_uses_current_volume():
++    """
++    change_box scales the box as it stands now, so the factor must be referred
++    to the current volume rather than the windowed mean that fed the fit.
++    """
++    # exactly linear P(V): P = 0 at V = 16.0
++    v0 = 16.0
++    pv_history = [(v0 - 0.4, 400.0), (v0 - 0.3, 300.0), (v0 - 0.2, 200.0)]
++
++    # referred to the mean-volume history entry (the old behaviour)
++    default = Phase._fit_volume_scale(pv_history, 0.0)
++    assert default == pytest.approx((v0 / (v0 - 0.2)) ** (1 / 3), rel=1e-9)
++
++    # referred to where the box really is now
++    current = 15.5
++    explicit = Phase._fit_volume_scale(pv_history, 0.0, current)
++    assert explicit == pytest.approx((v0 / current) ** (1 / 3), rel=1e-9)
++    assert explicit != pytest.approx(default, rel=1e-6)
++
++
++class _PVStub:
++    """
++    Minimal runner stub with an exactly-linear equation of state.
++
++    ``run`` appends one cycle of samples at the current box and relaxes the box
++    slightly toward equilibrium (so the P-V history has distinct volumes, as a
++    real barostat would); ``change_box`` scales it. No noise, so the fit is
++    exact and any contamination from pre-rescale samples shows up as a clean
++    numerical discrepancy.
++    """
++
++    # ``relax`` is deliberately far slower than the sampling window: the box
++    # must still be well away from equilibrium when the P-V fit first fires,
++    # so that the rescale -- not the barostat -- is what closes the gap. That
++    # is the regime in which stale pre-rescale samples actually corrupt the
++    # averages.
++    def __init__(self, natoms, ncount, v0=16.0, bulk=1.0e6, start_frac=0.97,
++                 relax=0.002):
++        self.natoms = natoms
++        self.ncount = ncount
++        self.v0 = v0
++        self.bulk = bulk
++        self.relax = relax
++        self.volatom = v0 * start_frac
++        self.rows = []
++        self.commands = []
++        self.n_change_box = 0
++
++    def _pressure(self):
++        return -self.bulk * (self.volatom - self.v0) / self.v0
++
++    def command(self, cmd):
++        self.commands.append(" ".join(cmd.split()))
++        tokens = cmd.split()
++        if tokens[0] == "run":
++            for _ in range(self.ncount):
++                # barostat nudges the box toward equilibrium each sample
++                self.volatom += self.relax * (self.v0 - self.volatom)
++                length = (self.volatom * self.natoms) ** (1.0 / 3.0)
++                self.rows.append([len(self.rows), length, length, length,
++                                  self._pressure()])
++        elif tokens[0] == "change_box":
++            scale = float(tokens[tokens.index("scale") + 1])
++            self.volatom *= scale ** 3
++            self.n_change_box += 1
++
++    def sync(self):
++        pass
++
++    def close(self):
++        pass
++
++    def rotate_logs(self, stage):
++        pass
++
++    def read_timeseries(self, name, usecols=None):
++        arr = np.array(self.rows, dtype=float)
++        if usecols is not None:
++            arr = arr[:, list(usecols)]
++        return arr
++
++
++def test_pressure_convergence_discards_pre_rescale_samples(make_calc, recorded_job):
++    """
++    After a change_box the stored box must describe the *new* cell only.
++
++    The stub's equation of state puts zero pressure exactly at ``v0``, so a
++    correct run converges with the stored vol/atom on ``v0``. If samples taken
++    before the rescale still counted, the stored box would sit between the old
++    and new volumes instead.
++    """
++    calc = make_calc("B1")
++    # tight tolerance so the loop has to reach equilibrium rather than stop on
++    # the first cycle, which is what brings the P-V fit into play at all
++    calc.tolerance.pressure = 1.0
++    job, _ = recorded_job(Solid, calc)
++
++    ncount = int(calc.md.n_small_steps) // int(
++        calc.md.n_every_steps * calc.md.n_repeat_steps
++    )
++    stub = _PVStub(natoms=job.natoms, ncount=ncount)
++    job.run_pressure_convergence(stub)
++
++    assert stub.n_change_box > 0, "P-V fit path was never exercised"
++    assert job.volatom == pytest.approx(stub.v0, rel=2e-4), (
++        "stored vol/atom %.6f is not the equilibrium volume %.6f -- "
++        "pre-rescale samples leaked into the average"
++        % (job.volatom, stub.v0)
++    )
++    # and the stored box is self-consistent with the stored volume
++    assert job.lx * job.ly * job.lz / job.natoms == pytest.approx(
++        job.volatom, rel=2e-3
++    )
++
++
++def test_pressure_convergence_skips_transient_cycle_after_rescale(
++    make_calc, recorded_job
++):
++    """The cycle straight after a rescale is pure transient and must not
++    declare convergence."""
++    calc = make_calc("B1")
++    calc.tolerance.pressure = 1.0
++    job, _ = recorded_job(Solid, calc)
++
++    ncount = int(calc.md.n_small_steps) // int(
++        calc.md.n_every_steps * calc.md.n_repeat_steps
++    )
++    stub = _PVStub(natoms=job.natoms, ncount=ncount)
++    job.run_pressure_convergence(stub)
++
++    runs = [c for c in stub.commands if c.startswith("run")]
++    changes = [i for i, c in enumerate(stub.commands) if c.startswith("change_box")]
++    # every change_box is followed by at least one more run before the loop ends
++    for idx in changes:
++        assert any(c.startswith("run") for c in stub.commands[idx + 1:]), (
++            "a rescale was the last thing the loop did; the new box was never "
++            "sampled before the stored value was taken"
++        )
++    assert len(runs) > len(changes)

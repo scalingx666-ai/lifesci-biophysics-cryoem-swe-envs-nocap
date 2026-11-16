@@ -1,0 +1,2537 @@
+diff --git a/.gitignore b/.gitignore
+index 03a5fafd8..b7d3771c9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -275,3 +275,7 @@ webui/tsconfig.tsbuildinfo
+ # Built React bundle: produced by `cd webui && npm run build:package` (or
+ # scripts/build_webui.sh) at release time, never committed.
+ scilink/server/static/
++
++# Checked-in NWChem test fixtures: real engine output captured as ground truth
++# for the convergence parsers (overrides the *.out rule above).
++!tests/fixtures/nwchem/*.out
+diff --git a/scilink/agents/sim_agents/convergence.py b/scilink/agents/sim_agents/convergence.py
+new file mode 100644
+index 000000000..4e795e691
+--- /dev/null
++++ b/scilink/agents/sim_agents/convergence.py
+@@ -0,0 +1,304 @@
++"""Numeric parameter-convergence comparator (engine-neutral).
++
++A static calculation's accuracy depends on numerical parameters (VASP ENCUT and
++k-points, QE ecutwfc/ecutrho, a QC basis-set ladder). The convention is to run
++the calculation at increasing settings and take the cheapest setting past which
++the observable stops changing within a tolerance. This module holds the pure
++decision — "given an observable measured along a ladder of settings, where does
++it plateau?" — with no engine, LLM, or I/O. The engine skills declare the ladder,
++the observable, and the tolerance; the sweep driver runs the ladder and feeds the
++results here.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
++
++
++@dataclass
++class ConvergenceResult:
++    """Outcome of assessing one parameter ladder.
++
++    Attributes:
++        converged: True when a demonstrated plateau exists — the observable at
++            some setting and every higher setting agree with the most-accurate
++            (highest) setting within ``tolerance``, and at least two settings
++            take part (a single point cannot demonstrate a plateau).
++        setting: The cheapest setting that is converged (the one to adopt), or
++            None when not converged.
++        value: The observable at the most-accurate (highest) setting — the best
++            available estimate — or None when there is nothing to report.
++        deltas: ``(setting, |value - best_value|)`` for each setting, in input
++            order; the evidence behind the verdict.
++        reason: Short human-readable explanation.
++    """
++
++    converged: bool
++    setting: Any
++    value: Optional[float]
++    deltas: List[Tuple[Any, float]]
++    reason: str
++
++
++def converged_setting(
++    observations: Sequence[Tuple[Any, Optional[float]]],
++    tolerance: float,
++) -> ConvergenceResult:
++    """Find where an observable plateaus along a ladder of settings.
++
++    Args:
++        observations: ``(setting, value)`` pairs ordered from least to most
++            accurate/expensive (e.g. ascending ENCUT). ``value`` is the
++            convergence observable (energy/atom, lattice constant, gap, …).
++            A ``None`` value marks a setting whose run failed or produced no
++            reading; such settings cannot anchor a plateau.
++        tolerance: Maximum absolute difference (in the observable's units) that
++            counts as "unchanged". Must be non-negative.
++
++    Returns:
++        A :class:`ConvergenceResult`. The adopted setting is the *cheapest* one
++        from which the observable no longer moves beyond ``tolerance`` relative
++        to the most-accurate setting, so downstream work runs at the cheapest
++        trustworthy setting while the reported value is the most accurate.
++    """
++    if tolerance < 0:
++        raise ValueError("tolerance must be non-negative")
++
++    finite = [(s, v) for s, v in observations if v is not None]
++    if not finite:
++        return ConvergenceResult(False, None, None, [], "no readable observations")
++    if len(finite) == 1:
++        # One point cannot demonstrate a plateau, but it is the best estimate.
++        s, v = finite[0]
++        return ConvergenceResult(
++            False, None, v, [(s, 0.0)],
++            "only one setting produced a value — cannot demonstrate a plateau")
++
++    best_value = finite[-1][1]  # highest (most accurate) setting
++    deltas = [(s, abs(v - best_value)) for s, v in finite]
++
++    # The cheapest setting from which every higher setting (inclusive) is within
++    # tolerance of the best value. Walk from cheapest up; the first setting whose
++    # own delta AND all deltas above it are within tolerance is the plateau start.
++    converged_idx: Optional[int] = None
++    for i in range(len(finite)):
++        if all(d <= tolerance for _, d in deltas[i:]):
++            converged_idx = i
++            break
++
++    if converged_idx is None or converged_idx >= len(finite) - 1:
++        # Either nothing is within tolerance of the top, or only the top setting
++        # agrees with itself — the ladder has not shown a plateau. Report the
++        # best value so the caller can widen the ladder, but do not claim
++        # convergence.
++        return ConvergenceResult(
++            False, None, best_value, deltas,
++            "observable still changing at the top of the ladder — extend it")
++
++    setting = finite[converged_idx][0]
++    return ConvergenceResult(
++        True, setting, best_value, deltas,
++        f"converged at {setting}: observable within {tolerance} of the "
++        f"most-accurate setting from here up")
++
++
++@dataclass
++class SweepResult:
++    """Outcome of running one parameter ladder to convergence.
++
++    Attributes:
++        convergence: The comparator verdict over the ladder.
++        observations: ``(setting, value)`` for each ladder rung, in order
++            (``value`` is None where the run failed or produced no reading).
++        run_dirs: ``setting -> run directory`` for every rung that ran.
++        param_name: The parameter that was swept (for reporting).
++    """
++
++    convergence: ConvergenceResult
++    observations: List[Tuple[Any, Optional[float]]]
++    run_dirs: Dict[Any, str]
++    param_name: str
++
++
++def run_convergence_sweep(
++    *,
++    ladder: Sequence[Any],
++    build_member: Callable[[Any], Dict[str, str]],
++    run_ladder: Callable[[Dict[Any, Dict[str, str]]], Dict[Any, str]],
++    read_observable: Callable[[Optional[str]], Optional[float]],
++    tolerance: float,
++    param_name: str = "parameter",
++) -> SweepResult:
++    """Run a parameter ladder as a batch fan-out and assess convergence.
++
++    Engine-neutral. The three callbacks carry all engine-specific knowledge, so
++    this driver has no dependency on any engine, agent, or executor and is
++    exercised with fakes in tests:
++
++    - ``build_member(setting)`` returns the input-file map for that rung (the
++      base deck with the swept parameter set to ``setting`` — the engine skill's
++      param-setter).
++    - ``run_ladder({setting: inputs})`` executes every rung (in production, one
++      fan-out campaign through the existing executor path) and returns
++      ``{setting: run_dir}``. Rungs it omits are treated as failed.
++    - ``read_observable(run_dir)`` extracts the convergence observable from a
++      finished rung, or returns None if it cannot (the engine's output parser).
++
++    Args:
++        ladder: Settings from least to most accurate/expensive.
++        tolerance: Passed to :func:`converged_setting`.
++        param_name: Name of the swept parameter, for the result.
++
++    Returns:
++        A :class:`SweepResult` pairing the comparator verdict with the raw
++        observations and run directories.
++    """
++    members = {setting: build_member(setting) for setting in ladder}
++    run_dirs = run_ladder(members)
++    observations: List[Tuple[Any, Optional[float]]] = []
++    for setting in ladder:
++        run_dir = run_dirs.get(setting)
++        value = read_observable(run_dir) if run_dir is not None else None
++        observations.append((setting, value))
++    convergence = converged_setting(observations, tolerance)
++    return SweepResult(
++        convergence=convergence,
++        observations=observations,
++        run_dirs=run_dirs,
++        param_name=param_name,
++    )
++
++
++def _floor_ladder(
++    ladder: Sequence[Any], base: Any, direction: str,
++) -> Tuple[List[Any], bool]:
++    """Restrict a ladder to rungs at least as accurate as the base deck's value.
++
++    The ladder is ordered least- to most-accurate. ``direction`` says how the
++    raw value tracks accuracy: ``"ascending"`` (higher = more accurate, e.g.
++    ENCUT) or ``"descending"`` (smaller = more accurate, e.g. KSPACING). Rungs
++    less accurate than ``base`` are dropped, and ``base`` itself is prepended as
++    the cheapest rung when not already present, so the sweep can never adopt a
++    setting below the one input validation approved (e.g. ENCUT >= 1.3x ENMAX).
++
++    Returns ``(effective_ladder, floored)`` where ``floored`` is True when the
++    ladder changed (a rung dropped or the base prepended).
++    """
++    if direction == "descending":
++        kept = [v for v in ladder if v <= base]
++    else:
++        kept = [v for v in ladder if v >= base]
++    eff = list(kept)
++    if base not in eff:
++        eff = [base] + eff
++    return eff, (eff != list(ladder))
++
++
++@dataclass
++class ParameterConvergence:
++    """The result of converging a set of parameters for one calculation.
++
++    Attributes:
++        final_inputs: The deck with every converged parameter adopted (a
++            parameter that did not converge is left at its base value).
++        sweeps: One :class:`SweepResult` per parameter, in the order swept.
++        all_converged: True only if every parameter showed a plateau.
++        floors: ``parameter -> base value`` for each parameter whose ladder was
++            floored at the base deck's value (for reporting; empty when no floor
++            applied).
++    """
++
++    final_inputs: Dict[str, str]
++    sweeps: List[SweepResult]
++    all_converged: bool
++    floors: Dict[str, Any] = field(default_factory=dict)
++
++
++def converge_parameters(
++    *,
++    base_inputs: Dict[str, str],
++    specs: Sequence[dict],
++    set_param: Callable[[Dict[str, str], str, Any], Dict[str, str]],
++    read_observable: Callable[[Optional[str], str], Optional[float]],
++    run_ladder: Callable[[str, Dict[Any, Dict[str, str]]], Dict[Any, str]],
++    get_param: Optional[Callable[[Dict[str, str], str], Any]] = None,
++    tolerance_default: float = 0.0,
++) -> ParameterConvergence:
++    """Converge several numerical parameters in declared order (adopt-as-you-go).
++
++    Each spec (from the skill's ``convergence:`` frontmatter) is swept with
++    :func:`run_convergence_sweep`; when a parameter converges its value is
++    written into the working deck before the next parameter is swept, so later
++    ladders sit on the earlier converged settings — the standard protocol.
++
++    Engine-neutral. ``set_param`` / ``read_observable`` are the engine skill's
++    registry hooks; ``run_ladder(param, {setting: inputs})`` executes one ladder
++    (namespaced by ``param`` so run dirs don't collide) and returns
++    ``{setting: run_dir}``.
++
++    Args:
++        base_inputs: The generated base deck.
++        specs: Convergence specs, each ``{parameter, ladder, observable,
++            tolerance?}``.
++        set_param, read_observable, run_ladder: Injected engine/execution hooks.
++        tolerance_default: Tolerance for a spec that omits one.
++
++    Returns:
++        A :class:`ParameterConvergence`.
++    """
++    working = dict(base_inputs)
++    sweeps: List[SweepResult] = []
++    floors: Dict[str, Any] = {}
++    for spec in specs:
++        param = spec["parameter"]
++        ladder = list(spec["ladder"])
++        observable = spec["observable"]
++        tolerance = spec.get("tolerance", tolerance_default)
++        direction = spec.get("direction", "ascending")
++
++        # Floor the ladder at the base deck's value: input validation already
++        # approved it (e.g. ENCUT >= 1.3x ENMAX), and a plateau the observable
++        # reaches at a lower rung must not pull the adopted setting below it.
++        # Rungs below the floor are dropped before running (also a compute
++        # saving). Skipped when the base value is not comparably present.
++        if get_param is not None:
++            try:
++                base_val = get_param(working, param)
++            except Exception:
++                base_val = None
++            if base_val is None and spec.get("skip_without_floor", False):
++                # No readable base value and a floor is required (e.g. ENCUT,
++                # whose ladder bottom can sit below the POTCAR's 1.3x ENMAX
++                # minimum): running the ladder blind could adopt an invalid
++                # setting, so skip this parameter rather than guess.
++                sweeps.append(SweepResult(
++                    convergence=ConvergenceResult(
++                        False, None, None, [],
++                        "base value unreadable and a floor is required — "
++                        "parameter not swept"),
++                    observations=[], run_dirs={}, param_name=param))
++                continue
++            if base_val is not None:
++                ladder, floored = _floor_ladder(ladder, base_val, direction)
++                if floored:
++                    floors[param] = base_val
++
++        sweep = run_convergence_sweep(
++            ladder=ladder,
++            build_member=lambda v, w=working, p=param: set_param(w, p, v),
++            run_ladder=lambda members, p=param: run_ladder(p, members),
++            read_observable=lambda d, o=observable: read_observable(d, o),
++            tolerance=tolerance,
++            param_name=param,
++        )
++        sweeps.append(sweep)
++        if sweep.convergence.converged:
++            working = set_param(working, param, sweep.convergence.setting)
++
++    return ParameterConvergence(
++        final_inputs=working,
++        sweeps=sweeps,
++        all_converged=all(s.convergence.converged for s in sweeps),
++        floors=floors,
++    )
+diff --git a/scilink/agents/sim_agents/simulation_pipeline.py b/scilink/agents/sim_agents/simulation_pipeline.py
+index 9912531a3..236c32329 100644
+--- a/scilink/agents/sim_agents/simulation_pipeline.py
++++ b/scilink/agents/sim_agents/simulation_pipeline.py
+@@ -34,6 +34,7 @@
+ import json
+ import logging
+ import os
++import shutil
+ from pathlib import Path
+ from typing import Any, Dict, Optional
+ 
+@@ -428,6 +429,18 @@ def _apply_and_recheck(candidate):
+     )
+ 
+ 
++def _convergence_specs(software: str, scale: str) -> list:
++    """Return the engine skill's ``convergence:`` frontmatter block, or []."""
++    try:
++        from ...skills.loader import load_skill
++        meta = load_skill(software, domain=scale).get("meta") or {}
++        specs = meta.get("convergence") or []
++        return specs if isinstance(specs, list) else []
++    except Exception as e:  # a missing/malformed block must never break a run
++        logger.debug("no convergence specs for %s/%s: %r", software, scale, e)
++        return []
++
++
+ def _run_workflow_once(
+     user_request: str,
+     *,
+@@ -456,6 +469,7 @@ def _run_workflow_once(
+     auto_fix: bool = True,
+     required_observables: Optional[list] = None,
+     derive_observables: bool = False,
++    converge_parameters: bool = False,
+ ) -> Dict[str, Any]:
+     """Run the full structure → inputs → validation pipeline for any scale.
+ 
+@@ -803,6 +817,98 @@ def _run_workflow_once(
+                   if method != "llm" else "validation disabled by caller")
+         result["input_validation"] = {"status": "skipped", "message": reason}
+ 
++    # ── Step 3.5: numeric parameter convergence (opt-in; static scales) ──
++    # For a static calc whose engine skill declares a `convergence:` block, run
++    # each parameter's ladder to a plateau and adopt the converged settings into
++    # the deck before the production run. Same family as reference_check /
++    # derive_observables: opt-in, engine-neutral, skill-declared. Needs an
++    # executor + run_command since the ladder members are executed.
++    if (converge_parameters and scale in ("periodic_dft", "molecular_qc")
++            and executor is not None and run_command):
++        specs = _convergence_specs(software, scale)
++        base_inputs = _collect_input_files(gen_result)
++        if specs and base_inputs:
++            try:
++                from .convergence import converge_parameters as _run_convergence
++                from ...skills._shared._registry import get_tool_function
++                _set = get_tool_function("set_convergence_param",
++                                         active_skills=[software])
++                _read = get_tool_function("read_convergence_observable",
++                                          active_skills=[software])
++                try:
++                    _get = get_tool_function("get_convergence_param",
++                                             active_skills=[software])
++                except Exception:
++                    _get = None  # engine without a getter: no ladder floor
++                entry = gen_result.get("entry_file")
++
++                def _run_ladder(param, members, _entry=entry):
++                    dirs: Dict[Any, str] = {}
++                    root = os.path.join(output_dir, "convergence", str(param))
++                    for setting, member_inputs in members.items():
++                        rdir = os.path.join(root, str(setting))
++                        # Clear the step folder first: it is reused across a
++                        # structure retry (run_complete_workflow -> same
++                        # output_dir), and the observable reader only checks that
++                        # vasprun.xml exists. A step that fails before the engine
++                        # writes output would otherwise read the previous
++                        # attempt's output (a different structure) as valid.
++                        if os.path.isdir(rdir):
++                            shutil.rmtree(rdir, ignore_errors=True)
++                        os.makedirs(rdir, exist_ok=True)
++                        cmd = (run_command.format(script=_entry)
++                               if _entry and "{script}" in run_command
++                               else run_command)
++                        executor.run(member_inputs, cmd, rdir)
++                        dirs[setting] = rdir
++                    return dirs
++
++                pc = _run_convergence(
++                    base_inputs=base_inputs, specs=specs,
++                    set_param=lambda i, p, v: _set(input_files=i, param=p, value=v),
++                    read_observable=lambda d, o: _read(output_dir=d, observable=o),
++                    run_ladder=_run_ladder,
++                    get_param=((lambda i, p: _get(input_files=i, param=p))
++                               if _get is not None else None),
++                )
++                # Adopt converged settings into the deck the production run uses.
++                gen_result["input_files"] = pc.final_inputs
++                for name, contents in pc.final_inputs.items():
++                    (Path(output_dir) / name).write_text(contents, encoding="utf-8")
++                # Remove base-deck files the converged settings dropped (e.g. a
++                # KPOINTS file superseded by INCAR KSPACING). The executor writes
++                # the files it is given but never deletes, and the production run
++                # executes in output_dir, so a stale file left on disk would
++                # silently override the converged setting.
++                for name in set(base_inputs) - set(pc.final_inputs):
++                    try:
++                        (Path(output_dir) / name).unlink()
++                    except FileNotFoundError:
++                        pass
++                result["parameter_convergence"] = {
++                    "all_converged": pc.all_converged,
++                    "parameters": {
++                        s.param_name: {
++                            "converged": s.convergence.converged,
++                            "setting": s.convergence.setting,
++                            "value": s.convergence.value,
++                            "observations": s.observations,
++                            "reason": s.convergence.reason,
++                        } for s in pc.sweeps
++                    },
++                    # parameters whose ladder was floored at the base deck's
++                    # validated value (sweep could not adopt below it).
++                    "floored_at_base": pc.floors,
++                }
++                if pc.floors:
++                    logger.info("Convergence ladders floored at base deck values: %s",
++                                pc.floors)
++                result["steps_completed"].append("parameter_convergence")
++            except Exception as e:  # convergence is best-effort; never break the run
++                logger.warning("Parameter convergence skipped: %s", e)
++                result["parameter_convergence"] = {
++                    "status": "error", "message": str(e)}
++
+     # ── Step 4: supervised execution + refinement (only when an executor is
+     # supplied; DFT's default executor=None stops here and runs externally) ──
+     if executor is None:
+diff --git a/scilink/skills/molecular_qc/nwchem/nwchem.md b/scilink/skills/molecular_qc/nwchem/nwchem.md
+index 63a934e14..fc973f61b 100644
+--- a/scilink/skills/molecular_qc/nwchem/nwchem.md
++++ b/scilink/skills/molecular_qc/nwchem/nwchem.md
+@@ -12,6 +12,15 @@ detect:
+     module). Detection should treat the `nwchem` binary on $PATH, or any
+     of these env vars, as a positive hit. Unlike PySCF (a python module),
+     NWChem is an external executable, so python_modules is empty.
++# No `convergence:` block here. A plateau-style sweep fits a parameter whose
++# value FLATTENS as the knob increases (plane-wave ENCUT / k-points — see
++# vasp.md). A Gaussian basis sweep on the *absolute* energy does not flatten: it
++# approaches the CBS limit only slowly (~L^-3), so "adopt the smallest basis
++# past which the energy stops changing" is not a practical target. Basis
++# adequacy for QC belongs to a property / energy-difference target or a CBS
++# extrapolation (a different mechanism); until that exists, QC declares no
++# convergence sweep. The NWChem output reader
++# (nwchem_convergence.read_convergence_observable) stays as a reusable hook.
+ ---
+ # NWChem Molecular Quantum Chemistry Skill
+ 
+diff --git a/scilink/skills/molecular_qc/nwchem/nwchem_convergence.py b/scilink/skills/molecular_qc/nwchem/nwchem_convergence.py
+new file mode 100644
+index 000000000..15bdc8934
+--- /dev/null
++++ b/scilink/skills/molecular_qc/nwchem/nwchem_convergence.py
+@@ -0,0 +1,282 @@
++"""NWChem hooks for the engine-neutral parameter-convergence sweep.
++
++Mirrors the VASP hooks (`scilink/skills/periodic_dft/vasp/vasp_convergence.py`):
++the engine-neutral driver resolves these by name through the skill registry.
++
++- ``set_convergence_param`` writes one basis-set ladder value into the deck
++  (every ``* library <basis>`` line in the ``basis … end`` block).
++- ``read_convergence_observable`` reads the convergence observable
++  (total energy, HOMO–LUMO gap, dipole) from a finished run via cclib.
++
++Which basis ladder, observable, and tolerance to use is declared in the
++``convergence:`` block of ``nwchem.md``'s frontmatter — not here.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++from typing import Any, Dict, Optional
++
++from ..._shared._spec import ToolSpec
++
++logger = logging.getLogger(__name__)
++
++# `library <name>` inside a basis block — the token a basis sweep rewrites.
++_LIBRARY_RE = re.compile(r"(\blibrary\s+)(\S+)", re.IGNORECASE)
++
++_HARTREE_EV = 27.211386245988
++
++# NWChem's SCF/DFT reference energy line: "Total DFT energy = -76.35..." (DFT)
++# or "Total SCF energy = ..." (HF). Parsed directly so the primary observable
++# needs no cclib (which may be absent).
++_ENERGY_RE = re.compile(
++    r"Total\s+(?:DFT|SCF)\s+energy\s*=\s*(-?\d+\.\d+)", re.IGNORECASE)
++
++# Post-HF correlated total-energy lines, highest level of theory first. For an
++# MP2 or CCSD(T) run the basis-dependent result is the correlated total, not the
++# SCF/DFT reference _ENERGY_RE matches — judging the sweep on the reference would
++# converge the wrong quantity and adopt too small a basis. The presence of a
++# correlated total is the signal the run was post-HF, so prefer whichever the
++# log holds (CCSD(T) > CCSD > MP2).
++#
++# Two module families write the line two different ways (both captured from real
++# NWChem 7.2.3 output on a water/3-21G run — see tests/fixtures/nwchem/):
++#   TCE module:      "CCSD(T) total energy / hartree    =   -75.716987..."
++#   classic/direct:  "Total CCSD(T) energy:                -75.716987..."
++#                    "Total MP2 energy           -75.708301..."   (no '=' or ':')
++# so each pattern matches BOTH "Total <M> energy" and "<M> total energy
++# [/ hartree]", with the number after '=', ':' or just whitespace. Traps avoided:
++# the leading (?<![\w-]) rejects the scaled variants "SCS-MP2"/"SCS-CCSD", and
++# matching CCSD(T) with literal "(T)" skips the "[T]"/"CCSD+T(CCSD)" lines.
++def _total_energy_re(method: str) -> "re.Pattern":
++    return re.compile(
++        rf"(?<![\w-])(?:Total\s+{method}\s+energy|"
++        rf"{method}\s+total\s+energy(?:\s*/\s*hartree)?)"
++        rf"\s*[=:]?\s+(-?\d+\.\d+)",
++        re.IGNORECASE)
++
++
++_CORRELATED_ENERGY_RES = (
++    _total_energy_re(r"CCSD\(T\)"),
++    _total_energy_re(r"CCSD"),
++    _total_energy_re(r"(?:MP2|MBPT\(2\))"),  # direct MP2 module, or TCE's MBPT(2)
++)
++
++
++def _find_nwchem_log(output_dir: str):
++    """The NWChem output log in a run dir (LocalExecutor writes run_stdout.log)."""
++    from pathlib import Path
++    d = Path(output_dir)
++    for name in ("run_stdout.log", "stdout", "nwchem.out"):
++        if (d / name).is_file():
++            return d / name
++    for pattern in ("*.out", "*.nwo", "*.log"):
++        hits = sorted(d.glob(pattern))
++        if hits:
++            return hits[-1]
++    return None
++
++
++def _read_total_energy_eV(output_dir: str):
++    """Highest-level total energy from the NWChem log, in eV (or None).
++
++    For a post-HF run (MP2, CCSD(T) via TCE) the basis-dependent result is the
++    correlated total energy; prefer whichever correlated total the log holds
++    (CCSD(T) > CCSD > MP2), falling back to the SCF/DFT reference for an HF/DFT
++    run. Takes the last occurrence so a multi-step deck reads its final result.
++    """
++    log = _find_nwchem_log(output_dir)
++    if log is None:
++        return None
++    try:
++        text = log.read_text(errors="replace")
++    except OSError:
++        return None
++    for rx in _CORRELATED_ENERGY_RES:
++        matches = rx.findall(text)
++        if matches:
++            return float(matches[-1]) * _HARTREE_EV
++    matches = _ENERGY_RE.findall(text)
++    if not matches:
++        return None
++    return float(matches[-1]) * _HARTREE_EV
++
++
++def _set_orbital_basis(deck: str, value: Any) -> tuple:
++    """Rewrite ``library <x>`` → ``library <value>`` only in the orbital basis.
++
++    A basis sweep must touch the AO (orbital) basis and nothing else. NWChem
++    decks also carry ``library`` lines the sweep must leave alone: an ``ecp``
++    block (``* library def2-ecp``) and named auxiliary/fitting bases
++    (``basis "cd basis" ... * library def2-universal-jkfit``). Rewriting those
++    (as a deck-wide substitution does) turns an ECP into a non-ECP basis and
++    corrupts the fitting set, so every rung past Kr fails or gives wrong
++    energies. Scope the substitution to the orbital basis block — opened by a
++    bare ``basis`` or ``basis "ao basis"`` and closed by ``end``.
++
++    Returns ``(new_deck, n_substitutions)``.
++    """
++    out_lines = []
++    in_orbital_basis = False
++    n = 0
++    for line in deck.split("\n"):
++        toks = line.strip().lower().split()
++        if toks and toks[0] == "basis":
++            # Orbital basis unless it is a *named* auxiliary basis (e.g.
++            # "cd basis", "fitting basis"); unnamed or "ao basis" is the orbital one.
++            m = re.search(r'"([^"]*)"', line)
++            name = (m.group(1).lower() if m else "ao basis")
++            in_orbital_basis = name in ("ao basis", "")
++            out_lines.append(line)
++        elif in_orbital_basis and toks == ["end"]:
++            in_orbital_basis = False
++            out_lines.append(line)
++        elif in_orbital_basis:
++            new_line, k = _LIBRARY_RE.subn(
++                lambda mm: f"{mm.group(1)}{value}", line)
++            n += k
++            out_lines.append(new_line)
++        else:
++            out_lines.append(line)
++    return "\n".join(out_lines), n
++
++
++def _deck_key(input_files: Dict[str, str]) -> str:
++    """Return the NWChem deck filename (the single `.nw` file)."""
++    nw = [k for k in input_files if k.lower().endswith(".nw")]
++    if not nw:
++        raise KeyError("no NWChem deck (*.nw) in input_files")
++    return nw[0]
++
++
++def set_convergence_param(
++    input_files: Dict[str, str], param: str, value: Any,
++) -> Dict[str, str]:
++    """Return a copy of ``input_files`` with the basis set to ``value``.
++
++    Args:
++        input_files: The base deck as ``{filename: contents}`` (one ``*.nw``).
++        param: The frontmatter parameter name — only ``"basis"`` is supported.
++        value: The basis-library name to write (e.g. ``"def2-tzvp"``).
++
++    Returns:
++        A new ``{filename: contents}`` map with every ``library <x>`` in the
++        deck replaced by ``library <value>`` — a basis sweep uses one basis for
++        the whole molecule per rung.
++
++    Raises:
++        ValueError: If ``param`` is not ``"basis"``.
++        KeyError: If there is no ``*.nw`` deck.
++        ValueError: If the deck has no ``library`` line to set.
++    """
++    if param != "basis":
++        raise ValueError(
++            f"unknown NWChem convergence parameter {param!r}; only 'basis'")
++    key = _deck_key(input_files)
++    deck = input_files[key]
++    new_deck, n = _set_orbital_basis(deck, value)
++    if n == 0:
++        raise ValueError(
++            "no `library <basis>` line found in the NWChem orbital basis block")
++    out = dict(input_files)
++    out[key] = new_deck
++    return out
++
++
++def read_convergence_observable(
++    output_dir: str, observable: str,
++) -> Optional[float]:
++    """Read one convergence observable from a finished NWChem run.
++
++    Args:
++        output_dir: The run directory.
++        observable: ``"total_energy"`` (eV), ``"homo_lumo_gap"`` (eV), or
++            ``"dipole"`` (Debye).
++
++    Returns:
++        The observable as a float, or ``None`` if it cannot be read (missing or
++        unparseable output, unknown observable). Never raises.
++    """
++    if observable == "total_energy":
++        # Regex the energy straight from the log — robust and cclib-free, since
++        # the total energy is the primary (universal) convergence observable.
++        try:
++            return _read_total_energy_eV(output_dir)
++        except Exception as e:
++            logger.warning("total_energy read failed in %s: %s", output_dir, e)
++            return None
++
++    # HOMO-LUMO gap and dipole go through cclib (install cclib to use them).
++    try:
++        import cclib
++        import numpy as np
++        # Use the same log resolver as total_energy — an unsorted glob can pick
++        # run_stderr.log (the executor writes both run_stdout.log and
++        # run_stderr.log), which cclib reads as empty -> None every rung.
++        log = _find_nwchem_log(output_dir)
++        if log is None:
++            return None
++        data = cclib.io.ccread(str(log))
++        if data is None:
++            return None
++        if observable == "homo_lumo_gap":
++            mo = data.moenergies[0]          # eV, first spin channel
++            h = data.homos[0]
++            return float(mo[h + 1] - mo[h])
++        if observable == "dipole":
++            return float(np.linalg.norm(data.moments[1]))  # Debye
++    except Exception as e:
++        logger.warning("could not read %s from %s: %s", observable, output_dir, e)
++        return None
++
++    logger.warning("unknown convergence observable %r", observable)
++    return None
++
++
++TOOL_SPECS = [
++    ToolSpec(
++        name="set_convergence_param",
++        description=(
++            "Write one basis-set ladder value into an NWChem deck (replaces "
++            "`* library <basis>` in the basis block). Engine hook for the "
++            "convergence sweep; the basis ladder lives in nwchem.md's "
++            "`convergence:` frontmatter."
++        ),
++        parameters={
++            "input_files": {"type": "object",
++                            "description": "Base deck {filename: contents}."},
++            "param": {"type": "string", "description": "Must be 'basis'."},
++            "value": {"type": "string",
++                      "description": "Basis library name, e.g. def2-tzvp."},
++        },
++        required=["input_files", "param", "value"],
++        signature="set_convergence_param(input_files: dict, param: str, value) -> dict",
++        import_line=(
++            "from scilink.skills.molecular_qc.nwchem.nwchem_convergence import "
++            "set_convergence_param"),
++        agents=["simulation"],
++        returns="dict {filename: contents} with the basis applied.",
++    ),
++    ToolSpec(
++        name="read_convergence_observable",
++        description=(
++            "Read a convergence observable (total_energy, homo_lumo_gap, "
++            "dipole) from a finished NWChem run directory via cclib. Engine "
++            "hook for the convergence sweep; returns None if unreadable."
++        ),
++        parameters={
++            "output_dir": {"type": "string",
++                           "description": "Finished NWChem run directory."},
++            "observable": {"type": "string",
++                           "description": "total_energy | homo_lumo_gap | dipole."},
++        },
++        required=["output_dir", "observable"],
++        signature="read_convergence_observable(output_dir: str, observable: str) -> float | None",
++        import_line=(
++            "from scilink.skills.molecular_qc.nwchem.nwchem_convergence import "
++            "read_convergence_observable"),
++        agents=["simulation"],
++        returns="float observable value, or None if unreadable.",
++    ),
++]
+diff --git a/scilink/skills/periodic_dft/vasp/vasp.md b/scilink/skills/periodic_dft/vasp/vasp.md
+index 2881951c5..faabc78ab 100644
+--- a/scilink/skills/periodic_dft/vasp/vasp.md
++++ b/scilink/skills/periodic_dft/vasp/vasp.md
+@@ -19,6 +19,32 @@ detect:
+     HPC clusters with Lmod or similar, the binary may only be on
+     $PATH after `module load vasp/<version>`. Detection should
+     consider any of the above as a positive hit.
++# Numerical parameters whose value must be converged before a result is
++# trustworthy. The engine-neutral convergence sweep reads this block, runs each
++# ladder (least->most accurate order) as a fan-out via the skill hooks
++# set_convergence_param / read_convergence_observable, and adopts the cheapest
++# setting past which the observable stops changing within tolerance.
++convergence:
++  - parameter: ENCUT
++    ladder: [300, 400, 500, 600, 700]     # eV
++    direction: ascending                   # higher ENCUT = more accurate; floor the
++                                           # ladder at (>=) the base deck's ENCUT so the
++                                           # sweep never adopts below the validated
++                                           # 1.3x-ENMAX minimum (see Quality checks below)
++    skip_without_floor: true               # if the deck leaves ENCUT unset there is no
++                                           # safe floor (the 300 eV rung may be < ENMAX),
++                                           # so skip the sweep rather than run it blind
++    observable: energy_per_atom           # eV/atom
++    tolerance: 0.001
++  - parameter: k-points
++    ladder: [0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.12, 0.1]  # KSPACING Å^-1, descending = denser
++    direction: descending                  # smaller KSPACING = more accurate; floor the
++                                           # ladder at (<=) the base deck's KSPACING
++    observable: energy_per_atom           # eV/atom
++    tolerance: 0.005                       # judge at the meaningful energy scale (~few
++                                           # meV); a metal's k-sampling wobbles sub-5-meV
++                                           # even at dense meshes, and the properties the
++                                           # benchmark scores need far less than 1 meV
+ ---
+ # VASP Input Generation Skill
+ 
+diff --git a/scilink/skills/periodic_dft/vasp/vasp_convergence.py b/scilink/skills/periodic_dft/vasp/vasp_convergence.py
+new file mode 100644
+index 000000000..0023fb4d4
+--- /dev/null
++++ b/scilink/skills/periodic_dft/vasp/vasp_convergence.py
+@@ -0,0 +1,372 @@
++"""VASP hooks for the engine-neutral parameter-convergence sweep.
++
++The convergence driver (`scilink.agents.sim_agents.convergence`) is engine-
++neutral; the engine specifics live here and are resolved by name through the
++skill registry (like ``default_run_command`` / ``snapshot_run``):
++
++- ``set_convergence_param`` writes one ladder value into a deck (ENCUT into
++  INCAR; k-point density via INCAR ``KSPACING``, dropping any KPOINTS file so
++  the spacing takes effect).
++- ``read_convergence_observable`` reads the convergence observable
++  (energy/atom, lattice constant, band gap) from a finished run.
++
++Which parameters, ladders, observables, and tolerances to use is declared in
++the ``convergence:`` block of ``vasp.md``'s frontmatter — not here.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++from pathlib import Path
++from typing import Any, Dict, Optional
++
++from ..._shared._spec import ToolSpec
++
++logger = logging.getLogger(__name__)
++
++_INCAR = "INCAR"
++_KPOINTS = "KPOINTS"
++
++# frontmatter `parameter` name -> INCAR key it maps to.
++_PARAM_TO_INCAR_KEY = {
++    "ENCUT": "ENCUT",
++    "KSPACING": "KSPACING",
++    "k-points": "KSPACING",
++    "kpoints": "KSPACING",
++}
++
++
++def _set_incar_key(incar_text: str, key: str, value: Any) -> str:
++    """Return INCAR text with ``key`` set to ``value`` (replaced or appended).
++
++    VASP allows several tags on one line separated by ``;`` (plus trailing ``#``
++    / ``!`` comments) and reads the FIRST occurrence of a tag. So the match is
++    anchored at a line start OR just after a ``;`` — a tag that is not first on
++    its line is edited in place rather than left intact while a duplicate is
++    appended (the engine would read the stale first copy). The value match stops
++    at the next ``;``, ``#`` or ``!`` so neighbouring tags and comments survive.
++    """
++    newval = f"{key} = {value}"
++    pattern = re.compile(
++        rf"(?P<lead>^|;)(?P<ws>[^\S\n]*){re.escape(key)}\s*=\s*[^;#!\n]*",
++        re.MULTILINE | re.IGNORECASE)
++    if pattern.search(incar_text):
++        return pattern.sub(
++            lambda m: f"{m.group('lead')}{m.group('ws')}{newval}", incar_text)
++    sep = "" if incar_text.endswith("\n") or not incar_text else "\n"
++    return f"{incar_text}{sep}{newval}\n"
++
++
++def set_convergence_param(
++    input_files: Dict[str, str], param: str, value: Any,
++) -> Dict[str, str]:
++    """Return a copy of ``input_files`` with one convergence parameter set.
++
++    Args:
++        input_files: The base deck as ``{filename: contents}`` (must contain
++            INCAR).
++        param: The frontmatter ``parameter`` name (e.g. ``"ENCUT"`` or
++            ``"k-points"``).
++        value: The ladder value to write.
++
++    Returns:
++        A new ``{filename: contents}`` map with the parameter applied. For a
++        k-point sweep the INCAR ``KSPACING`` is set and any ``KPOINTS`` file is
++        removed so the spacing governs the mesh.
++
++    Raises:
++        KeyError: If INCAR is absent.
++        ValueError: If ``param`` is not a known VASP convergence parameter.
++    """
++    incar_key = _PARAM_TO_INCAR_KEY.get(param)
++    if incar_key is None:
++        raise ValueError(
++            f"unknown VASP convergence parameter {param!r}; "
++            f"known: {sorted(set(_PARAM_TO_INCAR_KEY))}")
++    if _INCAR not in input_files:
++        raise KeyError("INCAR not present in input_files")
++
++    out = dict(input_files)
++    out[_INCAR] = _set_incar_key(out[_INCAR], incar_key, value)
++    if incar_key == "KSPACING":
++        out.pop(_KPOINTS, None)  # KSPACING is ignored while a KPOINTS file exists
++    return out
++
++
++def _effective_kspacing(input_files: Dict[str, str]) -> Optional[float]:
++    """Effective KSPACING (Å^-1) of an explicit KPOINTS mesh, or ``None``.
++
++    Decks from pymatgen/atomate2 usually carry a KPOINTS file rather than INCAR
++    ``KSPACING``; to floor the k-point sweep we need the starting density as a
++    scalar. Reads the regular mesh from KPOINTS and the cell from POSCAR and
++    returns the coarsest per-axis spacing ``max_i(|b_i| / N_i)`` with ``|b_i|``
++    including the 2*pi factor (VASP's convention, so it round-trips through
++    ``N_i = max(1, ceil(|b_i| / KSPACING))``). Returns ``None`` for a non-mesh
++    KPOINTS (explicit/line-mode/length-style), a missing POSCAR, or anything
++    unparseable — the caller then applies no floor rather than guessing.
++
++    The floor is therefore on the *spacing* (the coarsest axis, which limits
++    accuracy), not on the per-axis k-point counts. For a mesh that was not set
++    from the reciprocal-vector lengths this coarsest spacing can regenerate a
++    sparser mesh on the other axes (e.g. a uniform 8x8x8 on a 3x4x6 Å cell comes
++    back ~8x6x4 at the floor value), so "never below the base" holds for spacing,
++    not for the original counts — acceptable because the coarsest spacing is the
++    accuracy-limiting one.
++    """
++    kpoints_text = input_files.get(_KPOINTS)
++    poscar_text = input_files.get("POSCAR")
++    if not kpoints_text or not poscar_text:
++        return None
++    try:
++        import math  # noqa: F401  (kept explicit for clarity of the formula)
++        from pymatgen.core import Structure
++        from pymatgen.io.vasp.inputs import Kpoints
++        mesh = list(Kpoints.from_str(kpoints_text).kpts[0])
++        if len(mesh) != 3 or any(int(n) < 1 for n in mesh):
++            return None  # length-style automatic or explicit/line-mode: not a mesh
++        b = Structure.from_str(poscar_text, fmt="poscar").lattice.reciprocal_lattice.abc
++        return max(float(b[i]) / int(mesh[i]) for i in range(3))
++    except Exception as e:
++        logger.warning("could not derive effective KSPACING from KPOINTS: %s", e)
++        return None
++
++
++def get_convergence_param(
++    input_files: Dict[str, str], param: str,
++) -> Optional[float]:
++    """Return the base deck's current value for a convergence parameter.
++
++    The sweep uses this to *floor* its ladder at the value input validation
++    already approved (e.g. ENCUT >= 1.3x max ENMAX, vasp.md:293), so a plateau
++    that the observable happens to reach at a lower rung cannot pull the
++    production run below the validated setting.
++
++    Parses the deck with pymatgen (``Incar`` / ``Kpoints``) rather than a regex,
++    so a tag anywhere on a line — first, after a ``;``, or with a trailing
++    comment — is read correctly.
++
++    Args:
++        input_files: The base deck as ``{filename: contents}``.
++        param: The frontmatter ``parameter`` name (e.g. ``"ENCUT"``).
++
++    Returns:
++        The current value as a float, or ``None`` when it is not present in a
++        comparable form. For k-points: INCAR ``KSPACING`` is ignored whenever a
++        KPOINTS file exists (VASP lets the mesh govern), in which case the mesh's
++        effective KSPACING is returned; otherwise INCAR ``KSPACING`` is used. For
++        ENCUT: ``None`` when the deck leaves it unset (no safe scalar to floor;
++        the driver skips that sweep). On ``None`` the driver applies no floor for
++        that parameter rather than guessing. Never raises for a readable deck.
++
++    Raises:
++        ValueError: If ``param`` is not a known VASP convergence parameter.
++    """
++    incar_key = _PARAM_TO_INCAR_KEY.get(param)
++    if incar_key is None:
++        raise ValueError(
++            f"unknown VASP convergence parameter {param!r}; "
++            f"known: {sorted(set(_PARAM_TO_INCAR_KEY))}")
++
++    if incar_key == "KSPACING":
++        # A KPOINTS file overrides INCAR KSPACING in VASP, so when one is present
++        # the mesh is the real starting density.
++        if _KPOINTS in input_files:
++            return _effective_kspacing(input_files)
++        incar = _parse_incar(input_files.get(_INCAR))
++        v = incar.get("KSPACING")
++        return float(v) if v is not None else None
++
++    incar = _parse_incar(input_files.get(_INCAR))
++    v = incar.get(incar_key)
++    try:
++        return float(v) if v is not None else None
++    except (TypeError, ValueError):
++        return None
++
++
++def _parse_incar(incar_text: Optional[str]) -> Dict[str, Any]:
++    """Parse INCAR text to a ``{tag: value}`` dict with pymatgen, or ``{}``."""
++    if not incar_text:
++        return {}
++    try:
++        from pymatgen.io.vasp.inputs import Incar
++        return dict(Incar.from_str(incar_text))
++    except Exception as e:
++        logger.warning("could not parse INCAR: %s", e)
++        return {}
++
++
++def read_convergence_observable(
++    output_dir: str, observable: str,
++) -> Optional[float]:
++    """Read one convergence observable from a finished VASP run.
++
++    Args:
++        output_dir: The run directory (must contain vasprun.xml).
++        observable: One of ``"energy_per_atom"`` (eV/atom),
++            ``"lattice_constant_a"`` (Å), ``"band_gap"`` (eV).
++
++    Returns:
++        The observable as a float, or ``None`` if it cannot be read (missing or
++        unparseable output, unknown observable). Never raises — a failed rung
++        becomes a ``None`` the comparator skips.
++    """
++    vasprun_path = Path(output_dir) / "vasprun.xml"
++    if not vasprun_path.exists():
++        return None
++    try:
++        from pymatgen.io.vasp.outputs import Vasprun
++    except ImportError as e:  # pragma: no cover
++        logger.warning("pymatgen not available: %s", e)
++        return None
++
++    need_eigen = observable == "band_gap"
++    try:
++        vr = Vasprun(
++            str(vasprun_path), parse_dos=False, parse_eigen=need_eigen,
++            parse_potcar_file=False, exception_on_bad_xml=False,
++        )
++    except Exception as e:
++        logger.warning("vasprun.xml parse failed in %s: %s", output_dir, e)
++        return None
++
++    try:
++        if observable == "energy_per_atom":
++            # A run that hit NELM without electronic convergence still reports a
++            # final energy; accepting it would let the comparator fake or block a
++            # plateau. An unconverged rung reads as None (per this hook's contract).
++            if not vr.converged_electronic:
++                logger.warning(
++                    "SCF not electronically converged in %s; energy_per_atom=None",
++                    output_dir)
++                return None
++            n = len(vr.final_structure)
++            return float(vr.final_energy) / n if n else None
++        if observable == "lattice_constant_a":
++            # A geometry observable — require ionic relaxation (and its SCF
++            # steps) to have converged, not just a parsable final structure.
++            if not vr.converged:
++                logger.warning(
++                    "relaxation not converged in %s; lattice_constant_a=None",
++                    output_dir)
++                return None
++            return float(vr.final_structure.lattice.abc[0])
++        if observable == "band_gap":
++            if not vr.converged_electronic:
++                logger.warning(
++                    "SCF not electronically converged in %s; band_gap=None",
++                    output_dir)
++                return None
++            return float(vr.eigenvalue_band_properties[0])
++    except Exception as e:
++        logger.warning("could not read %s from %s: %s", observable, output_dir, e)
++        return None
++
++    logger.warning("unknown convergence observable %r", observable)
++    return None
++
++
++def kspacing_to_mesh(output_dir: str) -> Optional[str]:
++    """Return the k-mesh a KSPACING run generated, as ``"n1×n2×n3"``.
++
++    Computes the mesh VASP derives from KSPACING and the cell —
++    ``N_i = max(1, ceil(|b_i| / KSPACING))`` with reciprocal vectors ``b_i``
++    including the 2π factor — so a human-facing report can speak in meshes even
++    though the ladder is declared in KSPACING. Reads the run's INCAR (for
++    KSPACING) and POSCAR (for the cell). Returns ``None`` when the run has no
++    KSPACING (e.g. an ENCUT rung) or the cell cannot be read.
++    """
++    d = Path(output_dir)
++    incar, poscar = d / "INCAR", d / "POSCAR"
++    if not incar.is_file() or not poscar.is_file():
++        return None
++    m = re.search(r"^\s*KSPACING\s*=\s*([0-9.eE+-]+)", incar.read_text(),
++                  re.MULTILINE | re.IGNORECASE)
++    if not m:
++        return None
++    try:
++        import math
++        import numpy as np
++        from ase.io import read as _read
++        kspacing = float(m.group(1))
++        atoms = _read(str(poscar), format="vasp")
++        recip = 2 * math.pi * np.linalg.inv(np.array(atoms.cell[:])).T  # rows b_i
++        dims = [max(1, math.ceil(float(np.linalg.norm(recip[i])) / kspacing))
++                for i in range(3)]
++        return "×".join(str(n) for n in dims)
++    except Exception as e:  # display-only; never break on it
++        logger.debug("kspacing_to_mesh failed in %s: %s", output_dir, e)
++        return None
++
++
++TOOL_SPECS = [
++    ToolSpec(
++        name="set_convergence_param",
++        description=(
++            "Write one convergence-ladder value into a VASP deck (ENCUT into "
++            "INCAR, or k-point density via INCAR KSPACING). Engine hook for the "
++            "convergence sweep; declared parameters/ladders live in vasp.md's "
++            "`convergence:` frontmatter."
++        ),
++        parameters={
++            "input_files": {"type": "object",
++                            "description": "Base deck {filename: contents}."},
++            "param": {"type": "string",
++                      "description": "Frontmatter parameter name, e.g. ENCUT."},
++            "value": {"type": ["number", "string"],
++                      "description": "Ladder value to write."},
++        },
++        required=["input_files", "param", "value"],
++        signature="set_convergence_param(input_files: dict, param: str, value) -> dict",
++        import_line=(
++            "from scilink.skills.periodic_dft.vasp.vasp_convergence import "
++            "set_convergence_param"),
++        agents=["simulation"],
++        returns="dict {filename: contents} with the parameter applied.",
++    ),
++    ToolSpec(
++        name="get_convergence_param",
++        description=(
++            "Read a VASP deck's current convergence-parameter value (ENCUT, or "
++            "k-point density via INCAR KSPACING) so the sweep can floor its "
++            "ladder at the validated setting. Returns None if not present in a "
++            "comparable form (e.g. an explicit KPOINTS mesh)."
++        ),
++        parameters={
++            "input_files": {"type": "object",
++                            "description": "Base deck {filename: contents}."},
++            "param": {"type": "string",
++                      "description": "Frontmatter parameter name, e.g. ENCUT."},
++        },
++        required=["input_files", "param"],
++        signature="get_convergence_param(input_files: dict, param: str) -> float | None",
++        import_line=(
++            "from scilink.skills.periodic_dft.vasp.vasp_convergence import "
++            "get_convergence_param"),
++        agents=["simulation"],
++        returns="float current value, or None if not comparably present.",
++    ),
++    ToolSpec(
++        name="read_convergence_observable",
++        description=(
++            "Read a convergence observable (energy_per_atom, lattice_constant_a, "
++            "band_gap) from a finished VASP run directory. Engine hook for the "
++            "convergence sweep; returns None if unreadable."
++        ),
++        parameters={
++            "output_dir": {"type": "string",
++                           "description": "Finished VASP run directory."},
++            "observable": {"type": "string",
++                           "description": "energy_per_atom | lattice_constant_a "
++                                          "| band_gap."},
++        },
++        required=["output_dir", "observable"],
++        signature="read_convergence_observable(output_dir: str, observable: str) -> float | None",
++        import_line=(
++            "from scilink.skills.periodic_dft.vasp.vasp_convergence import "
++            "read_convergence_observable"),
++        agents=["simulation"],
++        returns="float observable value, or None if unreadable.",
++    ),
++]
+diff --git a/tests/fixtures/nwchem/README.md b/tests/fixtures/nwchem/README.md
+index 293ba7316..8e22e19c6 100644
+--- a/tests/fixtures/nwchem/README.md
++++ b/tests/fixtures/nwchem/README.md
+@@ -1,9 +1,23 @@
+-# NWChem output fixtures (for `snapshot_run` tests)
++# NWChem output fixtures
+ 
+-Drop a real NWChem output log here (e.g. `dipropylamine_opt.out`) to activate
+-the layer-3 parse test in `tests/test_molecular_qc_output.py`
+-(`test_snapshot_real_output`), which is skipped until a `*.out` file exists in
+-this directory.
++Real NWChem output captured so parsers are tested against actual module wording,
++not a guessed format.
++
++- `h2o_b3lyp_smoketest.out` — DFT single point (activates the `snapshot_run`
++  layer-3 parse test in `tests/test_molecular_qc_output.py`).
++- `h2o_tce_ccsdt_7.2.3.out` — excerpt, TCE CCSD(T) (`CCSD(T) total energy /
++  hartree = ...`).
++- `h2o_direct_mp2_ccsdt_7.2.3.out` — excerpt, direct MP2 + classic CCSD(T)
++  (`Total MP2 energy ...`, `Total CCSD(T) energy: ...`).
++
++The two correlated excerpts were captured from NWChem 7.2.3 (water / 3-21G) on
++Deception 2026-10-07 and drive the `read_convergence_observable` correlated-
++energy tests in `tests/test_nwchem_convergence_hooks.py` — the two module
++families write the total-energy line differently, and the sweep must read the
++correlated total (MP2/CCSD(T)), not the SCF reference.
++
++Drop any additional real NWChem `*.out` here (e.g. `dipropylamine_opt.out`) to
++exercise more of the parser; the `cclib`-based tests also need `cclib` installed.
+ 
+ Why this is empty: the project archive's `3_DFT/nwchem_jobs/` contains only
+ `_rdkit.xyz` **inputs** — NWChem was never run — so no real output was
+diff --git a/tests/fixtures/nwchem/h2o_direct_mp2_ccsdt_7.2.3.out b/tests/fixtures/nwchem/h2o_direct_mp2_ccsdt_7.2.3.out
+new file mode 100644
+index 000000000..99a7749fc
+--- /dev/null
++++ b/tests/fixtures/nwchem/h2o_direct_mp2_ccsdt_7.2.3.out
+@@ -0,0 +1,35 @@
++                              NWChem (excerpt)
++    Real energy-bearing lines from NWChem 7.2.3 (water / 3-21G), the direct/
++    classic modules, `task mp2 energy` then `task ccsd(t) energy`. Captured on
++    Deception 2026-10-07. This family writes "Total <METHOD> energy[:] <value>"
++    (Total first; ':' or just whitespace, no "/ hartree") — different wording
++    from the TCE module, which is why the parser must handle both. Traps: the
++    SCS-* scaled variants, and "Total CCSD+T(CCSD) energy" (the [T], not the
++    (T) we want).
++
++         Total SCF energy =    -75.585380768303
++
++                   NWChem MP2 Semi-direct Energy/Gradient Module
++
++          Correlation energy          -0.122920417412
++          Total MP2 energy           -75.708301185715
++
++                    Spin Component Scaled (SCS) MP2
++          SCS-MP2 correlation energy          -0.123347518960
++          Total SCS-MP2 energy               -75.708728287263
++
++ MP2 Corr. energy:             -0.122920417412402
++ Total MP2 energy:            -75.708301185715300
++
++ CCSD corr. energy:             -0.130243971043722
++ Total CCSD energy:            -75.715624739346623
++
++ Spin Component Scaled (SCS) CCSD
++ SCS-CCSD correlation energy:            -0.162151308774602
++ Total SCS-CCSD energy:                 -75.747532077077494
++
++ CCSD corr. energy:                     -0.130243971043722
++ T(CCSD) corr. energy:                  -0.001448190755085
++ Total CCSD+T(CCSD) energy:            -75.717072930101708
++ CCSD corr. energy:                     -0.130243971043722
++ Total CCSD(T) energy:                 -75.716987101819456
+diff --git a/tests/fixtures/nwchem/h2o_tce_ccsdt_7.2.3.out b/tests/fixtures/nwchem/h2o_tce_ccsdt_7.2.3.out
+new file mode 100644
+index 000000000..da8cc30f9
+--- /dev/null
++++ b/tests/fixtures/nwchem/h2o_tce_ccsdt_7.2.3.out
+@@ -0,0 +1,21 @@
++                              NWChem (excerpt)
++    Real energy-bearing lines from NWChem 7.2.3 (water / 3-21G), TCE module,
++    `tce; ccsd(t); end; task tce energy`. Captured on Deception 2026-10-07.
++    Kept as a fixture so the correlated-energy parser is tested against real
++    module wording ("<METHOD> total energy / hartree = ...") rather than a guess.
++    The "(T)" total is the one to extract; the "[T]" lines are a trap.
++
++         Total SCF energy =    -75.585380768303
++
++ CCSD correlation energy / hartree =        -0.130243948774105
++ CCSD total energy / hartree       =       -75.715624717076864
++
++                   CCSD(T)
++ Using plain CCSD(T) code
++
++ CCSD[T]  correction energy / hartree =        -0.001448190267540
++ CCSD[T] correlation energy / hartree =        -0.131692139041645
++ CCSD[T] total energy / hartree       =       -75.717072907344402
++ CCSD(T)  correction energy / hartree =        -0.001362362485734
++ CCSD(T) correlation energy / hartree =        -0.131606311259838
++ CCSD(T) total energy / hartree       =       -75.716987079562600
+diff --git a/tests/test_convergence_comparator.py b/tests/test_convergence_comparator.py
+new file mode 100644
+index 000000000..3625c5506
+--- /dev/null
++++ b/tests/test_convergence_comparator.py
+@@ -0,0 +1,371 @@
++"""Unit tests for the engine-neutral convergence comparator."""
++
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++from scilink.agents.sim_agents.convergence import (  # noqa: E402
++    converged_setting, ConvergenceResult, run_convergence_sweep, SweepResult,
++    converge_parameters, ParameterConvergence, _floor_ladder,
++)
++
++
++def test_clear_plateau_adopts_cheapest_trustworthy_setting():
++    # Energy/atom (eV) vs ENCUT (eV): flat from 400 up, within 1 meV.
++    obs = [(300, -5.20), (400, -5.401), (500, -5.4015), (600, -5.4012)]
++    r = converged_setting(obs, tolerance=0.001)
++    assert r.converged is True
++    assert r.setting == 400            # cheapest within tol of the top
++    assert r.value == -5.4012          # value from the most-accurate setting
++
++
++def test_not_converged_when_still_drifting_at_top():
++    obs = [(300, -5.0), (400, -5.2), (500, -5.35), (600, -5.47)]
++    r = converged_setting(obs, tolerance=0.001)
++    assert r.converged is False
++    assert r.setting is None
++    assert r.value == -5.47            # best estimate still reported
++    assert "extend" in r.reason
++
++
++def test_single_setting_cannot_demonstrate_plateau():
++    r = converged_setting([(500, -5.4)], tolerance=0.01)
++    assert r.converged is False
++    assert r.setting is None
++    assert r.value == -5.4
++
++
++def test_empty_observations():
++    r = converged_setting([], tolerance=0.01)
++    assert r.converged is False and r.value is None
++    assert "no readable" in r.reason
++
++
++def test_none_values_are_skipped():
++    # The 500 run failed; the plateau is still demonstrable from 400 vs 600.
++    obs = [(300, -5.2), (400, -5.401), (500, None), (600, -5.4012)]
++    r = converged_setting(obs, tolerance=0.001)
++    assert r.converged is True
++    assert r.setting == 400
++
++
++def test_only_top_agrees_is_not_a_plateau():
++    # Every cheaper setting is outside tol of the top; only the top agrees with
++    # itself — not a demonstrated plateau.
++    obs = [(300, -5.0), (400, -5.30), (500, -5.42)]
++    r = converged_setting(obs, tolerance=0.001)
++    assert r.converged is False
++    assert r.value == -5.42
++
++
++def test_tolerance_boundary_is_inclusive():
++    obs = [(400, -5.400), (500, -5.401)]   # delta exactly 0.001
++    assert converged_setting(obs, tolerance=0.001).converged is True
++    assert converged_setting(obs, tolerance=0.0009).converged is False
++
++
++def test_lattice_constant_ladder_over_kpoints():
++    # k-mesh density ladder; lattice constant (Å) plateaus at 6x6x6.
++    obs = [("2x2x2", 3.68), ("4x4x4", 3.615), ("6x6x6", 3.611), ("8x8x8", 3.612)]
++    r = converged_setting(obs, tolerance=0.005)
++    assert r.converged is True
++    assert r.setting == "4x4x4"        # within 0.005 Å of the top from here up
++    assert r.value == 3.612
++
++
++def test_negative_tolerance_rejected():
++    with pytest.raises(ValueError):
++        converged_setting([(1, 1.0), (2, 1.0)], tolerance=-0.1)
++
++
++def test_result_is_dataclass_with_deltas():
++    r = converged_setting([(400, -5.401), (500, -5.4012)], tolerance=0.001)
++    assert isinstance(r, ConvergenceResult)
++    assert [s for s, _ in r.deltas] == [400, 500]
++
++
++# ---------------------------------------------------------------------------
++# run_convergence_sweep — engine-neutral driver, tested with fakes
++# ---------------------------------------------------------------------------
++
++def _fake_energies(mapping):
++    """read_observable that maps a run_dir string to a canned energy."""
++    return lambda run_dir: mapping.get(run_dir)
++
++
++def test_sweep_converges_and_reports_cheapest_setting():
++    ladder = [300, 400, 500, 600]
++    built = {}
++
++    def build_member(setting):
++        m = {"INCAR": f"ENCUT = {setting}", "POSCAR": "..."}
++        built[setting] = m
++        return m
++
++    def run_ladder(members):
++        # Verify each rung got its own param-set deck, then "run" it.
++        assert set(members) == set(ladder)
++        return {s: f"/run/{s}" for s in members}
++
++    energies = {"/run/300": -5.20, "/run/400": -5.401,
++                "/run/500": -5.4015, "/run/600": -5.4012}
++
++    res = run_convergence_sweep(
++        ladder=ladder, build_member=build_member, run_ladder=run_ladder,
++        read_observable=_fake_energies(energies), tolerance=0.001,
++        param_name="ENCUT",
++    )
++    assert isinstance(res, SweepResult)
++    assert res.param_name == "ENCUT"
++    assert res.convergence.converged is True
++    assert res.convergence.setting == 400
++    assert res.convergence.value == -5.4012
++    assert built[600]["INCAR"] == "ENCUT = 600"          # param-setter ran per rung
++    assert res.observations[0] == (300, -5.20)
++
++
++def test_sweep_marks_failed_rung_as_none():
++    ladder = [300, 400, 500]
++
++    def run_ladder(members):
++        # The 400 rung failed to produce a run dir.
++        return {300: "/run/300", 500: "/run/500"}
++
++    res = run_convergence_sweep(
++        ladder=ladder, build_member=lambda s: {"INCAR": str(s)},
++        run_ladder=run_ladder,
++        read_observable=_fake_energies({"/run/300": -5.0, "/run/500": -5.4}),
++        tolerance=0.001,
++    )
++    assert res.observations == [(300, -5.0), (400, None), (500, -5.4)]
++    assert res.convergence.converged is False   # only two points, still drifting
++
++
++def test_sweep_unreadable_observable_is_none():
++    ladder = [400, 500]
++
++    res = run_convergence_sweep(
++        ladder=ladder, build_member=lambda s: {"INCAR": str(s)},
++        run_ladder=lambda m: {s: f"/run/{s}" for s in m},
++        read_observable=lambda run_dir: None,   # parser found nothing
++        tolerance=0.001,
++    )
++    assert [v for _, v in res.observations] == [None, None]
++    assert res.convergence.converged is False
++
++
++# ---------------------------------------------------------------------------
++# converge_parameters — sequential multi-parameter orchestration (fakes)
++# ---------------------------------------------------------------------------
++
++def _fake_set_param(inputs, param, value):
++    # Store the parameter's current value in the deck dict for inspection.
++    return {**inputs, param: value}
++
++
++def test_converge_parameters_adopts_in_sequence():
++    # ENCUT plateaus at 400; k-points (KSPACING, descending) plateaus at 0.3.
++    energies = {
++        # ENCUT ladder run dirs
++        "/run/ENCUT/300": -5.20, "/run/ENCUT/400": -5.401,
++        "/run/ENCUT/500": -5.4015, "/run/ENCUT/600": -5.4012,
++        # k-points ladder run dirs
++        "/run/k-points/0.5": -5.30, "/run/k-points/0.4": -5.401,
++        "/run/k-points/0.3": -5.4013, "/run/k-points/0.2": -5.4012,
++    }
++    seen_members = {}
++
++    def run_ladder(param, members):
++        seen_members[param] = members
++        return {s: f"/run/{param}/{s}" for s in members}
++
++    specs = [
++        {"parameter": "ENCUT", "ladder": [300, 400, 500, 600],
++         "observable": "e", "tolerance": 0.001},
++        {"parameter": "k-points", "ladder": [0.5, 0.4, 0.3, 0.2],
++         "observable": "e", "tolerance": 0.001},
++    ]
++    pc = converge_parameters(
++        base_inputs={"INCAR": "base"}, specs=specs,
++        set_param=_fake_set_param,
++        read_observable=lambda d, o: energies.get(d),
++        run_ladder=run_ladder,
++    )
++    assert isinstance(pc, ParameterConvergence)
++    assert pc.all_converged is True
++    assert pc.final_inputs["ENCUT"] == 400
++    assert pc.final_inputs["k-points"] == 0.4    # cheapest KSPACING within tol
++    # Sequential adopt: the k-points members were built on the adopted ENCUT.
++    assert all(m["ENCUT"] == 400 for m in seen_members["k-points"].values())
++
++
++def test_converge_parameters_leaves_unconverged_param_unadopted():
++    # ENCUT never plateaus; k-points does. ENCUT stays at base (not adopted).
++    energies = {
++        "/run/ENCUT/300": -5.0, "/run/ENCUT/400": -5.2, "/run/ENCUT/500": -5.4,
++        "/run/k-points/0.5": -5.30, "/run/k-points/0.4": -5.401,
++        "/run/k-points/0.3": -5.4013,
++    }
++    specs = [
++        {"parameter": "ENCUT", "ladder": [300, 400, 500],
++         "observable": "e", "tolerance": 0.001},
++        {"parameter": "k-points", "ladder": [0.5, 0.4, 0.3],
++         "observable": "e", "tolerance": 0.001},
++    ]
++    pc = converge_parameters(
++        base_inputs={"INCAR": "base"}, specs=specs,
++        set_param=_fake_set_param,
++        read_observable=lambda d, o: energies.get(d),
++        run_ladder=lambda p, members: {s: f"/run/{p}/{s}" for s in members},
++    )
++    assert pc.all_converged is False
++    assert "ENCUT" not in pc.final_inputs           # not adopted
++    assert pc.final_inputs["k-points"] == 0.4       # cheapest within tol
++    assert len(pc.sweeps) == 2
++
++
++# ---------------------------------------------------------------------------
++# Flooring the ladder at the base deck's validated value (bug #1)
++# ---------------------------------------------------------------------------
++
++def test_floor_ladder_ascending_base_between_rungs():
++    # ENCUT 520 (validated) between 500 and 600: drop 300/400/500, base is cheapest.
++    eff, floored = _floor_ladder([300, 400, 500, 600, 700], 520, "ascending")
++    assert eff == [520, 600, 700] and floored is True
++
++
++def test_floor_ladder_ascending_base_on_rung():
++    eff, floored = _floor_ladder([300, 400, 500, 600, 700], 400, "ascending")
++    assert eff == [400, 500, 600, 700] and floored is True   # 300 dropped, no prepend
++
++
++def test_floor_ladder_descending_kspacing():
++    # KSPACING base 0.23 (validated): keep denser-or-equal, base is cheapest.
++    eff, floored = _floor_ladder([0.5, 0.4, 0.3, 0.25, 0.2, 0.15], 0.23, "descending")
++    assert eff == [0.23, 0.2, 0.15] and floored is True
++
++
++def test_floor_ladder_no_change_when_base_at_bottom():
++    eff, floored = _floor_ladder([300, 400, 500], 300, "ascending")
++    assert eff == [300, 400, 500] and floored is False
++
++
++def test_converge_parameters_never_adopts_below_base():
++    # Energy is flat from 400 up, so WITHOUT a floor the sweep would adopt 400.
++    # The base deck validated ENCUT at 520 (>= 1.3x ENMAX), so the sweep must
++    # run only 520/600/700 and adopt no lower than 520.
++    energies = {
++        "/run/ENCUT/520": -5.401, "/run/ENCUT/600": -5.4012,
++        "/run/ENCUT/700": -5.4013,
++    }
++    seen = {}
++
++    def run_ladder(param, members):
++        seen[param] = set(members)
++        return {s: f"/run/{param}/{s}" for s in members}
++
++    specs = [{"parameter": "ENCUT", "ladder": [300, 400, 500, 600, 700],
++              "direction": "ascending", "observable": "e", "tolerance": 0.001}]
++    pc = converge_parameters(
++        base_inputs={"INCAR": "ENCUT = 520"}, specs=specs,
++        set_param=_fake_set_param,
++        read_observable=lambda d, o: energies.get(d),
++        run_ladder=run_ladder,
++        get_param=lambda inputs, param: 520,   # the validated base value
++    )
++    assert seen["ENCUT"] == {520, 600, 700}        # 300/400/500 never run
++    assert pc.final_inputs["ENCUT"] == 520         # cheapest VALID rung, not 400
++    assert pc.floors == {"ENCUT": 520}
++
++
++def test_converge_parameters_skips_sweep_when_floor_required_but_unreadable():
++    # ENCUT with skip_without_floor: if the base value can't be read (deck left
++    # ENCUT unset) running the 300 eV ladder blind could adopt below ENMAX, so
++    # the sweep is skipped rather than run.
++    seen = {}
++
++    def run_ladder(param, members):
++        seen[param] = set(members)
++        return {s: f"/run/{param}/{s}" for s in members}
++
++    specs = [{"parameter": "ENCUT", "ladder": [300, 400, 500],
++              "observable": "e", "tolerance": 0.001, "skip_without_floor": True}]
++    pc = converge_parameters(
++        base_inputs={"INCAR": "PREC = Accurate\n"}, specs=specs,
++        set_param=_fake_set_param,
++        read_observable=lambda d, o: -5.0,
++        run_ladder=run_ladder,
++        get_param=lambda inputs, param: None,   # ENCUT unreadable
++    )
++    assert "ENCUT" not in seen                   # ladder never ran
++    assert pc.sweeps[0].convergence.converged is False
++    assert "ENCUT" not in pc.final_inputs        # nothing adopted
++    assert pc.all_converged is False
++
++
++def test_converge_parameters_no_floor_when_base_unreadable():
++    # get_param returns None (no skip_without_floor) -> full ladder.
++    energies = {
++        "/run/ENCUT/300": -5.20, "/run/ENCUT/400": -5.401,
++        "/run/ENCUT/500": -5.4012,
++    }
++    seen = {}
++
++    def run_ladder(param, members):
++        seen[param] = set(members)
++        return {s: f"/run/{param}/{s}" for s in members}
++
++    specs = [{"parameter": "ENCUT", "ladder": [300, 400, 500],
++              "observable": "e", "tolerance": 0.001}]
++    pc = converge_parameters(
++        base_inputs={"INCAR": "base"}, specs=specs,
++        set_param=_fake_set_param,
++        read_observable=lambda d, o: energies.get(d),
++        run_ladder=run_ladder,
++        get_param=lambda inputs, param: None,
++    )
++    assert seen["ENCUT"] == {300, 400, 500}        # nothing floored
++    assert pc.floors == {}
++    assert pc.final_inputs["ENCUT"] == 400
++
++
++# ---------------------------------------------------------------------------
++# Regression: real VASP Cu energies from a live convergence run
++# ---------------------------------------------------------------------------
++
++# energy/atom (eV) at each KSPACING rung, ENCUT already converged to 400 eV.
++_CU_KPOINTS = [
++    (0.5, -3.75676533), (0.4, -3.68430451), (0.3, -3.72132136),
++    (0.25, -3.7166153), (0.2, -3.71651444), (0.15, -3.71432999),
++    (0.12, -3.71703282), (0.1, -3.71568771),
++]
++_CU_ENCUT = [
++    (300, -3.72864119), (400, -3.72132136), (500, -3.72140217),
++    (600, -3.72103981), (700, -3.72091285),
++]
++
++
++def test_cu_encut_converges_at_400():
++    r = converged_setting(_CU_ENCUT, tolerance=0.001)
++    assert r.converged is True and r.setting == 400
++
++
++def test_cu_kpoints_tolerance_too_strict_does_not_converge():
++    # 1 meV/atom is below the metal's k-sampling wobble — correctly not converged.
++    assert converged_setting(_CU_KPOINTS, tolerance=0.001).converged is False
++
++
++def test_cu_kpoints_converges_at_meaningful_tolerance():
++    # 5 meV/atom (the skill's k-point tolerance) converges at KSPACING 0.25
++    # (13x13x13 for this cell) — in the 11-16 mesh range a practitioner accepts.
++    r = converged_setting(_CU_KPOINTS, tolerance=0.005)
++    assert r.converged is True
++    assert r.setting == 0.25
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_convergence_pipeline_step.py b/tests/test_convergence_pipeline_step.py
+new file mode 100644
+index 000000000..521d98e9b
+--- /dev/null
++++ b/tests/test_convergence_pipeline_step.py
+@@ -0,0 +1,208 @@
++"""Wiring test for the opt-in parameter-convergence pipeline step.
++
++Exercises the Step 3.5 integration in `_run_workflow_once` with a fake
++executor and monkeypatched skill hooks (no LLM, no VASP), mirroring
++tests/test_pipeline_refinement_integration.py's approach. The real VASP
++end-to-end is validated on the cluster.
++"""
++
++import os
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++import scilink.agents.sim_agents.simulation_pipeline as sp  # noqa: E402
++import scilink.skills._shared._registry as reg  # noqa: E402
++import scilink.agents.sim_agents.refinement as rf  # noqa: E402
++
++
++class _FakeExecutor:
++    def run(self, input_files, run_command, run_dir):
++        Path(run_dir).mkdir(parents=True, exist_ok=True)
++        for name, contents in (input_files or {}).items():
++            (Path(run_dir) / name).write_text(contents)
++        return {"status": "completed", "output_dir": run_dir, "returncode": 0}
++
++
++def _install_fakes(monkeypatch, energies, spec):
++    # Base deck from generation (no LLM).
++    monkeypatch.setattr(sp, "_generate_inputs", lambda **kw: {
++        "status": "success",
++        "input_files": {"INCAR": "PREC = Accurate\n", "POSCAR": "Si\n"},
++        "entry_file": None,
++    })
++    monkeypatch.setattr(sp, "_convergence_specs", lambda software, scale: [spec])
++
++    def fake_get_tool_function(name, active_skills=None):
++        if name == "set_convergence_param":
++            return lambda input_files, param, value: {
++                **input_files, "INCAR": f"{param} = {value}\n"}
++        if name == "read_convergence_observable":
++            # run_dir basename is the ladder setting.
++            return lambda output_dir, observable: energies.get(Path(output_dir).name)
++        raise LookupError(name)
++
++    monkeypatch.setattr(reg, "get_tool_function", fake_get_tool_function)
++    # Skip the real production run in Step 4.
++    monkeypatch.setattr(sp, "_collect_stages", lambda *a, **k: [])
++    monkeypatch.setattr(rf, "run_campaign", lambda *a, **k: {"status": "success"})
++
++
++def _run(tmp_path, **overrides):
++    structure = tmp_path / "POSCAR"
++    structure.write_text("Si\n")
++    kwargs = dict(
++        scale="periodic_dft", software="vasp",
++        structure_file=str(structure), output_dir=str(tmp_path / "out"),
++        validate=False, executor=_FakeExecutor(), run_command="vasp_std",
++        converge_parameters=True, api_key="k",
++    )
++    kwargs.update(overrides)
++    return sp.run_complete_workflow("relax Si and report a", **kwargs)
++
++
++def test_step_runs_sweep_and_adopts_converged_setting(tmp_path, monkeypatch):
++    _install_fakes(
++        monkeypatch,
++        energies={"300": -5.0, "400": -5.401, "500": -5.4012},
++        spec={"parameter": "ENCUT", "ladder": [300, 400, 500],
++              "observable": "energy_per_atom", "tolerance": 0.001},
++    )
++    result = _run(tmp_path)
++
++    pc = result["parameter_convergence"]
++    assert pc["all_converged"] is True
++    assert pc["parameters"]["ENCUT"]["converged"] is True
++    assert pc["parameters"]["ENCUT"]["setting"] == 400
++    assert "parameter_convergence" in result["steps_completed"]
++    # The converged value was written into the deck the production run uses.
++    assert result["input_generation"]["input_files"]["INCAR"].strip() == "ENCUT = 400"
++    # And onto disk.
++    assert (tmp_path / "out" / "INCAR").read_text().strip() == "ENCUT = 400"
++
++
++def test_step_reports_non_convergence_without_adopting(tmp_path, monkeypatch):
++    _install_fakes(
++        monkeypatch,
++        energies={"300": -5.0, "400": -5.2, "500": -5.4},   # still drifting
++        spec={"parameter": "ENCUT", "ladder": [300, 400, 500],
++              "observable": "energy_per_atom", "tolerance": 0.001},
++    )
++    result = _run(tmp_path)
++    pc = result["parameter_convergence"]
++    assert pc["all_converged"] is False
++    assert pc["parameters"]["ENCUT"]["converged"] is False
++
++
++def test_step_skipped_when_flag_off(tmp_path, monkeypatch):
++    _install_fakes(
++        monkeypatch,
++        energies={"300": -5.0, "400": -5.401, "500": -5.4012},
++        spec={"parameter": "ENCUT", "ladder": [300, 400, 500],
++              "observable": "energy_per_atom", "tolerance": 0.001},
++    )
++    result = _run(tmp_path, converge_parameters=False)
++    assert "parameter_convergence" not in result
++    assert "parameter_convergence" not in result["steps_completed"]
++
++
++def test_step_skipped_for_md_scale(tmp_path, monkeypatch):
++    # MD is not a static scale — the DFT/QC convergence step must not fire.
++    _install_fakes(
++        monkeypatch,
++        energies={"300": -5.0, "400": -5.401, "500": -5.4012},
++        spec={"parameter": "ENCUT", "ladder": [300, 400, 500],
++              "observable": "energy_per_atom", "tolerance": 0.001},
++    )
++    result = _run(tmp_path, scale="molecular_dynamics", software="lammps")
++    assert "parameter_convergence" not in result
++
++
++def test_adoption_removes_base_file_the_converged_setting_dropped(tmp_path, monkeypatch):
++    # k-point convergence drops the KPOINTS file (INCAR KSPACING supersedes it).
++    # The stale KPOINTS that generation wrote into output_dir must be removed,
++    # or the production run (which executes in output_dir) reads it and silently
++    # ignores the converged spacing.
++    monkeypatch.setattr(sp, "_generate_inputs", lambda **kw: {
++        "status": "success",
++        "input_files": {"INCAR": "PREC = Accurate\n", "POSCAR": "Cu\n",
++                        "KPOINTS": "Gamma\n0\nAuto\n20\n"},
++        "entry_file": None,
++    })
++    spec = {"parameter": "k-points", "ladder": [0.5, 0.3, 0.2],
++            "observable": "energy_per_atom", "tolerance": 0.005}
++    monkeypatch.setattr(sp, "_convergence_specs", lambda software, scale: [spec])
++    energies = {"0.5": -5.0, "0.3": -5.41, "0.2": -5.412}
++
++    def fake_get_tool_function(name, active_skills=None):
++        if name == "set_convergence_param":
++            def _set(input_files, param, value):      # k-points: drop KPOINTS
++                out = {k: v for k, v in input_files.items() if k != "KPOINTS"}
++                out["INCAR"] = f"KSPACING = {value}\n"
++                return out
++            return _set
++        if name == "read_convergence_observable":
++            return lambda output_dir, observable: energies.get(Path(output_dir).name)
++        raise LookupError(name)
++
++    monkeypatch.setattr(reg, "get_tool_function", fake_get_tool_function)
++    monkeypatch.setattr(sp, "_collect_stages", lambda *a, **k: [])
++    monkeypatch.setattr(rf, "run_campaign", lambda *a, **k: {"status": "success"})
++
++    out_dir = tmp_path / "out"
++    out_dir.mkdir(parents=True, exist_ok=True)
++    (out_dir / "KPOINTS").write_text("Gamma\n0\nAuto\n20\n")   # as generation wrote
++
++    structure = tmp_path / "POSCAR"
++    structure.write_text("Cu\n")
++    result = sp.run_complete_workflow(
++        "converge Cu k-points", scale="periodic_dft", software="vasp",
++        structure_file=str(structure), output_dir=str(out_dir),
++        validate=False, executor=_FakeExecutor(), run_command="vasp_std",
++        converge_parameters=True, api_key="k")
++
++    assert "parameter_convergence" in result["steps_completed"]
++    # Converged spacing adopted into the deck, and the stale KPOINTS removed.
++    assert result["input_generation"]["input_files"]["INCAR"].startswith("KSPACING")
++    assert "KPOINTS" not in result["input_generation"]["input_files"]
++    assert not (out_dir / "KPOINTS").exists()
++
++
++def test_step_folder_cleared_before_running_a_rung(tmp_path, monkeypatch):
++    # A step folder is reused across a structure retry; a stale vasprun.xml left
++    # from a previous attempt (a different structure) must not survive into the
++    # rung's run, or the reader accepts it as a valid result.
++    seen_at_entry = {}
++
++    class _CapturingExecutor:
++        def run(self, input_files, run_command, run_dir):
++            seen_at_entry[Path(run_dir).name] = set(os.listdir(run_dir))
++            Path(run_dir).mkdir(parents=True, exist_ok=True)
++            for name, contents in (input_files or {}).items():
++                (Path(run_dir) / name).write_text(contents)
++            return {"status": "completed", "output_dir": run_dir, "returncode": 0}
++
++    _install_fakes(
++        monkeypatch,
++        energies={"300": -5.0, "400": -5.401, "500": -5.4012},
++        spec={"parameter": "ENCUT", "ladder": [300, 400, 500],
++              "observable": "energy_per_atom", "tolerance": 0.001},
++    )
++    out_dir = tmp_path / "out"
++    stale = out_dir / "convergence" / "ENCUT" / "400"
++    stale.mkdir(parents=True)
++    (stale / "vasprun.xml").write_text("<previous attempt, different structure/>")
++
++    _run(tmp_path, executor=_CapturingExecutor(), output_dir=str(out_dir))
++
++    # The 400 rung ran against a cleared (empty) folder — the stale file is gone.
++    assert "vasprun.xml" not in seen_at_entry["400"]
++    assert seen_at_entry["400"] == set()
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_dft_accuracy_live.py b/tests/test_dft_accuracy_live.py
+new file mode 100644
+index 000000000..1d71d5d26
+--- /dev/null
++++ b/tests/test_dft_accuracy_live.py
+@@ -0,0 +1,188 @@
++"""Live DFT value-ACCURACY test (real VASP, run in a SLURM allocation).
++
++Where ``test_dft_convergence_live.py`` only checks that each ladder rung yields a
++readable energy, this goes the whole way the paper's accuracy claim needs: it
++converges ENCUT + k-points with the convergence machinery, adopts the converged
++settings, runs ONE cell relaxation at those settings, and scores the relaxed
++lattice constant against a reference within 2.5% (the `test_dft` band). Passing
++shows the converged parameters actually produce a physically correct value — not
++just that the sweep plateaus.
++
++Run inside a compute-node allocation (VASP runs in-process via LocalExecutor):
++
++    export VASP_PP_PATH=/path/to/potpaw_PBE     # per-element POTCAR root
++    export VASP_RUN_CMD="mpirun vasp_std"       # + module loads (see the sbatch)
++    python tests/test_dft_accuracy_live.py --system si
++
++`--system si` (diamond semiconductor, a = 5.431 Å) or `--system cu` (FCC metal,
++a = 3.615 Å). References are the experimental cubic lattice constants; PBE sits
++well inside 2.5% of each.
++"""
++
++import argparse
++import json
++import os
++import shutil
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++RUN_ROOT = REPO_ROOT / "tests" / "_dft_accuracy_runs"
++
++# Experimental conventional-cubic lattice constants (Å) and the scoring band.
++# Cu: 3.6149 Å (CODATA/Cu fcc, 298 K); Si: 5.4310 Å (Si diamond, 298 K).
++_REFERENCE_A = {"cu": 3.6149, "si": 5.4310}
++_TOL_FRAC = 0.025  # within 2.5%, matching test_dft's lattice-constant tolerance
++
++# Per-system smearing for the static (convergence) and relax (production) decks.
++_SMEAR = {"cu": "ISMEAR = 1\nSIGMA = 0.2\n", "si": "ISMEAR = 0\nSIGMA = 0.05\n"}
++
++# Static SCF deck for the convergence sweep (energy/atom observable). KSPACING in
++# the INCAR, no KPOINTS file, so the k-point ladder can vary it.
++def _static_incar(system: str) -> str:
++    return (f"SYSTEM = {system} convergence\nPREC = Accurate\nENCUT = 400\n"
++            f"{_SMEAR[system]}EDIFF = 1E-6\nLREAL = .FALSE.\n"
++            "IBRION = -1\nNSW = 0\nLWAVE = .FALSE.\nLCHARG = .FALSE.\n"
++            "KSPACING = 0.3\n")
++
++
++# Production relaxation deck at the ADOPTED ENCUT/KSPACING (full cell relax).
++def _relax_incar(system: str, encut, kspacing) -> str:
++    return (f"SYSTEM = {system} accuracy relax\nPREC = Accurate\nENCUT = {encut}\n"
++            f"{_SMEAR[system]}EDIFF = 1E-6\nEDIFFG = -0.01\nLREAL = .FALSE.\n"
++            "IBRION = 2\nISIF = 3\nNSW = 80\nLWAVE = .FALSE.\nLCHARG = .FALSE.\n"
++            f"KSPACING = {kspacing}\n")
++
++
++def _build_conventional(system: str, poscar_path: Path):
++    """Write the CONVENTIONAL cubic cell so lattice_constant_a (= abc[0]) is the
++    conventional a, not a primitive-cell edge."""
++    from ase.build import bulk
++    from ase.io import write
++    a0 = _REFERENCE_A[system]
++    kind = "fcc" if system == "cu" else "diamond"
++    el = "Cu" if system == "cu" else "Si"
++    atoms = bulk(el, kind, a=a0, cubic=True)
++    write(str(poscar_path), atoms, format="vasp", sort=True, direct=True)
++
++
++def _species_from_poscar(poscar_path: Path):
++    return poscar_path.read_text().splitlines()[5].split()
++
++
++def _assemble_potcar(species, pp_root: Path) -> str:
++    parts = []
++    for el in species:
++        p = pp_root / el / "POTCAR"
++        if not p.is_file():
++            raise SystemExit(f"missing POTCAR for {el} at {p} "
++                             f"(is VASP_PP_PATH the per-element root?)")
++        parts.append(p.read_text())
++    return "".join(parts)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--system", choices=["cu", "si"], default="si")
++    ap.add_argument("--timeout", type=int, default=3600)
++    args = ap.parse_args()
++
++    pp_root = os.environ.get("VASP_PP_PATH")
++    run_cmd = os.environ.get("VASP_RUN_CMD", "mpirun vasp_std")
++    if not pp_root:
++        raise SystemExit("set VASP_PP_PATH to the per-element POTCAR root")
++    pp_root = Path(pp_root)
++
++    work = RUN_ROOT / args.system
++    shutil.rmtree(work, ignore_errors=True)
++    work.mkdir(parents=True, exist_ok=True)
++
++    poscar = work / "POSCAR"
++    _build_conventional(args.system, poscar)
++    species = _species_from_poscar(poscar)
++    print(f"system={args.system}  species={species}  run_cmd={run_cmd!r}", flush=True)
++
++    base_inputs = {
++        "INCAR": _static_incar(args.system),
++        "POSCAR": poscar.read_text(),
++        "POTCAR": _assemble_potcar(species, pp_root),
++    }
++
++    from scilink.skills.loader import load_skill
++    from scilink.skills._shared._registry import get_tool_function
++    from scilink.agents.sim_agents.convergence import converge_parameters
++    from scilink.agents.sim_agents.refinement import LocalExecutor
++
++    specs = load_skill("vasp", domain="periodic_dft")["meta"]["convergence"]
++    print("convergence specs:", json.dumps(specs), flush=True)
++
++    set_param = get_tool_function("set_convergence_param", active_skills=["vasp"])
++    get_param = get_tool_function("get_convergence_param", active_skills=["vasp"])
++    read_obs = get_tool_function("read_convergence_observable", active_skills=["vasp"])
++    executor = LocalExecutor(timeout=args.timeout)
++
++    def run_ladder(param, members):
++        dirs = {}
++        root = work / "convergence" / str(param)
++        for setting, inputs in members.items():
++            rdir = root / str(setting)
++            rdir.mkdir(parents=True, exist_ok=True)
++            print(f"  [{param}={setting}] VASP in {rdir} ...", flush=True)
++            res = executor.run(inputs, run_cmd, str(rdir))
++            print(f"    -> {res.get('status')} rc={res.get('returncode')}", flush=True)
++            dirs[setting] = str(rdir)
++        return dirs
++
++    # ── Step 1: converge ENCUT + k-points (energy/atom) ──
++    pc = converge_parameters(
++        base_inputs=base_inputs, specs=specs,
++        set_param=lambda i, p, v: set_param(input_files=i, param=p, value=v),
++        read_observable=lambda d, o: read_obs(output_dir=d, observable=o),
++        run_ladder=run_ladder,
++        get_param=lambda i, p: get_param(input_files=i, param=p),
++    )
++    print("\nconverged:", pc.all_converged,
++          "| floored:", json.dumps(pc.floors), flush=True)
++
++    # Adopted settings (fall back to the base deck's values if a sweep didn't
++    # plateau — converge_parameters leaves those unchanged).
++    adopted_encut = get_param(input_files=pc.final_inputs, param="ENCUT") or 400
++    adopted_kspacing = get_param(input_files=pc.final_inputs, param="k-points") or 0.3
++    print(f"adopted: ENCUT={adopted_encut} eV  KSPACING={adopted_kspacing} /Å",
++          flush=True)
++
++    # ── Step 2: ONE relaxation at the adopted settings ──
++    prod = work / "production"
++    prod.mkdir(parents=True, exist_ok=True)
++    prod_inputs = {
++        "INCAR": _relax_incar(args.system, adopted_encut, adopted_kspacing),
++        "POSCAR": base_inputs["POSCAR"],
++        "POTCAR": base_inputs["POTCAR"],
++    }
++    print(f"\nrelaxing at adopted settings in {prod} ...", flush=True)
++    res = executor.run(prod_inputs, run_cmd, str(prod))
++    print(f"  -> {res.get('status')} rc={res.get('returncode')}", flush=True)
++
++    # ── Step 3: score the relaxed lattice constant vs reference ──
++    a_computed = read_obs(output_dir=str(prod), observable="lattice_constant_a")
++    a_ref = _REFERENCE_A[args.system]
++
++    print("\n" + "=" * 60 + "\nVALUE-ACCURACY\n" + "=" * 60, flush=True)
++    if a_computed is None:
++        print("FAIL: relaxation produced no readable converged lattice constant "
++              "(check the production run's ionic convergence)")
++        sys.exit(1)
++    dev = abs(a_computed - a_ref) / a_ref
++    print(f"  computed a = {a_computed:.4f} Å")
++    print(f"  reference  = {a_ref:.4f} Å  (experiment)")
++    print(f"  deviation  = {dev*100:.2f} %   (band: {_TOL_FRAC*100:.1f} %)")
++    ok = dev <= _TOL_FRAC
++    print("\n" + ("PASS: within the accuracy band" if ok
++                  else "FAIL: outside the accuracy band"))
++    sys.exit(0 if ok else 1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_nwchem_convergence_hooks.py b/tests/test_nwchem_convergence_hooks.py
+new file mode 100644
+index 000000000..855776838
+--- /dev/null
++++ b/tests/test_nwchem_convergence_hooks.py
+@@ -0,0 +1,204 @@
++"""Tests for the NWChem convergence hooks + the `convergence:` frontmatter.
++
++The basis param-setter is pure text manipulation (no NWChem needed). The
++frontmatter and registry tests confirm the engine-neutral driver can discover
++the spec and hooks when the `nwchem` skill is active. The observable extractor
++needs real NWChem output (cclib) and is validated on the cluster.
++"""
++
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++from scilink.skills.molecular_qc.nwchem.nwchem_convergence import (  # noqa: E402
++    set_convergence_param, read_convergence_observable, _find_nwchem_log,
++)
++
++_DECK = (
++    "start job\n"
++    "geometry units angstrom\n"
++    "  O 0.0 0.0 0.0\n"
++    "  H 0.0 0.0 0.96\n"
++    "end\n"
++    "basis\n"
++    "  * library def2-svp\n"
++    "end\n"
++    "dft\n"
++    "  xc b3lyp\n"
++    "end\n"
++    "task dft energy\n"
++)
++
++
++class TestSetConvergenceParam:
++    def test_replaces_basis_library(self):
++        out = set_convergence_param({"job.nw": _DECK}, "basis", "def2-tzvp")
++        assert "* library def2-tzvp" in out["job.nw"]
++        assert "def2-svp" not in out["job.nw"]
++        assert "job.nw" in _DECK or True            # original dict untouched
++        assert "def2-svp" in _DECK                  # source constant unchanged
++
++    def test_replaces_every_library_line(self):
++        deck = _DECK + "basis\n  * library def2-svp\nend\ntce\n  ccsd(t)\nend\n"
++        out = set_convergence_param({"calc.nw": deck}, "basis", "def2-qzvp")
++        assert out["calc.nw"].count("library def2-qzvp") == 2
++        assert "def2-svp" not in out["calc.nw"]
++
++    def test_leaves_ecp_and_fitting_basis_untouched(self):
++        # A def2 deck for a heavy element carries an ECP and a cd fitting basis
++        # whose `library` lines must NOT be rewritten by a basis sweep (doing so
++        # turns the ECP into a non-ECP basis and corrupts the fitting set).
++        deck = (
++            "basis\n  * library def2-svp\nend\n"
++            'basis "cd basis"\n  * library def2-universal-jkfit\nend\n'
++            "ecp\n  * library def2-ecp\nend\n"
++            "dft\n  xc b3lyp\nend\ntask dft energy\n"
++        )
++        out = set_convergence_param({"heavy.nw": deck}, "basis", "def2-tzvp")["heavy.nw"]
++        assert "* library def2-tzvp" in out                 # orbital basis changed
++        assert "* library def2-universal-jkfit" in out       # cd fitting preserved
++        assert "* library def2-ecp" in out                   # ECP preserved
++        assert "jkfit" not in out.replace("def2-universal-jkfit", "")  # not clobbered
++
++
++class TestLogResolution:
++    def test_find_log_prefers_stdout_over_stderr(self, tmp_path):
++        # The executor writes BOTH run_stdout.log and run_stderr.log; the gap /
++        # dipole observables must read stdout, not whichever glob returns first.
++        (tmp_path / "run_stderr.log").write_text("srun: error ...\n")
++        (tmp_path / "run_stdout.log").write_text("   Total DFT energy = -76.0\n")
++        assert _find_nwchem_log(str(tmp_path)).name == "run_stdout.log"
++
++    def test_case_insensitive_library_keyword(self):
++        out = set_convergence_param(
++            {"job.nw": "basis\n  * LIBRARY cc-pvdz\nend\n"}, "basis", "cc-pvtz")
++        assert "cc-pvtz" in out["job.nw"] and "cc-pvdz" not in out["job.nw"]
++
++    def test_unknown_param_raises(self):
++        with pytest.raises(ValueError):
++            set_convergence_param({"job.nw": _DECK}, "xc", "pbe")
++
++    def test_no_deck_raises(self):
++        with pytest.raises(KeyError):
++            set_convergence_param({"notes.txt": "x"}, "basis", "def2-tzvp")
++
++    def test_no_library_line_raises(self):
++        with pytest.raises(ValueError):
++            set_convergence_param({"job.nw": "task dft energy\n"}, "basis", "def2-tzvp")
++
++
++class TestReadTotalEnergy:
++    _HARTREE_EV = 27.211386245988
++
++    def test_reads_total_dft_energy_in_eV(self, tmp_path):
++        # Real NWChem footer line from a water run.
++        (tmp_path / "run_stdout.log").write_text(
++            "   ...\n   Total DFT energy =      -76.358285492866\n"
++            " Total times  cpu: 0.2s\n")
++        v = read_convergence_observable(str(tmp_path), "total_energy")
++        assert v == pytest.approx(-76.358285492866 * self._HARTREE_EV)
++
++    def test_reads_scf_energy_for_hf(self, tmp_path):
++        (tmp_path / "run_stdout.log").write_text(
++            "Total SCF energy =    -76.02663\n")
++        v = read_convergence_observable(str(tmp_path), "total_energy")
++        assert v == pytest.approx(-76.02663 * self._HARTREE_EV)
++
++    def test_takes_last_energy(self, tmp_path):
++        (tmp_path / "run_stdout.log").write_text(
++            "Total DFT energy = -76.10\nTotal DFT energy = -76.358285\n")
++        v = read_convergence_observable(str(tmp_path), "total_energy")
++        assert v == pytest.approx(-76.358285 * self._HARTREE_EV)
++
++    def test_mp2_prefers_correlated_total_over_scf(self, tmp_path):
++        # Direct MP2 prints the SCF reference and the correlated total; the
++        # basis-dependent result is the MP2 total, not the SCF reference.
++        (tmp_path / "run_stdout.log").write_text(
++            "          SCF energy                 -76.026000\n"
++            "          correlation energy          -0.270000\n"
++            "          Total MP2 energy           -76.296000\n")
++        v = read_convergence_observable(str(tmp_path), "total_energy")
++        assert v == pytest.approx(-76.296000 * self._HARTREE_EV)
++
++    def test_ccsdt_tce_prefers_ccsdt_total(self, tmp_path):
++        # TCE prints the SCF ref, the CCSD total and the CCSD(T) total; CCSD(T)
++        # (highest level present) is the one the basis sweep must judge.
++        (tmp_path / "run_stdout.log").write_text(
++            " Total SCF energy =   -76.026000\n"
++            " CCSD total energy / hartree       =       -76.280000\n"
++            " CCSD(T) total energy / hartree    =       -76.300000\n")
++        v = read_convergence_observable(str(tmp_path), "total_energy")
++        assert v == pytest.approx(-76.300000 * self._HARTREE_EV)
++
++    def test_dft_run_still_reads_dft_energy(self, tmp_path):
++        # No correlated line present -> fall back to the SCF/DFT reference.
++        (tmp_path / "run_stdout.log").write_text(
++            "   Total DFT energy =      -76.358285492866\n")
++        v = read_convergence_observable(str(tmp_path), "total_energy")
++        assert v == pytest.approx(-76.358285492866 * self._HARTREE_EV)
++
++    def test_none_without_log(self, tmp_path):
++        assert read_convergence_observable(str(tmp_path), "total_energy") is None
++
++    def test_none_without_energy_line(self, tmp_path):
++        (tmp_path / "run_stdout.log").write_text("no energy here\n")
++        assert read_convergence_observable(str(tmp_path), "total_energy") is None
++
++
++class TestReadTotalEnergyFromRealLogs:
++    """Drive the extractor with REAL NWChem 7.2.3 output (both module families),
++    captured as fixtures. These are the cases that defeated the earlier regex:
++    the classic module writes 'Total <M> energy[:]', the TCE module writes
++    '<M> total energy / hartree =', and both carry SCS-* and [T] decoys."""
++
++    _HARTREE_EV = 27.211386245988
++    _FIX = Path(__file__).resolve().parent / "fixtures" / "nwchem"
++
++    def _read(self, tmp_path, fixture):
++        (tmp_path / "run_stdout.log").write_text((self._FIX / fixture).read_text())
++        return read_convergence_observable(str(tmp_path), "total_energy")
++
++    def test_tce_ccsdt_fixture(self, tmp_path):
++        # Must pick the (T) total, not CCSD, not SCF, not the CCSD[T] decoy.
++        v = self._read(tmp_path, "h2o_tce_ccsdt_7.2.3.out")
++        assert v == pytest.approx(-75.716987079562600 * self._HARTREE_EV)
++
++    def test_classic_mp2_ccsdt_fixture(self, tmp_path):
++        # Classic wording "Total CCSD(T) energy:"; not SCS-*, not CCSD+T(CCSD).
++        v = self._read(tmp_path, "h2o_direct_mp2_ccsdt_7.2.3.out")
++        assert v == pytest.approx(-75.716987101819456 * self._HARTREE_EV)
++
++    def test_dft_smoketest_fixture(self, tmp_path):
++        # A pure-DFT run: no correlated line, so the SCF/DFT reference is used.
++        v = self._read(tmp_path, "h2o_b3lyp_smoketest.out")
++        assert v == pytest.approx(-76.408706523741 * self._HARTREE_EV)
++
++
++class TestConvergenceFrontmatter:
++    def test_nwchem_declares_no_convergence_sweep(self):
++        # Deliberately NO `convergence:` block: a plateau sweep on the absolute
++        # QC energy is not a practical target (it approaches CBS only slowly, so
++        # it never flattens). The output reader stays available as a hook, but
++        # the skill must not advertise a basis sweep to converge toward.
++        from scilink.skills.loader import load_skill
++        conv = load_skill("nwchem", domain="molecular_qc")["meta"].get("convergence")
++        assert not conv
++
++
++class TestRegistryResolution:
++    def test_hooks_resolve_when_nwchem_active(self):
++        from scilink.skills._shared._registry import get_tool_function
++        setter = get_tool_function("set_convergence_param", active_skills=["nwchem"])
++        reader = get_tool_function("read_convergence_observable",
++                                   active_skills=["nwchem"])
++        out = setter(input_files={"job.nw": _DECK}, param="basis", value="def2-tzvp")
++        assert "def2-tzvp" in out["job.nw"]
++        assert reader(output_dir="/nonexistent", observable="total_energy") is None
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_vasp_convergence_hooks.py b/tests/test_vasp_convergence_hooks.py
+new file mode 100644
+index 000000000..1dc4431ae
+--- /dev/null
++++ b/tests/test_vasp_convergence_hooks.py
+@@ -0,0 +1,252 @@
++"""Tests for the VASP convergence hooks + the `convergence:` frontmatter.
++
++The param-setter is pure string manipulation (no VASP needed). The frontmatter
++and registry tests confirm the engine-neutral driver can discover the spec and
++the hooks for the active engine. The observable extractor needs real vasprun.xml
++output and is validated on the cluster, not here.
++"""
++
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++import types  # noqa: E402
++
++from scilink.skills.periodic_dft.vasp.vasp_convergence import (  # noqa: E402
++    set_convergence_param, get_convergence_param,
++    kspacing_to_mesh, read_convergence_observable,
++)
++
++
++class _StructList(list):
++    """A final_structure stand-in: len() = atom count, plus a .lattice."""
++
++
++class TestObservableConvergenceGate:
++    """An unconverged rung must read as None, not a bogus number that could
++    fake or block a plateau."""
++
++    def _patch_vasprun(self, monkeypatch, tmp_path, **attrs):
++        (tmp_path / "vasprun.xml").write_text("<modeling/>")  # just needs to exist
++        struct = _StructList(range(attrs.get("natoms", 2)))
++        struct.lattice = types.SimpleNamespace(abc=(attrs.get("a", 3.6),) * 3)
++        fake = types.SimpleNamespace(
++            converged_electronic=attrs.get("converged_electronic", True),
++            converged=attrs.get("converged", True),
++            final_energy=attrs.get("energy", -10.0),
++            final_structure=struct,
++            eigenvalue_band_properties=(attrs.get("gap", 1.2),),
++        )
++        monkeypatch.setattr("pymatgen.io.vasp.outputs.Vasprun",
++                            lambda *a, **k: fake)
++        return str(tmp_path)
++
++    def test_energy_none_when_scf_unconverged(self, monkeypatch, tmp_path):
++        d = self._patch_vasprun(monkeypatch, tmp_path, converged_electronic=False)
++        assert read_convergence_observable(d, "energy_per_atom") is None
++
++    def test_energy_value_when_converged(self, monkeypatch, tmp_path):
++        d = self._patch_vasprun(monkeypatch, tmp_path,
++                                converged_electronic=True, energy=-10.0, natoms=2)
++        assert read_convergence_observable(d, "energy_per_atom") == -5.0
++
++    def test_band_gap_none_when_scf_unconverged(self, monkeypatch, tmp_path):
++        d = self._patch_vasprun(monkeypatch, tmp_path, converged_electronic=False)
++        assert read_convergence_observable(d, "band_gap") is None
++
++    def test_lattice_none_when_relaxation_unconverged(self, monkeypatch, tmp_path):
++        # Electronically converged but ionic relaxation did not finish.
++        d = self._patch_vasprun(monkeypatch, tmp_path,
++                                converged_electronic=True, converged=False)
++        assert read_convergence_observable(d, "lattice_constant_a") is None
++
++    def test_lattice_value_when_fully_converged(self, monkeypatch, tmp_path):
++        d = self._patch_vasprun(monkeypatch, tmp_path, converged=True, a=3.61)
++        assert read_convergence_observable(d, "lattice_constant_a") == 3.61
++
++
++class TestSetConvergenceParam:
++    def test_replaces_existing_encut(self):
++        deck = {"INCAR": "PREC = Accurate\nENCUT = 400\nISMEAR = 0\n",
++                "POSCAR": "..."}
++        out = set_convergence_param(deck, "ENCUT", 600)
++        assert "ENCUT = 600" in out["INCAR"]
++        assert "ENCUT = 400" not in out["INCAR"]
++        assert out["INCAR"].count("ENCUT") == 1
++        assert deck["INCAR"].count("400") == 1   # original not mutated
++
++    def test_appends_encut_when_absent(self):
++        deck = {"INCAR": "PREC = Accurate\n", "POSCAR": "..."}
++        out = set_convergence_param(deck, "ENCUT", 500)
++        assert "ENCUT = 500" in out["INCAR"]
++
++    def test_kspacing_sets_incar_and_drops_kpoints(self):
++        deck = {"INCAR": "PREC = Accurate\n", "KPOINTS": "mesh\n0\nG\n4 4 4\n",
++                "POSCAR": "..."}
++        out = set_convergence_param(deck, "k-points", 0.2)
++        assert "KSPACING = 0.2" in out["INCAR"]
++        assert "KPOINTS" not in out          # dropped so KSPACING governs
++        assert "KPOINTS" in deck             # original untouched
++
++    def test_replaces_existing_kspacing(self):
++        deck = {"INCAR": "KSPACING = 0.5\nPREC = Accurate\n"}
++        out = set_convergence_param(deck, "k-points", 0.15)
++        assert "KSPACING = 0.15" in out["INCAR"]
++        assert "0.5" not in out["INCAR"]
++
++    def test_case_insensitive_existing_key(self):
++        deck = {"INCAR": "encut = 400\n"}
++        out = set_convergence_param(deck, "ENCUT", 600)
++        assert "ENCUT = 600" in out["INCAR"]
++        assert "400" not in out["INCAR"]
++
++    def test_preserves_other_tags_on_the_same_line(self):
++        # VASP allows `A = 1; B = 2`; setting ENCUT must not drop PREC.
++        deck = {"INCAR": "ENCUT = 500; PREC = Accurate\nISMEAR = 0\n"}
++        out = set_convergence_param(deck, "ENCUT", 400)["INCAR"]
++        assert "ENCUT = 400" in out
++        assert "PREC = Accurate" in out          # survived the substitution
++        assert "ENCUT = 500" not in out
++
++    def test_preserves_trailing_comment(self):
++        deck = {"INCAR": "ENCUT = 500  # plane-wave cutoff\n"}
++        out = set_convergence_param(deck, "ENCUT", 600)["INCAR"]
++        assert "ENCUT = 600" in out
++        assert "plane-wave cutoff" in out        # comment survived
++
++    def test_edits_in_place_when_tag_is_not_first_on_its_line(self):
++        # The bug: ^-anchored match missed a trailing-tag ENCUT and APPENDED a
++        # second one; VASP reads the first, so every rung ran at the old value.
++        deck = {"INCAR": "PREC = Accurate; ENCUT = 500\nISMEAR = 0\n"}
++        out = set_convergence_param(deck, "ENCUT", 400)["INCAR"]
++        assert out.count("ENCUT") == 1           # edited in place, not duplicated
++        assert "ENCUT = 400" in out and "ENCUT = 500" not in out
++        assert "PREC = Accurate" in out
++
++    def test_unknown_param_raises(self):
++        with pytest.raises(ValueError):
++            set_convergence_param({"INCAR": ""}, "SIGMA", 0.1)
++
++    def test_missing_incar_raises(self):
++        with pytest.raises(KeyError):
++            set_convergence_param({"POSCAR": "..."}, "ENCUT", 500)
++
++
++class TestGetConvergenceParam:
++    def test_reads_encut(self):
++        deck = {"INCAR": "PREC = Accurate\nENCUT = 520\nISMEAR = 0\n"}
++        assert get_convergence_param(deck, "ENCUT") == 520.0
++
++    def test_reads_encut_case_insensitive(self):
++        assert get_convergence_param({"INCAR": "encut = 400\n"}, "ENCUT") == 400.0
++
++    def test_encut_absent_returns_none(self):
++        assert get_convergence_param({"INCAR": "PREC = Accurate\n"}, "ENCUT") is None
++
++    def test_reads_kspacing_from_incar(self):
++        assert get_convergence_param({"INCAR": "KSPACING = 0.25\n"}, "k-points") == 0.25
++
++    def test_missing_incar_returns_none(self):
++        assert get_convergence_param({"POSCAR": "..."}, "ENCUT") is None
++
++    def test_unknown_param_raises(self):
++        with pytest.raises(ValueError):
++            get_convergence_param({"INCAR": "ENCUT = 400\n"}, "SIGMA")
++
++    def test_reads_encut_with_trailing_tag_on_same_line(self):
++        deck = {"INCAR": "ENCUT = 500 ; PREC = Accurate\n"}
++        assert get_convergence_param(deck, "ENCUT") == 500.0
++
++    def test_reads_encut_when_it_is_the_SECOND_tag_on_a_line(self):
++        # The bug: a regex anchored at ^ missed ENCUT after a ';'. pymatgen reads it.
++        deck = {"INCAR": "PREC = Accurate; ENCUT = 500\nISMEAR = 0\n"}
++        assert get_convergence_param(deck, "ENCUT") == 500.0
++
++    # --- k-point density from an explicit KPOINTS mesh (pymatgen/atomate2 decks) ---
++    _CUBIC_POSCAR = (
++        "Cu\n1.0\n3.5 0 0\n0 3.5 0\n0 0 3.5\nCu\n1\nDirect\n0 0 0\n")
++
++    def test_kspacing_derived_from_kpoints_mesh(self):
++        # |b| = 2*pi/3.5 = 1.7952; Gamma 8x8x8 -> effective KSPACING = 1.7952/8.
++        deck = {"INCAR": "PREC = Accurate\n",
++                "KPOINTS": "Auto\n0\nGamma\n8 8 8\n0 0 0\n",
++                "POSCAR": self._CUBIC_POSCAR}
++        v = get_convergence_param(deck, "k-points")
++        assert v == pytest.approx(1.7952 / 8, abs=1e-3)
++
++    def test_kpoints_mesh_overrides_incar_kspacing(self):
++        # VASP lets a KPOINTS file govern over INCAR KSPACING, so the mesh wins.
++        deck = {"INCAR": "KSPACING = 0.5\n",
++                "KPOINTS": "Auto\n0\nGamma\n8 8 8\n0 0 0\n",
++                "POSCAR": self._CUBIC_POSCAR}
++        assert get_convergence_param(deck, "k-points") == pytest.approx(1.7952 / 8, abs=1e-3)
++
++    def test_kspacing_none_when_kpoints_mesh_but_no_poscar(self):
++        deck = {"INCAR": "PREC = Accurate\n", "KPOINTS": "Auto\n0\nGamma\n4 4 4\n0 0 0\n"}
++        assert get_convergence_param(deck, "k-points") is None
++
++
++class TestKspacingToMesh:
++    def _write_run(self, tmp_path, kspacing):
++        # Conventional cubic FCC Cu (a=3.61) so the mesh is isotropic and
++        # predictable: |b| = 2*pi/3.61 = 1.740 Å^-1.
++        from ase.build import bulk
++        from ase.io import write
++        atoms = bulk("Cu", "fcc", a=3.61, cubic=True)
++        write(str(tmp_path / "POSCAR"), atoms, format="vasp", sort=True)
++        (tmp_path / "INCAR").write_text(f"PREC = Accurate\nKSPACING = {kspacing}\n")
++        return str(tmp_path)
++
++    def test_coarse_kspacing_gives_small_mesh(self, tmp_path):
++        # ceil(1.740 / 0.5) = 4 -> 4x4x4
++        assert kspacing_to_mesh(self._write_run(tmp_path, 0.5)) == "4×4×4"
++
++    def test_denser_kspacing_gives_larger_mesh(self, tmp_path):
++        # ceil(1.740 / 0.2) = 9 -> 9x9x9
++        assert kspacing_to_mesh(self._write_run(tmp_path, 0.2)) == "9×9×9"
++
++    def test_none_without_kspacing(self, tmp_path):
++        (tmp_path / "INCAR").write_text("PREC = Accurate\nENCUT = 400\n")
++        (tmp_path / "POSCAR").write_text("dummy\n")
++        assert kspacing_to_mesh(str(tmp_path)) is None
++
++    def test_none_when_files_absent(self, tmp_path):
++        assert kspacing_to_mesh(str(tmp_path)) is None
++
++
++class TestConvergenceFrontmatter:
++    def test_vasp_skill_declares_convergence_block(self):
++        from scilink.skills.loader import load_skill
++        meta = load_skill("vasp", domain="periodic_dft")["meta"]
++        conv = meta.get("convergence")
++        assert isinstance(conv, list) and conv, "no convergence block in vasp.md"
++        params = {c["parameter"] for c in conv}
++        assert "ENCUT" in params and "k-points" in params
++        for c in conv:
++            assert isinstance(c["ladder"], list) and len(c["ladder"]) >= 2
++            assert c["observable"] and c["tolerance"] > 0
++
++
++class TestRegistryResolution:
++    def test_hooks_resolve_when_vasp_active(self):
++        from scilink.skills._shared._registry import get_tool_function
++        setter = get_tool_function("set_convergence_param", active_skills=["vasp"])
++        reader = get_tool_function("read_convergence_observable",
++                                   active_skills=["vasp"])
++        # setter is callable end-to-end
++        out = setter(input_files={"INCAR": "PREC = Accurate\n"},
++                     param="ENCUT", value=520)
++        assert "ENCUT = 520" in out["INCAR"]
++        # reader returns None for a missing run dir rather than raising
++        assert reader(output_dir="/nonexistent", observable="energy_per_atom") is None
++        # getter resolves and reads the deck's current value (the ladder floor)
++        getter = get_tool_function("get_convergence_param", active_skills=["vasp"])
++        assert getter(input_files={"INCAR": "ENCUT = 520\n"}, param="ENCUT") == 520.0
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))

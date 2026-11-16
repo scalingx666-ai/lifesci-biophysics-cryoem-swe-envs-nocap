@@ -1,0 +1,220 @@
+diff --git a/src/core/electrostatics/elc.cpp b/src/core/electrostatics/elc.cpp
+index c93b6de5ac8..bd4d0c72c9c 100644
+--- a/src/core/electrostatics/elc.cpp
++++ b/src/core/electrostatics/elc.cpp
+@@ -40,6 +40,10 @@
+ #include <utils/Vector.hpp>
+ #include <utils/math/sqr.hpp>
+ 
++#ifdef SHARED_MEMORY_PARALLELISM
++#include <Kokkos_Core.hpp>
++#endif
++
+ #include <boost/mpi/collectives/all_reduce.hpp>
+ #include <boost/range/combine.hpp>
+ 
+@@ -1117,10 +1121,17 @@ void charge_assign(elc_data const &elc, CoulombP3M &solver,
+   solver.prepare_fft_mesh(protocol == ChargeProtocol::BOTH or
+                           protocol == ChargeProtocol::IMAGE);
+ 
++#ifdef SHARED_MEMORY_PARALLELISM
++  // multi-threading -> cache sizes must be equal to the number of particles
++  auto const include_neutral_particles = Kokkos::num_threads() > 1;
++#else
++  auto constexpr include_neutral_particles = false;
++#endif
++
+   for (auto zipped : p_q_pos_range) {
+     auto const p_q = boost::get<0>(zipped);
+     auto const &p_pos = boost::get<1>(zipped);
+-    if (p_q != 0.) {
++    if (include_neutral_particles or p_q != 0.) {
+       // assign real charges
+       if (protocol == ChargeProtocol::BOTH or
+           protocol == ChargeProtocol::REAL) {
+diff --git a/src/core/electrostatics/p3m.cpp b/src/core/electrostatics/p3m.cpp
+index 82e60680ee3..a0250247e3b 100644
+--- a/src/core/electrostatics/p3m.cpp
++++ b/src/core/electrostatics/p3m.cpp
+@@ -72,6 +72,10 @@
+ #include <utils/math/sqr.hpp>
+ #include <utils/serialization/array.hpp>
+ 
++#ifdef SHARED_MEMORY_PARALLELISM
++#include <Kokkos_Core.hpp>
++#endif
++
+ #include <boost/mpi/collectives/all_reduce.hpp>
+ #include <boost/mpi/collectives/broadcast.hpp>
+ #include <boost/mpi/collectives/reduce.hpp>
+@@ -365,10 +369,16 @@ template <int cao> struct AssignCharge {
+ 
+   template <typename combined_ranges>
+   void operator()(auto &p3m, combined_ranges const &p_q_pos_range) {
++#ifdef SHARED_MEMORY_PARALLELISM
++    // multi-threading -> cache sizes must be equal to the number of particles
++    auto const include_neutral_particles = Kokkos::num_threads() > 1;
++#else
++    auto constexpr include_neutral_particles = false;
++#endif
+     for (auto zipped : p_q_pos_range) {
+       auto const p_q = boost::get<0>(zipped);
+       auto const &p_pos = boost::get<1>(zipped);
+-      if (p_q != 0.0) {
++      if (include_neutral_particles or p_q != 0.0) {
+         this->operator()(p3m, p_q, p_pos, p3m.inter_weights);
+       }
+     }
+@@ -407,14 +417,9 @@ template <int cao> struct AssignForces {
+ 
+     assert(cao == p3m.inter_weights.cao());
+ 
+-    /* charged particle counter */
+-    auto p_index = std::size_t{0ul};
+-
+-    for (auto zipped : p_q_force_range) {
+-      auto p_q = boost::get<0>(zipped);
+-      auto &p_force = boost::get<1>(zipped);
+-      if (p_q != 0.0) {
+-        auto const pref = p_q * force_prefac;
++    auto const kernel = [&p3m](double pref, auto &p_force,
++                               std::size_t p_index) {
++      if (pref != 0.) {
+         auto const weights = p3m.inter_weights.template load<cao>(p_index);
+ 
+         Utils::Vector3d force{};
+@@ -426,6 +431,40 @@ template <int cao> struct AssignForces {
+                         });
+ 
+         p_force -= pref * force;
++      }
++    };
++
++#ifdef SHARED_MEMORY_PARALLELISM
++    if (Kokkos::num_threads() > 1) {
++      std::vector<double> q_vals;
++      std::vector<Utils::Vector3d *> f_ptrs;
++      q_vals.reserve(p3m.inter_weights.size());
++      f_ptrs.reserve(p3m.inter_weights.size());
++      for (auto zipped : p_q_force_range) {
++        q_vals.emplace_back(boost::get<0>(zipped));
++        f_ptrs.emplace_back(&boost::get<1>(zipped));
++      }
++      Kokkos::RangePolicy<> policy(std::size_t{0u}, q_vals.size());
++      auto const *q_vals_data = q_vals.data();
++      auto const *f_ptrs_data = f_ptrs.data();
++      Kokkos::parallel_for(
++          "AssignForces", policy, KOKKOS_LAMBDA(std::size_t p_index) {
++            auto p_q = q_vals_data[p_index];
++            auto &p_force = *f_ptrs_data[p_index];
++            kernel(p_q * force_prefac, p_force, p_index);
++          });
++      return;
++    }
++#endif
++
++    /* charged particle counter */
++    std::size_t p_index{0ul};
++
++    for (auto zipped : p_q_force_range) {
++      auto p_q = boost::get<0>(zipped);
++      if (p_q != 0.) {
++        auto &p_force = boost::get<1>(zipped);
++        kernel(p_q * force_prefac, p_force, p_index);
+         ++p_index;
+       }
+     }
+diff --git a/src/core/p3m/interpolation.hpp b/src/core/p3m/interpolation.hpp
+index 4cc815ccbbd..42edd8eca65 100644
+--- a/src/core/p3m/interpolation.hpp
++++ b/src/core/p3m/interpolation.hpp
+@@ -77,16 +77,16 @@ class p3m_interpolation_cache {
+    *
+    * @tparam cao Interpolation order has to match the order
+    *         set at last call to @ref p3m_interpolation_cache::reset.
+-   * @param w Interpolation weights to store.
++   * @param weights Interpolation weights to store.
+    */
+-  template <int cao> void store(const InterpolationWeights<cao> &w) {
++  template <int cao> void store(const InterpolationWeights<cao> &weights) {
+     assert(cao == m_cao);
+ 
+-    ca_fmp.push_back(w.ind);
++    ca_fmp.emplace_back(weights.ind);
+     auto it = std::back_inserter(ca_frac);
+-    std::ranges::copy(w.w_x, it);
+-    std::ranges::copy(w.w_y, it);
+-    std::ranges::copy(w.w_z, it);
++    std::ranges::copy(weights.w_x, it);
++    std::ranges::copy(weights.w_y, it);
++    std::ranges::copy(weights.w_z, it);
+   }
+ 
+   /**
+@@ -97,18 +97,18 @@ class p3m_interpolation_cache {
+    *
+    * @tparam cao Interpolation order has to match the order
+    *         set at last call to @ref p3m_interpolation_cache::reset.
+-   * @param i Index of the entry to load.
++   * @param p_index Index of the entry to load.
+    * @return i-it interpolation weights.
+    */
+-  template <int cao> InterpolationWeights<cao> load(std::size_t i) const {
++  template <int cao> InterpolationWeights<cao> load(std::size_t p_index) const {
+     assert(cao == m_cao);
+-    assert(i < size());
++    assert(p_index < size());
+ 
+     InterpolationWeights<cao> ret;
+-    ret.ind = ca_fmp[i];
++    ret.ind = ca_fmp[p_index];
+ 
+     auto const view = std::span(std::as_const(ca_frac));
+-    auto const offset = 3ul * i * static_cast<std::size_t>(cao);
++    auto const offset = 3ul * p_index * static_cast<std::size_t>(cao);
+ 
+     std::ranges::copy(view.subspan(offset + 0ul * cao, cao), ret.w_x.begin());
+     std::ranges::copy(view.subspan(offset + 1ul * cao, cao), ret.w_y.begin());
+diff --git a/src/core/particle_reduction.hpp b/src/core/particle_reduction.hpp
+index c4c9ef9416c..9756257c60a 100644
+--- a/src/core/particle_reduction.hpp
++++ b/src/core/particle_reduction.hpp
+@@ -28,6 +28,7 @@
+ #include <Kokkos_Core.hpp>
+ #endif
+ 
++#include <concepts>
+ #include <functional>
+ #include <utility>
+ 
+@@ -63,7 +64,7 @@ template <typename ResultType, typename Kernel> class KokkosReducer {
+   KokkosReducer(KokkosReducer const &other)
+       : reduction_op(other.reduction_op), kernel(other.kernel) {};
+ 
+-  KOKKOS_INLINE_FUNCTION void operator()(int const i,
++  KOKKOS_INLINE_FUNCTION void operator()(std::integral auto const i,
+                                          value_type &update) const {
+     kernel(i, update);
+   }
+@@ -108,8 +109,8 @@ ResultType reduce_over_local_particles(
+   auto const &cells = cs.decomposition().local_cells();
+   if (cells.size() > 1) { // parallel loop over cells
+     auto reducer = Reduction::make_kokkos_reducer<ResultType>(
+-        [&cells, add_partial](int i, ResultType &res) {
+-          for (auto const &p : cells[i]->particles()) {
++        [&cells, add_partial](std::size_t const c_index, ResultType &res) {
++          for (auto const &p : cells[c_index]->particles()) {
+             add_partial(p, res);
+           }
+         },
+@@ -121,8 +122,8 @@ ResultType reduce_over_local_particles(
+   // single cell case
+   auto const &particles = cells.front()->particles();
+   auto reducer = Reduction::make_kokkos_reducer<ResultType>(
+-      [&particles, add_partial](int i, ResultType &res) {
+-        add_partial(std::as_const(*(particles.begin() + i)), res);
++      [&particles, add_partial](std::size_t const p_index, ResultType &res) {
++        add_partial(std::as_const(*(particles.begin() + p_index)), res);
+       },
+       reduce_op);
+   Kokkos::parallel_reduce( // loop over particles

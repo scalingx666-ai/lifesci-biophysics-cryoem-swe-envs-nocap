@@ -1,0 +1,842 @@
+diff --git a/Yank/experiment.py b/Yank/experiment.py
+index 2df27c07..f43f782e 100644
+--- a/Yank/experiment.py
++++ b/Yank/experiment.py
+@@ -21,6 +21,7 @@
+ 
+ import collections
+ import copy
++import gc
+ import logging
+ import os
+ 
+@@ -489,8 +490,10 @@ def run(self, n_iterations=None):
+                     iterations_left[phase_id] -= iterations_to_run
+                 self._phases_last_iterations[phase_id] = alchemical_phase.iteration
+ 
+-                # Delete alchemical phase and prepare switching.
++                # Delete alchemical phase and prepare switching. We force garbage
++                # collection to make sure that everything finalizes correctly.
+                 del alchemical_phase
++                gc.collect()
+ 
+ 
+ class ExperimentBuilder(object):
+@@ -2554,6 +2557,7 @@ def __getattr__(self, _):
+             sampler_state = alchemical_phase._sampler._sampler_states[0]
+             mcmc_move = alchemical_phase._sampler.mcmc_moves[0]
+             del alchemical_phase
++            gc.collect()
+ 
+             # Restrain the receptor heavy atoms to avoid drastic
+             # conformational changes (possibly after equilibration).
+diff --git a/Yank/mpi.py b/Yank/mpi.py
+index 568e39e1..caace24e 100644
+--- a/Yank/mpi.py
++++ b/Yank/mpi.py
+@@ -42,12 +42,13 @@
+ # GLOBAL IMPORTS
+ # ==============================================================================
+ 
++import functools
++import logging
+ import os
+ import sys
+ import signal
+-import logging
+-import functools
+ from contextlib import contextmanager
++from traceback import format_exception
+ 
+ import numpy as np
+ 
+@@ -125,10 +126,17 @@ def get_mpicomm():
+     def mpi_excepthook(type, value, traceback):
+         sys.__excepthook__(type, value, traceback)
+         node_name = '{}/{}'.format(MPI.COMM_WORLD.rank+1, MPI.COMM_WORLD.size)
+-        logger.exception('MPI node {} raised exception.'.format(node_name))
+-        logger.critical('MPI node {} called Abort()!'.format(node_name))
++        # logging.exception() automatically print the sys.exc_info(), but here
++        # we may want to save the exception traceback of another MPI node so
++        # we pass the traceback manually.
++        logger.critical('MPI node {} raised an exception and called Abort()! The '
++                        'exception traceback follows'.format(node_name), exc_info=value)
++        # Flush everything.
+         sys.stdout.flush()
+         sys.stderr.flush()
++        for logger_handler in logger.handlers:
++            logger_handler.flush()
++        # Abort MPI execution.
+         if MPI.COMM_WORLD.size > 1:
+             MPI.COMM_WORLD.Abort(1)
+     # Use our exception handler.
+@@ -350,7 +358,11 @@ def exec_tasks(self, task, distributed_args, propagate_exceptions_to,
+             except Exception as e:
+                 # Create an exception with same type and traceback but with node info.
+                 error = type(e)('{}: {}'.format(node_name, str(e)))
+-                error.with_traceback(sys.exc_info()[2])
++                error.with_traceback(e.__traceback__)
++                # When sending the error over the network, the traceback seems to be lost,
++                # so we create a string version of it, and expose it for others to print.
++                traceback_str = ''.join(format_exception(type(e), e, e.__traceback__))
++                error.traceback_str = traceback_str
+                 break
+ 
+         # Propagate eventual exceptions to other nodes before raising.
+@@ -363,7 +375,15 @@ def exec_tasks(self, task, distributed_args, propagate_exceptions_to,
+         if error is not None:
+             raise error
+         elif len(all_errors) > 0:
+-            raise all_errors[0]
++            # Raise the first error received from a different MPI process.
++            external_error = all_errors[0]
++            # Include original traceback in the error message (indented 4 spaces).
++            traceback_str = '\n    '.join(external_error.traceback_str.split('\n'))
++            err_msg = ('{} received an exception from another MPI process. Original'
++                       ' stack trace follow:\n{}').format(node_name, traceback_str)
++            error = type(external_error)(err_msg)
++            error.with_traceback(external_error.__traceback__)
++            raise error
+ 
+         return results
+ 
+diff --git a/Yank/multistate/multistatereporter.py b/Yank/multistate/multistatereporter.py
+index 69c2c51c..9bc2296b 100644
+--- a/Yank/multistate/multistatereporter.py
++++ b/Yank/multistate/multistatereporter.py
+@@ -120,8 +120,8 @@ def __init__(self, storage, open_mode=None,
+             logger.debug("Initial checkpoint file automatically chosen as {}".format(checkpoint_storage))
+         else:
+             checkpoint_storage = os.path.join(dirname, checkpoint_storage)
+-        self._storage_file_analysis = storage
+-        self._storage_file_checkpoint = checkpoint_storage
++        self._storage_analysis_file_path = storage
++        self._storage_checkpoint_file_path = checkpoint_storage
+         self._storage_checkpoint = None
+         self._storage_analysis = None
+         self._checkpoint_interval = checkpoint_interval
+@@ -137,7 +137,7 @@ def filepath(self):
+ 
+         Classes outside the Reporter can access the file string for error messages and such.
+         """
+-        return self._storage_file_analysis
++        return self._storage_analysis_file_path
+ 
+     @property
+     def _storage(self):
+@@ -153,7 +153,12 @@ def _storage_paths(self):
+         Return an iterable of paths to the storage files
+         Object 0 is always the primary file, all others are subfiles
+         """
+-        return self._storage_file_analysis, self._storage_file_checkpoint
++        return self._storage_analysis_file_path, self._storage_checkpoint_file_path
++
++    @property
++    def _storage_dict(self):
++        """Return an iterable dictionary of the self._storage_X objects"""
++        return {'checkpoint': self._storage_checkpoint, 'analysis': self._storage_analysis}
+ 
+     @property
+     def n_states(self):
+@@ -175,11 +180,6 @@ def is_periodic(self):
+             return True
+         return False
+ 
+-    @property
+-    def _storage_dict(self):
+-        """Return an iterable dictionary of the self._storage_X objects"""
+-        return {'checkpoint': self._storage_checkpoint, 'analysis': self._storage_analysis}
+-
+     @property
+     def analysis_particle_indices(self):
+         """Return the tuple of indices of the particles which additional information is stored on for analysis"""
+@@ -253,102 +253,67 @@ def open(self, mode='r', convention='ReplicaExchange', netcdf_format='NETCDF4'):
+         """
+         # Ensure we don't have already another file
+         # open (possibly in a different mode).
+-        for storage in self._storage:
+-            if storage is not None:
+-                self.close()
+-                # No need to execute this code more than once
+-                break
++        self.close()
+ 
+         # Create directory if we want to write.
+         if mode != 'r':
+             for storage_path in self._storage_paths:
+-                storage_dir = os.path.dirname(storage_path)
+-                # When storage_dir == '', os.path.exists() returns False.
+-                if not os.path.exists(storage_dir) and storage_dir != '':
+-                    os.makedirs(storage_dir)
+-
+-        # Open NetCDF 4 file for writing.
+-        # If no file exists, this appropriately throws an error on 'r' mode
+-        primary_ncfiles = {}
+-        sub_ncfiles = {}
+-        # TODO: Figure out how to move around the analysis file without the checkpoint file
+-        # Cast this to a common name space for operation below
+-        primary_ncfiles['analysis'] = netcdf.Dataset(self._storage_file_analysis, mode, version=netcdf_format)
+-        primary_ncfiles['analysis'].set_auto_mask(False)
+-        if mode == 'w':
+-            sub_ncfiles['checkpoint'] = netcdf.Dataset(self._storage_file_checkpoint, mode, version=netcdf_format)
+-        else:  # Read/append mode
+-            # Try to open the files in read mode, its okay if they are not there
++                # normpath() transform '' to '.' for makedirs().
++                storage_dir = os.path.normpath(os.path.dirname(storage_path))
++                os.makedirs(storage_dir, exist_ok=True)
++
++        # Analysis file.
++        # ---------------
++
++        # Open analysis file.
++        self._storage_analysis = self._open_dataset_robustly(self._storage_analysis_file_path,
++                                                             mode, version=netcdf_format)
++        # Without set_auto_mask(False) np.inf are read as masked.
++        self._storage_analysis.set_auto_mask(False)
++
++        # The analysis netcdf file holds a reference UUID so that we can check
++        # that the secondary netcdf files (currently only the checkpoint
++        # file) have the same UUID to verify that the user isn't erroneously
++        # trying to associate the anaysis file to the incorrect checkpoint.
++        try:
++            # Check if we have previously created the file.
++            primary_uuid = self._storage_analysis.UUID
++        except AttributeError:
++            # This is a new file. Use uuid4 to avoid assigning hostname information.
++            primary_uuid = str(uuid.uuid4())
++            self._storage_analysis.UUID = primary_uuid
++
++        # Initialize dataset, if needed.
++        self._initialize_storage_file(self._storage_analysis, 'analysis', convention)
++
++        # Checkpoint file.
++        # -----------------
++
++        # Open checkpoint netcdf files.
++        msg = ('Could not locate checkpoint subfile. This is okay for analysis if the '
++               'solvent trajectory is not needed, but not for production simulation!')
++        self._storage_checkpoint = self._open_dataset_robustly(self._storage_checkpoint_file_path,
++                                                               mode, catch_io_error=True,
++                                                               io_error_warning=msg,
++                                                               version=netcdf_format)
++        if self._storage_checkpoint is not None:
++            # Check that the checkpoint file has the same UUID of the analysis file.
+             try:
+-                sub_ncfiles['checkpoint'] = netcdf.Dataset(self._storage_file_checkpoint, mode, version=netcdf_format)
+-                primary_uuid = primary_ncfiles['analysis'].UUID
+-                assert primary_uuid == sub_ncfiles['checkpoint'].UUID
+-            except IOError:  # Trap the "not on disk" warning
+-                logger.debug('Could not locate checkpoint subfile. This is okay for certain append and read '
+-                             'operations, but not for production simulation!')
++                assert self._storage_checkpoint.UUID == primary_uuid
+             except AttributeError:
+-                raise AttributeError("Checkpoint file is missing its linked primary file UUID!"
+-                                     "No way to ensure this checkpoint file contains data matching the analysis file!")
++                # This is a new file. Assign UUID.
++                self._storage_checkpoint.UUID = primary_uuid
+             except AssertionError:
+-                primary_uuid = primary_ncfiles['analysis'].UUID
+-                check_uuid = sub_ncfiles['checkpoint'].UUID
+-                raise IOError("Checkpoint UUID does not match analysis UUID! This checkpoint file came from another "
+-                              "simulation!\n"
+-                              "Analysis UUID: {}"
+-                              "Checkpoint UUID: {}".format(primary_uuid, check_uuid))
+-
+-        def check_and_build_storage_file(input_ncfile, input_nc_name, checkpoint_interval, input_convention):
+-            """
+-            Helper function to build default file settings
+-            Returns a bool depending on if it ran through the setup to indicate file needs additional data or not
+-            """
+-            if 'scalar' not in ncfile.dimensions:
+-                # Create common dimensions.
+-                input_ncfile.createDimension('scalar', 1)  # Scalar dimension.
+-                input_ncfile.createDimension('iteration', 0)  # Unlimited number of iterations.
+-                input_ncfile.createDimension('spatial', 3)  # Number of spatial dimensions.
+-
+-                # Set global attributes.
+-                input_ncfile.application = 'YANK'
+-                input_ncfile.program = 'yank.py'
+-                input_ncfile.programVersion = version.short_version
+-                input_ncfile.Conventions = input_convention
+-                input_ncfile.ConventionVersion = '0.2'
+-                input_ncfile.DataUsedFor = input_nc_name
+-                input_ncfile.CheckpointInterval = checkpoint_interval
+-
+-                # Create and initialize the global variables
+-                nc_last_good_iter = ncfile.createVariable('last_iteration', int, 'scalar')
+-                nc_last_good_iter[0] = 0
+-                return True
+-            else:
+-                return False
++                raise IOError('Checkpoint UUID does not match analysis UUID! '
++                              'This checkpoint file came from another simulation!\n'
++                              'Analysis UUID: {}; Checkpoint UUID: {}'.format(
++                    primary_uuid, self._storage_checkpoint.UUID))
+ 
+-        # Setup the primary file if needed
+-        # Generate a unique UUID in case we need to assign it
+-        # primary and subfiles are linked by UUID
+-        # Uses uuid4 to avoid assigning hostname information
+-        primary_uuid = str(uuid.uuid4())
+-        ncfile_ever_built = False
+-        for nc_name, ncfile in primary_ncfiles.items():
+-            ncfile_built = check_and_build_storage_file(ncfile, nc_name, self._checkpoint_interval, convention)
+-            if ncfile_built:
+-                ncfile_ever_built = True
+-            # Assign ncfile to class property
+-            setattr(self, '_storage_' + nc_name, ncfile)
+-        if ncfile_ever_built:  # Assign the same UUID to all primary files
+-            for _, ncfile in primary_ncfiles.items():
+-                ncfile.UUID = primary_uuid
+-        else:
+-            primary_uuid = primary_ncfiles['analysis'].UUID
+-        # Handle Subfiles
+-        for nc_name, ncfile in sub_ncfiles.items():
+-            # If they are in the sub-ncfiles dict, they exist and are open
+-            ncfile_built = check_and_build_storage_file(ncfile, nc_name, self._checkpoint_interval, convention)
+-            if ncfile_built:
+-                # Assign the UUID to the subfile
+-                ncfile.UUID = primary_uuid
+-            setattr(self, '_storage_' + nc_name, ncfile)
++            # Initialize dataset, if needed.
++            self._initialize_storage_file(self._storage_checkpoint, 'checkpoint', convention)
++
++        # Further checkpoint interval checks.
++        # -----------------------------------
+ 
+         if self._storage_analysis is not None:
+             # The same number will be on checkpoint file as well, but its not guaranteed to be present
+@@ -377,6 +342,63 @@ def check_and_build_storage_file(input_ncfile, input_nc_name, checkpoint_interva
+                              "Using on file analysis indices of {}".format(stored_analysis_particles))
+                 self._analysis_particle_indices = tuple(stored_analysis_particles.astype(int))
+ 
++    def _open_dataset_robustly(self, *args, n_attempts=5, sleep_time=2,
++                               catch_io_error=False, io_error_warning=None,
++                               **kwargs):
++        """Attempt to open the dataset multiple times if it raises an error.
++
++        This may be useful to solve some MPI concurrency and locking issues
++        that routinely and randomly pop up with HDF5. Some sleep time is
++        added between attempts (in seconds).
++
++        If the file is not found and catch_io_error is True, None is returned.
++        """
++        # Catch eventual errors n_attempts - 1 times.
++        for i in range(n_attempts-1):
++            try:
++                return netcdf.Dataset(*args, **kwargs)
++            except IOError as e:
++                # If the file does not exist, it doesn't make sense to try again.
++                if catch_io_error:
++                    if io_error_warning is not None:
++                        logger.warning(io_error_warning)
++                    return None
++                raise e
++            except:
++                logger.debug('Attempt {}/{} to open {} failed. Retrying '
++                             'in {} seconds'.format(i+1, n_attempts, sleep_time))
++                time.sleep(sleep_time)
++        # Last attempt finally raises any error.
++        return netcdf.Dataset(*args, **kwargs)
++
++    def _initialize_storage_file(self, ncfile, nc_name, convention):
++        """Helper function to initialize dimensions and global attributes.
++
++        If the dataset has been initialized before, nothing happens. Return True
++        if the file has been initialized before and False otherwise.
++        """
++        if 'scalar' not in ncfile.dimensions:
++            # Create common dimensions.
++            ncfile.createDimension('scalar', 1)  # Scalar dimension.
++            ncfile.createDimension('iteration', 0)  # Unlimited number of iterations.
++            ncfile.createDimension('spatial', 3)  # Number of spatial dimensions.
++
++            # Set global attributes.
++            ncfile.application = 'YANK'
++            ncfile.program = 'yank.py'
++            ncfile.programVersion = version.short_version
++            ncfile.Conventions = convention
++            ncfile.ConventionVersion = '0.2'
++            ncfile.DataUsedFor = nc_name
++            ncfile.CheckpointInterval = self._checkpoint_interval
++
++            # Create and initialize the global variables
++            nc_last_good_iter = ncfile.createVariable('last_iteration', int, 'scalar')
++            nc_last_good_iter[0] = 0
++            return True
++        else:
++            return False
++
+     def close(self):
+         """Close the storage files"""
+         for storage_name, storage in self._storage_dict.items():
+@@ -1414,9 +1436,9 @@ def _calculate_checkpoint_iteration(self, iteration):
+ 
+          Returns either the integer index, or None if there is no matched index
+          """
+-        checkpoint_index = float(iteration) / self._checkpoint_interval
+-        if checkpoint_index.is_integer():
+-            return int(checkpoint_index)
++        checkpoint_index, remainder = divmod(iteration, self._checkpoint_interval)
++        if remainder == 0:
++            return checkpoint_index
+         return None
+ 
+     def _map_iteration_to_good(self, iteration):
+diff --git a/Yank/multistate/multistatesampler.py b/Yank/multistate/multistatesampler.py
+index 26fdca8a..b6af1751 100644
+--- a/Yank/multistate/multistatesampler.py
++++ b/Yank/multistate/multistatesampler.py
+@@ -213,15 +213,24 @@ def from_storage(cls, storage):
+             last stored iteration.
+ 
+         """
+-        sampler, reporter = cls._instantiate_sampler_from_storage(storage)
+-        sampler._restore_sampler_from_reporter(reporter)
+-        # Close reading reporter.
+-        reporter.close()
++        # Handle case in which storage is a string.
++        reporter = cls._reporter_from_storage(storage, check_exist=True)
++
++        try:
++            # Open the reporter to read the data.
++            reporter.open(mode='r')
++            sampler = cls._instantiate_sampler_from_reporter(reporter)
++            sampler._restore_sampler_from_reporter(reporter)
++        finally:
++            # Close reporter in reading mode.
++            reporter.close()
++
+         # We open the reporter only in node 0 in append mode ready for use
+         sampler._reporter = reporter
+         mpi.run_single_node(0, sampler._reporter.open, mode='a',
+                             broadcast_result=False, sync_nodes=False)
+-        # Don't write the new last iteration, we have not technically written anything yet, so there is no "junk"
++        # Don't write the new last iteration, we have not technically
++        # written anything yet, so there is no "junk".
+         return sampler
+ 
+     # TODO use Python 3.6 namedtuple syntax when we drop Python 3.5 support.
+@@ -255,21 +264,24 @@ def read_status(cls, storage):
+         reporter = cls._reporter_from_storage(storage, check_exist=True)
+ 
+         # Read iteration and online analysis info.
+-        reporter.open(mode='r')
+-        options = reporter.read_dict('options')
+-        iteration = reporter.read_last_iteration(last_checkpoint=False)
+-        # Search for last cached free energies only if online analysis is activated.
+-        target_error = None
+-        last_err_free_energy = None
+-        # Check if online analysis is set AND that the target error is a stopping condition (> 0)
+-        if options['online_analysis_interval'] is not None and options['online_analysis_target_error'] != 0.0:
+-            target_error = options['online_analysis_target_error']
+-            try:
+-                last_err_free_energy = cls._read_last_free_energy(reporter, iteration)[1][1]
+-            except TypeError:
+-                # Trap for undefined free energy (has not been run yet)
+-                last_err_free_energy = np.inf
+-        reporter.close()
++        try:
++            reporter.open(mode='r')
++            options = reporter.read_dict('options')
++            iteration = reporter.read_last_iteration(last_checkpoint=False)
++            # Search for last cached free energies only if online analysis is activated.
++            target_error = None
++            last_err_free_energy = None
++            # Check if online analysis is set AND that the target error is a stopping condition (> 0)
++            if (options['online_analysis_interval'] is not None and
++                        options['online_analysis_target_error'] != 0.0):
++                target_error = options['online_analysis_target_error']
++                try:
++                    last_err_free_energy = cls._read_last_free_energy(reporter, iteration)[1][1]
++                except TypeError:
++                    # Trap for undefined free energy (has not been run yet)
++                    last_err_free_energy = np.inf
++        finally:
++            reporter.close()
+ 
+         # Check if the calculation is done.
+         number_of_iterations = options['number_of_iterations']
+@@ -513,9 +525,6 @@ def create(self, thermodynamic_states: list, sampler_states, storage,
+             raise RuntimeError('Storage file {} already exists; cowardly '
+                                'refusing to overwrite.'.format(self._reporter.filepath))
+ 
+-        # Make sure that only the root node has an open reporter.
+-        self._reporter.close()
+-
+         # Make sure sampler_states is an iterable of SamplerStates.
+         if isinstance(sampler_states, mmtools.states.SamplerState):
+             sampler_states = [sampler_states]
+@@ -820,7 +829,7 @@ def _pre_write_create(self,
+         self._energy_unsampled_states = np.zeros([self.n_replicas, len(self._unsampled_states)], np.float64)
+ 
+     @classmethod
+-    def _instantiate_sampler_from_storage(cls, storage):
++    def _instantiate_sampler_from_reporter(cls, reporter):
+         """
+         Creates a new instance of the reporter on disk and sampler which can then be manipulated.
+         Does not set any variables, use :func:`_restore_sampler_from_reporter` after calling this to set them.
+@@ -828,27 +837,16 @@ def _instantiate_sampler_from_storage(cls, storage):
+ 
+         Parameters
+         ----------
+-        storage : str or Reporter
+-            If str: The path to the storage file.
+-            If :class:`Reporter`: uses the :class:`Reporter` options
+-            In the future this will be able to take a Storage class as well.
++        reporter : Reporter
++            A reporter open for reading.
+ 
+         Returns
+         -------
+         sampler :  MultiStateSampler
+-            A new instance of MultiStateSampler (or subclass) with options restored from disk
+-        reporter : MultiStateReporter
+-            Loaded instance of the reporter from disk.
+-            In case ``storage`` was a reporter  returns the input reporter.
+-            Reporter will be closed when returned.
+-        """
+-
+-        # Handle case in which storage is a string.
+-        reporter = cls._reporter_from_storage(storage, check_exist=True)
+-
+-        # Open a reporter to read the data.
+-        reporter.open(mode='r')
++            A new instance of MultiStateSampler (or subclass) with options
++            restored from disk.
+ 
++        """
+         # Retrieve options and create new simulation.
+         options = reporter.read_dict('options')
+         options['mcmc_moves'] = reporter.read_mcmc_moves()
+@@ -856,8 +854,7 @@ def _instantiate_sampler_from_storage(cls, storage):
+ 
+         # Display papers to be cited.
+         sampler._display_citations()
+-        reporter.close()
+-        return sampler, reporter
++        return sampler
+ 
+     def _restore_sampler_from_reporter(self, reporter):
+         """
+@@ -876,13 +873,9 @@ def _restore_sampler_from_reporter(self, reporter):
+         Parameters
+         ----------
+         reporter : MultiStateReporter
+-            Reporter instance to read options from
++            Reporter open for reading.
+ 
+         """
+-        # Ensure reporter is closed for safe keeping first
+-        reporter.close()
+-        # Reopen in read mode
+-        reporter.open(mode='r')
+         # Read the last iteration reported to ensure we don't include junk
+         # data written just before a crash.
+         logger.debug("Reading storage file {}...".format(reporter.filepath))
+@@ -956,26 +949,30 @@ def _check_nan_energy(self):
+ 
+         """
+         # Find faulty replicas to create error message.
+-        faulty_replicas = set()
++        nan_replicas = []
+ 
+         # Check sampled thermodynamic states first.
+         state_type = 'thermodynamic state'
+-
+-        for (replica_id, state_id) in enumerate(self._replica_thermodynamic_states):
++        for replica_id, state_id in enumerate(self._replica_thermodynamic_states):
+             neighborhood = self._neighborhood(state_id)
+-            if np.any(np.isnan(self._energy_thermodynamic_states[replica_id,neighborhood])):
+-                faulty_replicas.add(replica_id)
++            energies_neighborhood = self._energy_thermodynamic_states[replica_id, neighborhood]
++            if np.any(np.isnan(energies_neighborhood)):
++                nan_replicas.append((replica_id, energies_neighborhood))
+ 
+-        # If there are no NaNs in energies, the problem is in the unsampled states.
+-        if (len(faulty_replicas) == 0) and (self._energy_unsampled_states.shape[1] > 0):
++        # If there are no NaNs in energies, look for NaNs in the unsampled states energies.
++        if (len(nan_replicas) == 0) and (self._energy_unsampled_states.shape[1] > 0):
+             state_type = 'unsampled thermodynamic state'
+             for replica_id in range(self.n_replicas):
+                 if np.any(np.isnan(self._energy_unsampled_states[replica_id])):
+-                    faulty_replicas.add(replica_id)
+-
+-        if len(faulty_replicas) > 0:
+-            # Raise exception.
+-            err_msg = "NaN encountered in {} energies for replicas {}".format(state_type, faulty_replicas)
++                    nan_replicas.append((replica_id, self._energy_unsampled_states[replica_id]))
++
++        # Raise exception if we have found some NaN energies.
++        if len(nan_replicas) > 0:
++            # Log failed replica, its thermo state, and the energy matrix row.
++            err_msg = "NaN encountered in {} energies for the following replicas and states".format(state_type)
++            for replica_id, energy_row in nan_replicas:
++                err_msg += '\n\tEnergies for positions at replica {} (current state {}): {} kT'.format(
++                    replica_id, self._replica_thermodynamic_states[replica_id], energy_row)
+             logger.critical(err_msg)
+             raise SimulationNaNError(err_msg)
+ 
+@@ -1051,7 +1048,7 @@ def _reporter_from_storage(storage, check_exist=True):
+         """Return the Reporter object associated to this storage.
+ 
+         If check_exist is True, FileNotFoundError is raised if the files
+-        are not found.
++        are not found. The return reporter is closed.
+         """
+         if isinstance(storage, str):
+             # Open a reporter to read the data.
+@@ -1061,7 +1058,6 @@ def _reporter_from_storage(storage, check_exist=True):
+ 
+         # Check if netcdf file exists.
+         if check_exist and not reporter.storage_exists():
+-            reporter.close()
+             raise FileNotFoundError('Storage file {} or its subfiles do not exist; '
+                                     'cannot read status.'.format(reporter.filepath))
+         return reporter
+@@ -1229,8 +1225,9 @@ def _propagate_replica(self, replica_id):
+             file_name = 'iteration{}-replica{}-state{}'.format(self._iteration, replica_id,
+                                                                thermodynamic_state_id)
+             e.serialize_error(os.path.join(output_dir, file_name))
+-            message = ('This Multistate Sampler simulation threw a NaN!\nLook for error logs in:\n'
+-                       '\tDirectory: {}\tFile Name Base: {}').format(output_dir, file_name)
++            message = ('Propagating replica {} at state {} resulted in a NaN!\n'
++                       'The state of the system and integrator before the error were saved'
++                       ' in {}').format(replica_id, thermodynamic_state_id, output_dir)
+             logger.critical(message)
+             raise SimulationNaNError(message)
+ 
+@@ -1327,20 +1324,18 @@ def _compute_energies(self):
+ 
+     def _compute_replica_energies(self, replica_id):
+         """Compute the energy for the replica in every ThermodynamicState."""
+-        # Initialize replica energies for each thermodynamic state.
+-        energy_thermodynamic_states = np.zeros(self.n_states)
++        # Determine neighborhood
++        state_index = self._replica_thermodynamic_states[replica_id]
++        neighborhood = self._neighborhood(state_index)
++
++        # Only compute energies of the sampled states over neighborhoods.
++        energy_neighborhood_states = np.zeros(len(neighborhood))
+         energy_unsampled_states = np.zeros(len(self._unsampled_states))
++        neighborhood_thermodynamic_states = [self._thermodynamic_states[n] for n in neighborhood]
+ 
+         # Retrieve sampler state associated to this replica.
+         sampler_state = self._sampler_states[replica_id]
+ 
+-        # Determine neighborhood
+-        state_index = self._replica_thermodynamic_states[replica_id]
+-        neighborhood = self._neighborhood(state_index)
+-        # Only compute energies over neighborhoods
+-        energy_neighborhood_states = energy_thermodynamic_states[neighborhood]  # Array, can be indexed like this
+-        neighborhood_thermodynamic_states = [self._thermodynamic_states[n] for n in neighborhood]  # List
+-
+         # Compute energy for all thermodynamic states.
+         for energies, states in [(energy_neighborhood_states, neighborhood_thermodynamic_states),
+                                  (energy_unsampled_states, self._unsampled_states)]:
+diff --git a/Yank/multistate/sams.py b/Yank/multistate/sams.py
+index fc27ac31..fc560bfd 100644
+--- a/Yank/multistate/sams.py
++++ b/Yank/multistate/sams.py
+@@ -308,7 +308,7 @@ def _pre_write_create(self, thermodynamic_states: list, sampler_states: list, st
+         super()._pre_write_create(thermodynamic_states, sampler_states, storage=storage, **kwargs)
+ 
+         if self.state_update_scheme == 'global-jump':
+-            self.locality = None # override locality to be global
++            self.locality = None  # override locality to be global
+         if self.locality is not None:
+             if self.locality < 1:
+                 raise Exception('locality must be >= 1')
+@@ -373,13 +373,14 @@ def _mix_replicas(self):
+         # TODO: We may be able to refactor this to simply have different update schemes compute neighborhoods differently.
+         # TODO: Can we allow "plugin" addition of new update schemes that can be registered externally?
+         with mmtools.utils.time_it('Mixing of replicas'):
+-            jump_and_mix = self._JumpAndMixPacket(self.n_replicas, self.n_states)
++            # Initialize statistics. This matrix is modified by the jump function and used when updating the logZ estimates.
++            replicas_log_P_k = np.zeros([self.n_replicas, self.n_states], np.float64)
+             if self.state_update_scheme == 'global-jump':
+-                self._global_jump(jump_and_mix)
++                self._global_jump(replicas_log_P_k)
+             elif self.state_update_scheme == 'local-jump':
+-                self._local_jump(jump_and_mix)
++                self._local_jump(replicas_log_P_k)
+             elif self.state_update_scheme == 'restricted-range-jump':
+-                self._restricted_range_jump(jump_and_mix)
++                self._restricted_range_jump(replicas_log_P_k)
+             else:
+                 raise Exception('Programming error: Unreachable code')
+ 
+@@ -394,12 +395,12 @@ def _mix_replicas(self):
+                                                                        swap_fraction_accepted * 100.0))
+ 
+         # Update logZ estimates
+-        self._update_logZ_estimates(jump_and_mix)
++        self._update_logZ_estimates(replicas_log_P_k)
+ 
+         # Update log weights based on target probabilities
+         self._update_log_weights()
+ 
+-    def _local_jump(self, jump_and_mix_data):
++    def _local_jump(self, replicas_log_P_k):
+         n_replica, n_states, locality = self.n_replicas, self.n_states, self.locality
+         for (replica_index, current_state_index) in enumerate(self._replica_thermodynamic_states):
+             u_k = np.zeros([n_states], np.float64)
+@@ -433,35 +434,37 @@ def _local_jump(self, jump_and_mix_data):
+             new_state_index = np.random.choice(neighborhood, p=P_k[neighborhood])
+             self._replica_thermodynamic_states[replica_index] = new_state_index
+             # Accumulate statistics
+-            jump_and_mix_data.replica_log_P_k[replica_index,:] = log_P_k[:]
++            replicas_log_P_k[replica_index,:] = log_P_k[:]
+             self._n_proposed_matrix[current_state_index, neighborhood] += 1
+             self._n_accepted_matrix[current_state_index, new_state_index] += 1
+ 
+-    def _global_jump(self, jump_and_mix_data):
++    def _global_jump(self, replicas_log_P_k):
+         """
+         Global jump scheme.
+         This method is described after Eq. 3 in [2]
+         """
+         n_replica, n_states = self.n_replicas, self.n_states
+-        for (replica_index, current_state_index) in enumerate(self._replica_thermodynamic_states):
+-            u_k = np.zeros([n_states], np.float64)
+-            log_P_k = np.zeros([n_states], np.float64)
+-            # Compute unnormalized log probabilities for all thermodynamic states
++        for replica_index, current_state_index in enumerate(self._replica_thermodynamic_states):
+             neighborhood = self._neighborhood(current_state_index)
++
++            # Compute unnormalized log probabilities for all thermodynamic states.
++            log_P_k = np.zeros([n_states], np.float64)
+             for state_index in neighborhood:
+-                u_k[state_index] = self._energy_thermodynamic_states[replica_index, state_index]
+-                log_P_k[state_index] = self.log_weights[state_index] - u_k[state_index]
++                u_k = self._energy_thermodynamic_states[replica_index, :]
++                log_P_k[state_index] =  - u_k[state_index] + self.log_weights[state_index]
+             log_P_k -= logsumexp(log_P_k)
++
+             # Update sampler Context to current thermodynamic state.
+             P_k = np.exp(log_P_k[neighborhood])
+             new_state_index = np.random.choice(neighborhood, p=P_k)
+             self._replica_thermodynamic_states[replica_index] = new_state_index
+-            # Accumulate statistics
+-            jump_and_mix_data.replica_log_P_k[replica_index,:] = log_P_k[:]
++
++            # Accumulate statistics.
++            replicas_log_P_k[replica_index,:] = log_P_k[:]
+             self._n_proposed_matrix[current_state_index, neighborhood] += 1
+             self._n_accepted_matrix[current_state_index, new_state_index] += 1
+ 
+-    def _restricted_range_jump(self, jump_and_mix_data):
++    def _restricted_range_jump(self, replicas_log_P_k):
+         # TODO: This has an major bug in that we also need to compute energies in `proposed_neighborhood`.
+         # I'm working on a way to make this work.
+         n_replica, n_states, locality = self.n_replicas, self.n_states, self.locality
+@@ -495,7 +498,7 @@ def _restricted_range_jump(self, jump_and_mix_data):
+             logger.debug('  new_state_index     : %d' % new_state_index)
+             self._replica_thermodynamic_states[replica_index] = new_state_index
+             # Accumulate statistics
+-            jump_and_mix_data.replica_log_P_k[replica_index,:] = log_P_k[:]
++            replicas_log_P_k[replica_index,:] = log_P_k[:]
+             self._n_proposed_matrix[current_state_index, neighborhood] += 1
+             self._n_accepted_matrix[current_state_index, new_state_index] += 1
+ 
+@@ -565,7 +568,7 @@ def _update_stage(self):
+                 # TODO: On resuming, we need to recompute or restore t0, or use some other way to compute it
+                 self._t0 = self._iteration - 1
+ 
+-    def _update_logZ_estimates(self, jump_and_mix_data):
++    def _update_logZ_estimates(self, replicas_log_P_k):
+         """
+         Update the logZ estimates according to selected SAMS update method
+ 
+@@ -616,7 +619,7 @@ def _update_logZ_estimates(self, jump_and_mix_data):
+                 # Based on Eq. 12 of Ref [1]
+                 # TODO: This has to be the previous state index and log_P_k used before update; store neighborhood?
+                 # TODO: Can we use masked arrays for this purpose?
+-                log_P_k = jump_and_mix_data.replica_log_P_k[replica_index,:]
++                log_P_k = replicas_log_P_k[replica_index,:]
+                 neighborhood = np.where(self._neighborhoods[replica_index,:])[0] # compact list of states defining neighborhood
+                 #logger.debug('  using neighborhood: %s' % str(neighborhood))
+                 #logger.debug('  using log_P_k : %s' % str(log_P_k[neighborhood]))
+@@ -646,14 +649,6 @@ def _update_log_weights(self):
+ 
+         self.log_weights = self.log_target_probabilities[:] - self._logZ[:]
+ 
+-    class _JumpAndMixPacket(object):
+-        """
+-        Helper class to pass information around between jump, mixing, and parameter update schemes
+-        which can be easily created and collapsed as an extendable object
+-        """
+-        def __init__(self, n_replicas, n_states):
+-            self.replica_log_P_k = np.zeros([n_replicas, n_states], np.float64)
+-
+ 
+ class SAMSAnalyzer(MultiStateSamplerAnalyzer):
+     """
+diff --git a/Yank/tests/test_sampling.py b/Yank/tests/test_sampling.py
+index 2f671599..f8cebecc 100644
+--- a/Yank/tests/test_sampling.py
++++ b/Yank/tests/test_sampling.py
+@@ -1031,11 +1031,10 @@ def test_from_storage(self):
+                 restored_ets = restored_dict.pop('_energy_thermodynamic_states')
+                 original_eus = original_dict.pop('_energy_unsampled_states')
+                 restored_eus = restored_dict.pop('_energy_unsampled_states')
+-                for replica_id in range(n_replicas):
+-                    if replica_id in node_replica_ids:
+-                        assert np.allclose(original_neighborhoods[replica_id], restored_neighborhoods[replica_id])
+-                        assert np.allclose(original_ets[replica_id], restored_ets[replica_id])
+-                        assert np.allclose(original_eus[replica_id], restored_eus[replica_id])
++                for replica_id in node_replica_ids:
++                    assert np.allclose(original_neighborhoods[replica_id], restored_neighborhoods[replica_id])
++                    assert np.allclose(original_ets[replica_id], restored_ets[replica_id])
++                    assert np.allclose(original_eus[replica_id], restored_eus[replica_id])
+ 
+                 # Only node 0 has updated accepted and proposed exchanges.
+                 original_accepted = original_dict.pop('_n_accepted_matrix')
+@@ -1052,10 +1051,6 @@ def test_from_storage(self):
+                 if len(node_replica_ids) == n_replicas:
+                     assert pickle.dumps(original_mcmc_moves) == pickle.dumps(restored_mcmc_moves)
+ 
+-                # Remove cached values that are not resumed.
+-                original_dict.pop('_cached_transition_counts', None)
+-                original_dict.pop('_cached_last_replica_thermodynamic_states', None)
+-
+                 # Check all other arrays. Instantiate list so that we can pop from original_dict.
+                 for attr, original_value in list(original_dict.items()):
+                     if isinstance(original_value, np.ndarray):
+diff --git a/Yank/yank.py b/Yank/yank.py
+index 9c50ebfd..b238467d 100644
+--- a/Yank/yank.py
++++ b/Yank/yank.py
+@@ -1217,6 +1217,14 @@ def extend(self, n_iterations):
+         """
+         self._sampler.extend(n_iterations)
+ 
++    # -------------------------------------------------------------------------
++    # Magic methods
++    # -------------------------------------------------------------------------
++
++    def __del__(self):
++        # Explicitly delete the sampler so that its reporter will close.
++        del self._sampler
++
+     # -------------------------------------------------------------------------
+     # Internal-usage
+     # -------------------------------------------------------------------------
+diff --git a/docs/whatsnew.rst b/docs/whatsnew.rst
+index 011d63ab..911c4de4 100644
+--- a/docs/whatsnew.rst
++++ b/docs/whatsnew.rst
+@@ -6,6 +6,13 @@ This section features and improvements of note in each release.
+ 
+ The full release history can be viewed `at the GitHub yank releases page <https://github.com/choderalab/yank/releases>`_.
+ 
++Development
++-----------
++
++- Fix bug where the stack trace of an exception raised by an MPI process would be logged incorrectly (`#1084 <https://github.com/choderalab/yank/pull/1084>`_).
++- Improved robustness of NetCDF dataset opening and closing (`#1084 <https://github.com/choderalab/yank/pull/1084>`_).
++
++
+ 0.23.4 Bugfix release
+ ---------------------
+ 

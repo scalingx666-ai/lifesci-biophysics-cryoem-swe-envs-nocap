@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Handling 0 atoms case in InterfaceFinder
+
+## Description
+
+Fixing an edge-case in InterfaceFinder and better handling of errors in BoundingBox
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `ed3061c292fa`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

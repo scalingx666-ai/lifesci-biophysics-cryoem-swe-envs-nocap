@@ -1,0 +1,716 @@
+diff --git a/.github/workflows/CI.yml b/.github/workflows/CI.yml
+index e281207..ab8cfbd 100644
+--- a/.github/workflows/CI.yml
++++ b/.github/workflows/CI.yml
+@@ -94,11 +94,11 @@ jobs:
+             # Plus the drift file's one short case (float32 NVE, about half a minute),
+             # in its own process like every drift case; it runs even when the first
+             # command fails, and the step fails if either did.
+-            run_short: "uv run --no-sync pytest tests/test_cli_errors.py tests/test_md_observables.py tests/test_md_output_integrity.py tests/test_model_registry.py tests/test_md_state_precision.py tests/test_min_kspace_dispersion.py tests/test_ci_lanes.py tests/test_legacy_model_autodetect.py tests/test_npt_flex.py tests/test_npt_coupling_safety.py tests/test_flash.py -v --tb=short || s=$?; uv run --no-sync pytest tests/test_integrator_drift.py -v --tb=short || s=$?; exit ${s:-0}"
++            run_short: "uv run --no-sync pytest tests/test_cli_errors.py tests/test_md_observables.py tests/test_md_output_integrity.py tests/test_model_registry.py tests/test_md_state_precision.py tests/test_min_kspace_dispersion.py tests/test_kspace_net_force.py tests/test_ci_lanes.py tests/test_legacy_model_autodetect.py tests/test_npt_flex.py tests/test_npt_coupling_safety.py tests/test_flash.py -v --tb=short || s=$?; uv run --no-sync pytest tests/test_integrator_drift.py -v --tb=short || s=$?; exit ${s:-0}"
+             # Each drift parameter still runs, but in its own interpreter: on
+             # large CPU nodes, repeated XLA compilations in one process can
+             # exhaust native compiler resources before later ensembles start.
+-            run_full: "uv run --no-sync pytest tests/test_cli_errors.py tests/test_md_observables.py tests/test_md_output_integrity.py tests/test_model_registry.py tests/test_md_state_precision.py tests/test_min_kspace_dispersion.py tests/test_ci_lanes.py tests/test_legacy_model_autodetect.py tests/test_npt_flex.py tests/test_npt_coupling_safety.py tests/test_flash.py -v --tb=short --full && tests/run_integrator_drift_tests.sh .venv/bin/python"
++            run_full: "uv run --no-sync pytest tests/test_cli_errors.py tests/test_md_observables.py tests/test_md_output_integrity.py tests/test_model_registry.py tests/test_md_state_precision.py tests/test_min_kspace_dispersion.py tests/test_kspace_net_force.py tests/test_ci_lanes.py tests/test_legacy_model_autodetect.py tests/test_npt_flex.py tests/test_npt_coupling_safety.py tests/test_flash.py -v --tb=short --full && tests/run_integrator_drift_tests.sh .venv/bin/python"
+     runs-on: ubuntu-latest
+     name: "${{ matrix.name }}"
+     # The full md-regressions lane launches every drift case in a fresh Python
+diff --git a/so3lr/cli/md_settings.yaml b/so3lr/cli/md_settings.yaml
+index aa98820..589dfdb 100644
+--- a/so3lr/cli/md_settings.yaml
++++ b/so3lr/cli/md_settings.yaml
+@@ -75,6 +75,7 @@ kspace_smearing: 4.0                      # Smearing width for k-space summation
+ kspace_spacing: 2.0                       # Grid spacing for k-space summation in Å [Default: 2.0]
+ kspace_interp_nodes: 4                    # Number of interpolation nodes for PME/P3M [Default: 4]
+ kspace_npt_cycles: 100                    # Re-tune the k-space grid every this many MD cycles in NPT; null disables [Default: 100]
++kspace_remove_net_force: true             # MD/opt forces with k-space minus their mean, so the box does not drift (PME's net force) [Default: true]
+ 
+ ## Charge overrides (optional; both default to following total_charge)
+ charge_embed_total_charge: null            # Total charge seen by the charge EMBEDDING: null = follow total_charge, 0.0 = neutral embedding. [Default: null]  (CLI: --charge-embed-total-charge)
+diff --git a/so3lr/cli/so3lr_cli.py b/so3lr/cli/so3lr_cli.py
+index 0840f02..3c4ab80 100644
+--- a/so3lr/cli/so3lr_cli.py
++++ b/so3lr/cli/so3lr_cli.py
+@@ -655,6 +655,8 @@ def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> Non
+     # K-space dispersion
+     'kspace_dispersion', 'kspace_dispersion_smearing',
+     'kspace_dispersion_spacing', 'kspace_dispersion_interp_nodes',
++    # K-space forces summing to zero (default true; so3lr_md.remove_kspace_net_force)
++    'kspace_remove_net_force',
+     # Numerical / safety knobs
+     'matmul_precision', 'minimum_cell_size_multiplier',
+     'energy_drift_threshold', 'drift_warmup_ps', 'dispersion_tail_correction',
+diff --git a/so3lr/cli/so3lr_md.py b/so3lr/cli/so3lr_md.py
+index d3ae80c..1dc2142 100755
+--- a/so3lr/cli/so3lr_md.py
++++ b/so3lr/cli/so3lr_md.py
+@@ -1087,6 +1087,7 @@ def to_jax_md_custom(
+         total_charge: float = 0.,
+         precision: jnp.dtype = jnp.float32,
+         num_unpaired_electrons: float = 0.,
++        remove_net_force: bool = False,
+         **neighbor_kwargs
+ ):
+     """Create neighbor functions and a jax-md energy function for the MD engine.
+@@ -1112,6 +1113,8 @@ def to_jax_md_custom(
+         total_charge: Total charge of the system.
+         precision: Precision to use for the auxiliary graph arrays.
+         num_unpaired_electrons: Number of unpaired electrons (spin).
++        remove_net_force: Forces minus their mean, so they sum to zero
++            (see :func:`so3lr.jaxmd_utils.without_net_force`).
+         **neighbor_kwargs: Additional keyword arguments for neighbor functions.
+ 
+     Returns:
+@@ -1133,10 +1136,35 @@ def to_jax_md_custom(
+         total_charge=total_charge,
+         num_unpaired_electrons=num_unpaired_electrons,
+         precision=precision,
++        remove_net_force=remove_net_force,
+         **neighbor_kwargs,
+     )
+ 
+ 
++def remove_kspace_net_force(all_settings: Dict) -> bool:
++    """Whether the forces are made to sum to zero: with a k-space part (PME or
++    Ewald, electrostatics or dispersion) unless ``kspace_remove_net_force: false``.
++    PME's mesh is fixed in space, so its forces leave a small net force that drifts
++    the whole box over a run (AMBER removes it the same way, netfrc)."""
++    kspace = bool(all_settings.get('kspace_electrostatics') or all_settings.get('kspace_dispersion'))
++    return bool(kspace and all_settings.get('kspace_remove_net_force', KS.DEFAULT_KSPACE_REMOVE_NET_FORCE))
++
++
++def restart_removes_com_motion(all_settings: Dict, restart_pysages: bool = False,
++                               held_atoms: bool = False) -> bool:
++    """Whether a restart zeroes the centre-of-mass motion (with or without k-space: a box that
++    drifted before is stopped): not when the run keeps the old behaviour
++    (``kspace_remove_net_force: false`` also keeps the restart's motion), not for Langevin
++    (its noise keeps the centre of mass thermal: jax-md ignores langevin_removecmmotion), not
++    with atoms held in place (their momenta stay zero), and not for a restarted PySAGES state
++    (it keeps its snapshot's momenta)."""
++    if restart_pysages or held_atoms:
++        return False
++    if not all_settings.get('kspace_remove_net_force', KS.DEFAULT_KSPACE_REMOVE_NET_FORCE):
++        return False
++    return str(all_settings.get('ensemble')).strip().lower().replace('_', '-') != 'nvt-langevin'
++
++
+ def process_model(
+     potential: PotentialSparse,
+     species: jnp.ndarray,
+@@ -1150,6 +1178,7 @@ def process_model(
+     precision: jnp.dtype = jnp.float32,
+     fractional_coordinates: bool = False,
+     has_aux: bool = False,
++    remove_net_force: bool = False,
+ ) -> Tuple[callable, callable, callable]:
+     """
+     Process the model and create the neighbor functions and energy function.
+@@ -1172,6 +1201,9 @@ def process_model(
+                     coordinates or not (needs to be True for periodic systems).
+                                             Defaults to False.
+         has_aux (bool, optional): Unused; the returned function takes has_aux per call.
++        remove_net_force (bool, optional): Forces minus their mean, so they sum to
++                    zero (k-space; see :func:`remove_kspace_net_force`).
++                                            Defaults to False.
+ 
+     Returns:
+         Tuple[callable, callable, callable]: Short- and long-range neighbor functions
+@@ -1200,6 +1232,7 @@ def process_model(
+         buffer_size_multiplier_lr=buffer_size_multiplier_lr,
+         buffer_size_multiplier_sr=buffer_size_multiplier_sr,
+         minimum_cell_size_multiplier=minimum_cell_size_multiplier,
++        remove_net_force=remove_net_force,
+     )
+ 
+     return neighbor_fn, neighbor_fn_lr, energy_or_obs_fn
+@@ -1670,6 +1703,49 @@ def apply_atom_constraints_to_state(
+     )
+ 
+ 
++COM_DRIFT_WARN_A_PER_PS = 1e-4  # 0.1 A per ns
++
++
++def remove_restart_com_momentum(momentum, mass):
++    """Restarted momenta with zero total momentum (m_i v_com off every momentum, the smallest
++    change in kinetic energy that does it; nothing for a single atom), logged: a warning when
++    the box was drifting. Periodic k-space runs before the net force was removed
++    (kspace_remove_net_force) random-walk the total momentum, and with zero-sum forces nothing
++    removes it later (restart_removes_com_motion says when this runs)."""
++    momentum = jnp.asarray(momentum)
++    m = jnp.broadcast_to(jnp.reshape(jnp.asarray(mass, momentum.dtype), (-1, 1)), (momentum.shape[0], 1))
++    v_com = jnp.sum(momentum, axis=0) / jnp.sum(m) * (momentum.shape[0] > 1)
++    speed = float(jnp.linalg.norm(v_com)) * units.metal_unit_system()['time']    # A/ps
++    if speed > COM_DRIFT_WARN_A_PER_PS:
++        logger.warning(
++            f'Restart: the box was drifting as a whole at {speed:.2e} A/ps '
++            f'({speed * 1e3:.2g} A per ns), as k-space runs did before kspace_remove_net_force; '
++            f'removed the centre-of-mass motion. Trajectories written before this restart '
++            f'contain the drift (it inflates MSDs and diffusion coefficients) unless the '
++            f'centre-of-mass motion is removed in the analysis.'
++        )
++    else:
++        logger.info(f'Restart: removed centre-of-mass motion of {speed:.2e} A/ps.')
++    return (momentum - m * v_com).astype(momentum.dtype)
++
++
++def remove_restart_com_motion(state):
++    """The restarted jax-md state without centre-of-mass motion."""
++    momentum = remove_restart_com_momentum(state.momentum, state.mass)
++    if isinstance(state, jax_md.simulate.NPTNoseHooverFlexState):
++        # stores velocity; its momentum is a read-only property
++        mass = jnp.reshape(jnp.asarray(state.mass, momentum.dtype), (-1, 1))
++        state = state.set(velocity=(momentum / mass).astype(state.velocity.dtype))
++    else:
++        state = state.set(momentum=momentum)
++    # Nose-Hoover's first half-step reads its cached kinetic energy (NVT: chain, NPT: thermostat)
++    kinetic = jax_md.quantity.kinetic_energy(momentum=state.momentum, mass=state.mass)
++    for name in ('chain', 'thermostat'):
++        if getattr(state, name, None) is not None:
++            state = state.set(**{name: getattr(state, name).set(kinetic_energy=kinetic)})
++    return state
++
++
+ def constrain_md_carry(
+     carry,
+     mobile_mask: Optional[jnp.ndarray],
+@@ -1843,6 +1919,9 @@ def perform_md(
+     charge_embed_total_charge = all_settings.get('charge_embed_total_charge', None)
+     charge_equilibration_total_charge = all_settings.get('charge_equilibration_total_charge', None)
+     kspace_npt_cycles = all_settings.get('kspace_npt_cycles', 100)
++    remove_net_force = remove_kspace_net_force(all_settings)
++    if remove_net_force:
++        logger.info('K-space: net force removed (forces minus their mean; kspace_remove_net_force).')
+ 
+     # Dispersion PME settings
+     kspace_dispersion = all_settings.get('kspace_dispersion', None)
+@@ -2045,6 +2124,9 @@ def perform_md(
+     hdf5_store = None
+ 
+     current_cycle = 0
++    # a restarted PySAGES state keeps the momenta its snapshot holds
++    com_free_restart = restart_removes_com_motion(
++        all_settings, restart_pysages, mobile_mask is not None and bool(jnp.any(mobile_mask == 0)))
+     # Loading restart
+     if restart:
+         logger.info(f'Loading state from {restart_load_path}.')
+@@ -2058,6 +2140,8 @@ def perform_md(
+             )
+             if str(ensemble).lower() == 'npt':
+                 validate_npt_restart_coupling(state, box, npt_coupling)
++            if com_free_restart:
++                state = remove_restart_com_motion(state)
+             position = state.position
+         except RestartInNewEnsembleError as e:
+             check_pysages_restart_ensemble(e, restart_pysages, ensemble)
+@@ -2065,6 +2149,9 @@ def perform_md(
+             position = e.loaded_state['position']
+             initial_geometry_dict['masses'] = e.loaded_state['mass']
+             initial_geometry_dict['momenta'] = e.loaded_state['momentum']
++            if com_free_restart:
++                initial_geometry_dict['momenta'] = remove_restart_com_momentum(
++                    e.loaded_state['momentum'], e.loaded_state['mass'])
+             box = e.loaded_state['box']
+             if np.all(box == 0) or box is None:
+                 box = jnp.array([0.0], dtype=dtype)
+@@ -2129,6 +2216,7 @@ def perform_md(
+         buffer_size_multiplier_lr=buffer_size_multiplier_lr,
+         buffer_size_multiplier_sr=buffer_size_multiplier_sr,
+         minimum_cell_size_multiplier=minimum_cell_size_multiplier,
++        remove_net_force=remove_net_force,
+         has_aux=len(observables)>0,
+     )
+     if cell is not None:
+@@ -3101,6 +3189,7 @@ def perform_min(
+         buffer_size_multiplier_lr=buffer_size_multiplier_lr,
+         buffer_size_multiplier_sr=buffer_size_multiplier_sr,
+         minimum_cell_size_multiplier=minimum_cell_size_multiplier,
++        remove_net_force=remove_kspace_net_force(all_settings),
+     )
+ 
+     k_grid, k_smearing = setup_kspace_grid(
+diff --git a/so3lr/flash/check.py b/so3lr/flash/check.py
+index 1d16fc2..310318e 100644
+--- a/so3lr/flash/check.py
++++ b/so3lr/flash/check.py
+@@ -53,7 +53,7 @@
+     "min_start_dt", "min_max_dt", "min_n_min", "force_convergence", "force_conv", "kspace_electrostatics",
+     "kspace_smearing", "kspace_spacing", "kspace_interp_nodes", "kspace_dispersion",
+     "kspace_dispersion_smearing", "kspace_dispersion_spacing", "kspace_dispersion_interp_nodes",
+-    "restart_load_path", "restart_save_path", "restart_reset", "energy_drift_threshold", "drift_warmup_ps",
++    "kspace_remove_net_force", "restart_load_path", "restart_save_path", "restart_reset", "energy_drift_threshold", "drift_warmup_ps",
+     "engine", "flash_mode", "flash_mixed", "flash_devices", "flash_kernels", "md_precision",
+     "do_enhanced_sampling", "pysages_input", "restart_pysages_load_path", "restart_pysages_save_path",
+     "buffer_size_multiplier_sr", "buffer_sr",       # the coordinationnumber CV's neighbour list
+diff --git a/so3lr/flash/engine.py b/so3lr/flash/engine.py
+index b1d252a..0d5cb94 100644
+--- a/so3lr/flash/engine.py
++++ b/so3lr/flash/engine.py
+@@ -30,7 +30,9 @@
+ * Long range in real space, or with particle-mesh Ewald for electrostatics and/or
+   dispersion (``pme_electrostatics=(smearing, spacing)``, ``pme_dispersion=...``: the
+   mesh as jaxpme builds it for ``--kspace-electrostatics pme`` /
+-  ``kspace_dispersion: pme``).
++  ``kspace_dispersion: pme``). The mesh is fixed in space, so its forces leave a small
++  net force; with ``remove_net_force`` (MD and opt: ``md.build_engine``) the forces are
++  returned minus their mean (as AMBER's netfrc), which keeps an MD box from drifting as a whole.
+ * ``energy_forces_strain`` also returns dE/d(strain) (the isotropic virial, box and
+   positions scaled together, as jax-md's NPT takes it; ``diag=True``: per axis, for
+   semi-isotropic NPT); the box is an argument of the compiled programs (``set_box``), so a
+@@ -1263,7 +1265,7 @@ def __init__(self, params, statics, z, box, *, total_charge=0.0, total_spin=0.0,
+                  keep_layer_inputs=True, keep_attention=False, split_channels=False,
+                  split_blocks=False, pme_electrostatics=None, pme_dispersion=None, box_margin=0.0,
+                  devices=1, atoms_per_program=None, size=None, kernels=None, sort_atoms=True,
+-                 staged=False):
++                 staged=False, remove_net_force=False):
+         degrees = [int(d) for d in statics["degrees"]]
+         self.nh = int(statics["num_heads"])
+         # one head per degree entry, each on its own block of G features (so3lr-tauri-s/m: 4 x 32,
+@@ -1367,6 +1369,8 @@ def __init__(self, params, statics, z, box, *, total_charge=0.0, total_spin=0.0,
+         self.pme_disp = tuple(float(v) for v in pme_dispersion) if pme_dispersion and self.disp else None
+         if self.vacuum and (self.pme_el or self.pme_disp):
+             raise ValueError("PME needs a box")
++        # the mesh's net force taken out of the forces (the rest of the model has none)
++        self.net_free = bool(remove_net_force) and bool(self.pme_el or self.pme_disp)
+         # the pair tables' end: 8 sigma, past which phi is in closed form (_far_field); with
+         # PME the cutoff (the dispersion mesh's table shares the grid)
+         self.r_tab = self.rc_lr if self.pme_el or self.pme_disp or not self.elec else min(self.rc_lr, 8.0 * sig)
+@@ -2007,7 +2011,7 @@ def rows(R, L, z, elem):
+             rows = jax.shard_map(rows, mesh=self.device_mesh, in_specs=(rep,) * 4, out_specs=(rep,) * 4,
+                                  check_vma=False)
+         e, f, over, w = rows(Rs, L, z, elem)
+-        return e, _unsorted(f, perm), over, w
++        return e, self._net_free(_unsorted(f, perm)), over, w
+ 
+     @contextlib.contextmanager
+     def _atoms(self, z, elem, L=None):
+@@ -2020,6 +2024,10 @@ def _atoms(self, z, elem, L=None):
+         finally:
+             self.z, self.elem, self._Lt = keep
+ 
++    def _net_free(self, forces):
++        """The forces minus their mean with PME (``remove_net_force``)."""
++        return forces - jnp.mean(forces, axis=0, keepdims=True) if self.net_free else forces
++
+     def _energy_forces_rows(self, R):
+         n, dt, M = self.n, self.dtype, self.M
+         pos3 = self._pos3(R)
+@@ -2190,7 +2198,7 @@ def energy_forces_strain_staged(self, R, diag=False):
+                 energy, f3, most = self._backward_staged(Rs, st)
+                 if not self._recover(R, int(int(jnp.max(cnt)) > self.K or int(most) > self.maxh)):
+                     w3 = self._strain(f3[3:], Rs)
+-                    return energy, _unsorted(jnp.stack(f3[:3], -1), perm), (w3 if diag else w3.sum())
++                    return energy, self._net_free(_unsorted(jnp.stack(f3[:3], -1), perm)), (w3 if diag else w3.sum())
+         raise RuntimeError(f"Flash: overflowed again after {MAX_REBUILDS} rebuilds")
+ 
+     def widen(self):
+diff --git a/so3lr/flash/md.py b/so3lr/flash/md.py
+index 908540c..27831a4 100644
+--- a/so3lr/flash/md.py
++++ b/so3lr/flash/md.py
+@@ -56,6 +56,10 @@
+     load_state,
+     npt_nose_hoover_for,
+     npt_start_motion,
++    remove_kspace_net_force,
++    remove_restart_com_momentum,
++    remove_restart_com_motion,
++    restart_removes_com_motion,
+     run_dtypes,
+     save_restart_checkpoints,
+     setup_run,
+@@ -102,7 +106,9 @@ def build_engine(atoms, settings, dtype, box_margin=None, positions=None):
+     """FlashSO3LR for ``atoms`` with the model, charges, PME and memory mode of
+     ``settings``; the cell grid laid out for a box ``box_margin`` smaller (default: NPT's
+     margin in NPT, else none). Atoms in free space (``check.in_vacuum``): the engine's box
+-    laid out for them at ``positions`` (default the atoms')."""
++    laid out for them at ``positions`` (default the atoms'). The forces minus their mean
++    with PME as ``remove_kspace_net_force(settings)`` says (MD and opt; SinglePoints turns
++    it off: single points keep the model's forces)."""
+     if box_margin is None:
+         box_margin = NPT_BOX_MARGIN if settings.get("ensemble") == "npt" else 0.0
+     precision = "float64" if dtype == jnp.float64 else "float32"
+@@ -154,7 +160,7 @@ def make(kw, staged, kernels):
+                           pme_electrostatics=pme_el, pme_dispersion=pme_disp,
+                           box_margin=box_margin, devices=devices,
+                           size=size, **kw,
+-                          kernels=kernels, staged=staged)
++                          kernels=kernels, staged=staged, remove_net_force=remove_kspace_net_force(settings))
+     kw, staged = MODES[mode][:2]
+     eng = make(kw, staged, kernels)
+     if picked and eng.cuda_kernels is None:
+@@ -418,7 +424,8 @@ def __call__(self, atoms, charge=0.0, spin=0.0):
+                 self.engine = self._ef = self._key = None    # until the new engine exists
+                 gc.collect()                 # the last engine's arrays, before the next one's
+                 self.engine, staged = build_engine(
+-                    atoms, dict(self.settings, total_charge=key[1], num_unpaired_electrons=key[2]), self.dtype,
++                    atoms, dict(self.settings, total_charge=key[1], num_unpaired_electrons=key[2],
++                                kspace_remove_net_force=False), self.dtype,     # the model's forces, as So3lrCalculator's
+                     box_margin=self.box_margin)
+                 self._ef = self.engine.energy_forces_staged if staged else self.engine.energy_forces
+                 self._key, self._builds = key, 0
+@@ -474,6 +481,11 @@ def perform_md_flash(all_settings, restart=False, atoms=None):
+     position = geo["positions"]
+ 
+     current_cycle, state = 0, None
++    # a restarted PySAGES state keeps its snapshot's momenta; held atoms keep zero momenta
++    # range-checked as perform_md does (check.py declines the mask file and mobile_atom_indices)
++    held = load_atom_masks(None, len(atoms), fixed_atom_indices=s.get("fixed_atom_indices"))[1]
++    held = np.zeros(0, np.int64) if held is None else held.astype(np.int64)
++    com_free_restart = restart_removes_com_motion(s, restart_pysages, held.size > 0)
+     if restart:
+         logger.info(f"Loading state from {restart_load_path}.")
+         try:
+@@ -482,6 +494,8 @@ def perform_md_flash(all_settings, restart=False, atoms=None):
+                                                     fractional_coordinates=npt, precision=sdt)
+             if npt:
+                 validate_npt_restart_coupling(state, rbox, coupling)
++            if com_free_restart:
++                state = remove_restart_com_motion(state)
+             if not vacuum:                   # (structure_problem: a restart in free space has no box)
+                 box = jnp.asarray(box_to_diag(rbox), sdt)
+         except RestartInNewEnsembleError as e:
+@@ -496,6 +510,8 @@ def perform_md_flash(all_settings, restart=False, atoms=None):
+                 position = position * box
+             geo["masses"] = jnp.asarray(loaded["mass"], sdt)
+             geo["momenta"] = jnp.asarray(loaded["momentum"], sdt)
++            if com_free_restart:
++                geo["momenta"] = remove_restart_com_momentum(geo["momenta"], geo["masses"])
+         if not vacuum:
+             atoms = atoms.copy()
+             atoms.set_cell(np.diag(np.asarray(box, np.float64)))      # the engine starts in this box
+@@ -544,9 +560,6 @@ def perform_md_flash(all_settings, restart=False, atoms=None):
+     if ensemble == "nvt-langevin" and (thermo is None or thermo <= 0):
+         raise ValueError(f"--langevin-thermo must be > 0 (received {thermo})")
+ 
+-    # range-checked as perform_md does (check.py declines the mask file and mobile_atom_indices)
+-    held = load_atom_masks(None, len(atoms), fixed_atom_indices=s.get("fixed_atom_indices"))[1]
+-    held = np.zeros(0, np.int64) if held is None else held.astype(np.int64)
+     R_held = (position if state is None else state.position)[held]
+ 
+     def in_place(st):
+diff --git a/so3lr/flash/verify.py b/so3lr/flash/verify.py
+index a3267c7..70a7ce3 100644
+--- a/so3lr/flash/verify.py
++++ b/so3lr/flash/verify.py
+@@ -34,7 +34,8 @@ def main(argv=None):
+     kdi = "pme" if "dispersion" in pme else None
+ 
+     from so3lr.cli.so3lr_md import (atoms_to_jnp, cell_from_atoms_boundary_conditions, handle_box,
+-                                    load_model, process_model, setup_jax_globals, setup_kspace_grid)
++                                    load_model, process_model, remove_kspace_net_force, setup_jax_globals,
++                                    setup_kspace_grid)
+     setup_jax_globals(precision=args.precision)
+     import jax
+     import jax.numpy as jnp
+@@ -74,7 +75,8 @@ def main(argv=None):
+             potential=potential, species=geo["species"], displacement=displacement, box=box,
+             total_charge=0, num_unpaired_electrons=0, precision=args.precision,
+             fractional_coordinates=frac, buffer_size_multiplier_lr=1.25, buffer_size_multiplier_sr=1.25,
+-            minimum_cell_size_multiplier=1.0, has_aux=False)
++            minimum_cell_size_multiplier=1.0, has_aux=False,
++            remove_net_force=remove_kspace_net_force(settings))
+         k_grid, k_smearing = setup_kspace_grid(kel, args.kspace_smearing, args.kspace_spacing, box)
+         k_grid_disp, k_smearing_disp = setup_kspace_grid(kdi, args.kspace_smearing, args.kspace_spacing, box)
+         if kel or kdi:
+diff --git a/so3lr/jaxmd_utils.py b/so3lr/jaxmd_utils.py
+index 50365c6..af8d5d4 100644
+--- a/so3lr/jaxmd_utils.py
++++ b/so3lr/jaxmd_utils.py
+@@ -19,6 +19,29 @@ def nbrs_cutoff(potential):
+     return potential.long_range_cutoff if potential.long_range_cutoff is not None else potential.cutoff
+ 
+ 
++@jax.custom_jvp
++def without_net_force(R):
++    """Identity on the positions whose derivative drops the mean over atoms.
++
++    Smooth PME (and the dispersion PME) is not translation invariant: the charges
++    are spread on a mesh fixed in space, so the analytic forces carry a small net
++    force (~1e-3 of the atomic forces), and nothing else in the model cancels it.
++    Over an MD run it accumulates into a drift of the whole box, which the MSD
++    then counts as diffusion. Passing the positions through this function gives
++    every atom's force minus the mean force, so the total force is zero (AMBER's
++    netfrc). The energy is unchanged, and so is its derivative with respect to the
++    box (the pressure): the box enters after the positions.
++    """
++    return R
++
++
++@without_net_force.defjvp
++def _without_net_force_jvp(primals, tangents):
++    R, = primals
++    dR, = tangents
++    return R, dR - jnp.mean(dR, axis=0, keepdims=True)
++
++
+ def neighbor_list_featurizer(
+         displacement_fn,
+         species,
+@@ -142,6 +165,7 @@ def to_jax_md(
+         total_charge: float = 0.0,  # net charge of the system (e)
+         num_unpaired_electrons: float = 0.0,  # spin: number of unpaired electrons
+         precision=None,  # the model's dtype; None leaves the graph in R.dtype (PotentialSparse casts it to its own)
++        remove_net_force: bool = False,  # forces summing to zero (k-space): without_net_force
+         **neighbor_kwargs
+ ):
+     """Build the (short-range, long-range) neighbor functions and a jax-md
+@@ -215,6 +239,8 @@ def energy_fn(
+             has_aux=False,
+             **energy_fn_kwargs
+     ):
++        if remove_net_force:
++            R = without_net_force(R)
+         graph = featurizer(R, neighbor, neighbor_lr, **energy_fn_kwargs)
+         # back in the positions' dtype before the sum (a float64 MD state sums in float64)
+         out = cast_float_params(potential(graph, has_aux=True) if has_aux else potential(graph), R.dtype)
+diff --git a/so3lr/kspace_defaults.py b/so3lr/kspace_defaults.py
+index 67ca995..38bbd93 100644
+--- a/so3lr/kspace_defaults.py
++++ b/so3lr/kspace_defaults.py
+@@ -11,3 +11,5 @@
+ DEFAULT_KSPACE_DISPERSION_SMEARING = 2.0  # A
+ DEFAULT_KSPACE_DISPERSION_SPACING = 3.0   # A
+ DEFAULT_KSPACE_DISPERSION_INTERP_NODES = 4
++# MD and opt take the k-space forces minus their mean (PME's mesh leaves a net force)
++DEFAULT_KSPACE_REMOVE_NET_FORCE = True
+diff --git a/tests/test_kspace_net_force.py b/tests/test_kspace_net_force.py
+new file mode 100644
+index 0000000..3b35543
+--- /dev/null
++++ b/tests/test_kspace_net_force.py
+@@ -0,0 +1,219 @@
++"""The k-space net force (kspace_remove_net_force).
++
++Smooth PME spreads the charges on a mesh fixed in space, so its forces are not
++translation invariant and sum to a small net force. In MD nothing cancels it, and
++it accumulates into a drift of the whole box (seen as superdiffusive MSDs in slow
++bulk liquids). With k-space on, the MD energy function hands the integrator the
++forces minus their mean; the energy and its box derivative (the pressure) stay as
++they were.
++"""
++import functools
++import pathlib
++
++import jax
++import jax.numpy as jnp
++import jax_md
++import numpy as np
++import numpy.testing as npt
++import pytest
++from ase.io import read
++
++from so3lr.jaxmd_utils import without_net_force
++
++jax.config.update('jax_enable_x64', True)
++
++WATER = pathlib.Path(__file__).parent / 'test_data' / 'water_64.xyz'
++LR_CUTOFF = 6.0      # minimum image holds in the 12.4 A cell
++
++
++def test_without_net_force_is_identity_with_mean_free_gradient():
++    R = jax.random.uniform(jax.random.PRNGKey(0), (7, 3), dtype=jnp.float64)
++    a = jax.random.normal(jax.random.PRNGKey(1), (7, 3), dtype=jnp.float64)
++
++    def energy(R):
++        return jnp.sum(a * jnp.sin(3.0 * R))
++
++    npt.assert_array_equal(without_net_force(R), R)
++    g = jax.grad(energy)(R)
++    g_free = jax.grad(lambda R: energy(without_net_force(R)))(R)
++    npt.assert_allclose(g_free, g - g.mean(0), atol=1e-14)
++    npt.assert_allclose(g_free.sum(0), 0.0, atol=1e-13)
++    # forward mode agrees (custom_jvp, so jacfwd works too)
++    npt.assert_allclose(jax.jacfwd(lambda R: energy(without_net_force(R)))(R), g_free, atol=1e-14)
++
++
++@pytest.mark.parametrize('settings, expected', [
++    (dict(kspace_electrostatics='pme'), True),
++    (dict(kspace_dispersion='pme'), True),
++    (dict(kspace_electrostatics='ewald', kspace_remove_net_force=True), True),
++    (dict(kspace_electrostatics='pme', kspace_remove_net_force=False), False),
++    (dict(), False),
++    (dict(kspace_electrostatics=None, kspace_dispersion=None), False),
++    (dict(kspace_electrostatics='', kspace_dispersion=False), False),            # no k-space, as elsewhere
++])
++def test_remove_kspace_net_force_settings(settings, expected):
++    from so3lr.cli.so3lr_md import remove_kspace_net_force
++    assert remove_kspace_net_force(settings) is expected
++
++
++@pytest.mark.parametrize('settings, expected', [
++    (dict(ensemble='nvt'), True),
++    (dict(ensemble='npt', kspace_electrostatics='pme'), True),
++    (dict(ensemble='nvt', kspace_remove_net_force=False), False),                 # the old behaviour
++    (dict(ensemble='nvt-langevin'), False),                                     # thermal COM motion
++    (dict(ensemble='nvt_langevin', langevin_removecmmotion=True), False),
++])
++def test_restart_removes_com_motion_settings(settings, expected):
++    from so3lr.cli.so3lr_md import restart_removes_com_motion
++    assert restart_removes_com_motion(settings) is expected
++
++
++def test_restart_keeps_pysages_and_held_atoms_momenta():
++    """A restarted PySAGES state keeps its snapshot's momenta, and held atoms their zero
++    momenta, in both engines."""
++    from so3lr.cli.so3lr_md import restart_removes_com_motion
++    assert restart_removes_com_motion(dict(ensemble='nvt'), restart_pysages=True) is False
++    assert restart_removes_com_motion(dict(ensemble='nvt'), held_atoms=True) is False
++
++
++def test_flash_single_points_keep_the_model_forces(monkeypatch):
++    """so3lr eval and the flash ASE calculator return the forces So3lrCalculator does; only
++    MD and opt take them without the net force."""
++    import so3lr.flash.md as flash_md
++    from so3lr.cli.so3lr_md import remove_kspace_net_force
++    seen = {}
++
++    class Engine:
++        device_mesh, builds = None, 0
++
++        def energy_forces(self, R):
++            return 0.0, jnp.zeros_like(R)
++
++    def build_engine(atoms, settings, dtype, box_margin=None, positions=None):
++        seen['remove_net_force'] = remove_kspace_net_force(settings)
++        return Engine(), False
++
++    monkeypatch.setattr(flash_md, 'build_engine', build_engine)
++    for check in ('flash_problem', 'structure_problem'):          # no GPU, a small box
++        monkeypatch.setattr(flash_md, check, lambda *args, **kwargs: None)
++    points = flash_md.SinglePoints(dict(kspace_electrostatics='pme', precision='float64'), task='eval')
++    points(read(WATER))
++    assert seen['remove_net_force'] is False
++
++
++@functools.cache
++def _md_energy_fn(remove_net_force):
++    """The float64 energy function `so3lr npt` integrates for water_64 with PME
++    electrostatics and dispersion (fractional positions, as in NPT), and its
++    arguments."""
++    from so3lr import kspace_defaults as KS
++    from so3lr.cli import so3lr_md
++    from so3lr.model_registry import DEFAULT_MODEL
++
++    atoms = read(WATER)
++    cell = so3lr_md.cell_from_atoms_boundary_conditions(atoms, LR_CUTOFF, 'pme', KS.DEFAULT_KSPACE_SMEARING)
++    atoms.wrap()
++    geometry = so3lr_md.atoms_to_jnp(atoms, precision='float64')
++    position, box, displacement, _, frac = so3lr_md.handle_box(
++        'periodic', geometry['positions'], cell, precision=jnp.float64)
++    potential = so3lr_md.load_model(DEFAULT_MODEL, precision=jnp.float64, lr_cutoff=LR_CUTOFF,
++                                    dispersion_damping=2.0, kspace_electrostatics='pme',
++                                    kspace_dispersion='pme')
++    neighbor_fn, neighbor_fn_lr, energy_or_obs_fn = so3lr_md.process_model(
++        potential=potential, species=geometry['species'], displacement=displacement, box=box,
++        total_charge=0, num_unpaired_electrons=0, precision='float64', fractional_coordinates=frac,
++        buffer_size_multiplier_lr=1.25, buffer_size_multiplier_sr=1.25,
++        minimum_cell_size_multiplier=1.0, remove_net_force=remove_net_force)
++    k_grid, k_smearing = so3lr_md.setup_kspace_grid(
++        kspace_electrostatics='pme', kspace_spacing=KS.DEFAULT_KSPACE_SPACING,
++        kspace_smearing=KS.DEFAULT_KSPACE_SMEARING, box=box)
++    k_grid_disp, k_smearing_disp = so3lr_md.setup_kspace_grid(
++        kspace_electrostatics='pme', kspace_spacing=KS.DEFAULT_KSPACE_DISPERSION_SPACING,
++        kspace_smearing=KS.DEFAULT_KSPACE_DISPERSION_SMEARING, box=box)
++    energy_fn = functools.partial(energy_or_obs_fn, has_aux=False, k_smearing=k_smearing,
++                                  k_smearing_disp=k_smearing_disp)
++    nbrs = neighbor_fn.allocate(position, box=box)
++    nbrs_lr = neighbor_fn_lr.allocate(position, box=box)
++    kw = dict(neighbor=nbrs.idx, neighbor_lr=nbrs_lr.idx, box=box, k_grid=k_grid, k_grid_disp=k_grid_disp)
++    return energy_fn, position, kw
++
++
++def _energy_forces_strain(remove_net_force):
++    energy_fn, R, kw = _md_energy_fn(remove_net_force)
++    e = float(jax.jit(energy_fn)(R, **kw))
++    f = np.asarray(jax.jit(jax_md.quantity.force(energy_fn))(R, **kw))
++    # dE/d(strain), box and positions scaled together: what jax-md's NPT takes
++    w = float(jax.jit(jax.grad(lambda eps: energy_fn(R, perturbation=1.0 + eps, **kw)))(0.0))
++    return e, f, w
++
++
++def test_md_forces_sum_to_zero_with_pme():
++    e0, f0, w0 = _energy_forces_strain(False)
++    e1, f1, w1 = _energy_forces_strain(True)
++    net0 = np.linalg.norm(f0.sum(0))
++    # the mesh leaves a net force well above float64 roundoff ...
++    assert net0 > 1e-6, net0
++    # ... which is gone, with every atom's force moved by the same mean
++    assert np.linalg.norm(f1.sum(0)) < 1e-10 * len(f1)
++    npt.assert_allclose(f1, f0 - f0.mean(0), atol=1e-10)
++    # energy and pressure unchanged (to the last bits: on a GPU the two programs sum in their own order)
++    assert e1 == pytest.approx(e0, rel=1e-13)
++    npt.assert_allclose(w1, w0, rtol=1e-12, atol=1e-12)
++
++
++def _drifting(n=6, speed_internal=0.01, seed=0):
++    """Thermal-looking momenta plus a centre-of-mass velocity along x."""
++    mass = jnp.asarray(np.random.default_rng(seed).uniform(1.0, 16.0, n))
++    p = jax.random.normal(jax.random.PRNGKey(seed), (n, 3), dtype=jnp.float64)
++    p = p - mass[:, None] * (p.sum(0) / mass.sum())
++    v_com = jnp.array([speed_internal, 0.0, 0.0])
++    return p + mass[:, None] * v_com, p, mass
++
++
++def test_restart_loses_com_motion(caplog):
++    """Momentum states, the flexible-cell state (which stores velocity) and bare momenta;
++    a warning only when the box was drifting."""
++    from so3lr.cli.so3lr_md import remove_restart_com_momentum, remove_restart_com_motion
++    drifting, still, mass = _drifting()
++    zeros = jnp.zeros_like(drifting)
++    nve = jax_md.simulate.NVEState(position=zeros, momentum=drifting, force=zeros, mass=mass[:, None])
++    flex = jax_md.simulate.NPTNoseHooverFlexState(
++        position=zeros, velocity=drifting / mass[:, None], force=zeros, mass=mass[:, None],
++        reference_box=None, box_position=None, box_velocity=None, box_mass=None,
++        barostat=None, thermostat=None, stress_tensor=None)
++    with caplog.at_level('INFO', logger='SO3LR'):
++        for m in (mass, mass[:, None]):                  # jax-md keeps [n] or [n, 1]
++            npt.assert_allclose(remove_restart_com_momentum(drifting, m), still, atol=1e-13)
++        npt.assert_allclose(remove_restart_com_motion(nve).momentum, still, atol=1e-13)
++        npt.assert_allclose(remove_restart_com_motion(flex).momentum, still, atol=1e-13)
++    assert caplog.text.count('drifting as a whole') == 4
++    assert f"{0.01 * jax_md.units.metal_unit_system()['time']:.2e} A/ps" in caplog.text
++    caplog.clear()
++    with caplog.at_level('INFO', logger='SO3LR'):
++        npt.assert_allclose(remove_restart_com_motion(nve.set(momentum=still)).momentum, still, atol=1e-13)
++    assert 'drifting' not in caplog.text and 'removed centre-of-mass motion' in caplog.text
++
++
++@pytest.mark.slow
++def test_cli_restart_removes_com_drift(tmp_path):
++    """A restart file whose box drifts (written before the net-force removal) continues
++    without the drift, and the log says so."""
++    import subprocess
++    from subprocess_env import so3lr_subprocess_env
++    acetone = pathlib.Path(__file__).parent / 'test_data' / 'acetone.xyz'
++
++    def so3lr(*args):
++        run = subprocess.run(['so3lr', 'nvt', '--input', str(acetone), '--engine', 'standard', '--no-relax',
++                              '--md-cycles', '2', '--md-steps', '2', *args],
++                             cwd=tmp_path, capture_output=True, text=True, env=so3lr_subprocess_env(), timeout=900)
++        assert run.returncode == 0, run.stdout[-2000:] + run.stderr[-2000:]
++
++    so3lr('--output', 'a.xyz', '--restart-save', 'a.npz')
++    a = dict(np.load(tmp_path / 'a.npz', allow_pickle=False))
++    mass = a['mass'].reshape(-1, 1)
++    a['momentum'] = a['momentum'] + mass * np.array([0.01, 0.0, 0.0])    # ~1 A/ps
++    np.savez(tmp_path / 'drift.npz', **a)
++    so3lr('--output', 'b.xyz', '--restart-load', 'drift.npz', '--restart-save', 'b.npz')
++    assert 'drifting as a whole' in (tmp_path / 'b.log').read_text()
++    total = np.load(tmp_path / 'b.npz')['momentum'].sum(0)
++    assert np.abs(total).max() < 1e-8 * mass.sum(), total
+diff --git a/tests/test_pme.py b/tests/test_pme.py
+index e7ca294..8828832 100644
+--- a/tests/test_pme.py
++++ b/tests/test_pme.py
+@@ -180,7 +180,9 @@ def _cli_md_energy_and_forces(atoms, settings):
+     box. Running perform_md itself would integrate and write a trajectory, so a
+     change to those calls there must be repeated here. Left out are
+     setup_jax_globals (process-wide: this module enables x64 and conftest sets the
+-    matmul precision) and everything after the neighbour lists.
++    matmul precision), the k-space net-force removal (the ASE calculator returns the
++    model's forces as they are; tests/test_kspace_net_force.py covers it) and
++    everything after the neighbour lists.
+     """
+     from so3lr import kspace_defaults as KS
+     from so3lr.cli import so3lr_md

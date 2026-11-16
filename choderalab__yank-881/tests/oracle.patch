@@ -1,0 +1,586 @@
+diff --git a/Yank/experiment.py b/Yank/experiment.py
+index 6fe018e8..77636915 100644
+--- a/Yank/experiment.py
++++ b/Yank/experiment.py
+@@ -433,7 +433,7 @@ def is_completed(self):
+ 
+     def run(self, n_iterations=None):
+         """
+-        Run the experiment
++        Run the experiment.
+ 
+         Runs until either the maximum number of iterations have been reached or the sampler
+         for that phase reports its own completion (e.g. online analysis)
+@@ -610,6 +610,7 @@ class ExperimentBuilder(object):
+         'experiments_dir': 'experiments',
+         'platform': 'fastest',
+         'precision': 'auto',
++        'max_n_contexts': 3,
+         'switch_experiment_interval': 0,
+         'processes_per_experiment': None
+     }
+@@ -763,7 +764,7 @@ def parse(self, script):
+             # The cache has been already used. Empty it before switching platform.
+             mmtools.cache.global_context_cache.empty()
+             mmtools.cache.global_context_cache.platform = platform
+-        mmtools.cache.global_context_cache.capacity = 3
++        mmtools.cache.global_context_cache.capacity = self._options['max_n_contexts']
+ 
+         # Initialize and configure database with molecules, solvents and systems
+         setup_dir = os.path.join(self._options['output_dir'], self._options['setup_dir'])
+@@ -1234,13 +1235,24 @@ def check_anisotropic_cutoff(cutoff):
+                                'number_of_iterations': integer_or_infinity,
+                                'anisotropic_dispersion_cutoff': check_anisotropic_cutoff}
+ 
+-        # Validate parameters
++        # Validate parameters.
+         try:
+             validated_options = utils.validate_parameters(options, template_options, check_unknown=True,
+                                                           process_units_str=True, float_to_int=True,
+                                                           special_conversions=special_conversions)
+         except (TypeError, ValueError) as e:
+             raise YamlParseError(str(e))
++
++        # Overwrite defaults.
++        defaults_to_overwrite = {
++            # With the analytical dispersion correction for alchemical atoms,
++            # the computation of the energy matrix becomes super slow.
++            'disable_alchemical_dispersion_correction': True,
++        }
++        for option, default_value in defaults_to_overwrite.items():
++            if option not in validated_options:
++                validated_options[option] = default_value
++
+         return validated_options
+ 
+     @classmethod
+diff --git a/Yank/repex.py b/Yank/repex.py
+index 873b5e1b..04bb8cce 100644
+--- a/Yank/repex.py
++++ b/Yank/repex.py
+@@ -2512,24 +2512,23 @@ def _compute_replica_energies(self, replica_id):
+         # Compute energy for all thermodynamic states.
+         for energies, states in [(energy_thermodynamic_states, self._thermodynamic_states),
+                                  (energy_unsampled_states, self._unsampled_states)]:
+-            for i, state in enumerate(states):
+-                # Check if we need to request a new Context.
+-                if i == 0 or not state.is_state_compatible(context_state):
+-                    context_state = state
+-
+-                    # Get the context, any Integrator works.
+-                    context, integrator = mmtools.cache.global_context_cache.get_context(state)
+-
+-                    # Update positions and box vectors. We don't need
+-                    # to set Context velocities for the potential.
+-                    sampler_state.apply_to_context(context, ignore_velocities=True)
+-                else:
+-                    # If this state is compatible with the context, just fix the
+-                    # thermodynamic state as positions/box vectors are the same.
+-                    state.apply_to_context(context)
+-
+-                # Compute energy.
+-                energies[i] = state.reduced_potential(context)
++            # Group thermodynamic states by compatibility.
++            compatible_groups, original_indices = mmtools.states.group_by_compatibility(states)
++
++            # Compute the reduced potentials of all the compatible states.
++            for compatible_group, state_indices in zip(compatible_groups, original_indices):
++                # Get the context, any Integrator works.
++                context, integrator = mmtools.cache.global_context_cache.get_context(compatible_group[0])
++
++                # Update positions and box vectors. We don't need
++                # to set Context velocities for the potential.
++                sampler_state.apply_to_context(context, ignore_velocities=True)
++
++                # Compute and update the reduced potentials.
++                compatible_energies = mmtools.states.ThermodynamicState.reduced_potential_at_states(
++                    context, compatible_group)
++                for energy_idx, state_idx in enumerate(state_indices):
++                    energies[state_idx] = compatible_energies[energy_idx]
+ 
+         # Return the new energies.
+         return energy_thermodynamic_states, energy_unsampled_states
+diff --git a/Yank/restraints.py b/Yank/restraints.py
+index e5a7e12f..494c7363 100644
+--- a/Yank/restraints.py
++++ b/Yank/restraints.py
+@@ -280,8 +280,7 @@ def apply_to_context(self, context):
+         except Exception:
+             raise RestraintStateError('The context does not have a restraint.')
+ 
+-    @classmethod
+-    def _standardize_system(cls, system):
++    def _standardize_system(self, system):
+         """Standardize the given system.
+ 
+         Set lambda_restraints of the system to 1.0.
+@@ -298,9 +297,62 @@ def _standardize_system(cls, system):
+ 
+         """
+         # Set lambda_restraints to 1.0 in all forces that have it.
+-        for force, parameter_id in cls._get_system_forces_parameters(system):
++        for force, parameter_id in self._get_system_forces_parameters(system):
+             force.setGlobalParameterDefaultValue(parameter_id, 1.0)
+ 
++    def _on_setattr(self, standard_system, attribute_name):
++        """Check if the standard system needs changes after a state attribute is set.
++
++        Parameters
++        ----------
++        standard_system : simtk.openmm.System
++            The standard system before setting the attribute.
++        attribute_name : str
++            The name of the attribute that has just been set or retrieved.
++
++        Returns
++        -------
++        need_changes : bool
++            True if the standard system has to be updated, False if no change
++            occurred.
++
++        """
++        # There are no attributes that can be set that can alter the standard system.
++        return False
++
++    def _find_force_groups_to_update(self, context, current_context_state, memo):
++        """Find the force groups whose energy must be recomputed after applying self.
++
++        Parameters
++        ----------
++        context : Context
++            The context, currently in `current_context_state`, that will
++            be moved to this state.
++        current_context_state : ThermodynamicState
++            The full thermodynamic state of the given context. This is
++            guaranteed to be compatible with self.
++        memo : dict
++            A dictionary that can be used by the state for memoization
++            to speed up consecutive calls on the same context.
++
++        Returns
++        -------
++        force_groups_to_update : set of int
++            The indices of the force groups whose energy must be computed
++            again after applying this state, assuming the context to be in
++            `current_context_state`.
++        """
++        # Check if lambda_restraints will change.
++        if self.lambda_restraints == current_context_state.lambda_restraints:
++            return set()
++
++        # Update memo if this is the first call for this context.
++        if len(memo) == 0:
++            system = context.getSystem()
++            for force, _ in self._get_system_forces_parameters(system):
++                memo['lambda_restraints'] = force.getForceGroup()
++        return {memo['lambda_restraints']}
++
+     @staticmethod
+     def _get_system_forces_parameters(system):
+         """Yields the system's forces having a ``lambda_restraints`` parameter.
+@@ -324,6 +376,7 @@ def _get_system_forces_parameters(system):
+                 if parameter_name == 'lambda_restraints':
+                     found_restraint = True
+                     yield force, parameter_id
++                    break
+ 
+         # Raise error if the system doesn't have a restraint.
+         if found_restraint is False:
+@@ -419,6 +472,23 @@ def determine_missing_parameters(self, thermodynamic_state, sampler_state, topog
+         raise NotImplementedError('{} does not support automatic determination of the '
+                                   'restraint parameters'.format(self.__class__.__name__))
+ 
++    @classmethod
++    def _add_force_in_separate_group(cls, system, restraint_force):
++        """Add the force to the System in a separate force group when possible."""
++        # OpenMM supports a maximum of 32 force groups.
++        available_force_groups = set(range(32))
++        for force in system.getForces():
++            available_force_groups.discard(force.getForceGroup())
++
++        # If the System is full, just separate the force from nonbonded interactions.
++        if len(available_force_groups) == 0:
++            nonbonded_force = mmtools.forces.find_nonbonded_force(system)
++            available_force_groups = set(range(32))
++            available_force_groups.discard(nonbonded_force.getForceGroup())
++
++        restraint_force.setForceGroup(min(available_force_groups))
++        system.addForce(restraint_force)
++
+ 
+ class _RestrainedAtomsProperty(object):
+     """
+@@ -587,7 +657,7 @@ def restrain_state(self, thermodynamic_state):
+ 
+         # Get a copy of the system of the ThermodynamicState, modify it and set it back.
+         system = thermodynamic_state.system
+-        system.addForce(restraint_force)
++        self._add_force_in_separate_group(system, restraint_force)
+         thermodynamic_state.system = system
+ 
+     def get_standard_state_correction(self, thermodynamic_state):
+@@ -1548,7 +1618,7 @@ def restrain_state(self, thermodynamic_state):
+ 
+         # Get a copy of the system of the ThermodynamicState, modify it and set it back.
+         system = thermodynamic_state.system
+-        system.addForce(restraint_force)
++        self._add_force_in_separate_group(system, restraint_force)
+         thermodynamic_state.system = system
+ 
+     def get_standard_state_correction(self, thermodynamic_state):
+diff --git a/Yank/tests/test_experiment.py b/Yank/tests/test_experiment.py
+index 03ee28b7..fc0cd67d 100644
+--- a/Yank/tests/test_experiment.py
++++ b/Yank/tests/test_experiment.py
+@@ -316,8 +316,9 @@ def test_yaml_parsing():
+     test: 2
+     """
+     exp_builder = ExperimentBuilder(textwrap.dedent(yaml_content))
++    # The plus 1 is because we overwrite disable_alchemical_dispersion_correction.
+     expected_n_options = (len(exp_builder.GENERAL_DEFAULT_OPTIONS) +
+-                          len(exp_builder.EXPERIMENT_DEFAULT_OPTIONS))
++                          len(exp_builder.EXPERIMENT_DEFAULT_OPTIONS) + 1)
+     assert len(exp_builder._options) == expected_n_options
+ 
+     # Correct parsing
+@@ -334,6 +335,7 @@ def test_yaml_parsing():
+         precision: mixed
+         switch_experiment_interval: -2.0
+         processes_per_experiment: 2
++        max_n_contexts: 9
+         switch_phase_interval: 32
+         temperature: 300*kelvin
+         pressure: null
+@@ -361,7 +363,10 @@ def test_yaml_parsing():
+     """
+ 
+     exp_builder = ExperimentBuilder(textwrap.dedent(yaml_content))
+-    assert len(exp_builder._options) == 35
++    assert len(exp_builder._options) == 36
++
++    # The global context cache has been set.
++    assert mmtools.cache.global_context_cache.capacity == 9
+ 
+     # Check correct types
+     assert exp_builder._options['output_dir'] == '/path/to/output/'
+@@ -1964,13 +1969,13 @@ def test_alchemical_phase_factory_building():
+ 
+         # AbsoluteAlchemicalFactory options.
+         template_script['options']['alchemical_pme_treatment'] = 'exact'
+-        template_script['options']['disable_alchemical_dispersion_correction'] = True
+ 
+         # Test that options are passed to AlchemicalPhaseFactory correctly.
+         exp_builder = ExperimentBuilder(script=template_script)
+         for experiment in exp_builder.build_experiments():
+             for phase_factory in experiment.phases:
+                 assert phase_factory.alchemical_factory.alchemical_pme_treatment == 'exact'
++                # Overwrite AbsoluteAlchemicalFactory default for disable_alchemical_dispersion_correction.
+                 assert phase_factory.alchemical_factory.disable_alchemical_dispersion_correction == True
+ 
+ 
+diff --git a/Yank/tests/test_repex.py b/Yank/tests/test_repex.py
+index 7a7fdcd1..145e1af1 100644
+--- a/Yank/tests/test_repex.py
++++ b/Yank/tests/test_repex.py
+@@ -1121,7 +1121,7 @@ def test_checkpointing(self):
+                 states = reporter.read_sampler_states(i)
+                 assert type(energies) is np.ndarray
+                 if reporter._calculate_checkpoint_iteration(i) is not None:
+-                    assert type(states[0].positions) is unit.Quantity
++                    assert type(states[0].positions) is mmtools.utils.TrackedQuantity
+                 else:
+                     assert states is None
+ 
+diff --git a/Yank/tests/test_restraints.py b/Yank/tests/test_restraints.py
+index 1c4ffb23..e6f1ce60 100644
+--- a/Yank/tests/test_restraints.py
++++ b/Yank/tests/test_restraints.py
+@@ -66,6 +66,19 @@ def __init__(self, **kwargs):
+                          for index in range(self.system.getNumForces())}
+         self.system.removeForce(force_indices['NonbondedForce'])
+ 
++    @staticmethod
++    def build_test_case():
++        """Create a new ThermodynamicState, SamplerState and Topography."""
++        # Create a test system
++        t = HostGuestNoninteracting()
++
++        # Create states and topography encoding the info to determine the parameters.
++        topography = Topography(t.topology, ligand_atoms='resname B2')
++        sampler_state = states.SamplerState(positions=t.positions)
++        thermodynamic_state = states.ThermodynamicState(system=t.system, temperature=300.0*unit.kelvin)
++        return thermodynamic_state, sampler_state, topography
++
++
+ expected_restraints = {
+     'Harmonic': yank.restraints.Harmonic,
+     'FlatBottom': yank.restraints.FlatBottom,
+@@ -342,24 +355,46 @@ def test_available_restraint_classes():
+ 
+ def test_restraint_dispatch():
+     """Test dispatch of various restraint types."""
++    thermodynamic_state, sampler_state, topography = HostGuestNoninteracting.build_test_case()
+     for restraint_type, restraint_class in expected_restraints.items():
+-        # Create a test system
+-        t = HostGuestNoninteracting()
+-
+-        # Create states and topography encoding the info to determine the parameters.
+-        topography = Topography(t.topology, ligand_atoms='resname B2')
+-        sampler_state = states.SamplerState(positions=t.positions)
+-        thermodynamic_state = states.ThermodynamicState(system=t.system, temperature=300.0*unit.kelvin)
+-
+         # Add restraints and determine parameters.
++        thermo_state = copy.deepcopy(thermodynamic_state)
+         restraint = yank.restraints.create_restraint(restraint_type)
+-        restraint.determine_missing_parameters(thermodynamic_state, sampler_state, topography)
++        restraint.determine_missing_parameters(thermo_state, sampler_state, topography)
+ 
+         # Check that we got the right restraint class.
+         assert restraint.__class__.__name__ == restraint_type
+         assert restraint.__class__ is restraint_class
+ 
+ 
++def test_restraint_force_group():
++    "The restraint force should be placed in its own force group for optimization."
++    thermodynamic_state, sampler_state, topography = HostGuestNoninteracting.build_test_case()
++    for restraint_type, restraint_class in expected_restraints.items():
++        # Add restraints and determine parameters.
++        thermo_state = copy.deepcopy(thermodynamic_state)
++        restraint = yank.restraints.create_restraint(restraint_type)
++        restraint.determine_missing_parameters(thermo_state, sampler_state, topography)
++        restraint.restrain_state(thermo_state)
++
++        # Find the force group of the restraint force.
++        system = thermo_state.system
++        for force_idx, force in enumerate(system.getForces()):
++            try:
++                parameter_name = force.getGlobalParameterName(0)
++            except AttributeError:
++                continue
++            if parameter_name == 'lambda_restraints':
++                restraint_force_idx = force_idx
++                restraint_force_group = force.getForceGroup()
++                break
++
++        # No other force should have the same force group.
++        for force_idx, force in enumerate(system.getForces()):
++            if force_idx != restraint_force_idx:
++                assert force.getForceGroup() != restraint_force_group
++
++
+ # ==============================================================================
+ # RESTRAINT STATE
+ # ==============================================================================
+@@ -431,6 +466,24 @@ def test_compatibility(self):
+             with nose.tools.assert_raises(yank.restraints.RestraintStateError):
+                 compound_state.system = unrestrained_system
+ 
++    def test_find_force_groups_to_update(self):
++        integrator = openmm.VerletIntegrator(1.0*unit.femtosecond)
++        for compound_state in self.get_restraint_cases():
++            context = compound_state.create_context(copy.deepcopy(integrator))
++
++            # Find the restraint force group.
++            system = context.getSystem()
++            force, _ = next(yank.restraints.RestraintState._get_system_forces_parameters(system))
++            force_group = force.getForceGroup()
++
++            # No force group should be updated if we don't move.
++            assert compound_state._find_force_groups_to_update(context, compound_state, memo={}) == set()
++
++            # We need to update the force if the current state changes.
++            compound_state2 = copy.deepcopy(compound_state)
++            compound_state2.lambda_restraints = 0.5
++            assert compound_state._find_force_groups_to_update(context, compound_state2, memo={}) == {force_group}
++
+ 
+ # ==============================================================================
+ # MAIN
+diff --git a/Yank/tests/test_yank.py b/Yank/tests/test_yank.py
+index a6f04715..12495d15 100644
+--- a/Yank/tests/test_yank.py
++++ b/Yank/tests/test_yank.py
+@@ -417,7 +417,8 @@ def test_non_alchemical_protocol(self):
+         name, thermodynamic_state, sampler_state, topography = self.host_guest_implicit
+         protocol = {
+             'lambda_sterics': [0.0, 0.5, 1.0],
+-            'temperature': [300, 320, 300] * unit.kelvin
++            'temperature': [300, 320, 300] * unit.kelvin,
++            'update_alchemical_charges': [True, True, False]
+         }
+         alchemical_phase = AlchemicalPhase(sampler=ReplicaExchange())
+         with self.temporary_storage_path() as storage_path:
+diff --git a/devtools/conda-recipe/meta.yaml b/devtools/conda-recipe/meta.yaml
+index 84f3afa3..998d94af 100644
+--- a/devtools/conda-recipe/meta.yaml
++++ b/devtools/conda-recipe/meta.yaml
+@@ -20,7 +20,7 @@ requirements:
+     - netcdf4
+     - openmm >=7.1
+     - mdtraj >=1.7.2
+-    - openmmtools >=0.13.4
++    - openmmtools >=0.14.0
+     - pymbar
+     - ambermini >=16.16.0
+     - docopt
+@@ -42,7 +42,7 @@ requirements:
+     - netcdf4
+     - openmm >=7.1
+     - mdtraj >=1.7.2
+-    - openmmtools >=0.13.4
++    - openmmtools >=0.14.0
+     - pymbar
+     - ambermini >=16.16.0
+     - docopt
+diff --git a/docs/whatsnew.rst b/docs/whatsnew.rst
+index 7ac07d3c..cb2cda05 100644
+--- a/docs/whatsnew.rst
++++ b/docs/whatsnew.rst
+@@ -6,6 +6,14 @@ This section features and improvements of note in each release.
+ 
+ The full release history can be viewed `at the GitHub yank releases page <https://github.com/choderalab/yank/releases>`_.
+ 
++0.20.1 Alchemical factory options and fast computation of the energy matrix
++---------------------------------------------------------------------------
++- Allow user to specify options for ``openmmtools.alchemy.AbsoluteAlchemicalFactory`` in the YAML file. In particular,
++  this introduces exact treatment of PME electrostatics for charged ligands. `[docs] <http://getyank.org/latest/yamlpages/options.html#alchemical_pme_treatment>`_
++- Major optimization of the computation of the energy matrix.
++- Added the option ``max_n_contexts``. `[docs] <http://getyank.org/latest/yamlpages/options.html#max_n_contexts>`_
++- Bumped minimum required version of ``openmmtools`` to ``0.14.0``.
++
+ 0.20.0 Support for processing proteins through PDBFixer
+ -------------------------------------------------------
+ - Adds an optional ``pdbfixer`` directive to the ``molecules`` section of the YAML file
+diff --git a/docs/yamlpages/index.rst b/docs/yamlpages/index.rst
+index 6e6ece44..45e93a1b 100644
+--- a/docs/yamlpages/index.rst
++++ b/docs/yamlpages/index.rst
+@@ -41,6 +41,7 @@ Detailed Options List
+     * :ref:`experiments_dir <yaml_options_experiments_dir>`
+     * :ref:`platform <yaml_options_platform>`
+     * :ref:`precision <yaml_options_precision>`
++    * :ref:`max_n_contexts <yaml_options_max_n_contexts>`
+     * :ref:`switch_experiment_interval <yaml_options_switch_experiment_interval>`
+     * :ref:`processes_per_experiment <yaml_options_processes_per_experiment>`
+ 
+@@ -86,6 +87,9 @@ Detailed Options List
+     * :ref:`softcore_d <yaml_options_alchemical_electrostatics>`
+     * :ref:`softcore_e <yaml_options_alchemical_electrostatics>`
+     * :ref:`softcore_f <yaml_options_alchemical_electrostatics>`
++    * :ref:`alchemical_pme_treatment <yaml_options_alchemical_pme_treatment>`
++    * :ref:`disable_alchemical_dispersion_correction <yaml_options_disable_alchemical_dispersion_correction>`
++    * :ref:`split_alchemical_forces <yaml_options_split_alchemical_forces>`
+ 
+   * :ref:`Online Analysis Parameters <yaml_options_online_analysis_parameters>`
+ 
+diff --git a/docs/yamlpages/options.rst b/docs/yamlpages/options.rst
+index e09768a0..2beea5de 100644
+--- a/docs/yamlpages/options.rst
++++ b/docs/yamlpages/options.rst
+@@ -175,6 +175,23 @@ Valid options: [auto]/double/mixed/single
+ 
+ 
+ 
++.. _yaml_options_max_n_contexts:
++
++.. rst-class:: html-toggle
++
++``max_n_contexts``
++------------------
++.. code-block:: yaml
++
++   options:
++     max_n_contexts: 3
++
++The maximum number of GPU contexts that can be in memory during the simulation. In general, YANK does not need more
++than 3 contexts.
++
++Valid options (3): <Integer>
++
++
+ 
+ .. _yaml_options_switch_experiment_interval:
+ 
+@@ -840,6 +857,69 @@ Valid Options for ``softcore_beta`` (0.0): <Float>
+ Valid Options for ``softcore_[d,e,f]`` (1,1,2): <Integer preferred, Float accepted>
+ 
+ 
++
++
++.. _yaml_options_alchemical_pme_treatment
++
++.. rst-class:: html-toggle
++
++``alchemical_pme_treatment``
++----------------------------
++.. code-block:: yaml
++
++   options:
++     alchemical_pme_treatment: direct-space
++
++When using PME, by default YANK runs the simulation modeling exclusively the direct space of PME. The reciprocal space
++is taken into account by reweighting the end states (the same reweighting performed for the anisotropic long-range
++dispersion correction). This makes it very fast to compute the energy matrix at each iteration. However, charged ligands
++may have a poor overlap between the direct-space-only and the full PME space. In this case, convergence rates can be
++very long, and it is recommended to use exact treatment of PME electrostatics.
++
++Valid Options: [direct-space]/exact/coulomb
++
++
++
++
++.. _yaml_options_disable_alchemical_dispersion_correction:
++
++.. rst-class:: html-toggle
++
++``disable_alchemical_dispersion_correction``
++--------------------------------------------
++.. code-block:: yaml
++
++   options:
++     disable_alchemical_dispersion_correction: yes
++
++By default, the contribution of the alchemical atoms to the analytical long-range dispersion correction is not included
++to speed up the computation of the energy matrix. This contribution is included in the end states anisotropic long-range
++dispersion correction.
++
++Valid Options: [yes]/no
++
++
++
++
++.. _yaml_options_split_alchemical_forces:
++
++.. rst-class:: html-toggle
++
++``split_alchemical_forces``
++---------------------------
++.. code-block:: yaml
++
++   options:
++     split_alchemical_forces: yes
++
++By default, the alchemical forces are split into their own OpenMM force groups to speed up the computation of the energy
++matrix. If your input system is particularly loaded with forces, and they occupy many force group, you may incur into
++errors during the creation of the alchemical system as OpenMM supports a maximum of 32 force groups. In this case, it is
++recommended to merge some of your forces into a single group. If this is not possible, set this to ``no`` to proceed
++without this optimization.
++
++Valid Options: [yes]/no
++
+ .. [1] Quantity strings are of the format: ``<float> * <unit>`` where ``<unit>`` is any valid unit specified in the "Valid Options" for an option. e.g. "<Quantity Length>" indicates any measure of length may be used for <unit> such as nanometer or angstrom.
+    Compound units are also parsed such as ``kilogram / meter**3`` for density.
+    Only full unit names as they appear in the simtk.unit package (part of OpenMM) are allowed; so "nm" and "A" will be rejected.
+diff --git a/setup.py b/setup.py
+index a017334c..61dbd412 100644
+--- a/setup.py
++++ b/setup.py
+@@ -146,7 +146,7 @@ def find_package_data(data_root, package_root):
+         'cython',
+         'openmm>=7.1',
+         'pymbar',
+-        'openmmtools>=0.13.4',
++        'openmmtools>=0.14.0',
+         'docopt>=0.6.1',
+         'netcdf4',
+         'cerberus',

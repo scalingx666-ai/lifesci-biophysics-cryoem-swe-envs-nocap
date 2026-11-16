@@ -1,0 +1,669 @@
+diff --git a/so3lr/config/config.yaml b/so3lr/config/config.yaml
+index 3dd41627..179dda9f 100644
+--- a/so3lr/config/config.yaml
++++ b/so3lr/config/config.yaml
+@@ -137,6 +137,7 @@ training:
+   # stage_two_loss_weights:  # Loss weights applied from stage_two_start_epoch onward. Same keys as loss_weights. Only used when stage_two_start_epoch is set.
+   #   energy: 0.1
+   #   forces: 0.9
++  # data_parallel: false  # Train on all local GPUs (TFDS datasets only). Each optimizer step takes one padded batch per device and averages the gradients, so the effective batch grows with the device count; consider scaling learning_rate, and note eval_every_num_steps counts optimizer steps. Set CUDA_VISIBLE_DEVICES to choose the devices.
+   model_seed: 42  # Random seed for model parameter initialization.
+   training_seed: 42  # Random seed for shuffling training batches each epoch.
+   log_gradient_values: false  # Log the L2 norm of gradients for each parameter group to WandB. Useful for debugging training dynamics.
+diff --git a/so3lr/mlff/config/from_config.py b/so3lr/mlff/config/from_config.py
+index 6d52753b..19808bb3 100644
+--- a/so3lr/mlff/config/from_config.py
++++ b/so3lr/mlff/config/from_config.py
+@@ -238,6 +238,15 @@ def _reduce_lr_kwargs(config):
+     )
+ 
+ 
++def _data_parallel(config, tf_record_present):
++    """training.data_parallel, which only fit_from_iterator (the TFDS path) supports."""
++    data_parallel = config.training.get('data_parallel', False)
++    if data_parallel and not tf_record_present:
++        logger.warning('training.data_parallel is only supported for TFDS datasets; '
++                       'training on a single device.')
++    return data_parallel
++
++
+ def make_optimizer_from_config(config: config_dict.ConfigDict = None):
+     """Make optax optimizer from config.
+ 
+@@ -455,6 +464,7 @@ def run_training(config: config_dict.ConfigDict, model: str = 'so3krates'):
+     _graph_to_batch_fn = _make_graph_to_batch_fn(config, training_data, tf_record_present)
+ 
+     logger.info('Training is starting!')
++    data_parallel = _data_parallel(config, tf_record_present)
+     if not tf_record_present:
+         training_utils.fit(
+             model=net,
+@@ -536,6 +546,7 @@ def run_training(config: config_dict.ConfigDict, model: str = 'so3krates'):
+             stage_two_val_fn=stage_two_val_fn,
+             # Dataset info for effective epoch tracking
+             dataset_info=training_data.dataset_info() if hasattr(training_data, 'dataset_info') else None,
++            data_parallel=data_parallel,
+         )
+     logger.info('Training has finished!')
+ 
+@@ -891,6 +902,7 @@ def run_fine_tuning(
+ 
+     _graph_to_batch_fn = _make_graph_to_batch_fn(config, training_data, tf_record_present)
+ 
++    data_parallel = _data_parallel(config, tf_record_present)
+     if tf_record_present is True:
+         training_utils.fit_from_iterator(
+             model=net,
+@@ -922,6 +934,7 @@ def run_fine_tuning(
+             # Dataset info for effective epoch tracking
+             dataset_info=training_data.dataset_info() if hasattr(training_data, 'dataset_info') else None,
+             **_reduce_lr_kwargs(config),
++            data_parallel=data_parallel,
+         )
+     else:
+         training_utils.fit(
+diff --git a/so3lr/mlff/utils/training_utils.py b/so3lr/mlff/utils/training_utils.py
+index 573fb4c6..5aa63326 100644
+--- a/so3lr/mlff/utils/training_utils.py
++++ b/so3lr/mlff/utils/training_utils.py
+@@ -36,7 +36,8 @@ def _wandb_log(*args, **kwargs):
+ _TFDS_TRAINING_STATE_VERSION = 1
+ # Checkpoints written before the fingerprint was dropped also carry a
+ # ``restart_fingerprint`` leaf; the restore target is built from the saved
+-# tree, so that extra leaf is restored and ignored.
++# tree, so that extra leaf is restored and ignored.  ``num_devices`` is
++# optional for the same reason: checkpoints written before it was saved lack it.
+ _TFDS_TRAINING_STATE_KEYS = frozenset({
+     'version', 'checkpoint_step',
+     'raw_params', 'optimizer_state', 'ema_params', 'jax_rng',
+@@ -54,7 +55,7 @@ def _make_tfds_training_state(
+         best_eval_loss, evals_without_improvement, stop_training,
+         plateau_best_loss, plateau_wait, plateau_cooldown_counter,
+         plateau_scale, plateau_active, reduce_lr_enabled, stage_two_active,
+-        header_printed, use_ema):
++        header_printed, use_ema, num_devices=1):
+     """Build the versioned, Orbax-compatible restart PyTree."""
+     return {
+         'version': _TFDS_TRAINING_STATE_VERSION,
+@@ -79,6 +80,7 @@ def _make_tfds_training_state(
+         'stage_two_active': bool(stage_two_active),
+         'header_printed': bool(header_printed),
+         'use_ema': bool(use_ema),
++        'num_devices': int(num_devices),
+     }
+ 
+ 
+@@ -922,40 +924,104 @@ def training_step_fn(
+             Updated state and metrics.
+ 
+         """
+-        (loss, metrics), grads = jax.value_and_grad(
+-            loss_fn,
+-            has_aux=True
+-        )(
+-            params,
+-            batch
+-        )
++        return _training_step(optimizer, loss_fn, log_gradient_values, params, opt_state, batch)
+ 
+-        # Per-leaf gradient norms go under their own key: writing them to
+-        # 'grad_norm' meant the unconditional global-norm assignment below
+-        # overwrote them every step, making log_gradient_values a no-op.
+-        if log_gradient_values:
+-            metrics['grad_norm_per_leaf'] = unfreeze(
+-                jax.tree_util.tree_map(
+-                    lambda x: jnp.linalg.norm(x.reshape(-1), axis=0), grads
+-                )
+-            )
++    return training_step_fn
+ 
+-        updates, opt_state = optimizer.update(
+-            grads,
+-            opt_state,
+-            params
+-        )
+ 
+-        params = optax.apply_updates(
+-            params=params,
+-            updates=updates
++def _training_step(optimizer, loss_fn, log_gradient_values, params, opt_state, batch, reduce=None):
++    """Loss, gradient and optimizer update shared by the single-device and the
++    data-parallel training steps; `reduce` (e.g. a pmean over devices) is applied
++    to the gradients and metrics before the update."""
++    (loss, metrics), grads = jax.value_and_grad(
++        loss_fn,
++        has_aux=True
++    )(
++        params,
++        batch
++    )
++    if reduce is not None:
++        grads, metrics = reduce(grads), reduce(metrics)
++
++    # Per-leaf gradient norms go under their own key: writing them to
++    # 'grad_norm' meant the unconditional global-norm assignment below
++    # overwrote them every step, making log_gradient_values a no-op.
++    if log_gradient_values:
++        metrics['grad_norm_per_leaf'] = unfreeze(
++            jax.tree_util.tree_map(
++                lambda x: jnp.linalg.norm(x.reshape(-1), axis=0), grads
++            )
+         )
+ 
+-        metrics['grad_norm'] = optax.global_norm(grads)
++    updates, opt_state = optimizer.update(
++        grads,
++        opt_state,
++        params
++    )
++
++    params = optax.apply_updates(
++        params=params,
++        updates=updates
++    )
+ 
+-        return params, opt_state, metrics
++    metrics['grad_norm'] = optax.global_norm(grads)
+ 
+-    return training_step_fn
++    return params, opt_state, metrics
++
++
++def make_data_parallel_training_step_fn(
++        optimizer: optax.GradientTransformation,
++        loss_fn: Callable,
++        mesh,
++        log_gradient_values: bool = False,
++):
++    """
++    Make a data-parallel training step over the devices of `mesh` (one mesh axis, 'devices').
++
++    params and opt_state are replicated on every device; the batch pytree carries a leading
++    device axis that is sharded over the mesh, i.e. one padded batch per device. Each device
++    computes the gradient of `loss_fn` on its own batch, gradients and metrics are averaged
++    across devices (pmean), and every device applies the same optimizer update, so the
++    replicas stay identical. With one batch per device this equals a single-device step on
++    the averaged gradient.
++
++    Args:
++        optimizer (optax.GradientTransformation): Optax optimizer.
++        loss_fn (Callable): Loss function, as for make_training_step_fn.
++        mesh (jax.sharding.Mesh): One-dimensional mesh with axis name 'devices'.
++        log_gradient_values (bool): Log gradient norms for each leaf in the params pytree.
++
++    Returns:
++        Training step fn with the same signature and outputs as make_training_step_fn.
++    """
++    from jax.sharding import PartitionSpec
++
++    def local_step(params, opt_state, batch):
++        batch = jax.tree_util.tree_map(lambda x: x[0], batch)  # this device's batch
++        return _training_step(optimizer, loss_fn, log_gradient_values, params, opt_state, batch,
++                              reduce=lambda tree: jax.lax.pmean(tree, 'devices'))
++
++    # check_vma=False keeps each device's gradient local, so the explicit pmean is the
++    # only cross-device reduction (with the check on, differentiating with respect to
++    # the replicated params already sums the gradients over devices).
++    return jax.jit(jax.shard_map(
++        local_step,
++        mesh=mesh,
++        in_specs=(PartitionSpec(), PartitionSpec(), PartitionSpec('devices')),
++        out_specs=(PartitionSpec(), PartitionSpec(), PartitionSpec()),
++        check_vma=False,
++    ))
++
++
++def _batch_groups(iterator, n):
++    """Yield (index of the last batch, list of n consecutive batches) from `iterator`;
++    a partial group left at the end is dropped. n=1 gives one batch per group."""
++    group = []
++    for index, item in enumerate(iterator):
++        group.append(item)
++        if len(group) == n:
++            yield index, group
++            group = []
+ 
+ 
+ def make_validation_step_fn(
+@@ -1523,6 +1589,7 @@ def fit_from_iterator(
+         stage_two_loss_fn=None,
+         stage_two_val_fn=None,
+         on_training_ready=None,
++        data_parallel: bool = False,
+ ):
+     """
+     Fit model.
+@@ -1561,11 +1628,42 @@ def fit_from_iterator(
+             'names', 'sizes', 'weights'. Used to log effective epochs per dataset.
+         on_training_ready (Callable, optional): Called after checkpoint validation
+             and restoration, before optimizer updates, to publish run metadata.
++        data_parallel (bool): Train data-parallel on all local devices. Every optimizer step
++            then consumes one padded batch per device and averages the gradients, so the
++            effective batch -- and the number of batches per step -- grows with the device
++            count (eval_every_num_steps still counts optimizer steps). Parameters, optimizer
++            state and EMA are replicated on every device; validation and checkpoints use
++            single-device copies, so checkpoints are identical in format to single-device
++            ones. A restart must use the same device count, and every epoch needs at least
++            one batch per device. Defaults to False.
+     Returns:
+ 
+     """
+     jax_rng = jax.random.PRNGKey(seed=model_seed)
+ 
++    num_devices = jax.local_device_count() if data_parallel else 1
++    if data_parallel and num_devices == 1:
++        logger.warning('data_parallel=True but only one local device is visible; '
++                       'training on a single device.')
++    if num_devices > 1:
++        from jax.sharding import Mesh, NamedSharding, PartitionSpec
++        mesh = Mesh(np.array(jax.local_devices()), ('devices',))
++        replicated = NamedSharding(mesh, PartitionSpec())
++        device_sharded = NamedSharding(mesh, PartitionSpec('devices'))
++        logger.info(f'Data-parallel training on {num_devices} devices: {num_devices} batches '
++                    f'per optimizer step, gradients averaged across devices.')
++
++    def _make_training_step(selected_loss_fn):
++        if num_devices > 1:
++            return make_data_parallel_training_step_fn(
++                optimizer, selected_loss_fn, mesh, log_gradient_values
++            )
++        return make_training_step_fn(optimizer, selected_loss_fn, log_gradient_values)
++
++    def _single_device(tree):
++        # Validation and checkpoints use one device's copy of the replicated state.
++        return jax.device_put(tree, jax.local_devices()[0]) if num_devices > 1 else tree
++
+     # Create checkpoint directory.
+     ckpt_dir = Path(ckpt_dir).expanduser().resolve()
+     ckpt_dir.mkdir(exist_ok=True)
+@@ -1586,11 +1684,7 @@ def fit_from_iterator(
+         ckpt_mngr_options=options
+     )
+ 
+-    training_step_fn = make_training_step_fn(
+-        optimizer,
+-        loss_fn,
+-        log_gradient_values
+-    )
++    training_step_fn = _make_training_step(loss_fn)
+ 
+     validation_step_fn = make_validation_step_fn(
+         val_fn
+@@ -1669,6 +1763,15 @@ def _ema_update_fn(ema_p, p):
+         ema_params = training_state['ema_params']
+         jax_rng = training_state['jax_rng']
+         step = int(training_state['checkpoint_step'])
++        # The device count sets the effective batch, so a different count would
++        # silently change the optimisation the learning-rate schedule was set for.
++        saved_devices = training_state.get('num_devices')
++        if saved_devices is not None and int(saved_devices) != num_devices:
++            raise RuntimeError(
++                f'Checkpoint step {latest_step} was written by a run on {int(saved_devices)} '
++                f'device(s), but this run trains on {num_devices}; the effective batch would '
++                'change. Resume on the same number of devices.'
++            )
+         # Continue with the next epoch rather than replaying the batches this
+         # one already consumed: the replay runs the full input pipeline and
+         # costs about as long as training on them did (hours to days).
+@@ -1698,9 +1801,7 @@ def _ema_update_fn(ema_p, p):
+                 raise RuntimeError(
+                     'Checkpoint is in stage two but no stage_two_loss_fn was provided.'
+                 )
+-            training_step_fn = make_training_step_fn(
+-                optimizer, stage_two_loss_fn, log_gradient_values
+-            )
++            training_step_fn = _make_training_step(stage_two_loss_fn)
+             validation_step_fn = make_validation_step_fn(
+                 stage_two_val_fn
+                 if stage_two_val_fn is not None else stage_two_loss_fn
+@@ -1730,8 +1831,7 @@ def _ema_update_fn(ema_p, p):
+             logger.info(f"Two-stage loss reweighting: switching to the stage-two "
+                         f"loss at epoch {epoch} (step {step}); resetting best-loss, "
+                         f"early-stopping and plateau trackers.")
+-            training_step_fn = make_training_step_fn(
+-                optimizer, stage_two_loss_fn, log_gradient_values)
++            training_step_fn = _make_training_step(stage_two_loss_fn)
+             validation_step_fn = make_validation_step_fn(
+                 stage_two_val_fn if stage_two_val_fn is not None else stage_two_loss_fn)
+             best_eval_loss = float('inf')
+@@ -1750,19 +1850,31 @@ def _ema_update_fn(ema_p, p):
+             mode='train',
+             epoch_index=epoch,
+         )
+-        for batch_index, (graph_batch_training, lr_batch_training) in enumerate(
+-                training_iterator_loop):
++        # One optimizer step per group of num_devices batches (one per device); with data
++        # parallelism a partial group at the end of an epoch is dropped.
++        epoch_start_step = step
++        for batch_index, group in _batch_groups(training_iterator_loop, num_devices):
+             batches_consumed = batch_index + 1
+-            batch_training = graph_to_batch_fn(graph_batch_training, lr_batch_training)
+-            processed_graphs += batch_training['num_of_non_padded_graphs']
+-            processed_nodes += int(batch_max_num_nodes - jraph.get_number_of_padding_with_graphs_nodes(graph_batch_training))
+-            # Training data is numpy arrays so we now transform them to jax.numpy arrays.
+-            batch_training = jax.tree_util.tree_map(jnp.array, batch_training)
++            batches = []
++            for graph_batch_training, lr_batch_training in group:
++                batch_training = graph_to_batch_fn(graph_batch_training, lr_batch_training)
++                processed_graphs += batch_training['num_of_non_padded_graphs']
++                processed_nodes += int(batch_max_num_nodes - jraph.get_number_of_padding_with_graphs_nodes(graph_batch_training))
++                batches.append(batch_training)
++            if num_devices > 1:
++                # Stack along a leading device axis (on device: graph_to_batch_fn is jitted,
++                # so no host round trip) and give each device its own batch.
++                batch_training = jax.device_put(
++                    jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *batches), device_sharded
++                )
++            else:
++                # Training data is numpy arrays so we now transform them to jax.numpy arrays.
++                batch_training = jax.tree_util.tree_map(jnp.array, batches[0])
+ 
+             # If params are None (in the first step), initialize the parameters or load from existing checkpoint.
+             if params is None:
+                 print(f'Initialize new parameters.')
+-                params = model.init(jax_rng, batch_training)
++                params = model.init(jax_rng, jax.tree_util.tree_map(jnp.array, batches[0]))
+ 
+                 # Initialize adaptive robust loss parameters if enabled
+                 if use_adaptive_robust_loss and adaptive_robust_loss_targets is not None:
+@@ -1801,6 +1913,12 @@ def _ema_update_fn(ema_p, p):
+                         "reduce_lr_on_plateau=True. Disabling plateau LR scaling.")
+                     reduce_lr_on_plateau = False
+ 
++            if num_devices > 1:
++                # Replicate the state; a no-op once it is placed, so initialisation, a restart
++                # and host-side optimizer-state changes (reduce-LR) need no bookkeeping.
++                params, opt_state, ema_params = jax.device_put(
++                    (params, opt_state, ema_params), replicated
++                )
+             params, opt_state, train_metrics = training_step_fn(params, opt_state, batch_training)
+             step += 1
+             if use_ema:
+@@ -1825,7 +1943,7 @@ def _ema_update_fn(ema_p, p):
+             # Start validation process.
+             if step % eval_every_num_steps == 0:
+                 # Use the EMA (deployed) weights for validation when enabled.
+-                eval_params = ema_params if use_ema else params
++                eval_params = _single_device(ema_params if use_ema else params)
+                 # Start iteration over validation batches.
+                 eval_totals = {}
+                 eval_counts = {}
+@@ -1893,11 +2011,14 @@ def _ema_update_fn(ema_p, p):
+                 # Save only after those transitions so the restored next update
+                 # sees exactly the same control state as uninterrupted training.
+                 if jnp.isfinite(eval_loss):
++                    raw_params, optimizer_state, saved_ema_params = _single_device(
++                        (params, opt_state, ema_params)
++                    )
+                     training_state = _make_tfds_training_state(
+                         step=step,
+-                        raw_params=params,
+-                        optimizer_state=opt_state,
+-                        ema_params=ema_params,
++                        raw_params=raw_params,
++                        optimizer_state=optimizer_state,
++                        ema_params=saved_ema_params,
+                         jax_rng=jax_rng,
+                         epoch=epoch,
+                         batches_consumed=batches_consumed,
+@@ -1915,6 +2036,7 @@ def _ema_update_fn(ema_p, p):
+                         stage_two_active=_stage_two_active,
+                         header_printed=header_printed,
+                         use_ema=use_ema,
++                        num_devices=num_devices,
+                     )
+                     checkpoint_started = ckpt_mngr.save(
+                         step,
+@@ -1941,6 +2063,12 @@ def _ema_update_fn(ema_p, p):
+                     close_training_iterator()
+                 break  # exit the batch loop
+ 
++        if step == epoch_start_step and num_devices > 1:
++            raise RuntimeError(
++                f'Epoch {epoch} has fewer than {num_devices} training batches, so data-parallel '
++                f'training on {num_devices} devices takes no optimizer step. Use fewer devices, '
++                'a smaller batch or data_parallel: false.'
++            )
+         if stop_training:
+             break  # exit the epoch loop
+ 
+diff --git a/tests/mlff_tests/test_data_parallel.py b/tests/mlff_tests/test_data_parallel.py
+new file mode 100644
+index 00000000..e62926cf
+--- /dev/null
++++ b/tests/mlff_tests/test_data_parallel.py
+@@ -0,0 +1,207 @@
++"""Data-parallel training (training.data_parallel) on simulated CPU devices.
++
++The device count is fixed when JAX initialises, so every check runs in a fresh
++interpreter with ``--xla_force_host_platform_device_count=4``.
++"""
++
++import subprocess
++import sys
++import textwrap
++
++import pytest
++
++from tests.subprocess_env import so3lr_subprocess_env
++
++NUM_DEVICES = 4
++
++
++def _run_on_simulated_devices(script, tmp_path=None):
++    env = so3lr_subprocess_env({
++        'XLA_FLAGS': f'--xla_force_host_platform_device_count={NUM_DEVICES}',
++        'JAX_PLATFORMS': 'cpu',
++    })
++    result = subprocess.run(
++        [sys.executable, '-c', textwrap.dedent(script)],
++        env=env, capture_output=True, text=True, timeout=900,
++        cwd=None if tmp_path is None else str(tmp_path),
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++    return result.stdout
++
++
++def test_data_parallel_step_matches_averaged_gradient_update():
++    """One batch per device == one update on the averaged gradient (Adam and Muon);
++    the same batch on every device == the single-device training step."""
++    out = _run_on_simulated_devices(f"""
++        import jax, jax.numpy as jnp, numpy as np, optax
++        from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
++        from so3lr.mlff.utils import training_utils as tu
++
++        n = {NUM_DEVICES}
++        assert jax.local_device_count() == n, jax.devices()
++        mesh = Mesh(np.array(jax.local_devices()), ('devices',))
++        repl, shard = NamedSharding(mesh, P()), NamedSharding(mesh, P('devices'))
++        rng = np.random.default_rng(0)
++
++        def loss_fn(params, batch):
++            h = jnp.tanh(batch['x'] @ params['w1'] + params['b1'])
++            pred = h @ params['w2']
++            loss = jnp.mean((pred - batch['y']) ** 2)
++            return loss, {{'loss': loss, 'mae': jnp.mean(jnp.abs(pred - batch['y']))}}
++
++        params0 = {{'w1': jnp.asarray(rng.normal(size=(6, 16)), jnp.float32),
++                    'b1': jnp.zeros(16, jnp.float32),
++                    'w2': jnp.asarray(rng.normal(size=(16, 3)), jnp.float32)}}
++        def make_batch():
++            return {{'x': rng.normal(size=(32, 6)).astype(np.float32),
++                     'y': rng.normal(size=(32, 3)).astype(np.float32)}}
++        def stack(batches):
++            return jax.device_put(jax.tree_util.tree_map(lambda *xs: np.stack(xs), *batches), shard)
++        def max_diff(a, b):
++            return max(float(jnp.max(jnp.abs(x - y)))
++                       for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b)))
++
++        for name, opt in (('adam', optax.adam(1e-2)), ('muon', optax.contrib.muon(1e-2))):
++            dp_step = tu.make_data_parallel_training_step_fn(opt, loss_fn, mesh)
++            single_step = tu.make_training_step_fn(opt, loss_fn, False)
++
++            p_ref, s_ref = params0, opt.init(params0)
++            p_dp, s_dp = jax.device_put(params0, repl), jax.device_put(opt.init(params0), repl)
++            for _ in range(5):
++                batches = [make_batch() for _ in range(n)]
++                grads = [jax.grad(lambda p, b=b: loss_fn(p, b)[0])(p_ref) for b in batches]
++                g = jax.tree_util.tree_map(lambda *xs: sum(xs) / n, *grads)
++                u, s_ref = opt.update(g, s_ref, p_ref)
++                p_ref = optax.apply_updates(p_ref, u)
++                p_dp, s_dp, metrics = dp_step(p_dp, s_dp, stack(batches))
++                assert max_diff(p_ref, p_dp) < 1e-5, (name, max_diff(p_ref, p_dp))
++            assert p_dp['w1'].sharding.is_fully_replicated
++            assert np.isfinite(float(metrics['grad_norm']))
++
++            p1, s1 = params0, opt.init(params0)
++            p2, s2 = jax.device_put(params0, repl), jax.device_put(opt.init(params0), repl)
++            for _ in range(5):
++                b = make_batch()
++                p1, s1, m1 = single_step(p1, s1, jax.tree_util.tree_map(jnp.asarray, b))
++                p2, s2, m2 = dp_step(p2, s2, stack([b] * n))
++                assert max_diff(p1, p2) < 1e-5, (name, max_diff(p1, p2))
++                assert abs(float(m1['loss']) - float(m2['loss'])) < 1e-5
++                assert abs(float(m1['grad_norm']) - float(m2['grad_norm'])) < 1e-4
++        print('OK')
++    """)
++    assert 'OK' in out
++
++
++def test_fit_from_iterator_data_parallel_matches_single_device(tmp_path):
++    """fit_from_iterator(data_parallel=True) on n batches per step reproduces a
++    single-device run on the averaged batches, writes single-device checkpoints,
++    resumes from them, and refuses a resume on another device count or an epoch
++    with fewer batches than devices."""
++    out = _run_on_simulated_devices(f"""
++        import functools
++        import jax, jax.numpy as jnp, numpy as np, optax
++        import orbax.checkpoint as ocp
++        from so3lr.mlff.utils import checkpoint_utils, training_utils
++
++        n = {NUM_DEVICES}
++        assert jax.local_device_count() == n
++        training_utils.jraph.get_number_of_padding_with_graphs_nodes = lambda graph: 0
++
++        class FiniteIterator:
++            n_proc = 1
++            def __init__(self, values):
++                self.values = [np.asarray(v, np.float32) for v in values]
++                self.calls = []
++            def next_epoch(self, split, mode, epoch_index=None, **kwargs):
++                self.calls.append((mode, epoch_index))
++                values = self.values if mode == 'train' else [np.zeros(3, np.float32)]
++                return iter((v, None) for v in values)
++
++        class Model:
++            @staticmethod
++            def init(rng, batch):
++                return {{'w': jnp.zeros(3, jnp.float32)}}
++
++        # Linear loss: the gradient is the batch vector, so averaging gradients
++        # over devices equals training on the averaged batch.
++        def loss_fn(params, batch):
++            loss = jnp.sum(params['w'] * batch['gradient'])
++            return loss, {{'loss': loss}}
++
++        def graph_to_batch(graph, long_range):
++            return {{'num_of_non_padded_graphs': 1, 'gradient': np.asarray(graph)}}
++
++        def run(ckpt_dir, values, data_parallel, epochs=1, allow_restart=False):
++            it = FiniteIterator(values)
++            training_utils.fit_from_iterator(
++                model=Model(), optimizer=optax.sgd(0.1, momentum=0.9),
++                loss_fn=loss_fn, val_fn=loss_fn, graph_to_batch_fn=graph_to_batch,
++                training_iterator=it, validation_iterator=FiniteIterator([]),
++                batch_max_num_nodes=10, batch_max_num_edges=20, batch_max_num_graphs=3,
++                batch_max_num_pairs=0, num_epochs=epochs, ckpt_dir=ckpt_dir,
++                ckpt_manager_options={{'max_to_keep': 10}}, eval_every_num_steps=1,
++                allow_restart=allow_restart, use_wandb=False,
++                use_ema=True, ema_decay=0.5, data_parallel=data_parallel)
++            return it
++
++        def assert_refused(match, *args, **kwargs):
++            try:
++                run(*args, **kwargs)
++            except RuntimeError as exc:
++                assert match in str(exc), exc
++            else:
++                raise AssertionError(f'run{{args}} was not refused')
++
++        # tree.map also checks that the two trees have the same structure
++        # (a zip over the leaves passes vacuously when one side is empty).
++        assert_trees_equal = functools.partial(
++            jax.tree.map, functools.partial(np.testing.assert_allclose, rtol=0, atol=1e-6))
++
++        def restored(path):
++            manager = checkpoint_utils.make_training_checkpoint_manager(path)
++            step = manager.latest_step()
++            state = manager.restore(step, args=ocp.args.Composite(
++                training_state=ocp.args.StandardRestore()))['training_state']
++            manager.close()
++            return step, state
++
++        rng = np.random.default_rng(0)
++        values = [rng.normal(size=3) for _ in range(2 * n)]
++        averaged = [np.mean(values[i * n:(i + 1) * n], axis=0) for i in range(2)]
++
++        run('dp', values, data_parallel=True)
++        run('single', averaged, data_parallel=False)
++        step_dp, dp = restored('dp')
++        step_single, single = restored('single')
++        assert step_dp == step_single == 2, (step_dp, step_single)
++        for key in ('raw_params', 'ema_params', 'optimizer_state'):
++            assert_trees_equal(dp[key], single[key])
++
++        # Checkpoints hold ordinary single-device arrays.
++        params = checkpoint_utils.load_params_from_checkpoint(ckpt_dir='dp')
++        assert all(len(x.devices()) == 1 for x in jax.tree_util.tree_leaves(params)
++                   if hasattr(x, 'devices'))
++
++        # A partial set of batches at the end of an epoch is dropped, not stepped.
++        run('partial', values[:n + 1], data_parallel=True)
++        assert restored('partial')[0] == 1
++        # With fewer batches than devices no step at all would be taken.
++        assert_refused('fewer than', 'tiny', values[:n - 1], data_parallel=True)
++
++        # The device count sets the effective batch: resuming on another count is refused.
++        assert_refused('device(s)', 'dp', values, data_parallel=False, epochs=2, allow_restart=True)
++        assert_refused('device(s)', 'single', averaged, data_parallel=True, epochs=2,
++                       allow_restart=True)
++
++        # Resume the data-parallel run for a second epoch and compare to an
++        # uninterrupted two-epoch single-device run on the averaged batches.
++        resumed = run('dp', values, data_parallel=True, epochs=2, allow_restart=True)
++        assert [c for c in resumed.calls if c[0] == 'train'] == [('train', 1)]
++        run('single2', averaged, data_parallel=False, epochs=2)
++        step_dp, dp = restored('dp')
++        step_single, single = restored('single2')
++        assert step_dp == step_single == 4
++        assert_trees_equal(dp['raw_params'], single['raw_params'])
++        print('OK')
++    """, tmp_path=tmp_path)
++    assert 'OK' in out
+diff --git a/tests/mlff_tests/test_tfds_pipeline_logic.py b/tests/mlff_tests/test_tfds_pipeline_logic.py
+index 3595aa14..a0a8b86b 100644
+--- a/tests/mlff_tests/test_tfds_pipeline_logic.py
++++ b/tests/mlff_tests/test_tfds_pipeline_logic.py
+@@ -141,10 +141,13 @@ def test_atomic_training_state_round_trip(tmp_path, masked_sgd, legacy_fingerpri
+         stage_two_active=True,
+         header_printed=True,
+         use_ema=True,
++        num_devices=4,
+     )
+     if legacy_fingerprint:
+-        # Checkpoints written by earlier versions carry a 32-byte digest leaf.
++        # Checkpoints written by earlier versions carry a 32-byte digest leaf
++        # and no device count.
+         state['restart_fingerprint'] = np.arange(32, dtype=np.uint8)
++        del state['num_devices']
+     manager = checkpoint_utils.make_training_checkpoint_manager(tmp_path)
+     assert manager.save(
+         120,
+@@ -175,6 +178,7 @@ def test_atomic_training_state_round_trip(tmp_path, masked_sgd, legacy_fingerpri
+     assert restored['plateau_active']
+     assert restored['stage_two_active']
+     assert restored['header_printed']
++    assert restored.get('num_devices') == (None if legacy_fingerprint else 4)
+     npt.assert_array_equal(restored['jax_rng'], jax.random.PRNGKey(7))
+     manager.close()
+ 

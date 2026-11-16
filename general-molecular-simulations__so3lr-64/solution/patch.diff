@@ -1,0 +1,648 @@
+diff --git a/.github/workflows/CI.yml b/.github/workflows/CI.yml
+index 452c46e1..63407230 100644
+--- a/.github/workflows/CI.yml
++++ b/.github/workflows/CI.yml
+@@ -59,8 +59,8 @@ jobs:
+           - group: 6
+             name: "so3lr-other"
+             sync_extra: ""
+-            run_short: "uv run --no-sync pytest tests/test_potential.py tests/test_ase.py tests/test_jaxmd.py tests/test_observables.py tests/test_model_invariance.py tests/test_observable_gradients.py tests/test_pme.py tests/test_charge_embed_override.py tests/test_pbc_validation.py tests/test_ase_small_cell.py tests/test_glp_cell_list_overflow.py tests/test_prepare_dimer.py -v --tb=short"
+-            run_full: "uv run --no-sync pytest tests/test_potential.py tests/test_ase.py tests/test_jaxmd.py tests/test_observables.py tests/test_model_invariance.py tests/test_observable_gradients.py tests/test_pme.py tests/test_charge_embed_override.py tests/test_pbc_validation.py tests/test_ase_small_cell.py tests/test_glp_cell_list_overflow.py tests/test_prepare_dimer.py tests/test_hessian.py -v --tb=short --full"
++            run_short: "uv run --no-sync pytest tests/test_potential.py tests/test_ase.py tests/test_jaxmd.py tests/test_observables.py tests/test_model_invariance.py tests/test_observable_gradients.py tests/test_pme.py tests/test_charge_embed_override.py tests/test_pbc_validation.py tests/test_ase_small_cell.py tests/test_engine.py tests/test_glp_cell_list_overflow.py tests/test_prepare_dimer.py -v --tb=short"
++            run_full: "uv run --no-sync pytest tests/test_potential.py tests/test_ase.py tests/test_jaxmd.py tests/test_observables.py tests/test_model_invariance.py tests/test_observable_gradients.py tests/test_pme.py tests/test_charge_embed_override.py tests/test_pbc_validation.py tests/test_ase_small_cell.py tests/test_engine.py tests/test_glp_cell_list_overflow.py tests/test_prepare_dimer.py tests/test_hessian.py -v --tb=short --full"
+           - group: 7
+             name: "pysages"
+             sync_extra: "--extra pysages"
+diff --git a/so3lr/__init__.py b/so3lr/__init__.py
+index b9229949..5167ac31 100644
+--- a/so3lr/__init__.py
++++ b/so3lr/__init__.py
+@@ -4,7 +4,7 @@
+ # must stay cheap and NOT pull in jax/flax/jax-md/glp — otherwise `so3lr --help`
+ # pays full JAX initialization. The heavy submodules are imported only when one
+ # of these names is actually accessed.
+-__all__ = ["So3lrCalculator", "FlashCalculator", "Graph", "to_jax_md", "So3lrPotential", "So3lr"]
++__all__ = ["So3lrCalculator", "FlashCalculator", "Graph", "to_jax_md", "So3lrPotential", "So3lr", "So3lrEngine"]
+ 
+ 
+ def __getattr__(name):
+@@ -26,6 +26,9 @@ def __getattr__(name):
+     if name == "So3lr":
+         from .base_calculator import make_so3lr
+         return make_so3lr
++    if name == "So3lrEngine":
++        from .engine import So3lrEngine
++        return So3lrEngine
+     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ 
+diff --git a/so3lr/cli/so3lr_md.py b/so3lr/cli/so3lr_md.py
+index 73632d9b..5cf76fcd 100755
+--- a/so3lr/cli/so3lr_md.py
++++ b/so3lr/cli/so3lr_md.py
+@@ -41,7 +41,7 @@
+     dispersion_tail_correction_energy,
+ )
+ 
+-from so3lr.jaxmd_utils import nbrs_cutoff, to_jax_md as _to_jax_md
++from so3lr.jaxmd_utils import OVERFLOW_EXTRA_LR, OVERFLOW_EXTRA_SR, nbrs_cutoff, to_jax_md as _to_jax_md
+ from so3lr.pbc import box_to_diag, is_fully_periodic, lattice_rows, minimum_image_problem
+ from so3lr import kspace_defaults as KS
+ from so3lr.mlff.utils.kspace_utils import setup_kspace_grid as _setup_kspace_grid
+@@ -1285,9 +1285,6 @@ def log_nbrs_info(nbrs, label: str = 'SR', box=None):
+                     f'cell_size={cell_size.min():.2f} A')
+ 
+ 
+-# Per-overflow cell-list headroom, added to cell_capacity on each reallocation.
+-OVERFLOW_EXTRA_SR = 2
+-OVERFLOW_EXTRA_LR = 8
+ MAX_OVERFLOW_RETRIES = 4
+ 
+ 
+diff --git a/so3lr/engine.py b/so3lr/engine.py
+new file mode 100644
+index 00000000..7f39c814
+--- /dev/null
++++ b/so3lr/engine.py
+@@ -0,0 +1,314 @@
++"""Energy and forces of one set of atoms, call after call: the force callback an MD code
++needs (OpenMM, i-PI, LAMMPS, a loop of your own).
++
++    import jax
++    jax.config.update("jax_enable_x64", True)     # precision mixed (the default) and float64 need it
++    from so3lr import So3lrEngine
++    engine = So3lrEngine(numbers, model="so3lr-tauri-m", charge=0, multiplicity=1)
++    energy, forces = engine(positions, box)       # A, lattice vectors as rows in A (None: no box)
++                                                  # -> eV, eV/A
++
++The atoms, charge and spin are fixed; positions and box change from call to call. For each
++box the engine takes the first of so3lr's three ways that can compute it:
++
++* flash (``so3lr.flash``): GPU kernels, for orthorhombic boxes at least twice the cutoffs
++  across, or no box (``flash.check.flash_problem`` says where else it declines: e.g. Ewald,
++  or a CPU). Once the box moves, the cell grid is laid out with NPT's margin, so boxes
++  within a few per cent compile nothing (with PME, each box gets its own mesh, as on the
++  other ways: a new mesh compiles again);
++* neighbour lists (``to_jax_md``): one compiled step that updates the lists on the device;
++  a list that overflows is allocated again here. Orthorhombic boxes at least twice the
++  cutoffs (plus the skin) across, or no box;
++* exact images (``So3lrCalculator`` with ``neighbor_backend="exact"``): any box, triclinic or
++  thinner than that; its neighbour list is built on the CPU at every call.
++
++``engine``: auto (that order), flash (raise where flash cannot run), or standard (never flash),
++as for ``so3lr md`` and ``so3lr eval``: auto also falls back, for good, where flash does not
++import or fails (to start, or to lay out a new box).
++"""
++from __future__ import annotations
++
++import functools
++import gc
++import warnings
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++
++from so3lr.jaxmd_utils import OVERFLOW_EXTRA_LR, OVERFLOW_EXTRA_SR
++
++_UNSET = object()
++
++
++def _coordinates(positions, lengths, dtype):
++    """Fractional coordinates in a diagonal box matrix, or Cartesian ones without a box."""
++    positions = jnp.asarray(positions, dtype)
++    if lengths is None:
++        return positions, {}
++    lengths = jnp.asarray(lengths, dtype)
++    return jnp.mod(positions / lengths, 1.0), {"box": jnp.diag(lengths)}
++
++
++class So3lrEngine:
++    """Energy (eV) and forces (eV/A) of atoms with atomic numbers ``numbers``.
++
++    model: a bundled name or a model directory (None: the default model); charge: the total
++    charge (e); multiplicity: 2S + 1; lr_cutoff: the long-range cutoff (A); dispersion_damping:
++    the long-range damping of the dispersion (A); precision: float32 or float64 throughout, or
++    mixed, a float32 model around float64 positions and sums (None: mixed with x64, float32
++    without; mixed and float64 need x64); kspace_electrostatics: ewald, pme or p3m for periodic
++    electrostatics in k-space (None: in real space up to lr_cutoff), with kspace_smearing and
++    kspace_spacing in A (None: so3lr's defaults); engine: auto, flash or standard (above);
++    skin: the neighbour lists' skin (A; they are updated at every call either way);
++    matmul_precision: what the model's matrix products run in (highest: full float32).
++
++    Pickles as its arguments: an unpickled engine compiles again at its first call.
++    """
++
++    def __init__(self, numbers, model=None, *, charge=0.0, multiplicity=1, lr_cutoff=12.0,
++                 dispersion_damping=2.0, precision=None, kspace_electrostatics=None,
++                 kspace_smearing=None, kspace_spacing=None, engine="auto", skin=0.0,
++                 matmul_precision="highest"):
++        from so3lr.flash.check import model_cutoff, validate_options
++        from so3lr.md_settings_validation import available_precision, model_precision, state_precision
++        from so3lr.mlff.nn.observable.dispersion_ref_data import (
++            check_atomic_numbers_supported, supported_atomic_numbers_for_model)
++
++        # the arguments as given, for pickling: precision is resolved again where it is unpickled
++        self._kwargs = dict(model=model, charge=charge, multiplicity=multiplicity, lr_cutoff=lr_cutoff,
++                            dispersion_damping=dispersion_damping, precision=precision,
++                            kspace_electrostatics=kspace_electrostatics, kspace_smearing=kspace_smearing,
++                            kspace_spacing=kspace_spacing, engine=engine, skin=skin,
++                            matmul_precision=matmul_precision)
++        self.numbers = np.asarray(numbers, dtype=np.int32).reshape(-1)
++        check_atomic_numbers_supported(self.numbers, supported_atomic_numbers_for_model(model),
++                                       context=f"SO3LR model {model}")
++        validate_options(dict(engine=engine))
++        if kspace_electrostatics not in (None, "ewald", "pme", "p3m"):
++            raise ValueError(f"kspace_electrostatics must be None, ewald, pme or p3m (received {kspace_electrostatics!r})")
++        if kspace_electrostatics is None and (kspace_smearing is not None or kspace_spacing is not None):
++            raise ValueError("kspace_smearing and kspace_spacing need kspace_electrostatics")
++        self._kspace = {}               # the k-space settings, as so3lr's settings and calculator name them
++        if kspace_electrostatics is not None:
++            from so3lr.kspace_defaults import DEFAULT_KSPACE_SMEARING, DEFAULT_KSPACE_SPACING
++            self._kspace = dict(
++                kspace_electrostatics=kspace_electrostatics,
++                kspace_smearing=DEFAULT_KSPACE_SMEARING if kspace_smearing is None else float(kspace_smearing),
++                kspace_spacing=DEFAULT_KSPACE_SPACING if kspace_spacing is None else float(kspace_spacing))
++        self.model, self.engine = model, engine
++        self.charge, self.multiplicity = float(charge), int(multiplicity)
++        self.lr_cutoff, self.dispersion_damping, self.skin = float(lr_cutoff), float(dispersion_damping), float(skin)
++        self.precision = available_precision(dict(precision=precision))
++        self.model_dtype = np.dtype(model_precision(self.precision))
++        self.dtype = np.dtype(state_precision(self.precision))
++        self.matmul_precision = matmul_precision
++        self._model_cutoff = model_cutoff(model)
++        # the lists are built at both cutoffs (and the skin), so the larger one counts
++        self._list_cutoff = max(self._model_cutoff, self.lr_cutoff) + self.skin
++        self._flash_settings = dict(model_path=model, lr_cutoff=self.lr_cutoff,
++                                    dispersion_damping=self.dispersion_damping, precision=self.precision,
++                                    engine=engine, **self._kspace)
++        self.backend = None                 # the way the last call took: flash, neighbour-list or exact
++        self._last_box = _UNSET             # the box the way was chosen for
++        self._flash_refusal = _UNSET        # why flash cannot run whatever the box (None: it can)
++        self._flash = self._atoms = self._calc = self._step = self._step_periodic = None
++        self._flash_box = _UNSET            # the box flash was built for
++        self._neighbor_fn = self._neighbor_fn_lr = self._nbrs = self._nbrs_lr = None
++        self._extra = np.zeros(2, int)      # the lists' extra capacity, grown at each overflow
++        self._k_box, self._k_args = None, {}
++
++    def __reduce__(self):
++        return functools.partial(type(self), **self._kwargs), (self.numbers,)
++
++    def __call__(self, positions, box=None):
++        """(energy in eV, forces in eV/A as an [N, 3] float64 array) at positions (A, [N, 3]) in
++        box (lattice vectors as rows, A, [3, 3]; None or all zeros: free space)."""
++        positions = np.asarray(positions, np.float64).reshape(len(self.numbers), 3)
++        if box is not None:
++            box = np.asarray(box, np.float64).reshape(3, 3)
++            if not box.any():
++                box = None                  # ASE's cell for a molecule: free space
++        key = None if box is None else box.tobytes()
++        if key != self._last_box:           # under a barostat every call: only the last box kept
++            if box is not None and abs(np.linalg.det(box)) < 1e-6:
++                raise ValueError(f"So3lrEngine: the box spans no volume (lattice vectors {box.tolist()})")
++            self.backend = self._route(positions, box)
++            self._last_box = key
++        with jax.default_matmul_precision(self.matmul_precision):
++            if self.backend == "flash":
++                result = self._call_flash(positions, box, key)
++                if result is not None:
++                    return result
++            if self.backend == "exact":
++                return self._call_exact(positions, box)
++            return self._call_lists(positions, box)
++
++    # ---- which way ------------------------------------------------------------------
++    def _route(self, positions, box):
++        if self.engine != "standard":
++            problem = self._flash_problem(positions, box)
++            if problem is None:
++                return "flash"
++            if self.engine == "flash":
++                raise ValueError(f"flash: {problem}")
++        return "neighbour-list" if box is None or self._minimum_image_works(box) else "exact"
++
++    def _flash_problem(self, positions, box):
++        """Why flash cannot take this box (None if it can): the settings, model, device and
++        import checked once, the structure for each box."""
++        from so3lr.flash.check import flash_problem, structure_problem
++        if self._flash_refusal is _UNSET:
++            problem = flash_problem(self._flash_settings, [], task="ase")
++            if problem is None:
++                try:
++                    import so3lr.flash.md  # noqa: F401
++                except Exception as exc:    # e.g. a JAX build without Pallas-Triton
++                    problem = f"it does not import here ({type(exc).__name__}: {exc})"
++            self._flash_refusal = problem
++        return self._flash_refusal or structure_problem(
++            self._flash_settings, self._ase_atoms(positions, box), self._model_cutoff)
++
++    def _minimum_image_works(self, box):
++        from so3lr.pbc import minimum_image_problem
++        orthorhombic = np.allclose(box - np.diag(np.diag(box)), 0.0, atol=1e-6)
++        return orthorhombic and minimum_image_problem(box, self._list_cutoff) is None
++
++    def _ase_atoms(self, positions, box):
++        """The atoms at positions in box: one ase.Atoms, updated."""
++        if self._atoms is None:
++            import ase
++            self._atoms = ase.Atoms(numbers=self.numbers)
++            self._atoms.info.update(charge=self.charge, multiplicity=self.multiplicity)
++        self._atoms.pbc = box is not None
++        self._atoms.set_cell(np.zeros((3, 3)) if box is None else box)
++        self._atoms.set_positions(positions)
++        return self._atoms
++
++    # ---- flash ----------------------------------------------------------------------
++    def _call_flash(self, positions, box, key):
++        """Energy and forces on flash; None where flash failed under auto (to start, to lay
++        out a new box, ...): flash is then off for this engine and the way is chosen again
++        without it, as ``so3lr md`` falls back."""
++        from so3lr.flash.check import NPT_BOX_MARGIN
++        from so3lr.flash.md import SinglePoints
++        if (self._flash is not None and not self._flash.box_margin and key != self._flash_box
++                and None not in (key, self._flash_box)):
++            # the box moves (a barostat): built again once, with NPT's margin, so later boxes
++            # within it compile nothing (a fixed box keeps every cell the margin would cost;
++            # free space lays out its own box)
++            self._flash = None
++            gc.collect()
++        failed = None
++        try:
++            if self._flash is None:
++                margin = 0.0 if self._flash_box is _UNSET else NPT_BOX_MARGIN
++                self._flash = SinglePoints(self._flash_settings, task="ase", matmul_precision=self.matmul_precision,
++                                           box_margin=margin)
++                self._flash_box = key
++            energy, forces, _ = self._flash(self._ase_atoms(positions, box), self.charge, self.multiplicity - 1.0)
++        except Exception as exc:
++            if self.engine == "flash":
++                raise
++            failed = f"it failed ({type(exc).__name__}: {exc})"
++        if failed is None:
++            return energy, forces
++        # out of the except block, so the traceback no longer holds the failed engine
++        self._flash, self._flash_refusal = None, failed
++        gc.collect()
++        warnings.warn(f"So3lrEngine: running without flash, as {failed}", stacklevel=3)
++        self.backend = self._route(positions, box)
++        return None
++
++    # ---- neighbour lists ------------------------------------------------------------
++    def _call_lists(self, positions, box):
++        lengths = None if box is None else box.diagonal().copy()
++        kwargs = self._k_grid(lengths) if self._kspace and lengths is not None else {}
++        if self._step_periodic != (lengths is not None):
++            self._build_lists(lengths)
++            self._nbrs = None
++        if self._nbrs is None:
++            self._allocate(positions, lengths, (True, True))
++        for _ in range(2):
++            try:
++                energy, forces, overflow, self._nbrs, self._nbrs_lr = self._step(
++                    positions, lengths, self._nbrs, self._nbrs_lr, **kwargs)
++            except BaseException:
++                self._nbrs = self._nbrs_lr = None   # donated to the step: allocated again next call
++                raise
++            energy, forces, overflow = jax.device_get((energy, forces, overflow))
++            if not overflow.any():
++                self._extra[:] = 0
++                return float(energy), np.asarray(forces, np.float64)
++            # a list overflowed, or the box shrank below its cells: that list allocated again
++            # for this box with more room, as so3lr md does, and the step again (it compiles
++            # again: a new list's cell-list functions are static, new objects)
++            self._extra += np.where(overflow, (OVERFLOW_EXTRA_SR, OVERFLOW_EXTRA_LR), 0)  # reset once it runs
++            self._allocate(positions, lengths, overflow)
++        raise RuntimeError("So3lrEngine: the neighbour lists overflow right after their allocation")
++
++    def _build_lists(self, lengths):
++        from jax_md import space
++
++        from so3lr import So3lrPotential, to_jax_md
++
++        if lengths is None:
++            displacement, _ = space.free()
++            options = dict(box_size=None, disable_cell_list=True, fractional_coordinates=False)
++        else:
++            box = jnp.diag(jnp.asarray(lengths, self.dtype))
++            displacement, _ = space.periodic_general(box, fractional_coordinates=True)
++            options = dict(box_size=box, fractional_coordinates=True)
++        potential = So3lrPotential(
++            model=self.model, lr_cutoff=self.lr_cutoff, dispersion_energy_cutoff_lr_damping=self.dispersion_damping,
++            dtype=self.model_dtype, coulomb_kspace_method=self._kspace.get("kspace_electrostatics", "pme"))
++        self._neighbor_fn, self._neighbor_fn_lr, energy_fn = to_jax_md(
++            potential, displacement, species=jnp.asarray(self.numbers), dr_threshold=self.skin,
++            total_charge=self.charge, num_unpaired_electrons=float(self.multiplicity - 1),
++            precision=self.model_dtype, **options)
++        dtype = self.dtype
++
++        def step(positions, lengths, nbrs, nbrs_lr, **kwargs):
++            R, box = _coordinates(positions, lengths, dtype)
++            nbrs = nbrs.update(R, **box)
++            nbrs_lr = nbrs_lr.update(R, **box)
++            energy, gradient = jax.value_and_grad(energy_fn)(R, nbrs.idx, nbrs_lr.idx, **box, **kwargs)
++            overflow = jnp.stack([nbrs.did_buffer_overflow | nbrs.cell_size_too_small,
++                                  nbrs_lr.did_buffer_overflow | nbrs_lr.cell_size_too_small])
++            # in jax-md, the gradient with respect to fractional coordinates is the Cartesian one
++            return energy, -gradient, overflow, nbrs, nbrs_lr
++
++        self._step = jax.jit(step, donate_argnums=(2, 3))
++        self._step_periodic = lengths is not None
++
++    def _allocate(self, positions, lengths, which):
++        """Allocate the short- and long-range lists where ``which`` says, for these positions."""
++        R, box = _coordinates(positions, lengths, self.dtype)
++        if which[0]:
++            self._nbrs = self._neighbor_fn.allocate(R, extra_capacity=int(self._extra[0]), **box)
++        if which[1]:
++            self._nbrs_lr = self._neighbor_fn_lr.allocate(R, extra_capacity=int(self._extra[1]), **box)
++
++    def _k_grid(self, lengths):
++        """The k-space grid for this box, set up again only when the box changes."""
++        from so3lr.mlff.utils.kspace_utils import setup_kspace_grid
++
++        key = lengths.tobytes()
++        if key != self._k_box:
++            k_grid, k_smearing = setup_kspace_grid(
++                self._kspace["kspace_electrostatics"], self._kspace["kspace_smearing"],
++                self._kspace["kspace_spacing"], jnp.asarray(lengths, self.dtype),
++                k_grid=self._k_args.get("k_grid"), dtype=self.dtype)
++            self._k_box, self._k_args = key, {"k_grid": k_grid, "k_smearing": k_smearing}
++        return self._k_args
++
++    # ---- exact images ---------------------------------------------------------------
++    def _call_exact(self, positions, box):
++        if self._calc is None:
++            from so3lr import So3lrCalculator
++            self._calc = So3lrCalculator(model=self.model, lr_cutoff=self.lr_cutoff,
++                                         dispersion_energy_cutoff_lr_damping=self.dispersion_damping,
++                                         neighbor_backend="exact", precision=self.precision, **self._kspace)
++        atoms = self._ase_atoms(positions, box)
++        atoms.calc = self._calc
++        return float(atoms.get_potential_energy()), np.asarray(atoms.get_forces(), np.float64)
+diff --git a/so3lr/jaxmd_utils.py b/so3lr/jaxmd_utils.py
+index dfa2205b..50365c63 100644
+--- a/so3lr/jaxmd_utils.py
++++ b/so3lr/jaxmd_utils.py
+@@ -7,6 +7,11 @@
+ 
+ from so3lr.graph import Graph
+ 
++# Per-overflow neighbour-list headroom (extra_capacity), added at each reallocation in a
++# row and reset once a step runs (so3lr md and So3lrEngine).
++OVERFLOW_EXTRA_SR = 2
++OVERFLOW_EXTRA_LR = 8
++
+ 
+ def nbrs_cutoff(potential):
+     """The longest cutoff the neighbour lists use: the long-range one, or the
+diff --git a/tests/test_engine.py b/tests/test_engine.py
+new file mode 100644
+index 00000000..73bed00d
+--- /dev/null
++++ b/tests/test_engine.py
+@@ -0,0 +1,245 @@
++"""So3lrEngine: energy and forces call after call, against So3lrCalculator on the same
++structures (float64, so the ways agree to round-off), the way it takes for each box, its
++neighbour lists allocated again on overflow, pickling, and the arguments it refuses."""
++import pathlib
++import pickle
++import warnings
++
++import numpy as np
++import numpy.testing as npt
++import pytest
++from ase.io import read
++
++from so3lr import So3lrCalculator, So3lrEngine
++from so3lr.flash.check import NPT_BOX_MARGIN, device_problem
++
++pytestmark = pytest.mark.usefixtures("x64")
++
++DATA = pathlib.Path(__file__).resolve().parent / "test_data"
++MODEL = "so3lr-tauri-s-2602"
++LR = 6.0                # a 12.4 A box of 64 waters holds 2 x this: minimum image
++GPU = pytest.mark.skipif(device_problem() is not None, reason="flash needs an NVIDIA or AMD Instinct GPU")
++
++
++def _water():
++    atoms = read(DATA / "water_64.xyz")
++    atoms.wrap()
++    return atoms
++
++
++def _molecule():
++    atoms = read(DATA / "dha.xyz")
++    atoms.pbc = False
++    atoms.set_cell(np.zeros(3))
++    return atoms
++
++
++def _calculator(**kwargs):
++    return So3lrCalculator(model=MODEL, lr_cutoff=LR, precision="float64", **kwargs)
++
++
++def _reference(atoms, charge=0, multiplicity=1, calc=None, **kwargs):
++    atoms = atoms.copy()
++    atoms.info.update(charge=charge, multiplicity=multiplicity)
++    atoms.calc = calc or _calculator(**kwargs)
++    return atoms.get_potential_energy(), atoms.get_forces()
++
++
++def _engine(atoms, **kwargs):
++    return So3lrEngine(atoms.numbers, **{"model": MODEL, "lr_cutoff": LR, "precision": "float64",
++                                         "engine": "standard", **kwargs})
++
++
++def _box(atoms):
++    return np.asarray(atoms.cell[:]) if atoms.pbc.any() else None
++
++
++def _assert_close(result, reference, energy=1e-8, forces=1e-7):
++    npt.assert_allclose(result[0], reference[0], rtol=0, atol=energy)
++    npt.assert_allclose(result[1], reference[1], rtol=0, atol=forces)
++
++
++@pytest.mark.parametrize("charge,multiplicity", [(0, 1), (1, 2)])
++def test_free_space_matches_calculator(charge, multiplicity):
++    atoms = _molecule()
++    engine = _engine(atoms, charge=charge, multiplicity=multiplicity)
++    _assert_close(engine(atoms.positions), _reference(atoms, charge, multiplicity))
++    assert engine.backend == "neighbour-list"
++
++
++def test_periodic_matches_calculator_as_positions_and_box_change():
++    atoms = _water()
++    engine, calc = _engine(atoms), _calculator()
++    rng = np.random.default_rng(0)
++    for scale in (1.0, 1.0, 1.01, 0.995):
++        atoms.set_cell(atoms.cell * scale, scale_atoms=True)
++        atoms.positions += rng.normal(scale=0.02, size=atoms.positions.shape)
++        _assert_close(engine(atoms.positions, _box(atoms)), _reference(atoms, calc=calc))
++        assert engine.backend == "neighbour-list"
++
++
++@pytest.mark.parametrize("method", ["pme", "p3m"])
++def test_mesh_kspace_matches_calculator(method):
++    atoms = _water()
++    kspace = dict(kspace_electrostatics=method, kspace_smearing=2.0, kspace_spacing=1.0)
++    engine = _engine(atoms, **kspace)
++    _assert_close(engine(atoms.positions, _box(atoms)), _reference(atoms, **kspace), energy=1e-6, forces=1e-5)
++
++
++def _skewed(atoms):
++    cell = np.asarray(atoms.cell[:]).copy()
++    cell[1, 0] = 2.0
++    atoms.set_cell(cell, scale_atoms=False)
++    atoms.wrap()
++    return atoms
++
++
++# thin: 12.4 A < 2 x (6 + 1) A; the triclinic one charged, its charge and spin through atoms.info
++@pytest.mark.parametrize("skin,skew,charge,multiplicity", [(1.0, False, 0, 1), (0.0, True, 1, 2)],
++                         ids=["thin", "triclinic"])
++def test_thin_and_triclinic_cells_take_exact_images(skin, skew, charge, multiplicity):
++    atoms = _skewed(_water()) if skew else _water()
++    engine = _engine(atoms, skin=skin, charge=charge, multiplicity=multiplicity)
++    _assert_close(engine(atoms.positions, _box(atoms)),
++                  _reference(atoms, charge, multiplicity, neighbor_backend="exact"))
++    assert engine.backend == "exact"
++
++
++def test_one_engine_goes_between_free_space_and_a_box():
++    atoms = _water()
++    cluster = atoms.copy()
++    cluster.pbc = False
++    cluster.set_cell(np.zeros(3))
++    # one calculator for each: a So3lrCalculator keeps the neighbour list of its first system
++    references = {False: _reference(cluster), True: _reference(atoms)}
++    engine = _engine(atoms)
++    for periodic in (False, True, False):
++        _assert_close(engine(atoms.positions, _box(atoms) if periodic else None), references[periodic])
++        assert engine.backend == "neighbour-list"
++
++
++def test_overflowing_lists_are_allocated_again():
++    atoms = _water()
++    dilute = atoms.copy()
++    dilute.set_cell(dilute.cell * 1.15, scale_atoms=True)
++    engine = _engine(atoms)
++    engine(dilute.positions, _box(dilute))
++    capacity = engine._nbrs.idx.shape[1]
++    # 1.5 x the density of the box the lists were sized in: they overflow
++    _assert_close(engine(atoms.positions, _box(atoms)), _reference(atoms))
++    assert engine._nbrs.idx.shape[1] > capacity
++
++
++def test_a_zero_box_is_free_space_and_a_flat_one_is_refused():
++    atoms = _molecule()
++    engine = _engine(atoms)
++    _assert_close(engine(atoms.positions, np.zeros((3, 3))), engine(atoms.positions), energy=1e-10, forces=1e-10)
++    with pytest.raises(ValueError, match="spans no volume"):
++        engine(atoms.positions, np.diag([10.0, 10.0, 0.0]))
++
++
++def test_pickles_as_its_arguments():
++    atoms = _molecule()
++    engine = _engine(atoms, charge=1, multiplicity=2)
++    first = engine(atoms.positions)
++    copy = pickle.loads(pickle.dumps(engine))
++    assert copy._step is None
++    _assert_close(copy(atoms.positions), first, energy=1e-10, forces=1e-10)
++
++
++@pytest.mark.parametrize("kwargs,match", [
++    (dict(engine="fast"), "engine must be one of"),
++    (dict(kspace_electrostatics="spme"), "kspace_electrostatics must be"),
++    (dict(kspace_smearing=2.0), "need kspace_electrostatics"),
++])
++def test_refuses_bad_arguments(kwargs, match):
++    with pytest.raises(ValueError, match=match):
++        _engine(_molecule(), **kwargs)
++
++
++def test_refuses_unsupported_elements():
++    with pytest.raises(ValueError, match="SO3LR model so3lr"):
++        So3lrEngine([1, 8, 92], model="so3lr", precision="float64")
++
++
++@pytest.mark.skipif(device_problem() is None, reason="on a GPU flash can run")
++def test_engine_flash_raises_where_flash_cannot_run():
++    atoms = _molecule()
++    engine = _engine(atoms, engine="flash")
++    with pytest.raises(ValueError, match="flash: "):
++        engine(atoms.positions)
++
++
++def test_auto_falls_back_where_flash_fails_to_start(monkeypatch):
++    import so3lr.flash.check as flash_check
++    flash_md = pytest.importorskip("so3lr.flash.md")
++
++    def fails(*args, **kwargs):
++        raise RuntimeError("out of memory")
++
++    monkeypatch.setattr(flash_md, "SinglePoints", fails)
++    monkeypatch.setattr(flash_check, "structure_problem", lambda *args: None)
++    atoms = _molecule()
++    engine = _engine(atoms, engine="auto")
++    engine._flash_refusal = None            # as on a GPU where the settings, model and device pass
++    with pytest.warns(UserWarning, match="running without flash, as it failed"):
++        result = engine(atoms.positions)
++    assert engine.backend == "neighbour-list"
++    _assert_close(result, _reference(atoms))
++
++
++class _FlashWithoutRoomForTheMargin:
++    """Flash that runs a fixed box, but fails to start again with NPT's margin."""
++    def __init__(self, settings, task, matmul_precision, box_margin):
++        if box_margin:
++            raise RuntimeError("out of memory")
++        self.box_margin = box_margin
++
++    def __call__(self, atoms, charge, spin):
++        return 0.0, np.zeros((len(atoms), 3)), True
++
++
++def test_auto_falls_back_where_flash_fails_to_start_again_for_a_moving_box(monkeypatch):
++    import so3lr.flash.check as flash_check
++    flash_md = pytest.importorskip("so3lr.flash.md")
++    monkeypatch.setattr(flash_md, "SinglePoints", _FlashWithoutRoomForTheMargin)
++    monkeypatch.setattr(flash_check, "structure_problem", lambda *args: None)
++    atoms = _water()
++    engine = _engine(atoms, engine="auto")
++    engine._flash_refusal = None
++    engine(atoms.positions, _box(atoms))
++    assert engine.backend == "flash"
++    atoms.set_cell(atoms.cell * 0.995, scale_atoms=True)
++    with pytest.warns(UserWarning, match="running without flash, as it failed"):
++        result = engine(atoms.positions, _box(atoms))
++    assert engine.backend == "neighbour-list"
++    _assert_close(result, _reference(atoms))
++    # flash stays off: the next box is not tried on it again
++    atoms.set_cell(atoms.cell * 0.995, scale_atoms=True)
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        engine(atoms.positions, _box(atoms))
++    assert not [w for w in caught if "flash" in str(w.message)]
++    assert engine.backend == "neighbour-list"
++    # engine="flash" raises instead
++    strict = _engine(atoms, engine="flash")
++    strict._flash_refusal = None
++    strict(atoms.positions, _box(atoms))
++    atoms.set_cell(atoms.cell * 0.995, scale_atoms=True)
++    with pytest.raises(RuntimeError, match="out of memory"):
++        strict(atoms.positions, _box(atoms))
++
++
++@GPU
++@pytest.mark.parametrize("periodic", [False, True])
++def test_flash_matches_neighbour_lists(periodic):
++    atoms = _water().repeat(2) if periodic else _molecule()
++    flash = _engine(atoms, engine="auto")
++    lists = _engine(atoms)
++    for scale in (1.0, 0.99, 0.995):         # periodic: the box moves, flash built again once
++        if periodic:
++            atoms.set_cell(atoms.cell * scale, scale_atoms=True)
++        result = flash(atoms.positions, _box(atoms))
++        assert flash.backend == "flash"
++        _assert_close(result, lists(atoms.positions, _box(atoms)), energy=1e-7, forces=1e-6)
++    assert flash._flash.box_margin == (NPT_BOX_MARGIN if periodic else 0.0)

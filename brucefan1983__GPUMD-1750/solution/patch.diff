@@ -1,0 +1,1460 @@
+diff --git a/src/measure/enhanced_sampling.cu b/src/measure/enhanced_sampling.cu
+new file mode 100644
+index 000000000..f53b0ac30
+--- /dev/null
++++ b/src/measure/enhanced_sampling.cu
+@@ -0,0 +1,394 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++/*----------------------------------------------------------------------------80
++Native enhanced sampling action.
++------------------------------------------------------------------------------*/
++
++#include "enhanced_sampling.cuh"
++#include "enhanced_sampling_distance_cv.cuh"
++#include "enhanced_sampling_harmonic_bias.cuh"
++#include "integrate/integrate.cuh"
++#include "model/atom.cuh"
++#include "utilities/error.cuh"
++#include "utilities/read_file.cuh"
++#include <cctype>
++#include <cmath>
++#include <cstring>
++#include <fstream>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++static void enhanced_sampling_input_error(
++  const std::string& filename,
++  const int line,
++  const std::string& message)
++{
++  const std::string error_message =
++    "In " + filename + ", line " + std::to_string(line) + ": " + message + "\n";
++  PRINT_INPUT_ERROR(error_message.c_str());
++}
++
++static bool enhanced_sampling_valid_name(const std::string& name)
++{
++  if (name.empty()) {
++    return false;
++  }
++  const unsigned char first = static_cast<unsigned char>(name[0]);
++  if (!(std::isalpha(first) || name[0] == '_')) {
++    return false;
++  }
++  for (int index = 1; index < name.size(); ++index) {
++    const unsigned char character = static_cast<unsigned char>(name[index]);
++    if (!(std::isalnum(character) || name[index] == '_')) {
++      return false;
++    }
++  }
++  return true;
++}
++
++static bool enhanced_sampling_is_orthogonal(const Box& box)
++{
++  return
++    box.cpu_h[1] == 0.0 && box.cpu_h[2] == 0.0 && box.cpu_h[3] == 0.0 &&
++    box.cpu_h[5] == 0.0 && box.cpu_h[6] == 0.0 && box.cpu_h[7] == 0.0;
++}
++
++EnhancedSamplingAction::EnhancedSamplingAction(const std::vector<std::string>& tokens)
++  : input_line_(0),
++    output_interval_(0),
++    output_is_set_(false),
++    start_is_set_(false),
++    output_(NULL)
++{
++  action_name = "enhanced_sampling";
++  if (tokens.size() != 2) {
++    PRINT_INPUT_ERROR("enhanced_sampling should have one parameter: the input file.\n");
++  }
++  input_filename_ = tokens[1];
++  parse_input_file();
++
++  printf("Use native enhanced sampling.\n");
++  printf("    input file: %s.\n", input_filename_.c_str());
++  printf("    output file: %s.\n", output_filename_.c_str());
++  printf("    output every %d steps.\n", output_interval_);
++  printf("    number of collective variables: %d.\n", engine_.get_number_of_cvs());
++  printf("    number of biases: %d.\n", engine_.get_number_of_biases());
++}
++
++EnhancedSamplingAction::~EnhancedSamplingAction()
++{
++  close_output();
++}
++
++void EnhancedSamplingAction::parse_input_file()
++{
++  std::ifstream input(input_filename_.c_str());
++  if (!input.is_open()) {
++    const std::string message = "Failed to open " + input_filename_ + ".\n";
++    PRINT_INPUT_ERROR(message.c_str());
++  }
++
++  std::string line;
++  while (std::getline(input, line)) {
++    ++input_line_;
++    const std::vector<std::string> tokens = get_tokens_without_comments(line);
++    if (tokens.empty()) {
++      continue;
++    }
++    if (tokens[0] == "output") {
++      parse_output(tokens);
++    } else if (tokens[0] == "start") {
++      parse_start(tokens);
++    } else if (tokens[0] == "cv") {
++      parse_cv(tokens);
++    } else if (tokens[0] == "bias") {
++      parse_bias(tokens);
++    } else {
++      enhanced_sampling_input_error(
++        input_filename_, input_line_, "Unknown enhanced-sampling keyword '" + tokens[0] + "'.");
++    }
++  }
++  input.close();
++
++  if (!output_is_set_) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "An output line is required.");
++  }
++  if (input_filename_ == output_filename_) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "The input and output file names must be different.");
++  }
++  if (engine_.get_number_of_cvs() == 0) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "At least one collective variable is required.");
++  }
++  if (engine_.get_number_of_biases() == 0) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "At least one bias is required.");
++  }
++}
++
++void EnhancedSamplingAction::parse_output(const std::vector<std::string>& tokens)
++{
++  if (output_is_set_) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "The output line can only be specified once.");
++  }
++  if (tokens.size() != 3) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "Output syntax is: output <filename> <interval>.");
++  }
++  if (!is_valid_int(tokens[2].c_str(), &output_interval_) || output_interval_ <= 0) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "The output interval must be a positive integer.");
++  }
++  output_filename_ = tokens[1];
++  if (output_filename_.empty()) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "The output file name cannot be empty.");
++  }
++  output_is_set_ = true;
++}
++
++void EnhancedSamplingAction::parse_start(const std::vector<std::string>& tokens)
++{
++  if (start_is_set_) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "The start line can only be specified once.");
++  }
++  if (tokens.size() != 2 || tokens[1] != "fresh") {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "V1A only accepts: start fresh.");
++  }
++  start_is_set_ = true;
++}
++
++void EnhancedSamplingAction::parse_cv(const std::vector<std::string>& tokens)
++{
++  if (tokens.size() != 8) {
++    enhanced_sampling_input_error(
++      input_filename_,
++      input_line_,
++      "Distance CV syntax is: cv <name> distance atoms <i> <j> pbc <on|off>.");
++  }
++  const std::string name = tokens[1];
++  if (!enhanced_sampling_valid_name(name)) {
++    enhanced_sampling_input_error(
++      input_filename_,
++      input_line_,
++      "A CV name must contain only letters, digits, and underscores and cannot "
++      "start with a digit.");
++  }
++  if (engine_.has_cv(name)) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "CV names must be unique.");
++  }
++  if (tokens[2] != "distance" || tokens[3] != "atoms" || tokens[6] != "pbc") {
++    enhanced_sampling_input_error(
++      input_filename_,
++      input_line_,
++      "Distance CV syntax is: cv <name> distance atoms <i> <j> pbc <on|off>.");
++  }
++
++  int atom_i = -1;
++  int atom_j = -1;
++  if (!is_valid_int(tokens[4].c_str(), &atom_i) || !is_valid_int(tokens[5].c_str(), &atom_j)) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "Distance-CV atom indices must be integers.");
++  }
++  if (atom_i < 0 || atom_j < 0) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "Distance-CV atom indices must be non-negative.");
++  }
++  if (atom_i == atom_j) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "A distance CV requires two different atoms.");
++  }
++
++  bool use_pbc = false;
++  if (tokens[7] == "on") {
++    use_pbc = true;
++  } else if (tokens[7] == "off") {
++    use_pbc = false;
++  } else {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "The distance-CV pbc option must be 'on' or 'off'.");
++  }
++
++  std::unique_ptr<EnhancedSamplingCV> cv;
++  cv.reset(new EnhancedSamplingDistanceCV(name, atom_i, atom_j, use_pbc));
++  engine_.add_cv(std::move(cv));
++}
++
++void EnhancedSamplingAction::parse_bias(const std::vector<std::string>& tokens)
++{
++  if (tokens.size() != 9) {
++    enhanced_sampling_input_error(
++      input_filename_,
++      input_line_,
++      "Harmonic-bias syntax is: bias <name> harmonic arg <cv> center <value> kappa <value>.");
++  }
++  const std::string name = tokens[1];
++  if (!enhanced_sampling_valid_name(name)) {
++    enhanced_sampling_input_error(
++      input_filename_,
++      input_line_,
++      "A bias name must contain only letters, digits, and underscores and cannot "
++      "start with a digit.");
++  }
++  if (engine_.has_bias(name)) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "Bias names must be unique.");
++  }
++  if (
++    tokens[2] != "harmonic" || tokens[3] != "arg" || tokens[5] != "center" ||
++    tokens[7] != "kappa") {
++    enhanced_sampling_input_error(
++      input_filename_,
++      input_line_,
++      "Harmonic-bias syntax is: bias <name> harmonic arg <cv> center <value> kappa <value>.");
++  }
++
++  const std::string argument_name = tokens[4];
++  if (!engine_.has_cv(argument_name)) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "A bias must refer to a CV defined earlier in the file.");
++  }
++
++  double center = 0.0;
++  double kappa = 0.0;
++  if (!is_valid_real(tokens[6].c_str(), &center) || !std::isfinite(center)) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "The harmonic center must be a finite number.");
++  }
++  if (!is_valid_real(tokens[8].c_str(), &kappa) || !std::isfinite(kappa) || kappa < 0.0) {
++    enhanced_sampling_input_error(
++      input_filename_, input_line_, "The harmonic kappa must be a finite, non-negative number.");
++  }
++
++  const int argument_index = engine_.get_cv_index(argument_name);
++  std::unique_ptr<EnhancedSamplingBias> bias;
++  bias.reset(new EnhancedSamplingHarmonicBias(
++    name, argument_name, argument_index, center, kappa));
++  engine_.add_bias(std::move(bias));
++}
++
++bool EnhancedSamplingAction::should_output(const int step) const
++{
++  return step % output_interval_ == 0;
++}
++
++void EnhancedSamplingAction::pre_run(
++  const int number_of_steps,
++  const double time_step,
++  Integrate& integrate,
++  std::vector<Group>& group,
++  Atom& atom,
++  Box& box,
++  Force& force)
++{
++  const EnsembleType type = integrate.get_type();
++  if (
++    type != EnsembleType::NVE &&
++    type != EnsembleType::NVT_NHC &&
++    type != EnsembleType::NVT_BDP) {
++    PRINT_INPUT_ERROR(
++      "Enhanced sampling V1A only supports NVE, NVT-NHC, and NVT-BDP.\n");
++  }
++  if (
++    (type == EnsembleType::NVT_NHC || type == EnsembleType::NVT_BDP) &&
++    integrate.get_temperature1() != integrate.get_temperature2()) {
++    PRINT_INPUT_ERROR(
++      "Enhanced sampling V1A requires a constant target temperature.\n");
++  }
++  if (integrate.get_fixed_group() >= 0 || integrate.get_move_group() >= 0) {
++    PRINT_INPUT_ERROR(
++      "Enhanced sampling V1A does not support fixed or moving atom groups.\n");
++  }
++  if (!enhanced_sampling_is_orthogonal(box)) {
++    PRINT_INPUT_ERROR("Enhanced sampling V1A requires an orthogonal simulation box.\n");
++  }
++  engine_.prepare(atom.number_of_atoms);
++  output_ = my_fopen(output_filename_.c_str(), "w");
++  engine_.write_header(output_);
++}
++
++void EnhancedSamplingAction::setup_force(
++  const double time_step,
++  Integrate& integrate,
++  std::vector<Group>& group,
++  Atom& atom,
++  Box& box,
++  Force& force)
++{
++  engine_.calculate(box, atom, true);
++  engine_.write_output(output_, 0);
++}
++
++void EnhancedSamplingAction::post_force(
++  const int step,
++  const double time_step,
++  Integrate& integrate,
++  std::vector<Group>& group,
++  Atom& atom,
++  Box& box,
++  Force& force)
++{
++  const int md_step = step + 1;
++  engine_.calculate(box, atom, should_output(md_step));
++}
++
++void EnhancedSamplingAction::end_of_step(
++  const int number_of_steps,
++  int step,
++  const int fixed_group,
++  const int move_group,
++  const double global_time,
++  const double temperature,
++  Integrate& integrate,
++  Box& box,
++  std::vector<Group>& group,
++  GPU_Vector<double>& thermo,
++  Atom& atom,
++  Force& force)
++{
++  const int md_step = step + 1;
++  if (should_output(md_step)) {
++    engine_.write_output(output_, md_step);
++  }
++}
++
++void EnhancedSamplingAction::post_run(
++  Atom& atom,
++  Box& box,
++  Integrate& integrate,
++  const int number_of_steps,
++  const double time_step,
++  const double temperature)
++{
++  engine_.check();
++  close_output();
++}
++
++void EnhancedSamplingAction::close_output()
++{
++  if (output_ != NULL) {
++    fclose(output_);
++    output_ = NULL;
++  }
++}
+diff --git a/src/measure/enhanced_sampling.cuh b/src/measure/enhanced_sampling.cuh
+new file mode 100644
+index 000000000..d6d5e5ed7
+--- /dev/null
++++ b/src/measure/enhanced_sampling.cuh
+@@ -0,0 +1,94 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#pragma once
++#include "action.cuh"
++#include "enhanced_sampling_engine.cuh"
++#include <cstdio>
++#include <string>
++#include <vector>
++
++class EnhancedSamplingAction : public Action
++{
++public:
++  EnhancedSamplingAction(const std::vector<std::string>& tokens);
++  ~EnhancedSamplingAction() override;
++
++  void pre_run(
++    const int number_of_steps,
++    const double time_step,
++    Integrate& integrate,
++    std::vector<Group>& group,
++    Atom& atom,
++    Box& box,
++    Force& force) override;
++
++  void setup_force(
++    const double time_step,
++    Integrate& integrate,
++    std::vector<Group>& group,
++    Atom& atom,
++    Box& box,
++    Force& force) override;
++
++  void post_force(
++    const int step,
++    const double time_step,
++    Integrate& integrate,
++    std::vector<Group>& group,
++    Atom& atom,
++    Box& box,
++    Force& force) override;
++
++  void end_of_step(
++    const int number_of_steps,
++    int step,
++    const int fixed_group,
++    const int move_group,
++    const double global_time,
++    const double temperature,
++    Integrate& integrate,
++    Box& box,
++    std::vector<Group>& group,
++    GPU_Vector<double>& thermo,
++    Atom& atom,
++    Force& force) override;
++
++  void post_run(
++    Atom& atom,
++    Box& box,
++    Integrate& integrate,
++    const int number_of_steps,
++    const double time_step,
++    const double temperature) override;
++
++private:
++  void parse_input_file();
++  void parse_output(const std::vector<std::string>& tokens);
++  void parse_start(const std::vector<std::string>& tokens);
++  void parse_cv(const std::vector<std::string>& tokens);
++  void parse_bias(const std::vector<std::string>& tokens);
++  bool should_output(const int step) const;
++  void close_output();
++
++  std::string input_filename_;
++  std::string output_filename_;
++  int input_line_;
++  int output_interval_;
++  bool output_is_set_;
++  bool start_is_set_;
++  FILE* output_;
++  EnhancedSamplingEngine engine_;
++};
+diff --git a/src/measure/enhanced_sampling_bias.cuh b/src/measure/enhanced_sampling_bias.cuh
+new file mode 100644
+index 000000000..861a97be3
+--- /dev/null
++++ b/src/measure/enhanced_sampling_bias.cuh
+@@ -0,0 +1,48 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#pragma once
++#include <string>
++
++class EnhancedSamplingBias
++{
++public:
++  EnhancedSamplingBias(
++    const std::string& name,
++    const std::string& argument_name,
++    const int argument_index)
++    : name_(name), argument_name_(argument_name), argument_index_(argument_index)
++  {
++  }
++
++  virtual ~EnhancedSamplingBias() {}
++
++  const std::string& get_name() const { return name_; }
++  const std::string& get_argument_name() const { return argument_name_; }
++  int get_argument_index() const { return argument_index_; }
++
++  virtual void evaluate(
++    const double* g_cv_values,
++    double* g_cv_derivatives,
++    double* g_bias_energy,
++    double* g_bias_derivative) = 0;
++
++  virtual void update(const int step, const double time) {}
++
++private:
++  std::string name_;
++  std::string argument_name_;
++  int argument_index_;
++};
+diff --git a/src/measure/enhanced_sampling_cv.cuh b/src/measure/enhanced_sampling_cv.cuh
+new file mode 100644
+index 000000000..15e1557b1
+--- /dev/null
++++ b/src/measure/enhanced_sampling_cv.cuh
+@@ -0,0 +1,46 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#pragma once
++#include "model/box.cuh"
++#include "utilities/gpu_vector.cuh"
++#include <string>
++
++class EnhancedSamplingCV
++{
++public:
++  explicit EnhancedSamplingCV(const std::string& name) : name_(name) {}
++  virtual ~EnhancedSamplingCV() {}
++
++  const std::string& get_name() const { return name_; }
++
++  virtual void prepare(const int number_of_atoms) = 0;
++
++  virtual void compute(
++    const Box& box,
++    const GPU_Vector<double>& position_per_atom,
++    double* g_value) = 0;
++
++  virtual void add_force_virial(
++    const double* g_derivative,
++    GPU_Vector<double>& force_per_atom,
++    GPU_Vector<double>& virial_per_atom,
++    double* g_bias_virial) = 0;
++
++  virtual void check() {}
++
++private:
++  std::string name_;
++};
+diff --git a/src/measure/enhanced_sampling_distance_cv.cu b/src/measure/enhanced_sampling_distance_cv.cu
+new file mode 100644
+index 000000000..330b19b27
+--- /dev/null
++++ b/src/measure/enhanced_sampling_distance_cv.cu
+@@ -0,0 +1,196 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++/*----------------------------------------------------------------------------80
++Distance collective variable for enhanced sampling.
++------------------------------------------------------------------------------*/
++
++#include "enhanced_sampling_distance_cv.cuh"
++#include "utilities/error.cuh"
++#include "utilities/gpu_macro.cuh"
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++
++static __global__ void gpu_enhanced_sampling_compute_distance(
++  const int number_of_atoms,
++  const int atom_i,
++  const int atom_j,
++  const bool use_pbc,
++  const Box box,
++  const double* g_position_per_atom,
++  double* g_distance_data,
++  double* g_value,
++  int* g_invalid_distance)
++{
++  if (blockIdx.x == 0 && threadIdx.x == 0) {
++    double dx = g_position_per_atom[atom_j] - g_position_per_atom[atom_i];
++    double dy = g_position_per_atom[atom_j + number_of_atoms] -
++                g_position_per_atom[atom_i + number_of_atoms];
++    double dz = g_position_per_atom[atom_j + number_of_atoms * 2] -
++                g_position_per_atom[atom_i + number_of_atoms * 2];
++
++    if (use_pbc) {
++      apply_mic(box, dx, dy, dz);
++    }
++
++    const double distance_squared = dx * dx + dy * dy + dz * dz;
++    const double distance = sqrt(distance_squared);
++
++    g_distance_data[0] = dx;
++    g_distance_data[1] = dy;
++    g_distance_data[2] = dz;
++    g_value[0] = distance;
++
++    if (!(distance_squared > 1.0e-20)) {
++      g_distance_data[3] = 0.0;
++      // Keep this flag set until the next output or post_run check. Checking it
++      // on the host every step would introduce a synchronization in the force path.
++      g_invalid_distance[0] = 1;
++    } else {
++      g_distance_data[3] = 1.0 / distance;
++    }
++  }
++}
++
++static __global__ void gpu_enhanced_sampling_add_distance_force_virial(
++  const int number_of_atoms,
++  const int atom_i,
++  const int atom_j,
++  const double* g_derivative,
++  const double* g_distance_data,
++  double* g_force_per_atom,
++  double* g_virial_per_atom,
++  double* g_bias_virial)
++{
++  if (blockIdx.x == 0 && threadIdx.x == 0) {
++    const double dx = g_distance_data[0];
++    const double dy = g_distance_data[1];
++    const double dz = g_distance_data[2];
++    const double inverse_distance = g_distance_data[3];
++    const double derivative = g_derivative[0];
++    const double force_factor = derivative * inverse_distance;
++
++    g_force_per_atom[atom_i] += force_factor * dx;
++    g_force_per_atom[atom_i + number_of_atoms] += force_factor * dy;
++    g_force_per_atom[atom_i + number_of_atoms * 2] += force_factor * dz;
++    g_force_per_atom[atom_j] -= force_factor * dx;
++    g_force_per_atom[atom_j + number_of_atoms] -= force_factor * dy;
++    g_force_per_atom[atom_j + number_of_atoms * 2] -= force_factor * dz;
++
++    const double virial_factor = -derivative * inverse_distance;
++    const double virial[9] = {
++      virial_factor * dx * dx,
++      virial_factor * dy * dy,
++      virial_factor * dz * dz,
++      virial_factor * dx * dy,
++      virial_factor * dx * dz,
++      virial_factor * dy * dz,
++      virial_factor * dy * dx,
++      virial_factor * dz * dx,
++      virial_factor * dz * dy};
++
++    for (int component = 0; component < 9; ++component) {
++      const double half_virial = 0.5 * virial[component];
++      g_virial_per_atom[atom_i + component * number_of_atoms] += half_virial;
++      g_virial_per_atom[atom_j + component * number_of_atoms] += half_virial;
++      g_bias_virial[component] += virial[component];
++    }
++  }
++}
++
++EnhancedSamplingDistanceCV::EnhancedSamplingDistanceCV(
++  const std::string& name,
++  const int atom_i,
++  const int atom_j,
++  const bool use_pbc)
++  : EnhancedSamplingCV(name),
++    atom_i_(atom_i),
++    atom_j_(atom_j),
++    use_pbc_(use_pbc),
++    number_of_atoms_(0)
++{
++}
++
++void EnhancedSamplingDistanceCV::prepare(const int number_of_atoms)
++{
++  if (number_of_atoms <= 0) {
++    PRINT_INPUT_ERROR("The number of atoms should be positive.\n");
++  }
++  if (atom_i_ < 0 || atom_i_ >= number_of_atoms || atom_j_ < 0 ||
++      atom_j_ >= number_of_atoms) {
++    PRINT_INPUT_ERROR("Atom index for a distance CV is out of range.\n");
++  }
++  if (atom_i_ == atom_j_) {
++    PRINT_INPUT_ERROR("The two atoms in a distance CV should be different.\n");
++  }
++
++  number_of_atoms_ = number_of_atoms;
++  distance_data_.resize(4);
++  invalid_distance_.resize(1, 0);
++}
++
++void EnhancedSamplingDistanceCV::compute(
++  const Box& box,
++  const GPU_Vector<double>& position_per_atom,
++  double* g_value)
++{
++  gpu_enhanced_sampling_compute_distance<<<1, 1>>>(
++    number_of_atoms_,
++    atom_i_,
++    atom_j_,
++    use_pbc_,
++    box,
++    position_per_atom.data(),
++    distance_data_.data(),
++    g_value,
++    invalid_distance_.data());
++  GPU_CHECK_KERNEL
++}
++
++void EnhancedSamplingDistanceCV::add_force_virial(
++  const double* g_derivative,
++  GPU_Vector<double>& force_per_atom,
++  GPU_Vector<double>& virial_per_atom,
++  double* g_bias_virial)
++{
++  gpu_enhanced_sampling_add_distance_force_virial<<<1, 1>>>(
++    number_of_atoms_,
++    atom_i_,
++    atom_j_,
++    g_derivative,
++    distance_data_.data(),
++    force_per_atom.data(),
++    virial_per_atom.data(),
++    g_bias_virial);
++  GPU_CHECK_KERNEL
++}
++
++void EnhancedSamplingDistanceCV::check()
++{
++  int invalid_distance = 0;
++  invalid_distance_.copy_to_host(&invalid_distance);
++  if (invalid_distance != 0) {
++    fprintf(stderr, "Runtime Error:\n");
++    fprintf(
++      stderr,
++      "    Error text: Distance CV '%s' has an invalid distance between "
++      "atoms %d and %d. The atoms may be coincident or nearly coincident.\n",
++      get_name().c_str(),
++      atom_i_,
++      atom_j_);
++    exit(1);
++  }
++}
+diff --git a/src/measure/enhanced_sampling_distance_cv.cuh b/src/measure/enhanced_sampling_distance_cv.cuh
+new file mode 100644
+index 000000000..f8a729f0d
+--- /dev/null
++++ b/src/measure/enhanced_sampling_distance_cv.cuh
+@@ -0,0 +1,59 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#pragma once
++#include "enhanced_sampling_cv.cuh"
++
++class EnhancedSamplingDistanceCV : public EnhancedSamplingCV
++{
++public:
++  EnhancedSamplingDistanceCV(
++    const std::string& name,
++    const int atom_i,
++    const int atom_j,
++    const bool use_pbc);
++
++  EnhancedSamplingDistanceCV(const EnhancedSamplingDistanceCV&) = delete;
++  EnhancedSamplingDistanceCV& operator=(const EnhancedSamplingDistanceCV&) = delete;
++  EnhancedSamplingDistanceCV(EnhancedSamplingDistanceCV&&) = delete;
++  EnhancedSamplingDistanceCV& operator=(EnhancedSamplingDistanceCV&&) = delete;
++
++  void prepare(const int number_of_atoms) override;
++
++  void compute(
++    const Box& box,
++    const GPU_Vector<double>& position_per_atom,
++    double* g_value) override;
++
++  void add_force_virial(
++    const double* g_derivative,
++    GPU_Vector<double>& force_per_atom,
++    GPU_Vector<double>& virial_per_atom,
++    double* g_bias_virial) override;
++
++  void check() override;
++
++  int get_atom_i() const { return atom_i_; }
++  int get_atom_j() const { return atom_j_; }
++  bool use_pbc() const { return use_pbc_; }
++
++private:
++  int atom_i_;
++  int atom_j_;
++  bool use_pbc_;
++  int number_of_atoms_;
++  GPU_Vector<double> distance_data_;
++  GPU_Vector<int> invalid_distance_;
++};
+diff --git a/src/measure/enhanced_sampling_engine.cu b/src/measure/enhanced_sampling_engine.cu
+new file mode 100644
+index 000000000..11e69f470
+--- /dev/null
++++ b/src/measure/enhanced_sampling_engine.cu
+@@ -0,0 +1,319 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++/*----------------------------------------------------------------------------80
++Coordinate collective variables and biases for enhanced sampling.
++------------------------------------------------------------------------------*/
++
++#include "enhanced_sampling_engine.cuh"
++#include "model/atom.cuh"
++#include "model/box.cuh"
++#include "utilities/error.cuh"
++#include "utilities/gpu_macro.cuh"
++#include <utility>
++
++static __global__ void gpu_enhanced_sampling_sum_potential(
++  const int number_of_atoms,
++  const double* g_potential,
++  double* g_sum)
++{
++  const int number_of_rounds = (number_of_atoms - 1) / 1024 + 1;
++  __shared__ double s_sum[1024];
++  s_sum[threadIdx.x] = 0.0;
++
++  for (int round = 0; round < number_of_rounds; ++round) {
++    const int atom_index = threadIdx.x + round * 1024;
++    if (atom_index < number_of_atoms) {
++      s_sum[threadIdx.x] += g_potential[atom_index];
++    }
++  }
++  __syncthreads();
++
++  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
++    if (threadIdx.x < offset) {
++      s_sum[threadIdx.x] += s_sum[threadIdx.x + offset];
++    }
++    __syncthreads();
++  }
++
++  if (threadIdx.x == 0) {
++    g_sum[0] = s_sum[0];
++  }
++}
++
++static __global__ void gpu_enhanced_sampling_sum_bias_energy(
++  const int number_of_biases,
++  const double* g_bias_energies,
++  double* g_total_bias_energy)
++{
++  if (blockIdx.x == 0 && threadIdx.x == 0) {
++    double sum = 0.0;
++    for (int bias_index = 0; bias_index < number_of_biases; ++bias_index) {
++      sum += g_bias_energies[bias_index];
++    }
++    g_total_bias_energy[0] = sum;
++  }
++}
++
++static __global__ void gpu_enhanced_sampling_add_bias_energy(
++  const int number_of_atoms,
++  const double* g_total_bias_energy,
++  double* g_potential)
++{
++  const int atom_index = blockIdx.x * blockDim.x + threadIdx.x;
++  if (atom_index < number_of_atoms) {
++    g_potential[atom_index] += g_total_bias_energy[0] / number_of_atoms;
++  }
++}
++
++EnhancedSamplingEngine::EnhancedSamplingEngine()
++  : number_of_atoms_(0), cpu_total_bias_energy_(0.0)
++{
++  for (int component = 0; component < 9; ++component) {
++    cpu_total_bias_virial_[component] = 0.0;
++  }
++  cpu_potential_before_after_[0] = 0.0;
++  cpu_potential_before_after_[1] = 0.0;
++}
++
++void EnhancedSamplingEngine::add_cv(std::unique_ptr<EnhancedSamplingCV> cv)
++{
++  if (!cv) {
++    PRINT_INPUT_ERROR("Cannot add an empty collective variable.\n");
++  }
++  const std::string name = cv->get_name();
++  if (has_cv(name)) {
++    PRINT_INPUT_ERROR("Collective variable names must be unique.\n");
++  }
++  const int index = static_cast<int>(cvs_.size());
++  cv_indices_[name] = index;
++  cvs_.emplace_back(std::move(cv));
++}
++
++void EnhancedSamplingEngine::add_bias(std::unique_ptr<EnhancedSamplingBias> bias)
++{
++  if (!bias) {
++    PRINT_INPUT_ERROR("Cannot add an empty bias.\n");
++  }
++  const std::string name = bias->get_name();
++  if (has_bias(name)) {
++    PRINT_INPUT_ERROR("Bias names must be unique.\n");
++  }
++  if (
++    bias->get_argument_index() < 0 ||
++    bias->get_argument_index() >= static_cast<int>(cvs_.size())) {
++    PRINT_INPUT_ERROR("A bias refers to an undefined collective variable.\n");
++  }
++  const int index = static_cast<int>(biases_.size());
++  bias_indices_[name] = index;
++  biases_.emplace_back(std::move(bias));
++}
++
++bool EnhancedSamplingEngine::has_cv(const std::string& name) const
++{
++  return cv_indices_.find(name) != cv_indices_.end();
++}
++
++bool EnhancedSamplingEngine::has_bias(const std::string& name) const
++{
++  return bias_indices_.find(name) != bias_indices_.end();
++}
++
++int EnhancedSamplingEngine::get_cv_index(const std::string& name) const
++{
++  std::map<std::string, int>::const_iterator iterator = cv_indices_.find(name);
++  if (iterator == cv_indices_.end()) {
++    PRINT_INPUT_ERROR("A bias refers to an undefined collective variable.\n");
++  }
++  return iterator->second;
++}
++
++int EnhancedSamplingEngine::get_number_of_cvs() const
++{
++  return static_cast<int>(cvs_.size());
++}
++
++int EnhancedSamplingEngine::get_number_of_biases() const
++{
++  return static_cast<int>(biases_.size());
++}
++
++void EnhancedSamplingEngine::prepare(const int number_of_atoms)
++{
++  if (number_of_atoms <= 0) {
++    PRINT_INPUT_ERROR("Enhanced sampling requires at least one atom.\n");
++  }
++  if (cvs_.empty()) {
++    PRINT_INPUT_ERROR("Enhanced sampling requires at least one collective variable.\n");
++  }
++  if (biases_.empty()) {
++    PRINT_INPUT_ERROR("Enhanced sampling requires at least one bias.\n");
++  }
++
++  number_of_atoms_ = number_of_atoms;
++  for (int cv_index = 0; cv_index < cvs_.size(); ++cv_index) {
++    cvs_[cv_index]->prepare(number_of_atoms_);
++  }
++
++  cv_values_.resize(cvs_.size());
++  cv_derivatives_.resize(cvs_.size());
++  bias_energies_.resize(biases_.size());
++  bias_derivatives_.resize(biases_.size());
++  total_bias_energy_.resize(1);
++  total_bias_virial_.resize(9);
++  potential_before_after_.resize(2);
++
++  cpu_cv_values_.resize(cvs_.size());
++  cpu_cv_derivatives_.resize(cvs_.size());
++  cpu_bias_energies_.resize(biases_.size());
++  cpu_bias_derivatives_.resize(biases_.size());
++}
++
++void EnhancedSamplingEngine::calculate(
++  const Box& box,
++  Atom& atom,
++  const bool collect_output_energy)
++{
++  if (collect_output_energy) {
++    gpu_enhanced_sampling_sum_potential<<<1, 1024>>>(
++      number_of_atoms_,
++      atom.potential_per_atom.data(),
++      potential_before_after_.data());
++    GPU_CHECK_KERNEL
++  }
++
++  cv_derivatives_.fill(0.0);
++  total_bias_virial_.fill(0.0);
++
++  for (int cv_index = 0; cv_index < cvs_.size(); ++cv_index) {
++    cvs_[cv_index]->compute(
++      box,
++      atom.position_per_atom,
++      cv_values_.data() + cv_index);
++  }
++
++  // These kernels are launched in the default stream. Their order is what
++  // makes plain += safe when biases share a CV or CVs share atoms.
++  for (int bias_index = 0; bias_index < biases_.size(); ++bias_index) {
++    biases_[bias_index]->evaluate(
++      cv_values_.data(),
++      cv_derivatives_.data(),
++      bias_energies_.data() + bias_index,
++      bias_derivatives_.data() + bias_index);
++  }
++
++  gpu_enhanced_sampling_sum_bias_energy<<<1, 1>>>(
++    static_cast<int>(biases_.size()),
++    bias_energies_.data(),
++    total_bias_energy_.data());
++  GPU_CHECK_KERNEL
++
++  for (int cv_index = 0; cv_index < cvs_.size(); ++cv_index) {
++    cvs_[cv_index]->add_force_virial(
++      cv_derivatives_.data() + cv_index,
++      atom.force_per_atom,
++      atom.virial_per_atom,
++      total_bias_virial_.data());
++  }
++
++  const int block_size = 128;
++  const int grid_size = (number_of_atoms_ - 1) / block_size + 1;
++  gpu_enhanced_sampling_add_bias_energy<<<grid_size, block_size>>>(
++    number_of_atoms_,
++    total_bias_energy_.data(),
++    atom.potential_per_atom.data());
++  GPU_CHECK_KERNEL
++
++  if (collect_output_energy) {
++    gpu_enhanced_sampling_sum_potential<<<1, 1024>>>(
++      number_of_atoms_,
++      atom.potential_per_atom.data(),
++      potential_before_after_.data() + 1);
++    GPU_CHECK_KERNEL
++  }
++}
++
++void EnhancedSamplingEngine::check()
++{
++  for (int cv_index = 0; cv_index < cvs_.size(); ++cv_index) {
++    cvs_[cv_index]->check();
++  }
++}
++
++void EnhancedSamplingEngine::write_header(FILE* fid) const
++{
++  fprintf(fid, "# enhanced_sampling\n");
++  fprintf(fid, "# format_version 1\n");
++  fprintf(
++    fid,
++    "# units distance=A energy=eV derivative=eV/A virial=eV\n");
++  fprintf(fid, "# columns step");
++  for (int cv_index = 0; cv_index < cvs_.size(); ++cv_index) {
++    fprintf(fid, " cv_%s", cvs_[cv_index]->get_name().c_str());
++  }
++  for (int bias_index = 0; bias_index < biases_.size(); ++bias_index) {
++    fprintf(fid, " bias_%s", biases_[bias_index]->get_name().c_str());
++  }
++  for (int bias_index = 0; bias_index < biases_.size(); ++bias_index) {
++    fprintf(
++      fid,
++      " dbias_%s_d_%s",
++      biases_[bias_index]->get_name().c_str(),
++      biases_[bias_index]->get_argument_name().c_str());
++  }
++  for (int cv_index = 0; cv_index < cvs_.size(); ++cv_index) {
++    fprintf(fid, " derivative_%s", cvs_[cv_index]->get_name().c_str());
++  }
++  fprintf(fid, " bias_total potential_before potential_after");
++  fprintf(fid, " virial_xx virial_xy virial_xz");
++  fprintf(fid, " virial_yx virial_yy virial_yz");
++  fprintf(fid, " virial_zx virial_zy virial_zz\n");
++  fflush(fid);
++}
++
++void EnhancedSamplingEngine::write_output(FILE* fid, const int step)
++{
++  check();
++  cv_values_.copy_to_host(cpu_cv_values_.data());
++  cv_derivatives_.copy_to_host(cpu_cv_derivatives_.data());
++  bias_energies_.copy_to_host(cpu_bias_energies_.data());
++  bias_derivatives_.copy_to_host(cpu_bias_derivatives_.data());
++  total_bias_energy_.copy_to_host(&cpu_total_bias_energy_);
++  total_bias_virial_.copy_to_host(cpu_total_bias_virial_);
++  potential_before_after_.copy_to_host(cpu_potential_before_after_);
++
++  fprintf(fid, "%d", step);
++  for (int cv_index = 0; cv_index < cpu_cv_values_.size(); ++cv_index) {
++    fprintf(fid, " %.17g", cpu_cv_values_[cv_index]);
++  }
++  for (int bias_index = 0; bias_index < cpu_bias_energies_.size(); ++bias_index) {
++    fprintf(fid, " %.17g", cpu_bias_energies_[bias_index]);
++  }
++  for (int bias_index = 0; bias_index < cpu_bias_derivatives_.size(); ++bias_index) {
++    fprintf(fid, " %.17g", cpu_bias_derivatives_[bias_index]);
++  }
++  for (int cv_index = 0; cv_index < cpu_cv_derivatives_.size(); ++cv_index) {
++    fprintf(fid, " %.17g", cpu_cv_derivatives_[cv_index]);
++  }
++  fprintf(fid, " %.17g", cpu_total_bias_energy_);
++  fprintf(fid, " %.17g %.17g", cpu_potential_before_after_[0], cpu_potential_before_after_[1]);
++
++  const int row_major_order[9] = {0, 3, 4, 6, 1, 5, 7, 8, 2};
++  for (int component = 0; component < 9; ++component) {
++    fprintf(fid, " %.17g", cpu_total_bias_virial_[row_major_order[component]]);
++  }
++  fprintf(fid, "\n");
++  fflush(fid);
++}
+diff --git a/src/measure/enhanced_sampling_engine.cuh b/src/measure/enhanced_sampling_engine.cuh
+new file mode 100644
+index 000000000..563bd9146
+--- /dev/null
++++ b/src/measure/enhanced_sampling_engine.cuh
+@@ -0,0 +1,78 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#pragma once
++#include "enhanced_sampling_bias.cuh"
++#include "enhanced_sampling_cv.cuh"
++#include "utilities/gpu_vector.cuh"
++#include <cstdio>
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++class Atom;
++class Box;
++
++class EnhancedSamplingEngine
++{
++public:
++  EnhancedSamplingEngine();
++
++  EnhancedSamplingEngine(const EnhancedSamplingEngine&) = delete;
++  EnhancedSamplingEngine& operator=(const EnhancedSamplingEngine&) = delete;
++  EnhancedSamplingEngine(EnhancedSamplingEngine&&) = delete;
++  EnhancedSamplingEngine& operator=(EnhancedSamplingEngine&&) = delete;
++
++  void add_cv(std::unique_ptr<EnhancedSamplingCV> cv);
++  void add_bias(std::unique_ptr<EnhancedSamplingBias> bias);
++
++  bool has_cv(const std::string& name) const;
++  bool has_bias(const std::string& name) const;
++  int get_cv_index(const std::string& name) const;
++
++  int get_number_of_cvs() const;
++  int get_number_of_biases() const;
++
++  void prepare(const int number_of_atoms);
++  void calculate(const Box& box, Atom& atom, const bool collect_output_energy);
++  void check();
++
++  void write_header(FILE* fid) const;
++  void write_output(FILE* fid, const int step);
++
++private:
++  int number_of_atoms_;
++  std::vector<std::unique_ptr<EnhancedSamplingCV> > cvs_;
++  std::vector<std::unique_ptr<EnhancedSamplingBias> > biases_;
++  std::map<std::string, int> cv_indices_;
++  std::map<std::string, int> bias_indices_;
++
++  GPU_Vector<double> cv_values_;
++  GPU_Vector<double> cv_derivatives_;
++  GPU_Vector<double> bias_energies_;
++  GPU_Vector<double> bias_derivatives_;
++  GPU_Vector<double> total_bias_energy_;
++  GPU_Vector<double> total_bias_virial_;
++  GPU_Vector<double> potential_before_after_;
++
++  std::vector<double> cpu_cv_values_;
++  std::vector<double> cpu_cv_derivatives_;
++  std::vector<double> cpu_bias_energies_;
++  std::vector<double> cpu_bias_derivatives_;
++  double cpu_total_bias_energy_;
++  double cpu_total_bias_virial_[9];
++  double cpu_potential_before_after_[2];
++};
+diff --git a/src/measure/enhanced_sampling_harmonic_bias.cu b/src/measure/enhanced_sampling_harmonic_bias.cu
+new file mode 100644
+index 000000000..822ef0510
+--- /dev/null
++++ b/src/measure/enhanced_sampling_harmonic_bias.cu
+@@ -0,0 +1,75 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++/*----------------------------------------------------------------------------80
++Harmonic bias for enhanced sampling.
++------------------------------------------------------------------------------*/
++
++#include "enhanced_sampling_harmonic_bias.cuh"
++#include "utilities/error.cuh"
++#include "utilities/gpu_macro.cuh"
++
++static __global__ void gpu_enhanced_sampling_evaluate_harmonic_bias(
++  const int argument_index,
++  const double center,
++  const double kappa,
++  const double* g_cv_values,
++  double* g_cv_derivatives,
++  double* g_bias_energy,
++  double* g_bias_derivative)
++{
++  if (blockIdx.x == 0 && threadIdx.x == 0) {
++    const double displacement = g_cv_values[argument_index] - center;
++    const double derivative = kappa * displacement;
++    g_bias_energy[0] = 0.5 * derivative * displacement;
++    g_bias_derivative[0] = derivative;
++    g_cv_derivatives[argument_index] += derivative;
++  }
++}
++
++EnhancedSamplingHarmonicBias::EnhancedSamplingHarmonicBias(
++  const std::string& name,
++  const std::string& argument_name,
++  const int argument_index,
++  const double center,
++  const double kappa)
++  : EnhancedSamplingBias(name, argument_name, argument_index),
++    center_(center),
++    kappa_(kappa)
++{
++  if (argument_index < 0) {
++    PRINT_INPUT_ERROR("The argument index for a harmonic bias should be non-negative.\n");
++  }
++  if (kappa < 0.0) {
++    PRINT_INPUT_ERROR("Kappa for a harmonic bias should be non-negative.\n");
++  }
++}
++
++void EnhancedSamplingHarmonicBias::evaluate(
++  const double* g_cv_values,
++  double* g_cv_derivatives,
++  double* g_bias_energy,
++  double* g_bias_derivative)
++{
++  gpu_enhanced_sampling_evaluate_harmonic_bias<<<1, 1>>>(
++    get_argument_index(),
++    center_,
++    kappa_,
++    g_cv_values,
++    g_cv_derivatives,
++    g_bias_energy,
++    g_bias_derivative);
++  GPU_CHECK_KERNEL
++}
+diff --git a/src/measure/enhanced_sampling_harmonic_bias.cuh b/src/measure/enhanced_sampling_harmonic_bias.cuh
+new file mode 100644
+index 000000000..60e296f99
+--- /dev/null
++++ b/src/measure/enhanced_sampling_harmonic_bias.cuh
+@@ -0,0 +1,41 @@
++/*
++    Copyright 2017 Zheyong Fan and GPUMD development team
++    This file is part of GPUMD.
++    GPUMD is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++    GPUMD is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++    You should have received a copy of the GNU General Public License
++    along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#pragma once
++#include "enhanced_sampling_bias.cuh"
++
++class EnhancedSamplingHarmonicBias : public EnhancedSamplingBias
++{
++public:
++  EnhancedSamplingHarmonicBias(
++    const std::string& name,
++    const std::string& argument_name,
++    const int argument_index,
++    const double center,
++    const double kappa);
++
++  void evaluate(
++    const double* g_cv_values,
++    double* g_cv_derivatives,
++    double* g_bias_energy,
++    double* g_bias_derivative) override;
++
++  double get_center() const { return center_; }
++  double get_kappa() const { return kappa_; }
++
++private:
++  double center_;
++  double kappa_;
++};
+diff --git a/src/measure/measure.cu b/src/measure/measure.cu
+index 2452f3018..397d9cea3 100644
+--- a/src/measure/measure.cu
++++ b/src/measure/measure.cu
+@@ -42,6 +42,7 @@ The driver class dealing with measurement.
+ #include "dump_thermo.cuh"
+ #include "dump_xyz.cuh"
+ #include "electron_stop.cuh"
++#include "enhanced_sampling.cuh"
+ #include "extrapolation.cuh"
+ #include "hac.cuh"
+ #include "hnemdec_kappa.cuh"
+@@ -104,6 +105,10 @@ bool Measure::parse_action(
+ #else
+     PRINT_INPUT_ERROR("plumed is available only when USE_PLUMED flag is set.\n");
+ #endif
++  } else if (tokens[0] == "enhanced_sampling") {
++    std::unique_ptr<Action> action;
++    action.reset(new EnhancedSamplingAction(tokens));
++    actions_.emplace_back(std::move(action));
+   } else if (tokens[0] == "dump_restart") {
+     std::unique_ptr<Action> action;
+     action.reset(new Dump_Restart(tokens));
+@@ -293,6 +298,8 @@ void Measure::pre_run(
+   std::vector<std::string> action_names;
+   int number_of_hnemd_methods = 0;
+   int number_of_modal_methods = 0;
++  bool has_deform = false;
++  bool has_enhanced_sampling = false;
+   for (auto& action : actions_) {
+     if (action->action_name == "") {
+       printf("Dear developer:\n");
+@@ -324,8 +331,17 @@ void Measure::pre_run(
+       action->action_name == "compute_hnema") {
+       ++number_of_modal_methods;
+     }
++    if (action->action_name == "deform") {
++      has_deform = true;
++    }
++    if (action->action_name == "enhanced_sampling") {
++      has_enhanced_sampling = true;
++    }
+     action_names.emplace_back(action->action_name);
+   }
++  if (has_deform && has_enhanced_sampling) {
++    PRINT_INPUT_ERROR("Enhanced sampling V1A does not support box deformation.");
++  }
+ 
+   if (number_of_modal_methods > 1) {
+     PRINT_INPUT_ERROR("There are multiple modal_analysis keywords within one run.");

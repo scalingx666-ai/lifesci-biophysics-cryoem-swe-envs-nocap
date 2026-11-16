@@ -1,0 +1,598 @@
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 4e710e190..f9cd867b1 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -26,6 +26,10 @@ jobs:
+         with:
+           python-version: ${{ matrix.python-version }}
+ 
++      - name: Set up MSVC (Windows)
++        if: runner.os == 'Windows'
++        uses: ilammy/msvc-dev-cmd@v1
++
+       - name: Install the project
+         run: uv sync --all-extras --dev
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 4d418492d..f68378243 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -21,6 +21,7 @@ dependencies = [
+   "triton; sys_platform == 'linux' and platform_machine != 'aarch64'",
+   "triton-windows; sys_platform == 'win32'",
+   "ase",
++  "setuptools>=82.0.0",
+ ]
+ 
+ [project.urls]
+diff --git a/tests/test_export.py b/tests/test_export.py
+new file mode 100644
+index 000000000..4e04f1ae7
+--- /dev/null
++++ b/tests/test_export.py
+@@ -0,0 +1,309 @@
++# Copyright Universitat Pompeu Fabra 2020-2023  https://www.compscience.org
++# Distributed under the MIT License.
++# (See accompanying file README.md file or copy at http://opensource.org/licenses/MIT)
++
++import pytest
++from pytest import mark
++import torch
++from torchmdnet import models
++from torchmdnet.models.model import create_model
++
++from utils import load_example_args, create_example_batch
++
++
++@mark.parametrize("model_name", ["tensornet"])
++@mark.parametrize("device", ["cpu", "cuda"])
++def test_torch_export(model_name, device):
++    """Test that a model can be exported using torch.export and produces correct outputs.
++
++    Note: This test requires derivative=False to avoid issues with requires_grad_ in the export.
++    """
++    if device == "cuda" and not torch.cuda.is_available():
++        pytest.skip("CUDA not available")
++
++    # torch.export was introduced in PyTorch 2.1+
++    if not hasattr(torch, "export"):
++        pytest.skip("torch.export not available in this PyTorch version")
++
++    # Create example data
++    z, pos, batch = create_example_batch()
++    z = z.to(device)
++    pos = pos.to(device)
++    batch = batch.to(device)
++
++    # Create model with export-compatible settings
++    args = load_example_args(
++        model_name,
++        remove_prior=True,
++        derivative=False,  # Avoid requires_grad_ inside forward
++    )
++    # Add parameters after loading since they're not in the YAML config
++    args["static_shapes"] = True
++    model = create_model(args).to(device=device)
++    model.eval()
++
++    # Get reference output from original model
++    with torch.no_grad():
++        y_ref = model(z, pos, batch=batch)
++
++    # Export the model
++    exported_program = torch.export.export(
++        model, args=(z, pos), kwargs={"batch": batch}
++    )
++
++    # Run exported model
++    with torch.no_grad():
++        y_exported = exported_program.module()(z, pos, batch=batch)
++
++    # Verify outputs match
++    torch.testing.assert_close(y_ref, y_exported, atol=1e-5, rtol=1e-5)
++
++
++@mark.parametrize("model_name", ["tensornet"])
++def test_torch_export_dynamic_shapes(model_name):
++    """Test torch.export with dynamic shapes across different atom counts.
++
++    This test requires CUDA with Triton for the neighbor list computation.
++    The Triton kernels are registered as custom ops via @triton_op, making them
++    compatible with torch.export's symbolic tracing (no tril_indices needed).
++    static_shapes=True avoids resize_to_fit boolean masking (data-dependent shapes).
++    num_systems=1 avoids the data-dependent batch.max().item() call.
++    """
++    if not hasattr(torch, "export"):
++        pytest.skip("torch.export not available in this PyTorch version")
++    if not torch.cuda.is_available():
++        pytest.skip(
++            "CUDA required for torch.export with dynamic shapes (Triton neighbor list)"
++        )
++
++    device = "cuda"
++
++    # Create model with static_shapes=True so resize_to_fit=False
++    # (avoids data-dependent boolean masking on neighbor list output)
++    args = load_example_args(model_name, remove_prior=True, derivative=False)
++    args["static_shapes"] = True
++    model = create_model(args).to(device=device)
++    model.eval()
++
++    # Create initial batch for export (single molecule)
++    z, pos, batch = create_example_batch(n_atoms=6, multiple_batches=False)
++    z, pos, batch = z.to(device), pos.to(device), batch.to(device)
++
++    from torch.export import Dim
++
++    # Define dynamic dimension for the number of atoms
++    num_atoms_dim = Dim("num_atoms")
++    dynamic_shapes = {
++        "z": {0: num_atoms_dim},
++        "pos": {0: num_atoms_dim},
++        "batch": {0: num_atoms_dim},
++        "num_systems": None,
++    }
++
++    # Pass num_systems=1 to avoid the data-dependent batch.max().item() call
++    # during tracing, enabling torch.export without a warm-up step.
++    exported_program = torch.export.export(
++        model,
++        args=(z, pos),
++        kwargs={"batch": batch, "num_systems": 1},
++        dynamic_shapes=dynamic_shapes,
++    )
++
++    # Test with different atom counts (single molecule each)
++    for n_atoms in [3, 6, 12]:
++        z_test, pos_test, batch_test = create_example_batch(
++            n_atoms=n_atoms, multiple_batches=False
++        )
++        z_test = z_test.to(device)
++        pos_test = pos_test.to(device)
++        batch_test = batch_test.to(device)
++
++        with torch.no_grad():
++            y_ref = model(z_test, pos_test, batch=batch_test, num_systems=1)
++            y_exported = exported_program.module()(
++                z_test, pos_test, batch=batch_test, num_systems=1
++            )
++
++        torch.testing.assert_close(y_ref, y_exported, atol=1e-5, rtol=1e-5)
++
++
++@mark.parametrize("model_name", ["tensornet"])
++def test_torch_export_save_load(model_name, tmp_path):
++    """Test that an exported model with dynamic shapes can be saved and loaded.
++
++    Uses torch.export.save/load to serialize the ExportedProgram to disk,
++    then verifies the loaded program produces correct outputs for different atom counts.
++    """
++    if not hasattr(torch, "export"):
++        pytest.skip("torch.export not available in this PyTorch version")
++    if not torch.cuda.is_available():
++        pytest.skip(
++            "CUDA required for torch.export with dynamic shapes (Triton neighbor list)"
++        )
++
++    device = "cuda"
++
++    # Create model
++    args = load_example_args(model_name, remove_prior=True, derivative=False)
++    args["static_shapes"] = True
++    model = create_model(args).to(device=device)
++    model.eval()
++
++    # Export with dynamic shapes
++    z, pos, batch = create_example_batch(n_atoms=6, multiple_batches=False)
++    z, pos, batch = z.to(device), pos.to(device), batch.to(device)
++
++    from torch.export import Dim
++
++    num_atoms_dim = Dim("num_atoms")
++    dynamic_shapes = {
++        "z": {0: num_atoms_dim},
++        "pos": {0: num_atoms_dim},
++        "batch": {0: num_atoms_dim},
++        "num_systems": None,
++    }
++
++    exported_program = torch.export.export(
++        model,
++        args=(z, pos),
++        kwargs={"batch": batch, "num_systems": 1},
++        dynamic_shapes=dynamic_shapes,
++        strict=False,
++    )
++
++    # Save and load
++    save_path = tmp_path / "exported_model.pt2"
++    torch.export.save(exported_program, save_path)
++    loaded_program = torch.export.load(save_path)
++
++    # Test with different atom counts
++    for n_atoms in [3, 6, 12]:
++        z_test, pos_test, batch_test = create_example_batch(
++            n_atoms=n_atoms, multiple_batches=False
++        )
++        z_test = z_test.to(device)
++        pos_test = pos_test.to(device)
++        batch_test = batch_test.to(device)
++
++        with torch.no_grad():
++            y_ref = model(z_test, pos_test, batch=batch_test, num_systems=1)
++            y_loaded = loaded_program.module()(
++                z_test, pos_test, batch=batch_test, num_systems=1
++            )
++
++        torch.testing.assert_close(y_ref, y_loaded, atol=1e-5, rtol=1e-5)
++
++
++@mark.parametrize("model_name", ["tensornet"])
++@mark.parametrize("device", ["cpu", "cuda"])
++def test_torch_export_then_compile(model_name, device):
++    """Test that an exported model can be torch.compiled afterwards for additional optimization."""
++    if device == "cuda" and not torch.cuda.is_available():
++        pytest.skip("CUDA not available")
++
++    if not hasattr(torch, "export"):
++        pytest.skip("torch.export not available in this PyTorch version")
++
++    # Create example data
++    z, pos, batch = create_example_batch()
++    z = z.to(device)
++    pos = pos.to(device)
++    batch = batch.to(device)
++
++    # Create and export model
++    args = load_example_args(model_name, remove_prior=True, derivative=False)
++    # Add parameters after loading since they're not in the YAML config
++    args["static_shapes"] = True
++    model = create_model(args).to(device=device)
++    model.eval()
++
++    # Get reference output
++    with torch.no_grad():
++        y_ref = model(z, pos, batch=batch)
++
++    # Export the model
++    exported_program = torch.export.export(
++        model, args=(z, pos), kwargs={"batch": batch}
++    )
++
++    # Now compile the exported model
++    compiled_model = torch.compile(exported_program.module(), backend="inductor")
++
++    with torch.no_grad():
++        y_compiled = compiled_model(z, pos, batch=batch)
++
++    # Verify outputs match
++    torch.testing.assert_close(y_ref, y_compiled, atol=1e-5, rtol=1e-5)
++
++
++@mark.parametrize("model_name", ["tensornet"])
++def test_torch_export_gradients(model_name):
++    """Test computing gradients (forces) through an exported model.
++
++    Exports a derivative=False model with dynamic shapes, then computes
++    forces as -dE/dpos using torch.autograd.grad on the exported model's output.
++    Verifies that the exported model's gradients match the original model.
++    """
++    if not hasattr(torch, "export"):
++        pytest.skip("torch.export not available in this PyTorch version")
++    if not torch.cuda.is_available():
++        pytest.skip(
++            "CUDA required for torch.export with dynamic shapes (Triton neighbor list)"
++        )
++
++    device = "cuda"
++
++    # Create model
++    args = load_example_args(model_name, remove_prior=True, derivative=False)
++    args["static_shapes"] = True
++    model = create_model(args).to(device=device)
++    model.eval()
++
++    # Export with dynamic shapes
++    z, pos, batch = create_example_batch(n_atoms=6, multiple_batches=False)
++    z, pos, batch = z.to(device), pos.to(device), batch.to(device)
++
++    from torch.export import Dim
++
++    num_atoms_dim = Dim("num_atoms")
++    dynamic_shapes = {
++        "z": {0: num_atoms_dim},
++        "pos": {0: num_atoms_dim},
++        "batch": {0: num_atoms_dim},
++        "num_systems": None,
++    }
++
++    exported_program = torch.export.export(
++        model,
++        args=(z, pos),
++        kwargs={"batch": batch, "num_systems": 1},
++        dynamic_shapes=dynamic_shapes,
++        strict=False,
++    )
++
++    # Test gradients with different atom counts
++    for n_atoms in [3, 6, 12]:
++        z_test, pos_test, batch_test = create_example_batch(
++            n_atoms=n_atoms, multiple_batches=False
++        )
++        z_test = z_test.to(device)
++        pos_test = pos_test.to(device)
++        batch_test = batch_test.to(device)
++
++        # Gradients through exported model
++        pos_grad = pos_test.clone().detach().requires_grad_(True)
++        y_exported = exported_program.module()(
++            z_test, pos_grad, batch=batch_test, num_systems=1
++        )
++        energy_exported = y_exported[0] if isinstance(y_exported, tuple) else y_exported
++        forces_exported = -torch.autograd.grad(energy_exported.sum(), pos_grad)[0]
++
++        # Gradients through original model
++        pos_grad_ref = pos_test.clone().detach().requires_grad_(True)
++        y_ref = model(z_test, pos_grad_ref, batch=batch_test, num_systems=1)
++        energy_ref = y_ref[0] if isinstance(y_ref, tuple) else y_ref
++        forces_ref = -torch.autograd.grad(energy_ref.sum(), pos_grad_ref)[0]
++
++        # Verify match
++        torch.testing.assert_close(energy_exported, energy_ref, atol=1e-5, rtol=1e-5)
++        torch.testing.assert_close(forces_exported, forces_ref, atol=1e-5, rtol=1e-5)
+diff --git a/torchmdnet/extensions/triton_brute.py b/torchmdnet/extensions/triton_brute.py
+index 6a6e19019..4f7d4951c 100644
+--- a/torchmdnet/extensions/triton_brute.py
++++ b/torchmdnet/extensions/triton_brute.py
+@@ -5,7 +5,12 @@
+ import triton.language as tl
+ from torch import Tensor
+ import torch
+-from torchmdnet.extensions.triton_neighbors import _tl_round, TritonNeighborAutograd
++from torchmdnet.extensions.triton_neighbors import (
++    _tl_round,
++    TritonNeighborAutograd,
++    neighbor_grad_positions,
++    neighbor_op_setup_context,
++)
+ from torch.library import triton_op, wrap_triton
+ from typing import Tuple
+ 
+@@ -224,6 +229,20 @@ def triton_neighbor_bruteforce(
+     return neighbors, deltas, distances, num_pairs
+ 
+ 
++def _bruteforce_backward(
++    ctx, grad_neighbors, grad_deltas, grad_distances, grad_num_pairs
++):
++    grad_positions = neighbor_grad_positions(ctx, grad_deltas, grad_distances)
++    return grad_positions, None, None, None, None, None, None, None, None
++
++
++torch.library.register_autograd(
++    "torchmdnet::triton_neighbor_bruteforce",
++    _bruteforce_backward,
++    setup_context=neighbor_op_setup_context,
++)
++
++
+ class TritonBruteNeighborAutograd(TritonNeighborAutograd):
+     @staticmethod
+     def forward(  # type: ignore[override]
+diff --git a/torchmdnet/extensions/triton_cell.py b/torchmdnet/extensions/triton_cell.py
+index 2586fdfcb..7532ce7ea 100644
+--- a/torchmdnet/extensions/triton_cell.py
++++ b/torchmdnet/extensions/triton_cell.py
+@@ -6,7 +6,11 @@
+ import torch
+ from torch import Tensor
+ from typing import Tuple
+-from torchmdnet.extensions.triton_neighbors import TritonNeighborAutograd
++from torchmdnet.extensions.triton_neighbors import (
++    TritonNeighborAutograd,
++    neighbor_grad_positions,
++    neighbor_op_setup_context,
++)
+ from torch.library import triton_op, wrap_triton
+ 
+ 
+@@ -433,6 +437,19 @@ def triton_neighbor_cell(
+     return neighbors, deltas, distances, num_pairs
+ 
+ 
++def _cell_backward(ctx, grad_neighbors, grad_deltas, grad_distances, grad_num_pairs):
++    grad_positions = neighbor_grad_positions(ctx, grad_deltas, grad_distances)
++    # Same as brute backward + extra None for num_cells input
++    return grad_positions, None, None, None, None, None, None, None, None, None
++
++
++torch.library.register_autograd(
++    "torchmdnet::triton_neighbor_cell",
++    _cell_backward,
++    setup_context=neighbor_op_setup_context,
++)
++
++
+ class TritonCellNeighborAutograd(TritonNeighborAutograd):
+     @staticmethod
+     def forward(
+diff --git a/torchmdnet/extensions/triton_neighbors.py b/torchmdnet/extensions/triton_neighbors.py
+index 5d2df81af..0d8888271 100644
+--- a/torchmdnet/extensions/triton_neighbors.py
++++ b/torchmdnet/extensions/triton_neighbors.py
+@@ -14,37 +14,56 @@ def _tl_round(x):
+     return tl.where(x >= 0, tl.math.floor(x + 0.5), tl.math.ceil(x - 0.5))
+ 
+ 
++def neighbor_grad_positions(ctx, grad_deltas, grad_distances):
++    """Compute gradient of positions from neighbor list gradients.
++
++    Shared backward logic for all Triton neighbor list ops.
++    Expects ctx to have saved_tensors = (neighbors, edge_vec, edge_weight)
++    and ctx.num_atoms set.
++
++    Returns grad_positions tensor of shape (num_atoms, 3).
++    """
++    neighbors, edge_vec, edge_weight = ctx.saved_tensors
++    num_atoms = ctx.num_atoms
++
++    if grad_deltas is None:
++        grad_deltas = torch.zeros_like(edge_vec)
++    if grad_distances is None:
++        grad_distances = torch.zeros_like(edge_weight)
++
++    zero_mask = edge_weight.eq(0)
++    zero_mask3 = zero_mask.unsqueeze(-1).expand_as(grad_deltas)
++
++    grad_distances_term = edge_vec / edge_weight.masked_fill(zero_mask, 1).unsqueeze(-1)
++    grad_distances_term = grad_distances_term * grad_distances.masked_fill(
++        zero_mask, 0
++    ).unsqueeze(-1)
++
++    grad_positions = torch.zeros(
++        (num_atoms, 3), device=edge_vec.device, dtype=edge_vec.dtype
++    )
++    edge_index_safe = neighbors.masked_fill(
++        zero_mask.unsqueeze(0).expand_as(neighbors), 0
++    )
++    grad_vec = grad_deltas.masked_fill(zero_mask3, 0) + grad_distances_term
++    grad_positions.index_add_(0, edge_index_safe[0], grad_vec)
++    grad_positions.index_add_(0, edge_index_safe[1], -grad_vec)
++
++    return grad_positions
++
++
++def neighbor_op_setup_context(ctx, inputs, output):
++    """Shared setup_context for register_autograd on neighbor list triton ops."""
++    positions = inputs[0]
++    neighbors, deltas, distances, num_pairs = output
++    ctx.save_for_backward(neighbors, deltas, distances)
++    ctx.num_atoms = positions.size(0)
++
++
+ class TritonNeighborAutograd(torch.autograd.Function):
+     @staticmethod
+     def backward(ctx, grad_neighbors, grad_deltas, grad_distances, grad_num_pairs):  # type: ignore[override]
+-        neighbors, edge_vec, edge_weight = ctx.saved_tensors
+-        num_atoms = ctx.num_atoms
+-
+-        if grad_deltas is None:
+-            grad_deltas = torch.zeros_like(edge_vec)
+-        if grad_distances is None:
+-            grad_distances = torch.zeros_like(edge_weight)
+-
+-        zero_mask = edge_weight.eq(0)
+-        zero_mask3 = zero_mask.unsqueeze(-1).expand_as(grad_deltas)
+-
+-        grad_distances_term = edge_vec / edge_weight.masked_fill(
+-            zero_mask, 1
+-        ).unsqueeze(-1)
+-        grad_distances_term = grad_distances_term * grad_distances.masked_fill(
+-            zero_mask, 0
+-        ).unsqueeze(-1)
+-
+-        grad_positions = torch.zeros(
+-            (num_atoms, 3), device=edge_vec.device, dtype=edge_vec.dtype
+-        )
+-        edge_index_safe = neighbors.masked_fill(
+-            zero_mask.unsqueeze(0).expand_as(neighbors), 0
+-        )
+-        grad_vec = grad_deltas.masked_fill(zero_mask3, 0) + grad_distances_term
+-        grad_positions.index_add_(0, edge_index_safe[0], grad_vec)
+-        grad_positions.index_add_(0, edge_index_safe[1], -grad_vec)
+-
++        grad_positions = neighbor_grad_positions(ctx, grad_deltas, grad_distances)
+         return (
+             grad_positions,
+             None,
+@@ -87,7 +106,7 @@ def triton_neighbor_pairs(
+             use_periodic,
+             float(cutoff_lower),
+             float(cutoff_upper),
+-            int(max_num_pairs),
++            max_num_pairs,
+             bool(loop),
+             bool(include_transpose),
+         )
+@@ -99,7 +118,7 @@ def triton_neighbor_pairs(
+             use_periodic,
+             cutoff_lower,
+             cutoff_upper,
+-            int(max_num_pairs),
++            max_num_pairs,
+             bool(loop),
+             bool(include_transpose),
+             num_cells,
+diff --git a/torchmdnet/models/model.py b/torchmdnet/models/model.py
+index 54b7322bd..cbdcac5f6 100644
+--- a/torchmdnet/models/model.py
++++ b/torchmdnet/models/model.py
+@@ -447,6 +447,7 @@ def forward(
+         q: Optional[Tensor] = None,
+         s: Optional[Tensor] = None,
+         extra_args: Optional[Dict[str, Tensor]] = None,
++        num_systems: Optional[int] = None,
+     ) -> Tuple[Tensor, Tensor]:
+         """
+         Compute the output of the model.
+@@ -479,6 +480,11 @@ def forward(
+             q (Tensor, optional): Atomic charges in the molecule. Shape: (N,).
+             s (Tensor, optional): Atomic spins in the molecule. Shape: (N,).
+             extra_args (Dict[str, Tensor], optional): Extra arguments to pass to the prior model.
++            num_systems (int, optional): Number of systems in the batch. If provided,
++                this is used directly as the output size of the scatter/reduce operation,
++                avoiding the data-dependent ``batch.max().item() + 1`` call. This is
++                required for ``torch.export`` with dynamic atom counts (no warm-up needed).
++                Defaults to None, which falls back to inferring the count from ``batch``.
+ 
+         Returns:
+             Tuple[Tensor, Optional[Tensor]]: The output of the model and the derivative of the output with respect to the positions if derivative is True, None otherwise.
+@@ -505,7 +511,7 @@ def forward(
+                 x = prior.pre_reduce(x, z, pos, batch, extra_args)
+ 
+         # aggregate atoms
+-        x = self.output_model.reduce(x, batch)
++        x = self.output_model.reduce(x, batch, num_systems=num_systems)
+ 
+         # shift by data mean
+         if self.mean is not None:
+diff --git a/torchmdnet/models/output_modules.py b/torchmdnet/models/output_modules.py
+index ed32db538..caac8a65e 100644
+--- a/torchmdnet/models/output_modules.py
++++ b/torchmdnet/models/output_modules.py
+@@ -34,7 +34,12 @@ def reset_parameters(self):
+     def pre_reduce(self, x, v, z, pos, batch):
+         return
+ 
+-    def reduce(self, x, batch):
++    def reduce(self, x, batch, num_systems: Optional[int] = None):
++        # If num_systems is explicitly provided, use it directly.
++        # This avoids the .item() call that is incompatible with torch.export tracing,
++        # and allows dynamic atom counts without a warm-up step.
++        if num_systems is not None:
++            return scatter(x, batch, dim=0, dim_size=num_systems, reduce=self.reduce_op)
+         # torch.compile and torch.export don't support .item() calls during tracing
+         # The model should be warmed up before compilation to set the correct dim_size
+         if torch.compiler.is_compiling():
+diff --git a/torchmdnet/models/utils.py b/torchmdnet/models/utils.py
+index 407a1c55c..bf762d501 100644
+--- a/torchmdnet/models/utils.py
++++ b/torchmdnet/models/utils.py
+@@ -282,7 +282,7 @@ def forward(
+         if box.dtype != pos.dtype:
+             box = box.to(dtype=pos.dtype)
+ 
+-        max_pairs: int = self.max_num_pairs
++        max_pairs = self.max_num_pairs
+         if self.max_num_pairs < 0:
+             max_pairs = -self.max_num_pairs * pos.shape[0]
+         if batch is None:
+@@ -291,7 +291,7 @@ def forward(
+             strategy=self.strategy,
+             positions=pos,
+             batch=batch,
+-            max_num_pairs=int(max_pairs),
++            max_num_pairs=max_pairs,
+             cutoff_lower=self.cutoff_lower,
+             cutoff_upper=self.cutoff_upper,
+             loop=self.loop,

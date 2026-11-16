@@ -1,0 +1,621 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index bb57f6ed..333c2fc5 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -982,6 +982,11 @@ Settled rules, each learned from a live run or a review:
+   its task and context carry everything. The persistent specialists stay for
+   conversation, where accumulating context is the point — and two concurrent
+   `run_task` calls on one specialist would each report the other's output.
++  An analysis item carries its own depth (`profile`, `targets`,
++  `time_budget_s`) as a delegation and a fan-out branch do: one rule reads it
++  on all three paths (`fanout.analysis_depth`; a bad value is refused before
++  anything runs), it is on the entry, and a rerun or a re-run after a
++  retraction starts from it (#756).
+ - **The coordinator is rules, not a model.** Admission by free memory (an
+   item is estimated by its LARGEST unit, nested data included — a series runs
+   its units one at a time, times the replay workers the agent itself resolves
+diff --git a/scilink/agents/meta_agent/board.py b/scilink/agents/meta_agent/board.py
+index 5384da6e..9b9491ab 100644
+--- a/scilink/agents/meta_agent/board.py
++++ b/scilink/agents/meta_agent/board.py
+@@ -1176,11 +1176,13 @@ def source(idx, e, worker=None, mode=None, subject=None, via="posted"):
+         if e.get("caused_by"):
+             # a reaction re-run still rests on its cause (its task quotes it)
+             item["rests_on"] = list(e["caused_by"])
+-        for key in ("data_path", "reads_board", "check"):
++        for key in ("data_path", "pattern", "reads_board", "check"):
+             # ``reads_board: {}`` is the plain opt-in and falsy — test for
+             # presence, not truth; a False check or an absent spec is the default.
+             if e.get(key) is not None and e.get(key) is not False:
+                 item[key] = e[key]
++        if src["mode"] == "analysis" and isinstance(e.get("depth"), dict):
++            item.update(e["depth"])           # the depth the original ran at
+         rerun_items.append(item)
+     parts = ([f"withdraws {', '.join(fx['withdrawn'])}"] if fx["withdrawn"] else []) \
+         + ([f"taints {len(fx['tainted'])}"] if fx["tainted"] else []) \
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index 917cc4a8..46fdc446 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -37,6 +37,7 @@
+ from scilink.utils import path_fence as _path_fence
+ import io
+ import json
++import math
+ import logging
+ import os
+ 
+@@ -571,6 +572,42 @@ def _ensure_stop_guard_installed() -> None:
+ FANOUT_SERIES_BUDGET_FACTOR = 2.0
+ #: A branch's typed depth, the single delegation's ``depth`` keys.
+ _BRANCH_DEPTH_KEYS = ("profile", "targets", "time_budget_s")
++
++
++def analysis_depth(source: Any) -> dict:
++    """The typed depth of an analysis delegation, a fan-out branch or a swarm
++    item — ``profile``, ``targets``, ``time_budget_s`` — read by one rule on
++    all three paths (#756). Unset keys are left out, so a source with none
++    gives ``{}`` and the child's call is what it was without them. Raises
++    ``ValueError`` with the reason for a profile no preset names, targets
++    that are not quantity names, or a budget that is not a positive number:
++    refused before anything runs, never passed through."""
++    src = source if isinstance(source, dict) else {}
++    depth: dict = {}
++    if src.get("profile"):
++        from ..exp_agents._qc_profile import resolve_profile
++        resolve_profile(src["profile"])          # its error names the presets
++        depth["profile"] = src["profile"]
++    targets = src.get("targets")
++    if targets:
++        if isinstance(targets, str):
++            targets = [targets]
++        if (not isinstance(targets, (list, tuple))
++                or not all(isinstance(t, str) and t.strip() for t in targets)):
++            raise ValueError(f"targets must be a list of quantity names (got {targets!r})")
++        depth["targets"] = [t.strip() for t in targets]
++    budget = src.get("time_budget_s")
++    if budget:                                   # 0 / None: no budget, as on every path before
++        try:
++            if isinstance(budget, bool):
++                raise TypeError
++            budget = float(budget)
++        except (TypeError, ValueError):
++            raise ValueError(f"time_budget_s must be a number of seconds (got {budget!r})") from None
++        if not math.isfinite(budget) or budget <= 0:
++            raise ValueError(f"time_budget_s must be a positive, finite number of seconds (got {budget!r})")
++        depth["time_budget_s"] = budget
++    return depth
+ # In AUTONOMOUS mode there is no human to confirm, so the verdict IS the gate:
+ # proceed only on a confident 'complementary' read.
+ AUTONOMOUS_CONFIDENCE_THRESHOLD = 0.6
+@@ -1514,7 +1551,7 @@ def _run_one_branch(orch, branch: dict, companions: List[dict],
+                          else _mesh_task(branch, companions))
+             # Typed per-branch depth (the single-delegation path's twin): the
+             # child applies it to every run_analysis call of the branch.
+-            _depth = {k: branch.get(k) for k in _BRANCH_DEPTH_KEYS if branch.get(k)}
++            _depth = analysis_depth(branch)
+             # The branch's wall-clock budget is NOT handed to the child as a
+             # run deadline: the fan-out's hard cancel already bounds the
+             # branch, and a run deadline counts human wait (an AUTOPILOT plan
+@@ -2038,6 +2075,11 @@ def run_fanout(orch, branches: List[dict],
+                            f"(same data_path AND task): {dp}")
+             continue
+         seen_dup.add(dup_key)
++        try:
++            depth = analysis_depth(b)
++        except ValueError as e:
++            return json.dumps({"status": "error", "message": (
++                f"Branch '{b.get('label') or Path(dp).stem}': {e}. Nothing was started.")})
+         norm.append({
+             "data_path": dp, "task": task,
+             "label": (b.get("label") or Path(dp).stem),
+@@ -2052,7 +2094,7 @@ def run_fanout(orch, branches: List[dict],
+             "figure_style": (str(figure_style) if figure_style else None),
+             # The branch's typed depth (#718): read at the launch site and
+             # applied by the child to every run_analysis call of the branch.
+-            **{k: b.get(k) for k in _BRANCH_DEPTH_KEYS if b.get(k)},
++            **depth,
+         })
+     # Stash for fuse_delegations (a separate tool call): fusion codegen
+     # applies the same presentation preference to fusion_figure.png.
+@@ -2277,7 +2319,7 @@ def _companions_for(i):
+             if b.get("_steering"):
+                 entry["steered_by"] = [p["label"] for p in b["_steering"]]
+             # As _delegate records it, and what a resumed branch runs under.
+-            _depth = {k: b.get(k) for k in _BRANCH_DEPTH_KEYS if b.get(k)}
++            _depth = analysis_depth(b)
+             if _depth:
+                 entry["depth"] = _depth
+             # Carry the input path/metadata so a later fuse_delegations can
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index 97e03865..4850e900 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -1459,8 +1459,15 @@ def _delegate(self, mode: str, task: str, context: Optional[dict] = None,
+                 "message": f"Unknown delegation target: {mode}",
+             })
+ 
++        if mode == "analysis":
++            from .fanout import analysis_depth
++            try:
++                depth = analysis_depth(depth)
++            except ValueError as e:
++                return json.dumps({"status": "error", "message": f"{e}. Nothing was delegated."})
++        else:
++            depth = {}
+         entry = self._open_delegation(mode, task, context, context_from, label)
+-        depth = {k: v for k, v in (depth or {}).items() if v} if mode == "analysis" else {}
+         with self._fanout_lock:               # new keys on a live entry: see _ledger_snapshot
+             if depth:
+                 entry["depth"] = depth
+diff --git a/scilink/agents/meta_agent/meta_orchestrator_tools.py b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+index 81f75bcb..30e70d24 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator_tools.py
++++ b/scilink/agents/meta_agent/meta_orchestrator_tools.py
+@@ -856,6 +856,29 @@ def run_swarm(work_items: list, item_time_budget_s: float = None,
+                                                          "dataset path, used to estimate the "
+                                                          "item's memory and set its time "
+                                                          "budget."},
++                            "pattern": {"type": "string",
++                                        "description": "Optional, analysis items: a filename "
++                                                       "glob selecting the item's files when "
++                                                       "data_path is a directory holding several "
++                                                       "datasets; sizes its memory estimate and "
++                                                       "time budget. The task must still name "
++                                                       "the files it analyses."},
++                            "profile": {"type": "string",
++                                        "enum": ["thorough", "quick", "extract"],
++                                        "description": "Optional, analysis items: the depth for "
++                                                       "THIS item, chosen by what its result is "
++                                                       "for (see delegate_to_analysis). Omit for "
++                                                       "thorough."},
++                            "targets": {"type": "array", "items": {"type": "string"},
++                                        "description": "Optional, analysis items: the quantities "
++                                                       "needed from THIS item, in plain words; "
++                                                       "scopes its verifier to them."},
++                            "time_budget_s": {"type": "number",
++                                              "description": "Optional, analysis items: soft "
++                                                             "wall-clock budget per analysis, in "
++                                                             "seconds (see delegate_to_analysis); "
++                                                             "item_time_budget_s still bounds the "
++                                                             "whole item."},
+                             "context": {"type": "object",
+                                         "description": "Optional context, as for a "
+                                                        "delegate_to_* call."},
+@@ -902,8 +925,9 @@ def run_swarm(work_items: list, item_time_budget_s: float = None,
+                     "type": "array",
+                     "description": ("Optional reactions: {on: {kind, subject?, status?}, "
+                                     "enqueue: {mode, label, task, subject?, reads_board?, "
+-                                    "check?, context?, data_path?}, max_fires?}. `task` and "
+-                                    "`label` are templates filled from the triggering finding."),
++                                    "check?, context?, data_path?, pattern?, profile?, targets?, "
++                                    "time_budget_s?}, max_fires?}. `task` and `label` are "
++                                    "templates filled from the triggering finding."),
+                     "items": {
+                         "type": "object",
+                         "properties": {
+@@ -923,6 +947,11 @@ def run_swarm(work_items: list, item_time_budget_s: float = None,
+                                             "task": {"type": "string"},
+                                             "subject": {"type": "string"},
+                                             "data_path": {"type": "string"},
++                                            "pattern": {"type": "string"},
++                                            "profile": {"type": "string",
++                                                        "enum": ["thorough", "quick", "extract"]},
++                                            "targets": {"type": "array", "items": {"type": "string"}},
++                                            "time_budget_s": {"type": "number"},
+                                             "context": {"type": "object"},
+                                             "reads_board": {"type": "object"},
+                                             "check": {"type": "boolean"}},
+diff --git a/scilink/agents/meta_agent/peaks.py b/scilink/agents/meta_agent/peaks.py
+index 5095a545..6e7a6bdc 100644
+--- a/scilink/agents/meta_agent/peaks.py
++++ b/scilink/agents/meta_agent/peaks.py
+@@ -13,7 +13,10 @@
+ type), that unit's in-memory size bucket (powers of two of a megabyte) and
+ how many units there are. Two cubes of the same size and kind are one
+ class whatever the agent then chooses to do with them, which is the
+-granularity the measurement can honestly support. The table keeps the MAX
++granularity the measurement can honestly support — except the depth the
++caller asked for: a quick or extract analysis (``:quick``, by a profile
++dict's ``base``) is its own class, since its spend says nothing about a
++thorough run's, and a thorough one keeps the plain key (#756). The table keeps the MAX
+ seen per class: a class is sized by its worst run, never by its average.
+ Recorded: a run that did its class's work (peak and tokens), and a run that
+ ended on memory — killed by the system, or cancelled by the guard — whose
+@@ -71,14 +74,32 @@ def _units_bucket(n: int) -> str:
+ 
+ 
+ def item_class(item: dict) -> str:
+-    """``mode[:kind:largest-unit-bucket:units[:wN]]`` — see the module
+-    docstring. ``:wN`` is the series' replay workers when more than one
++    """``mode[:kind:largest-unit-bucket:units[:wN]][:profile]`` — see the
++    module docstring. ``:wN`` is the series' replay workers when more than one
+     (#750's own resolver and cap: a series' peak is its units in flight at
+     once, so a four-worker run and a one-worker run of the same cubes are
+     two classes). An analysis item with data it cannot read is
+     ``analysis:unreadable``."""
+     mode = str(item.get("mode") or "")
+-    if mode != "analysis" or not item.get("data_path"):
++    if mode != "analysis":
++        return mode
++    return _base_class(item, mode) + _profile_suffix(item)
++
++
++def _profile_suffix(item: dict) -> str:
++    """``:<preset>`` for an analysis asked for at a depth other than the
++    default (a swarm item's ``depth``, a fan-out branch's own field), so its
++    spend sizes only its own kind of run; empty for thorough."""
++    prof = (item.get("depth") or {}).get("profile") if isinstance(item.get("depth"), dict) else None
++    prof = prof or item.get("profile")
++    if isinstance(prof, dict):
++        prof = prof.get("base") or prof.get("name")
++    prof = str(prof or "").strip().lower()
++    return "" if prof in ("", "thorough") else f":{prof}"
++
++
++def _base_class(item: dict, mode: str) -> str:
++    if not item.get("data_path"):
+         return mode
+     from ...utils.workers import resolve_workers
+     from . import fanout as fo
+diff --git a/scilink/agents/meta_agent/placements.py b/scilink/agents/meta_agent/placements.py
+index 9fbb64bc..645aacd1 100644
+--- a/scilink/agents/meta_agent/placements.py
++++ b/scilink/agents/meta_agent/placements.py
+@@ -211,6 +211,7 @@ def item_spec(orch, item: dict, task: str, base_dir: Path, autonomy: str) -> dic
+     from ... import executors
+     return {
+         "mode": item["mode"], "task": task, "context": item.get("context"),
++        "depth": dict(item.get("depth") or {}),
+         "label": item["label"], "base_dir": str(base_dir), "autonomy": autonomy,
+         "budget_s": item.get("_budget_s"), "host": host_spec(orch),
+         "sandbox_approved": bool(getattr(executors, "_GLOBAL_SANDBOX_APPROVED", False)
+@@ -286,7 +287,8 @@ def sink(model, prompt_tokens, completion_tokens, latency_s, session, worker=Non
+     try:
+         child = build_child(host, spec["mode"], base_dir, label=f"Swarm: {spec['label']}")
+         result = child.run_task(spec["task"], context=spec.get("context"),
+-                                autonomy=autonomy_for(spec["mode"], spec["autonomy"]))
++                                autonomy=autonomy_for(spec["mode"], spec["autonomy"]),
++                                **(spec.get("depth") or {}))
+     except Exception as exc:  # noqa: BLE001 - the work's failure is a result
+         result = {"status": "error", "error": str(exc), "summary": "", "key_findings": [],
+                   "files_produced": [], "suggested_followups": [], "warnings": []}
+diff --git a/scilink/agents/meta_agent/reactions.py b/scilink/agents/meta_agent/reactions.py
+index 647618d8..583b8357 100644
+--- a/scilink/agents/meta_agent/reactions.py
++++ b/scilink/agents/meta_agent/reactions.py
+@@ -78,6 +78,13 @@ def normalize_subscriptions(raw: Any) -> Tuple[List[dict], List[dict]]:
+         if not task:
+             refused.append({"subscription": n, "reason": "enqueue.task is empty"})
+             continue
++        if mode == "analysis":
++            from .fanout import analysis_depth
++            try:
++                analysis_depth(enq)
++            except ValueError as e:
++                refused.append({"subscription": n, "reason": f"enqueue: {e}"})
++                continue
+         try:
+             max_fires = int(sub.get("max_fires", DEFAULT_MAX_FIRES))
+         except (TypeError, ValueError):
+diff --git a/scilink/agents/meta_agent/swarm.py b/scilink/agents/meta_agent/swarm.py
+index 1422e7e9..9835b683 100644
+--- a/scilink/agents/meta_agent/swarm.py
++++ b/scilink/agents/meta_agent/swarm.py
+@@ -146,7 +146,15 @@ def normalize_items(items: Any, *, coordinator: bool = False) -> Tuple[List[dict
+         if not task:
+             refused.append({"item": i + 1, "label": label, "reason": "empty task"})
+             continue
++        # An analysis item's typed depth, by the rule a delegation and a
++        # fan-out branch use (#756); other modes have none, as before.
++        try:
++            depth = fo.analysis_depth(raw) if mode == "analysis" else {}
++        except ValueError as e:
++            refused.append({"item": i + 1, "label": label, "reason": str(e)})
++            continue
+         ok.append({**{k: v for k, v in raw.items() if coordinator or k not in _COORDINATOR_FIELDS},
++                   "depth": depth,
+                    "mode": mode, "task": task, "label": label,
+                    "subject": (str(raw.get("subject")).strip() if raw.get("subject") else None),
+                    "reads_board": _read_spec(raw.get("reads_board")),
+@@ -373,7 +381,8 @@ def _run_item(orch, item: dict, entry: dict, channel, autonomy: str, stop_event)
+             else:
+                 child = build_child(orch, item["mode"], base_dir, label=f"Swarm: {item['label']}")
+                 result = child.run_task(task, context=item.get("context"),
+-                                        autonomy=autonomy_for(item["mode"], autonomy))
++                                        autonomy=autonomy_for(item["mode"], autonomy),
++                                        **(item.get("depth") or {}))
+         except Exception as exc:  # noqa: BLE001
+             fo.logger.exception(f"swarm item {index} failed: {exc}")
+             result = _error_result(str(exc))
+@@ -639,6 +648,10 @@ def launch(pool, item) -> Any:
+                 # its complementarity gate from the entries' data paths.
+                 entry["data_path"] = str(item["data_path"])
+             entry["_budget_s"] = item_budget
++            if item.get("depth"):
++                entry["depth"] = dict(item["depth"])
++            if item["mode"] == "analysis" and item.get("pattern"):
++                entry["pattern"] = str(item["pattern"])
+             # The item's own inputs, so a re-run (retract_finding's
+             # rerun_items) starts from what this one had.
+             if item.get("reads_board") is not None:
+diff --git a/tests/test_swarm_item_depth.py b/tests/test_swarm_item_depth.py
+new file mode 100644
+index 00000000..a4675a81
+--- /dev/null
++++ b/tests/test_swarm_item_depth.py
+@@ -0,0 +1,274 @@
++"""A swarm analysis item carries its own depth (#756), by the rule a single
++delegation and a fan-out branch use: ``profile``, ``targets``,
++``time_budget_s`` read by one helper, recorded on the ledger entry, passed to
++the child's ``run_task`` on the thread and the process placement, kept on a
++memory-guard rerun and on a re-run after a retraction. An unknown profile is
++refused with its reason before anything runs.
++
++The workers are stand-ins; the meta, its ledger and the coordinator are real.
++No LLM calls.
++"""
++
++import json
++import os
++import threading
++import time
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import scilink.agents.meta_agent.fanout as fo
++from scilink.agents.meta_agent import placements, swarm
++from scilink.agents.meta_agent.meta_orchestrator import MetaMode, MetaOrchestratorAgent
++
++DEPTH = {"profile": "extract", "targets": ["band position"], "time_budget_s": 120.0}
++
++
++class Worker:
++    """Records the depth each call received; ``until_stopped`` keeps it
++    running (printing, which is where a Stop lands) until it is cancelled."""
++
++    calls: list = []
++
++    def __init__(self, mode, base_dir, until_stopped=lambda task: False):
++        self.mode, self.base_dir, self.until_stopped = mode, Path(base_dir), until_stopped
++
++    def run_task(self, task, context=None, autonomy=None, **depth):
++        Worker.calls.append({"mode": self.mode, "task": task, **depth})
++        deadline = time.time() + (1.0 if task == "light" else 0.1)
++        while time.time() < deadline or self.until_stopped(task):
++            print(".", end="", flush=True)
++            time.sleep(0.05)
++            if time.time() > deadline + 20:
++                break
++        return {"status": "success", "summary": f"{task} done", "key_findings": [],
++                "files_produced": [], "suggested_followups": [], "warnings": []}
++
++
++@pytest.fixture()
++def meta(tmp_path, monkeypatch):
++    monkeypatch.setenv("SCILINK_HOME", str(tmp_path / "home"))
++    monkeypatch.setenv("SCILINK_SWARM_PLACEMENT", "thread")
++    monkeypatch.setattr(swarm, "_POLL_S", 0.05)
++    monkeypatch.setattr(swarm.fo, "_available_memory", lambda: 8e9)
++    monkeypatch.setattr(swarm, "_memory", lambda: {"total": 16e9, "available": 8e9})
++    Worker.calls = []
++    m = MetaOrchestratorAgent(base_dir=str(tmp_path / "meta"), model_name="anthropic/claude-sonnet-4-5",
++                              meta_mode=MetaMode.AUTONOMOUS, launch_dir=str(tmp_path))
++    m._enable_human_feedback = False
++    return m
++
++
++def _workers(monkeypatch, until_stopped=lambda task: False):
++    def build(orch, mode, base_dir, **kw):
++        Path(base_dir).mkdir(parents=True, exist_ok=True)
++        return Worker(mode, base_dir, until_stopped)
++    monkeypatch.setattr(swarm, "build_child", build)
++
++
++def _depth_of(call):
++    return {k: v for k, v in call.items() if k in fo._BRANCH_DEPTH_KEYS}
++
++
++def test_an_items_depth_reaches_its_worker_and_its_entry(meta, monkeypatch):
++    _workers(monkeypatch)
++    res = json.loads(swarm.run_swarm(meta, [
++        {"mode": "analysis", "task": "fit A", "label": "A", **DEPTH},
++        {"mode": "analysis", "task": "fit B", "label": "B"},
++        {"mode": "planning", "task": "plan C", "label": "C", "profile": "quick"}]))
++    assert res["status"] == "success" and res["not_started"] == []
++    by_task = {c["task"]: c for c in Worker.calls}
++    assert _depth_of(by_task["fit A"]) == DEPTH
++    # without depth the call is what it was; a planning item has none to take
++    assert set(by_task["fit B"]) == {"mode", "task"}
++    assert set(by_task["plan C"]) == {"mode", "task"}
++    ledger = {e["task"]: e for e in meta._delegation_ledger}
++    assert ledger["fit A"]["depth"] == DEPTH
++    assert "depth" not in ledger["fit B"] and "depth" not in ledger["plan C"]
++
++
++def test_a_memory_guard_rerun_keeps_the_items_depth(meta, monkeypatch):
++    monkeypatch.setitem(swarm._MODE_MEM_FLOOR, "analysis", 2e9)        # the heavy one
++    runs = {"heavy": 0}
++
++    def until_stopped(task):
++        return task == "heavy" and runs["heavy"] == 1
++    _workers(monkeypatch, until_stopped)
++    real_run_task = Worker.run_task
++
++    def counting(self, task, **kw):
++        if task == "heavy":
++            runs["heavy"] += 1
++        return real_run_task(self, task, **kw)
++    monkeypatch.setattr(Worker, "run_task", counting)
++    low = {"on": False}
++    monkeypatch.setattr(swarm, "_memory", lambda: {"total": 16e9, "available": 1e8 if low["on"] else 8e9})
++    threading.Timer(0.4, lambda: low.update(on=True)).start()
++    real_guard = swarm._guard_memory
++
++    def guard(*args):
++        cancelled = real_guard(*args)
++        if cancelled is not None:
++            low["on"] = False
++        return cancelled
++    monkeypatch.setattr(swarm, "_guard_memory", guard)
++    res = json.loads(swarm.run_swarm(meta, [
++        {"mode": "planning", "task": "light", "label": "light"},
++        {"mode": "analysis", "task": "heavy", "label": "heavy", **DEPTH}]))
++    assert [(r["label"], r["status"]) for r in res["results"]][1:] == [("heavy", "cancelled"),
++                                                                      ("heavy", "success")]
++    heavy = [_depth_of(c) for c in Worker.calls if c["task"] == "heavy"]
++    assert heavy == [DEPTH, DEPTH]
++
++
++def test_the_process_worker_runs_under_the_items_depth(meta, monkeypatch, tmp_path):
++    item = {"mode": "analysis", "task": "fit A", "label": "A", "depth": dict(DEPTH)}
++    spec = placements.item_spec(meta, item, "fit A", tmp_path / "w", "AUTONOMOUS")
++    assert spec["depth"] == DEPTH
++    json.dumps(spec)                                          # plain data: it crosses a process
++    from scilink.agents.meta_agent import workers
++    monkeypatch.setattr(workers, "build_child", lambda host, mode, base_dir, **kw: Worker(mode, base_dir))
++    out = placements.run_item(spec)
++    assert out["result"]["status"] == "success" and _depth_of(Worker.calls[-1]) == DEPTH
++    # an item with none: the call is what it was
++    Worker.calls.clear()
++    placements.run_item(placements.item_spec(meta, {"mode": "analysis", "task": "t", "label": "B"},
++                                             "t", tmp_path / "w2", "AUTONOMOUS"))
++    assert set(Worker.calls[-1]) == {"mode", "task"}
++
++
++# ── one rule on all three paths ──────────────────────────────────────────
++
++@pytest.mark.parametrize("given, applied", [
++    (DEPTH, DEPTH),
++    ({"profile": "quick", "targets": "band position", "time_budget_s": "90"},
++     {"profile": "quick", "targets": ["band position"], "time_budget_s": 90.0}),
++    ({"profile": None, "targets": [], "time_budget_s": 0}, {}),
++])
++def test_the_same_depth_reaches_the_child_on_every_path(meta, monkeypatch, tmp_path, given, applied):
++    # a single delegation
++    meta._get_analysis_child = lambda: Worker("analysis", tmp_path / "d")
++    meta._delegate("analysis", "fit D", None, None, "D", depth=dict(given))
++    # a fan-out branch
++    paths = []
++    for n in "AB":
++        paths.append(str(tmp_path / f"{n}.npy"))
++        np.save(paths[-1], np.zeros((4, 4)))
++    monkeypatch.setattr(fo, "_llm_json", lambda orch, prompt, extra_parts=None: {
++        "verdict": "complementary", "confidence": 0.9, "rationale": "r", "join_axis": "T",
++        "join_type": "shared_parameter_axis", "fanout_set": list(paths), "redundant_clusters": [],
++        "unrelated": [], "excluded_notes": ""})
++    monkeypatch.setattr(fo, "_make_ephemeral_analysis_child",
++                        lambda orch, base_dir, restore=False: Worker("analysis", base_dir))
++    meta._run_fanout([{"data_path": p, "task": f"fit {Path(p).stem}", "label": Path(p).stem, **given}
++                      for p in paths])
++    # a swarm item
++    _workers(monkeypatch)
++    swarm.run_swarm(meta, [{"mode": "analysis", "task": "fit S", "label": "S", **given},
++                           {"mode": "analysis", "task": "fit T", "label": "T", **given}])
++    seen = {c["task"]: _depth_of(c) for c in Worker.calls}
++    assert set(seen) >= {"fit D", "fit S", "fit T"} and any(t.startswith("Analyze") or "fit A" in t
++                                                           for t in seen)
++    assert all(d == applied for d in seen.values()), seen
++
++
++@pytest.mark.parametrize("bad, why", [
++    ({"profile": "thorogh"}, "thorogh"),
++    ({"targets": [3]}, "targets"),
++    ({"time_budget_s": -5}, "time_budget_s"),
++    ({"time_budget_s": float("nan")}, "time_budget_s"),
++    ({"time_budget_s": float("inf")}, "time_budget_s"),
++    ({"time_budget_s": True}, "time_budget_s"),
++])
++def test_bad_depth_is_refused_with_its_reason_before_anything_runs(meta, monkeypatch, tmp_path, bad, why):
++    meta._get_analysis_child = lambda: Worker("analysis", tmp_path / "d")
++    out = json.loads(meta._delegate("analysis", "fit D", None, None, "D", depth=bad))
++    assert out["status"] == "error" and why in out["message"] and meta._delegation_ledger == []
++    out = json.loads(meta._run_fanout([{"data_path": str(tmp_path), "task": f"t{n}", "label": n, **bad}
++                                       for n in "AB"]))
++    assert out["status"] == "error" and why in out["message"]
++    _workers(monkeypatch)
++    res = json.loads(swarm.run_swarm(meta, [{"mode": "analysis", "task": "x", "label": "x", **bad},
++                                            {"mode": "planning", "task": "p", "label": "p"},
++                                            {"mode": "planning", "task": "q", "label": "q"}]))
++    [refused] = res["not_started"]
++    assert refused["label"] == "x" and why in refused["reason"]
++    assert all(c["mode"] == "planning" for c in Worker.calls)
++
++
++def test_a_subscription_with_bad_depth_is_refused_when_declared():
++    from scilink.agents.meta_agent import reactions
++    ok, refused = reactions.normalize_subscriptions([
++        {"on": {"kind": "claim"}, "enqueue": {"mode": "analysis", "task": "t", "profile": "fast"}},
++        {"on": {"kind": "claim"}, "enqueue": {"mode": "analysis", "task": "t", "profile": "quick"}}])
++    assert len(ok) == 1 and ok[0]["enqueue"]["profile"] == "quick"
++    assert refused[0]["subscription"] == 1 and "fast" in refused[0]["reason"]
++
++
++def test_a_rerun_after_a_retraction_starts_from_the_items_depth_and_pattern(meta, monkeypatch, tmp_path):
++    from scilink.agents.meta_agent import board as board_mod
++    _workers(monkeypatch)
++    data = tmp_path / "series"
++    data.mkdir()
++    claim = meta.board.post(kind="claim", author={"worker": "w", "delegation_index": 90, "mode": "analysis"},
++                            subject="s", payload={"text": "a claim"}, status="verified")["finding_id"]
++    swarm.run_swarm(meta, [
++        {"mode": "analysis", "task": "fit A", "label": "A", "data_path": str(data), "pattern": "a_*.csv",
++         "subject": "s", "reads_board": {}, **DEPTH},
++        {"mode": "planning", "task": "plan", "label": "P"}])
++    entry = next(e for e in meta._delegation_ledger if e["task"].startswith("fit A"))
++    assert entry["pattern"] == "a_*.csv" and entry["depth"] == DEPTH and claim in entry["reads"]
++    out = board_mod.retract_and_report(meta, claim, "wrong")
++    [item] = [i for i in out["rerun_items"] if i["context"]["reruns_delegation"] == entry["index"]]
++    assert item["pattern"] == "a_*.csv" and _depth_of(item) == DEPTH
++    # and it is an item run_swarm takes as it is
++    ok, refused = swarm.normalize_items([item, {"mode": "planning", "task": "p", "label": "p"}])
++    assert refused == [] and ok[0]["depth"] == DEPTH
++
++
++def test_the_swarm_tool_offers_an_items_depth(meta):
++    params = next(t for t in meta.tools.openai_schemas
++                  if t["function"]["name"] == "run_swarm")["function"]["parameters"]
++    item = params["properties"]["work_items"]["items"]["properties"]
++    assert item["profile"]["enum"] == ["thorough", "quick", "extract"]
++    assert {"targets", "time_budget_s", "pattern"} <= set(item)
++
++
++# ── a quick run is measured apart from a thorough one ────────────────────
++
++def test_a_quick_or_extract_item_is_its_own_measured_class(tmp_path):
++    from scilink.agents.meta_agent import peaks
++    data = tmp_path / "d"
++    data.mkdir()
++    np.save(data / "a.npy", np.zeros((64, 64)))
++    base = {"mode": "analysis", "data_path": str(data)}
++    plain = peaks.item_class(base)
++    # thorough keeps the key existing tables were recorded under
++    assert peaks.item_class({**base, "depth": {"profile": "thorough"}}) == plain
++    assert peaks.item_class({**base, "depth": {"profile": "quick"}}) == plain + ":quick"
++    assert peaks.item_class({**base, "profile": "extract"}) == plain + ":extract"          # a fan-out branch
++    assert peaks.item_class({**base, "depth": {"profile": {"base": "quick", "max_attempts": 1}}}) == plain + ":quick"
++    assert peaks.item_class({"mode": "planning", "depth": {"profile": "quick"}}) == "planning"
++
++
++@pytest.mark.parametrize("recorded, asked, runs", [
++    # a cheap screening spend must not size a thorough run's reservation...
++    ({"quick": 30_000}, None, False),
++    # ...nor a thorough spend refuse the cheap screening swarm
++    ({"thorough": 300_000, "quick": 30_000}, "quick", True),
++])
++def test_a_reservation_is_sized_by_runs_at_the_items_own_depth(meta, monkeypatch, recorded, asked, runs):
++    from scilink.agents.meta_agent import peaks
++    for prof, tokens in recorded.items():
++        peaks.record(peaks.item_class({"mode": "analysis", "depth": {"profile": prof}}), tokens=tokens)
++    _workers(monkeypatch)
++    depth = {"profile": asked} if asked else {}
++    res = json.loads(swarm.run_swarm(meta, [{"mode": "analysis", "task": f"fit {n}", "label": n, **depth}
++                                            for n in "ABC"], budget={"max_tokens": 200_000}))
++    started = {c["task"] for c in Worker.calls}
++    assert (started == {"fit A", "fit B", "fit C"}) is runs, res.get("not_started")
++    if not runs:
++        assert all("token budget" in r["reason"] for r in res["not_started"])

@@ -1,0 +1,1111 @@
+diff --git a/scilink/agents/sim_agents/health.py b/scilink/agents/sim_agents/health.py
+index f927df26..e3b746f7 100644
+--- a/scilink/agents/sim_agents/health.py
++++ b/scilink/agents/sim_agents/health.py
+@@ -56,12 +56,20 @@ class HealthBand:
+     """A plausible range for one observable.
+ 
+     Either bound may be ``None`` (one-sided). ``observable`` is the name the
+-    per-engine reader hook understands (e.g. ``"density"``).
++    per-engine reader hook understands (e.g. ``"density"``). ``units`` is the
++    optional unit string the band (and the reader) are expressed in — carried so
++    a system-aware deriver can ask the model for an expected value in the SAME
++    units the gate judges in. ``source`` records provenance (``"frontmatter"``
++    for a static skill-declared band, ``"derived"`` for a model-derived
++    system-aware one) so a violation can say whether the BAND or the RUN is
++    suspect.
+     """
+ 
+     observable: str
+     minimum: Optional[float] = None
+     maximum: Optional[float] = None
++    units: Optional[str] = None
++    source: str = "frontmatter"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -72,9 +80,19 @@ class HealthViolation:
+     value: float
+     minimum: Optional[float]
+     maximum: Optional[float]
++    source: str = "frontmatter"
+ 
+     @property
+     def reason(self) -> str:
++        base = self._base_reason()
++        # A model-derived band is a hypothesis about the system, not a
++        # skill-vetted bound: flag its provenance so the critic can question the
++        # BAND (re-derive / loosen) rather than only the run.
++        if self.source == "derived":
++            return f"{base} [band was model-derived]"
++        return base
++
++    def _base_reason(self) -> str:
+         if not math.isfinite(self.value):
+             return f"{self.observable}={self.value} (non-finite)"
+         if self.minimum is not None and self.value < self.minimum:
+@@ -110,7 +128,13 @@ def parse_health_specs(specs) -> List[HealthBand]:
+             logger.warning(
+                 "health band for %r has min %g > max %g; skipping it", name, lo, hi)
+             continue
+-        bands.append(HealthBand(observable=str(name), minimum=lo, maximum=hi))
++        units = spec.get("units")
++        units = str(units) if units is not None else None
++        # Provenance is optional metadata; a raw frontmatter spec carries none
++        # and is, by definition, frontmatter.
++        source = spec.get("source") or "frontmatter"
++        bands.append(HealthBand(observable=str(name), minimum=lo, maximum=hi,
++                                units=units, source=str(source)))
+     return bands
+ 
+ 
+@@ -142,14 +166,14 @@ def evaluate_health(
+             continue
+         if not math.isfinite(value):
+             violations.append(HealthViolation(
+-                band.observable, value, band.minimum, band.maximum))
++                band.observable, value, band.minimum, band.maximum, band.source))
+             continue
+         if band.minimum is not None and value < band.minimum:
+             violations.append(HealthViolation(
+-                band.observable, value, band.minimum, band.maximum))
++                band.observable, value, band.minimum, band.maximum, band.source))
+         elif band.maximum is not None and value > band.maximum:
+             violations.append(HealthViolation(
+-                band.observable, value, band.minimum, band.maximum))
++                band.observable, value, band.minimum, band.maximum, band.source))
+     return violations
+ 
+ 
+diff --git a/scilink/agents/sim_agents/health_bounds.py b/scilink/agents/sim_agents/health_bounds.py
+new file mode 100644
+index 00000000..a0e9676c
+--- /dev/null
++++ b/scilink/agents/sim_agents/health_bounds.py
+@@ -0,0 +1,271 @@
++"""System-aware derivation of physical-sanity ``health:`` bands (issue #783).
++
++The #782 health gate reads its plausible bands from STATIC skill frontmatter
++(e.g. density ``0.02–30`` for any LAMMPS run). Those universal bands catch only
++the grossest pathologies: a box that half-vaporized to 0.1 g/cm³ sails straight
++through ``0.02–30`` even though it is plainly broken for liquid water. This
++module makes the bands SYSTEM-AWARE — derived from the actual system — while the
++frontmatter stays as the fallback (resolved in ``refinement._resolve_health``).
++
++The design constraint is AVOIDING ACCURACY-CREEP. The model is asked only for
++the EXPECTED single value ``e`` of each sanity observable for this system; the
++WIDTH of the band is owned by CODE (the multiplicative clamp below), never by
++the model. That is structural: the model is literally not given a way to hand
++back a narrow band, so it cannot quietly turn a gross-sanity tripwire into an
++accuracy check. The reasoning/section reuse mirrors
++:class:`~scilink.agents.sim_agents.critics.ReferencePropertyCritic` (same
++``validation`` skill section, where the expected/reference-value knowledge
++lives), but this deriver never calls it: that critic judges MEASURED values
++through a live-measurement seam that is not yet implemented, and it returns
++verdicts, not bounds.
++
++Fail-open is MANDATORY: any failure (no skill, LLM error, unparseable output)
++yields ``[]`` so the gate silently falls back to the frontmatter bands and a run
++is never blocked by a derivation hiccup.
++"""
++
++import math
++from typing import Any, Dict, List, Optional
++
++from .critics import _CriticBase
++from .health import _as_number
++
++
++# The default slack: the model supplies the CENTER e, CODE owns the WIDTH.
++#
++#     min = e / K      max = e * K
++#
++# K=5 gives water (e≈1.0) a band of 0.2–5.0: it catches a half-vaporized box at
++# 0.1 g/cm³ (which the universal frontmatter 0.02–30 misses) yet still lets a
++# merely-inaccurate 0.85 pass — a gross-sanity tripwire, not an accuracy check.
++# It is multiplicative so one constant works across density, pressure, lattice
++# constant, modulus, etc. (each with its own scale). This is deliberately NOT a
++# "superset of the frontmatter" rule: that would forbid the useful tightening of
++# 0.02–30 down to 0.2–5.0 that is the whole point of making bands system-aware.
++# The factor is a CALLER-level knob (``health_slack_factor``, threaded from the
++# pipeline) defaulting to this constant — the model still never sets the width.
++_SLACK_K = 5.0
++
++
++def clamp_center_to_band(
++    observable: str, expected, slack_factor: float = _SLACK_K,
++) -> Optional[Dict[str, Any]]:
++    """Turn an expected CENTER value ``e`` into a K-slack raw ``health:`` spec.
++
++    ``expected`` is parsed with :func:`health._as_number`, so the same coercion
++    rules (numeric strings yes, booleans/None no) apply here as in the gate. The
++    band is computed directly as ``[e / K, e * K]`` with ``K = slack_factor``;
++    the direct form stays underflow-safe down to the smallest positive float
++    (a ``sqrt(e*e)`` center would underflow to 0.0 for e <~ 1e-154 and collapse
++    the band to ``[0.0, e]``). Returns ``{"observable", "min", "max"}`` or
++    ``None`` when ``e`` is non-positive / non-finite / unparseable, or when
++    ``slack_factor`` is not a finite number > 1 (drop it, fall back to
++    frontmatter).
++    """
++    if not observable:
++        return None
++    e = _as_number(expected)
++    if e is None or not math.isfinite(e) or e <= 0:
++        return None
++    k = _as_number(slack_factor)
++    if k is None or not math.isfinite(k) or k <= 1:
++        return None
++    lo, hi = e / k, e * k
++    if not (math.isfinite(lo) and math.isfinite(hi)):
++        return None
++    return {"observable": str(observable), "min": lo, "max": hi}
++
++
++class HealthBoundsDeriver(_CriticBase):
++    """Derives system-aware physical-sanity ``health:`` bands from the system.
++
++    For each gross-sanity observable the skill declares an interest in, the model
++    is asked for the EXPECTED/TYPICAL single value for THIS system (a number, not
++    a band); CODE widens it to a K-slack band via :func:`clamp_center_to_band`.
++    Guided by the active skill's ``validation`` section — the same section
++    :class:`~scilink.agents.sim_agents.critics.ReferencePropertyCritic` reads for
++    known reference behaviour.
++
++    Best-effort: ``derive`` returns raw spec dicts already widened by the clamp,
++    or ``[]`` on ANY failure (fail-open), so the gate falls back to frontmatter.
++    """
++
++    SKILL_SECTION = "validation"
++    BASELINE_PROMPT_TEMPLATE = ""
++
++    def derive(
++        self,
++        research_goal: str,
++        *,
++        system_description: str = "",
++        components: Optional[List[Dict[str, Any]]] = None,
++        skill: Optional[str] = None,
++        domain: Optional[str] = None,
++        input_files: Optional[Dict[str, str]] = None,
++        slack_factor: float = _SLACK_K,
++    ) -> List[Dict[str, Any]]:
++        """Return system-aware ``health:`` band spec dicts for this system.
++
++        Args:
++            research_goal: What the run computes (context for the judge).
++            system_description: Optional free-text system description.
++            components: Optional packed-box components (name/smiles/count) that
++                anchor the model's reasoning about the expected values.
++            skill: Skill bundle whose ``validation`` section supplies known
++                reference behaviour (same section as ``ReferencePropertyCritic``).
++            domain: Skill subdirectory (required when ``skill`` is given).
++            input_files: Optional generated deck (``{filename: contents}``) so the
++                model reasons about the EXACT run it is grounding — the goal AND
++                the deck, as #783 asks. Truncated in the prompt.
++            slack_factor: Multiplicative K owning the band WIDTH (min = e/K,
++                max = e*K). Caller-level knob; the model never sets the width.
++
++        Returns:
++            A list of raw ``{"observable", "min", "max", "source"}`` spec dicts,
++            each band widened by the K-slack clamp and each carrying
++            ``source="derived"``; ``[]`` on any failure. ``parse_health_specs``
++            validates these identically to frontmatter.
++
++        A derived center is kept only when it is physically consistent with the
++        frontmatter fallback band (if one exists for that observable): a center
++        OUTSIDE the frontmatter ``[min, max]`` is almost always a units slip
++        (e.g. water handed back as 997 kg/m³ instead of ~1 g/cm³), which would
++        turn the gate into a tripwire that fires on every healthy run. Such a
++        band is dropped so the frontmatter fallback stands.
++        """
++        if skill and not domain:
++            raise ValueError(
++                "domain is required when skill is provided (e.g. 'lammps' with "
++                "'molecular_dynamics')."
++            )
++        try:
++            # The frontmatter health block tells us WHICH observables to ground,
++            # their units, and the fallback band each derived center is sanity-
++            # checked against (the same load path the gate uses).
++            fm_bands = self._frontmatter_bands(skill, domain)
++            skill_context = self._load_skill_section(skill, domain or "")
++            prompt = self._build_prompt(
++                research_goal, system_description, components, skill_context,
++                fm_bands, input_files)
++            report = self._generate_json(prompt)
++            return self._parse(report, fm_bands, slack_factor)
++        except Exception as exc:  # derivation is best-effort, never fatal
++            self.logger.warning("Health-bounds derivation failed: %s", exc)
++            return []
++
++    @staticmethod
++    def _frontmatter_bands(skill: Optional[str], domain: Optional[str]):
++        """Parsed frontmatter ``health:`` bands for the active engine, by name.
++
++        Uses the same ``_health_specs`` -> ``parse_health_specs`` path as the
++        gate, so the deriver sees exactly the observables (and units, and
++        fallback bands) the gate will judge against. Best-effort: ``{}`` on any
++        failure keeps derivation fail-open.
++        """
++        from .refinement import _health_specs
++        from .health import parse_health_specs
++        try:
++            bands = parse_health_specs(_health_specs(skill, domain))
++        except Exception:
++            return {}
++        return {b.observable: b for b in bands}
++
++    def _build_prompt(self, research_goal: str, system_description: str,
++                      components: Optional[List[Dict[str, Any]]],
++                      skill_context: str, fm_bands, input_files) -> str:
++        if components:
++            comp_lines = "\n".join(
++                f"- {c.get('name', '?')}"
++                + (f" [{c.get('smiles')}]" if c.get("smiles") else "")
++                + (f" x{c.get('count')}" if c.get("count") is not None else "")
++                for c in components if isinstance(c, dict)
++            )
++            comp_block = f"=== Components ===\n{comp_lines}\n\n"
++        else:
++            comp_block = ""
++        if fm_bands:
++            obs_lines = "\n".join(
++                f"- {b.observable}"
++                + (f" (units: {b.units})" if b.units else " (units: unspecified)")
++                for b in fm_bands.values()
++            )
++            obs_block = (
++                "=== Sanity observables to ground (give the expected value in "
++                "the stated units) ===\n" + obs_lines + "\n\n")
++        else:
++            obs_block = ""
++        if input_files:
++            deck_block = "=== Generated input deck ===\n" + _format_deck(
++                input_files) + "\n\n"
++        else:
++            deck_block = ""
++        return (
++            "You are setting GROSS PHYSICAL-SANITY expectations for a simulation "
++            "before it runs. Independently of any target result, state the "
++            "EXPECTED / TYPICAL value of each sanity observable for THIS system, "
++            "reasoning from the well-established behaviour of its constituents.\n\n"
++            f"{skill_context or '(no engine skill guidance loaded)'}\n\n"
++            f"=== System ===\n{system_description or '(not provided)'}\n\n"
++            f"{comp_block}"
++            f"{obs_block}"
++            f"{deck_block}"
++            f"=== Research goal (context only) ===\n{research_goal}\n\n"
++            "For each sanity observable whose plausible scale you can state for "
++            "this system (e.g. 'density' for a condensed-phase box), give a "
++            "SINGLE expected value `e` — one positive number IN THE STATED UNITS "
++            "for that observable, NOT a range and NOT an uncertainty. You are "
++            "giving the CENTER only; the code owns the tolerance. Omit any "
++            "observable you cannot ground for this system.\n"
++            "Return JSON: {\"bounds\": [{\"observable\": <str>, "
++            "\"expected\": <number>}, ...]}."
++        )
++
++    def _parse(self, report: Dict[str, Any], fm_bands,
++               slack_factor: float) -> List[Dict[str, Any]]:
++        out: List[Dict[str, Any]] = []
++        for item in (report.get("bounds") or []):
++            if not isinstance(item, dict):
++                continue
++            observable = item.get("observable")
++            expected = item.get("expected")
++            spec = clamp_center_to_band(observable, expected, slack_factor)
++            if spec is None:
++                continue
++            # Units-slip guard: a derived CENTER that falls outside the
++            # frontmatter fallback band for the same observable is almost
++            # certainly a wrong-units value (e.g. 997 kg/m^3 for a density the
++            # gate reads in g/cm^3). Dropping it keeps the frontmatter band as
++            # the fallback rather than deriving a band that trips every run.
++            fm = fm_bands.get(spec["observable"]) if fm_bands else None
++            if fm is not None and not _center_in_band(_as_number(expected), fm):
++                self.logger.warning(
++                    "dropping derived health band for %r: center %r is outside "
++                    "the frontmatter fallback [%s, %s] (likely a units slip); "
++                    "keeping the frontmatter band",
++                    spec["observable"], expected, fm.minimum, fm.maximum)
++                continue
++            spec["source"] = "derived"
++            out.append(spec)
++        return out
++
++
++def _center_in_band(e: Optional[float], band) -> bool:
++    """Whether a derived center lies within a (possibly one-sided) band."""
++    if e is None or not math.isfinite(e):
++        return False
++    if band.minimum is not None and e < band.minimum:
++        return False
++    if band.maximum is not None and e > band.maximum:
++        return False
++    return True
++
++
++def _format_deck(input_files: Dict[str, str], limit: int = 4000) -> str:
++    """Render a deck mapping as labelled, truncated sections for the prompt."""
++    chunks = []
++    for name, content in (input_files or {}).items():
++        body = (content or "").rstrip()
++        if len(body) > limit:
++            body = body[:limit] + "\n[truncated]"
++        chunks.append(f"--- {name} ---\n{body}")
++    return "\n\n".join(chunks)
+diff --git a/scilink/agents/sim_agents/refinement.py b/scilink/agents/sim_agents/refinement.py
+index 5b2dfde9..4f25add6 100644
+--- a/scilink/agents/sim_agents/refinement.py
++++ b/scilink/agents/sim_agents/refinement.py
+@@ -320,6 +320,9 @@ class RefinementContext:
+         required_observables: Optional engine-neutral ``Requirement`` list the
+             run must yield; when set, the coverage gate checks this authoritative
+             list instead of re-deriving the required set from the goal.
++        health_bounds: Optional system-aware ``health:`` bands (raw spec dicts)
++            derived from the system; merged OVER the frontmatter fallback in
++            :func:`_resolve_health`. None leaves frontmatter bands untouched.
+         history: Per-cycle records appended by :meth:`record`.
+         interact: Optional human-feedback handle; ``None`` for headless runs.
+     """
+@@ -335,6 +338,7 @@ class RefinementContext:
+     max_health_retries: int = 2
+     coverage_votes: int = 1
+     required_observables: Optional[List] = None
++    health_bounds: Optional[List[Dict[str, Any]]] = None
+     history: List[Dict[str, Any]] = field(default_factory=list)
+     interact: Optional[InteractFn] = None
+ 
+@@ -762,17 +766,47 @@ def _read_health_observations(output_dir: str, specs, reader, since=None) -> Dic
+     return obs
+ 
+ 
++def _merge_health_bounds(frontmatter, derived):
++    """Per-observable override of frontmatter bands by model-derived bands.
++    Derived wins where present; frontmatter observables with no derived band are kept;
++    derived observables absent from frontmatter are added. Both are raw spec dicts, so
++    parse_health_specs validates them identically.
++
++    Each surviving spec is tagged with its ``source`` (``"frontmatter"`` /
++    ``"derived"``) so a violation can say whether the BAND or the RUN is suspect
++    (an existing ``source`` is preserved). The no-derived fast path returns the
++    frontmatter list unchanged — the default-OFF gate is byte-identical and
++    ``parse_health_specs`` defaults an untagged spec to ``"frontmatter"``."""
++    if not derived:
++        return frontmatter
++    by_obs = {}
++    for d in frontmatter:
++        if isinstance(d, dict) and d.get("observable"):
++            by_obs[d["observable"]] = {**d, "source": d.get("source", "frontmatter")}
++    for d in derived:
++        if isinstance(d, dict) and d.get("observable"):
++            by_obs[d["observable"]] = {**d, "source": d.get("source", "derived")}
++    return list(by_obs.values())
++
++
+ def _resolve_health(ctx: RefinementContext):
+     """Resolve ``(specs, reader, perturb)`` for the active skill, once per context.
+ 
+     Skill and domain are fixed for the life of a ``RefinementContext``, so the
+     skill markdown is loaded and the hooks resolved a single time and cached on
+     the context — not re-parsed per phase × cycle × health-retry × member.
++
++    Precedence: frontmatter is the fallback; a system-aware derived band for the
++    same observable (``ctx.health_bounds``) replaces it. The merge is applied
++    BEFORE reader/perturb resolution so a derived-only band on an engine with no
++    frontmatter ``health:`` block still resolves a reader (this ordering is
++    load-bearing).
+     """
+     cached = getattr(ctx, "_health_cache", None)
+     if cached is not None:
+         return cached
+     specs = _health_specs(ctx.skill, ctx.domain)
++    specs = _merge_health_bounds(specs, getattr(ctx, "health_bounds", None))
+     reader = (_resolve_skill_callable(ctx.skill, ctx.domain, "read_health_observable")
+               if specs else None)
+     perturb = (_resolve_skill_callable(ctx.skill, ctx.domain, "perturb_for_retry")
+diff --git a/scilink/agents/sim_agents/simulation_orchestrator_tools.py b/scilink/agents/sim_agents/simulation_orchestrator_tools.py
+index 63c58d1e..8861dea1 100644
+--- a/scilink/agents/sim_agents/simulation_orchestrator_tools.py
++++ b/scilink/agents/sim_agents/simulation_orchestrator_tools.py
+@@ -1055,7 +1055,9 @@ def run_simulation(description: str, run_command: str = None,
+                            structure_file: str = None,
+                            max_refinement_cycles: int = 4,
+                            max_run_cycles: int = 3,
+-                           run_timeout: int = 3600) -> str:
++                           run_timeout: int = 3600,
++                           derive_health_bounds: bool = False,
++                           health_slack_factor: float = 5.0) -> str:
+             from .simulation_pipeline import run_complete_workflow
+ 
+             # Explicit opt-out: structure_file="new" forces a fresh build for
+@@ -1193,6 +1195,8 @@ def run_simulation(description: str, run_command: str = None,
+                     max_run_cycles=max_run_cycles,
+                     executor=executor, run_command=run_command,
+                     run_command_source=rc_source,
++                    derive_health_bounds=derive_health_bounds,
++                    health_slack_factor=health_slack_factor,
+                 )
+             except Exception as e:
+                 return json.dumps({
+@@ -1319,6 +1323,26 @@ def run_simulation(description: str, run_command: str = None,
+                     "type": "integer",
+                     "description": "Max run → assess → fix cycles per phase (default 3).",
+                 },
++                "derive_health_bounds": {
++                    "type": "boolean",
++                    "description": (
++                        "Opt-in (default false): derive SYSTEM-AWARE physical-"
++                        "sanity bands for the gross-sanity health gate from the "
++                        "actual system (the model gives the expected CENTER; code "
++                        "owns the width), tightening the engine's loose static "
++                        "bands so a non-physical-but-in-range run is still caught. "
++                        "Falls back to the static frontmatter bands on any failure."
++                    ),
++                },
++                "health_slack_factor": {
++                    "type": "number",
++                    "description": (
++                        "Multiplicative half-width K for a derived health band "
++                        "(min = e/K, max = e*K; default 5.0). Larger = looser. Only "
++                        "used when derive_health_bounds is true; the model never "
++                        "sets the width."
++                    ),
++                },
+             },
+             required=["description"],
+         )
+diff --git a/scilink/agents/sim_agents/simulation_pipeline.py b/scilink/agents/sim_agents/simulation_pipeline.py
+index 577a92e9..b8888776 100644
+--- a/scilink/agents/sim_agents/simulation_pipeline.py
++++ b/scilink/agents/sim_agents/simulation_pipeline.py
+@@ -494,6 +494,8 @@ def _run_workflow_once(
+     auto_fix: bool = True,
+     required_observables: Optional[list] = None,
+     derive_observables: bool = False,
++    derive_health_bounds: bool = False,
++    health_slack_factor: float = 5.0,
+     converge_parameters: bool = False,
+ ) -> Dict[str, Any]:
+     """Run the full structure → inputs → validation pipeline for any scale.
+@@ -629,6 +631,7 @@ def _run_workflow_once(
+     # selector ever ran. Pre-built data files and non-MD scales are untouched.
+     # When the caller already supplied force_field_files, respect them.
+     potential_selection = None
++    manifest = None
+     if (scale == "molecular_dynamics" and force_field_files is None):
+         from .potential_selection import select_potential_family
+         potential_selection = select_potential_family(
+@@ -844,6 +847,36 @@ def _run_workflow_once(
+         run_engine = "ase"
+         result["engine"] = run_engine
+ 
++    # ── Produce system-aware health bands when opted in (issue #783) ──
++    # Derive the physical-sanity bands from the actual system (the model gives
++    # the expected CENTER; code owns the K-slack width) and merge them OVER the
++    # static frontmatter fallback in the gate. Same family as derive_observables:
++    # opt-in, engine-neutral, fail-open — default OFF leaves existing runs alone.
++    #
++    # This runs AFTER input generation and the #784 re-grounding, on the
++    # EFFECTIVE engine (run_skill/run_domain): for an MLIP run those are the
++    # ``ase`` bundle, so the deriver grounds on the engine the gate actually
++    # judges (ase's `validation`/`health:`) rather than the routed classical
++    # engine, whose observables the ASE reader does not even serve. It also sees
++    # the generated deck, so it reasons about the exact run — goal + deck.
++    health_bounds = None
++    if derive_health_bounds:
++        try:
++            from .health_bounds import HealthBoundsDeriver
++            hbd = HealthBoundsDeriver(
++                api_key=api_key, base_url=base_url, model_name=model_name)
++            components = manifest["components"] if manifest else None
++            health_bounds = hbd.derive(
++                user_request, system_description=user_request,
++                components=components, skill=run_skill, domain=run_domain,
++                input_files=_collect_input_files(gen_result),
++                slack_factor=health_slack_factor) or None
++            if health_bounds:
++                logger.info("Derived %d system-aware health band(s).",
++                            len(health_bounds))
++        except Exception as e:
++            logger.warning("Health-bounds derivation skipped: %s", e)
++
+     # ── Step 3: pre-run input validation (engine-neutral critic) ──
+     # Skipped for named (deterministic, expert-defined) backends and when
+     # the caller opts out.
+@@ -1001,6 +1034,7 @@ def _run_ladder(param, members, _entry=entry):
+         skill=run_skill, domain=run_domain, autonomy=autonomy,
+         max_cycles=max_run_cycles, coverage_votes=coverage_votes,
+         required_observables=required_observables,
++        health_bounds=health_bounds,
+     )
+     run_critic = RunCritic(
+         api_key=api_key, base_url=base_url, model_name=model_name,
+diff --git a/scilink/skills/molecular_dynamics/ase/ase.md b/scilink/skills/molecular_dynamics/ase/ase.md
+index a8eeea5e..e493c540 100644
+--- a/scilink/skills/molecular_dynamics/ase/ase.md
++++ b/scilink/skills/molecular_dynamics/ase/ase.md
+@@ -23,7 +23,8 @@ health:
+   # `temperature` is declared here. Keep the bounds loose: only a genuinely
+   # broken run should trip them. Accuracy is judged downstream against a
+   # reference, never here. Read by the `read_health_observable` hook.
+-  - observable: temperature   # K
++  - observable: temperature
++    units: K                  # the units the band (and the reader) are in
+     min: 1.0                  # a dead / frozen run; a real MD setpoint is >> 1 K
+     max: 50000.0              # a thermostat blow-up; far above any physical setpoint
+ ---
+diff --git a/scilink/skills/molecular_dynamics/lammps/lammps.md b/scilink/skills/molecular_dynamics/lammps/lammps.md
+index efd164d5..99415c9e 100644
+--- a/scilink/skills/molecular_dynamics/lammps/lammps.md
++++ b/scilink/skills/molecular_dynamics/lammps/lammps.md
+@@ -22,7 +22,8 @@ health:
+   # vacuum), NOT an accuracy check. Keep the bounds loose: only a genuinely
+   # broken run should trip them. Accuracy is judged downstream against a
+   # reference, never here. Read by the `read_health_observable` hook.
+-  - observable: density       # g/cm^3
++  - observable: density
++    units: g/cm^3             # the units the band (and the reader) are in
+     min: 0.02                 # below any real liquid/solid; a blown-up box -> ~0
+     max: 30.0                 # above the densest solids; catches an implosion
+ ---
+diff --git a/tests/test_health.py b/tests/test_health.py
+index 6ad3ea78..dc1794d5 100644
+--- a/tests/test_health.py
++++ b/tests/test_health.py
+@@ -128,3 +128,33 @@ def test_observable_names_dedup_preserves_order():
+         {"observable": "density", "max": 30},
+     ]
+     assert observable_names(specs) == ["density", "temperature"]
++
++
++# ── units + provenance (issue #783) ──────────────────────────────────────────
++
++def test_parse_carries_units_and_defaults_source_frontmatter():
++    bands = parse_health_specs([{"observable": "density", "min": 0.02,
++                                 "max": 30.0, "units": "g/cm^3"}])
++    assert bands[0].units == "g/cm^3"
++    assert bands[0].source == "frontmatter"   # no source key -> frontmatter
++
++
++def test_parse_retains_explicit_source():
++    bands = parse_health_specs([{"observable": "density", "min": 0.2,
++                                 "max": 5.0, "source": "derived"}])
++    assert bands[0].source == "derived"
++
++
++def test_violation_from_frontmatter_band_reports_frontmatter_source():
++    specs = [{"observable": "density", "min": 0.2, "max": 5.0}]  # no source key
++    v = evaluate_health({"density": 0.1}, specs)[0]
++    assert v.source == "frontmatter"
++    assert "model-derived" not in v.reason
++
++
++def test_violation_from_derived_band_reports_derived_source():
++    specs = [{"observable": "density", "min": 0.2, "max": 5.0,
++              "source": "derived"}]
++    v = evaluate_health({"density": 0.1}, specs)[0]
++    assert v.source == "derived"
++    assert "band was model-derived" in v.reason
+diff --git a/tests/test_health_bounds.py b/tests/test_health_bounds.py
+new file mode 100644
+index 00000000..33e721fc
+--- /dev/null
++++ b/tests/test_health_bounds.py
+@@ -0,0 +1,136 @@
++"""Pure unit tests for the system-aware health-band machinery (issue #783).
++
++No LLM, no API key. Two pieces are exercised:
++
++* the CLAMP (``health_bounds``) — the model supplies only the expected CENTER,
++  CODE owns the K-slack WIDTH, and an explicit band is only ever WIDENED. This is
++  the accuracy-creep guard: the model is structurally incapable of tightening the
++  gate into an accuracy check.
++* the MERGE (``refinement._merge_health_bounds``) — a per-observable override of
++  the frontmatter fallback by the derived bands.
++"""
++
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++from scilink.agents.sim_agents.health import evaluate_health  # noqa: E402
++from scilink.agents.sim_agents.health_bounds import (  # noqa: E402
++    _SLACK_K,
++    clamp_center_to_band,
++)
++from scilink.agents.sim_agents.refinement import _merge_health_bounds  # noqa: E402
++
++
++# ── the clamp: center -> K-slack band ────────────────────────────────────────
++
++def test_center_becomes_K_slack_band():
++    assert _SLACK_K == 5.0
++    spec = clamp_center_to_band("density", 1.0)
++    assert spec["observable"] == "density"
++    assert spec["min"] == pytest.approx(0.2)
++    assert spec["max"] == pytest.approx(5.0)
++
++
++def test_center_band_is_exact_ratio_even_for_tiny_values():
++    # Regression: the center path must not route through sqrt(e*e), which
++    # underflows to 0.0 for e <~ 1e-154 and collapses the band to [0.0, e].
++    e = 1e-200
++    spec = clamp_center_to_band("x", e)
++    assert spec is not None
++    assert spec["min"] > 0.0
++    assert spec["min"] == pytest.approx(e / 5.0)
++    assert spec["max"] == pytest.approx(e * 5.0)
++
++
++def test_slack_factor_sets_band_width():
++    # The caller-level health_slack_factor owns the WIDTH; the model only ever
++    # supplies the center. K=10 -> [e/10, e*10].
++    spec = clamp_center_to_band("density", 1.0, slack_factor=10.0)
++    assert spec["min"] == pytest.approx(0.1)
++    assert spec["max"] == pytest.approx(10.0)
++
++
++def test_slack_factor_must_exceed_one():
++    # A degenerate K <= 1 (or non-finite) would not widen the center into a
++    # band — drop it so the frontmatter fallback stands.
++    assert clamp_center_to_band("density", 1.0, slack_factor=1.0) is None
++    assert clamp_center_to_band("density", 1.0, slack_factor=0.0) is None
++    assert clamp_center_to_band("density", 1.0, slack_factor=float("inf")) is None
++
++
++def test_nonpositive_or_nonfinite_center_is_dropped():
++    assert clamp_center_to_band("density", 0) is None
++    assert clamp_center_to_band("density", -1.0) is None
++    assert clamp_center_to_band("density", float("nan")) is None
++    assert clamp_center_to_band("density", float("inf")) is None
++    assert clamp_center_to_band("density", "not a number") is None
++    assert clamp_center_to_band("density", None) is None
++    assert clamp_center_to_band("", 1.0) is None
++
++
++# ── the merge: derived over frontmatter ──────────────────────────────────────
++
++FM = [{"observable": "density", "min": 0.02, "max": 30.0}]
++
++
++def test_merge_derived_overrides_frontmatter_same_observable():
++    derived = [{"observable": "density", "min": 0.2, "max": 5.0}]
++    merged = _merge_health_bounds(FM, derived)
++    by_obs = {d["observable"]: d for d in merged}
++    assert by_obs["density"]["min"] == 0.2 and by_obs["density"]["max"] == 5.0
++    assert len(merged) == 1
++
++
++def test_merge_keeps_frontmatter_observable_with_no_derived():
++    fm = [{"observable": "density", "min": 0.02, "max": 30.0},
++          {"observable": "pressure", "min": -5000, "max": 5000}]
++    derived = [{"observable": "density", "min": 0.2, "max": 5.0}]
++    merged = _merge_health_bounds(fm, derived)
++    by_obs = {d["observable"]: d for d in merged}
++    assert by_obs["pressure"]["min"] == -5000     # untouched frontmatter kept
++    assert by_obs["density"]["min"] == 0.2
++
++
++def test_merge_adds_derived_only_observable():
++    derived = [{"observable": "lattice_constant", "min": 1.0, "max": 25.0}]
++    merged = _merge_health_bounds(FM, derived)
++    by_obs = {d["observable"]: d for d in merged}
++    assert "density" in by_obs and "lattice_constant" in by_obs
++    assert by_obs["lattice_constant"]["max"] == 25.0
++
++
++def test_merge_tags_provenance_source():
++    # The merge is the one place that knows which list is frontmatter and which
++    # is derived — it tags each surviving spec so a later violation can say
++    # whether the BAND or the RUN is suspect.
++    fm = [{"observable": "density", "min": 0.02, "max": 30.0},
++          {"observable": "pressure", "min": -5000, "max": 5000}]
++    derived = [{"observable": "density", "min": 0.2, "max": 5.0}]
++    merged = _merge_health_bounds(fm, derived)
++    by_obs = {d["observable"]: d for d in merged}
++    assert by_obs["density"]["source"] == "derived"      # overridden by derived
++    assert by_obs["pressure"]["source"] == "frontmatter"  # untouched fallback
++
++
++def test_merge_none_is_identity():
++    assert _merge_health_bounds(FM, None) is FM
++    assert _merge_health_bounds(FM, []) is FM
++
++
++def test_malformed_derived_dropped_not_raised():
++    derived = ["notadict", {"no": "observable"}, {"observable": ""},
++               {"observable": "density", "min": 0.2, "max": 5.0}]
++    merged = _merge_health_bounds(FM, derived)
++    by_obs = {d["observable"]: d for d in merged if isinstance(d, dict)}
++    assert by_obs["density"]["min"] == 0.2
++    # only the one well-formed derived spec overrode; nothing malformed landed
++    assert set(by_obs) == {"density"}
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_health_bounds_deriver.py b/tests/test_health_bounds_deriver.py
+new file mode 100644
+index 00000000..715ec919
+--- /dev/null
++++ b/tests/test_health_bounds_deriver.py
+@@ -0,0 +1,156 @@
++"""Deriver tests for ``HealthBoundsDeriver`` (issue #783).
++
++The one LLM hop (``_generate_json``) is monkeypatched; no API key, no network.
++Covers that the deriver turns the model's expected CENTER values into K-slack
++bands via the clamp, fails open to ``[]`` on any error, and reuses the
++``validation`` skill section (the same one ``ReferencePropertyCritic`` reads).
++"""
++
++import math
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++from scilink.agents.sim_agents import refinement  # noqa: E402
++from scilink.agents.sim_agents.health_bounds import HealthBoundsDeriver  # noqa: E402
++
++DENSITY_FM = [{"observable": "density", "min": 0.02, "max": 30.0,
++               "units": "g/cm^3"}]
++
++
++def _deriver():
++    return HealthBoundsDeriver(api_key="test-key")
++
++
++def _with_frontmatter(monkeypatch, specs):
++    """Wire a frontmatter health block + a silent skill-section load.
++
++    ``_frontmatter_bands`` reads through ``refinement._health_specs``; the skill
++    section load is stubbed so the test needs no real skill bundle.
++    """
++    monkeypatch.setattr(refinement, "_health_specs",
++                        lambda skill, domain: specs)
++    d = _deriver()
++    d._load_skill_section = lambda skill, domain: ""
++    return d
++
++
++def test_parse_applies_slack_clamp():
++    d = _deriver()
++    # Model returns CENTERS only; code must widen each into min=e/5, max=e*5,
++    # and drop the non-positive one.
++    d._generate_json = lambda p: {"bounds": [
++        {"observable": "density", "expected": 1.0},
++        {"observable": "lattice_constant", "expected": 4.0},
++        {"observable": "bad", "expected": 0.0},   # dropped: non-positive
++    ]}
++    specs = d.derive("equilibrate water", domain="molecular_dynamics")
++    by_obs = {s["observable"]: s for s in specs}
++    assert set(by_obs) == {"density", "lattice_constant"}
++    assert by_obs["density"]["min"] == pytest.approx(0.2)
++    assert by_obs["density"]["max"] == pytest.approx(5.0)
++    assert by_obs["lattice_constant"]["min"] == pytest.approx(0.8)
++    assert by_obs["lattice_constant"]["max"] == pytest.approx(20.0)
++
++
++def test_derive_failure_returns_empty():
++    d = _deriver()
++
++    def boom(prompt):
++        raise RuntimeError("llm down")
++
++    d._generate_json = boom
++    assert d.derive("goal", domain="molecular_dynamics") == []
++
++
++def test_uses_validation_section():
++    assert HealthBoundsDeriver.SKILL_SECTION == "validation"
++
++
++def test_requires_domain_when_skill_given():
++    d = _deriver()
++    d._generate_json = lambda p: {"bounds": []}
++    with pytest.raises(ValueError):
++        d.derive("goal", skill="lammps")
++
++
++def test_derived_specs_tagged_source_derived():
++    d = _deriver()
++    d._generate_json = lambda p: {"bounds": [
++        {"observable": "density", "expected": 1.0}]}
++    specs = d.derive("equilibrate water", domain="molecular_dynamics")
++    assert specs[0]["source"] == "derived"
++
++
++# ── units-slip guard against the frontmatter fallback (issue #783) ───────────
++
++def test_center_outside_frontmatter_band_is_dropped(monkeypatch):
++    # A density center of 997 (kg/m^3 slip) is outside the frontmatter g/cm^3
++    # band 0.02–30, so the derived band is DROPPED — the frontmatter fallback
++    # stands rather than a 199–4985 band that trips every healthy run.
++    d = _with_frontmatter(monkeypatch, DENSITY_FM)
++    d._generate_json = lambda p: {"bounds": [
++        {"observable": "density", "expected": 997.0}]}
++    specs = d.derive("equilibrate water", skill="lammps",
++                     domain="molecular_dynamics")
++    assert specs == []
++
++
++def test_center_inside_frontmatter_band_is_kept(monkeypatch):
++    d = _with_frontmatter(monkeypatch, DENSITY_FM)
++    d._generate_json = lambda p: {"bounds": [
++        {"observable": "density", "expected": 1.0}]}
++    specs = d.derive("equilibrate water", skill="lammps",
++                     domain="molecular_dynamics")
++    by_obs = {s["observable"]: s for s in specs}
++    assert by_obs["density"]["min"] == pytest.approx(0.2)
++    assert by_obs["density"]["max"] == pytest.approx(5.0)
++
++
++def test_observable_without_frontmatter_band_is_kept(monkeypatch):
++    # The model grounds an observable the frontmatter does not declare: there is
++    # nothing to sanity-check the center against, so the derived band is kept.
++    d = _with_frontmatter(monkeypatch, DENSITY_FM)
++    d._generate_json = lambda p: {"bounds": [
++        {"observable": "lattice_constant", "expected": 4.0}]}
++    specs = d.derive("relax a crystal", skill="lammps",
++                     domain="molecular_dynamics")
++    by_obs = {s["observable"]: s for s in specs}
++    assert "lattice_constant" in by_obs
++    assert by_obs["lattice_constant"]["max"] == pytest.approx(20.0)
++
++
++def test_prompt_includes_units_and_deck(monkeypatch):
++    d = _with_frontmatter(monkeypatch, DENSITY_FM)
++    captured = {}
++
++    def _capture(prompt):
++        captured["p"] = prompt
++        return {"bounds": []}
++
++    d._generate_json = _capture
++    d.derive("equilibrate water", skill="lammps",
++             domain="molecular_dynamics",
++             input_files={"in.lmp": "velocity all create 300 42"})
++    assert "g/cm^3" in captured["p"]          # frontmatter units surfaced
++    assert "in.lmp" in captured["p"]          # the generated deck is shown
++    assert "velocity all create 300 42" in captured["p"]
++
++
++def test_slack_factor_threads_to_band_width(monkeypatch):
++    d = _with_frontmatter(monkeypatch, DENSITY_FM)
++    d._generate_json = lambda p: {"bounds": [
++        {"observable": "density", "expected": 1.0}]}
++    specs = d.derive("equilibrate water", skill="lammps",
++                     domain="molecular_dynamics", slack_factor=3.0)
++    by_obs = {s["observable"]: s for s in specs}
++    assert by_obs["density"]["min"] == pytest.approx(1.0 / 3.0)
++    assert by_obs["density"]["max"] == pytest.approx(3.0)
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_health_bounds_wiring.py b/tests/test_health_bounds_wiring.py
+new file mode 100644
+index 00000000..6a915fca
+--- /dev/null
++++ b/tests/test_health_bounds_wiring.py
+@@ -0,0 +1,137 @@
++"""Wiring tests for the system-aware health-bands opt-in (issue #783).
++
++No LLM, no API key: the deriver and the workflow are monkeypatched. Covers the
++two seams #785's review flagged:
++
++* **the flag is reachable** — ``derive_health_bounds`` is a real parameter on
++  ``_run_workflow_once`` and the ``run_simulation`` orchestrator tool forwards
++  it to ``run_complete_workflow`` (the gap the review found: the flag existed
++  only on the private entry point).
++* **placement + the #784 seam** — derivation runs AFTER input generation and
++  grounds on the EFFECTIVE engine (``run_skill``/``run_domain``), so an MLIP run
++  re-pointed to the ``ase`` bundle derives on ``ase``, not the routed classical
++  engine; the generated deck is handed to the deriver.
++"""
++
++import inspect
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++import scilink.agents.sim_agents.simulation_pipeline as sp  # noqa: E402
++
++
++# ── the flag is a real pipeline parameter and rides **kwargs ─────────────────
++
++def test_workflow_signature_has_flags():
++    params = inspect.signature(sp._run_workflow_once).parameters
++    assert "derive_health_bounds" in params
++    assert "health_slack_factor" in params
++
++
++def test_run_complete_workflow_forwards_kwargs():
++    # run_complete_workflow(**kwargs) -> _run_workflow_once, so the opt-in rides
++    # through for programmatic callers.
++    params = inspect.signature(sp.run_complete_workflow).parameters
++    assert any(p.kind == p.VAR_KEYWORD for p in params.values())
++
++
++# ── placement + the #784 seam ────────────────────────────────────────────────
++
++def _fake_ase_gen(**kw):
++    (Path(kw["output_dir"]) / "run_md.py").write_text("print('md')\n")
++    return {"status": "success", "runner": "ase",
++            "input_files": {"run_md.py": "print('md')\n"},
++            "entry_file": "run_md.py"}
++
++
++def test_derivation_runs_after_gen_on_effective_engine(tmp_path, monkeypatch):
++    import scilink.agents.sim_agents.health_bounds as hb_mod
++
++    captured = {}
++
++    class FakeDeriver:
++        def __init__(self, **kw):
++            pass
++
++        def derive(self, goal, **kw):
++            captured.update(kw)
++            return [{"observable": "density", "min": 0.2, "max": 5.0,
++                     "source": "derived"}]
++
++    monkeypatch.setattr(hb_mod, "HealthBoundsDeriver", FakeDeriver)
++    monkeypatch.setattr(sp, "_generate_inputs", _fake_ase_gen)
++
++    structure = tmp_path / "system.data"
++    structure.write_text("dummy")
++    sp.run_complete_workflow(
++        "equilibrate liquid water with an MLIP",
++        scale="molecular_dynamics", software="lammps",
++        structure_file=str(structure), output_dir=str(tmp_path / "out"),
++        api_key="fake-do-not-bill", validate=False,
++        derive_health_bounds=True,
++    )
++    # Grounds on the EFFECTIVE engine (ase), not the routed classical lammps.
++    assert captured.get("skill") == "ase"
++    assert captured.get("domain") == "molecular_dynamics"
++    # The generated deck was handed to the deriver (goal + deck, per #783).
++    assert captured.get("input_files", {}).get("run_md.py")
++
++
++def test_default_off_never_calls_deriver(tmp_path, monkeypatch):
++    import scilink.agents.sim_agents.health_bounds as hb_mod
++
++    class Boom:
++        def __init__(self, **kw):
++            raise AssertionError("deriver constructed with the flag OFF")
++
++    monkeypatch.setattr(hb_mod, "HealthBoundsDeriver", Boom)
++    monkeypatch.setattr(sp, "_generate_inputs", _fake_ase_gen)
++
++    structure = tmp_path / "system.data"
++    structure.write_text("dummy")
++    # Default OFF: no deriver is ever constructed (byte-identical to pre-#783).
++    sp.run_complete_workflow(
++        "equilibrate liquid water",
++        scale="molecular_dynamics", software="lammps",
++        structure_file=str(structure), output_dir=str(tmp_path / "out"),
++        api_key="fake-do-not-bill", validate=False,
++    )
++
++
++# ── the run_simulation tool forwards the flag (the reachability gap) ─────────
++
++def test_run_simulation_tool_forwards_flag(tmp_path, monkeypatch):
++    from scilink.agents.sim_agents import (
++        SimulationOrchestratorAgent, SimulationMode,
++    )
++
++    orch = SimulationOrchestratorAgent(
++        base_dir=str(tmp_path), api_key="fake-do-not-bill",
++        model_name="claude-opus-4-6",
++        simulation_mode=SimulationMode.AUTONOMOUS,
++    )
++
++    captured = {}
++
++    def fake_workflow(description, **kw):
++        captured.update(kw)
++        return {"final_status": "success", "refinement": {"status": "success"}}
++
++    monkeypatch.setattr(sp, "run_complete_workflow", fake_workflow)
++
++    tool = orch.tools.functions_map["run_simulation"]
++    tool("equilibrate liquid water", scale="molecular_dynamics",
++         software="lammps", run_command="echo x",
++         derive_health_bounds=True, health_slack_factor=7.0)
++
++    assert captured.get("derive_health_bounds") is True
++    assert captured.get("health_slack_factor") == 7.0
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_health_gate.py b/tests/test_health_gate.py
+index 0437eecb..fb2874c2 100644
+--- a/tests/test_health_gate.py
++++ b/tests/test_health_gate.py
+@@ -309,3 +309,50 @@ def test_campaign_surfaces_health_checked_false(monkeypatch):
+                        pre_run_verdict={"verdict": "good"})
+     assert out["status"] == "success"
+     assert out["health_checked"] is False
++
++
++# ── system-aware health bands (issue #783) ───────────────────────────────────
++
++WATER_BAND = [{"observable": "density", "min": 0.2, "max": 5.0}]
++
++
++def test_resolve_health_merges_bounds_over_frontmatter(monkeypatch):
++    # Frontmatter declares NO health block; a system-aware derived band must
++    # still be applied AND resolve a reader. The merge runs BEFORE the
++    # reader/perturb resolution, so the derived-only path is still gated.
++    _patch(monkeypatch, density=0.83, specs=[])
++    ctx = _ctx(health_bounds=WATER_BAND)
++    specs, reader, perturb = refinement._resolve_health(ctx)
++    assert any(s["observable"] == "density" for s in specs)
++    assert reader is not None
++
++
++def test_gate_uses_derived_band_tighter_than_frontmatter(monkeypatch):
++    # density 0.10 is inside the universal frontmatter 0.02–30 (a no-op under
++    # #782) but outside the system-aware water band 0.2–5.0 — now a violation.
++    _patch(monkeypatch, density=0.10, specs=DENSITY_SPEC)
++    ctx = _ctx(health_bounds=WATER_BAND)
++    result, violations, _, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), FakeExecutor(), ctx)
++    assert violations and "density" in violations[0].reason
++    assert checked is True
++
++
++def test_gate_derived_band_does_not_fire_on_accurate_value(monkeypatch):
++    # A merely-inaccurate-but-physical 0.88 passes the water band 0.2–5.0: the
++    # system-aware band is a gross-sanity tripwire, not an accuracy check.
++    _patch(monkeypatch, density=0.88, specs=DENSITY_SPEC)
++    ctx = _ctx(health_bounds=WATER_BAND)
++    result, violations, _, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), FakeExecutor(), ctx)
++    assert violations == [] and checked is True
++
++
++def test_back_compat_no_health_bounds(monkeypatch):
++    # health_bounds unset (None) -> identical to the #782 healthy-passes path.
++    _patch(monkeypatch, density=0.83, specs=DENSITY_SPEC)
++    ctx = _ctx()
++    assert ctx.health_bounds is None
++    result, violations, _, checked = _run_phase_health_gated(
++        _phase().input_files, _phase(), FakeExecutor(), ctx)
++    assert violations == [] and checked is True

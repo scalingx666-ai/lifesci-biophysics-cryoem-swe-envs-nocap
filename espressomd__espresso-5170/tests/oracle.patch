@@ -1,0 +1,1202 @@
+diff --git a/src/python/espressomd/particle_data.py b/src/python/espressomd/particle_data.py
+index fa44acf13cf..72751814c74 100644
+--- a/src/python/espressomd/particle_data.py
++++ b/src/python/espressomd/particle_data.py
+@@ -23,7 +23,7 @@
+ import functools
+ from .interactions import BondedInteraction
+ from .utils import nesting_level, array_locked, is_valid_type
+-from .utils import check_type_or_throw_except, to_bytes
++from .utils import check_type_or_throw_except
+ from .code_features import assert_features, has_features
+ from .script_interface import script_interface_register, ScriptInterfaceHelper
+ from .propagation import Propagation
+@@ -1336,25 +1336,30 @@ def select(self, *args, **kwargs):
+ 
+ 
+ def set_slice_one_for_all(p_slice, attribute, value):
+-    is_trivially_serializable = attribute in ParticleSlice._particle_attributes_trivially_serializable
+-    attribute_bytes = to_bytes(attribute)
+-    for p_id in p_slice.id_selection:
+-        p = p_slice._get_particle(p_id)
+-        if is_trivially_serializable:
+-            p.set_parameter(attribute_bytes, value)
+-        else:
+-            setattr(p, attribute, value)
++    set_slice_one_for_each(p_slice, attribute, [value] * len(p_slice))
+ 
+ 
+ def set_slice_one_for_each(p_slice, attribute, values):
+-    is_trivially_serializable = attribute in ParticleSlice._particle_attributes_trivially_serializable
+-    attribute_bytes = to_bytes(attribute)
+-    for p_id, value in zip(p_slice.id_selection, values):
+-        p = p_slice._get_particle(p_id)
+-        if is_trivially_serializable:
+-            p.set_parameter(attribute_bytes, value)
+-        else:
+-            setattr(p, attribute, value)
++    if attribute == "bonds":
++        all_bonds_ids = []
++        all_bonds_partner_ids = []
++        for i, bonds in enumerate(values):
++            p = p_slice._get_particle(p_slice.id_selection[i])
++            bonds_ids = []
++            bonds_partner_ids = []
++            for bond in bonds:
++                _bond = p.normalize_and_check_bond_or_throw_exception(bond)
++                p._bond_sanity_checks(_bond)
++                bonds_ids.append(_bond[0]._bond_id)
++                bonds_partner_ids.append(_bond[1:])
++            all_bonds_ids.append(bonds_ids)
++            all_bonds_partner_ids.append(bonds_partner_ids)
++        p_slice.call_method("set_param_parallel", name=attribute,
++                            all_bonds_ids=all_bonds_ids,
++                            all_bonds_partner_ids=all_bonds_partner_ids)
++    else:
++        p_slice.call_method("set_param_parallel",
++                            name=attribute, values=values)
+ 
+ 
+ def _add_particle_slice_properties():
+@@ -1382,7 +1387,11 @@ def set_attribute(particle_slice, values, attribute):
+         # Special attributes
+         if attribute == "bonds":
+             nlvl = nesting_level(values)
+-            if nlvl == 1 or nlvl == 2:
++            if nlvl == 1:
++                if len(values) > 0:
++                    values = [values]
++                set_slice_one_for_all(particle_slice, attribute, values)
++            elif nlvl == 2:
+                 set_slice_one_for_all(particle_slice, attribute, values)
+             elif nlvl == 3 and len(values) == N:
+                 set_slice_one_for_each(particle_slice, attribute, values)
+diff --git a/src/script_interface/ObjectHandle.hpp b/src/script_interface/ObjectHandle.hpp
+index 7a0ca5bd8ba..267912feaf3 100644
+--- a/src/script_interface/ObjectHandle.hpp
++++ b/src/script_interface/ObjectHandle.hpp
+@@ -125,7 +125,6 @@ class ObjectHandle {
+    */
+   void set_parameter(const std::string &name, const Variant &value);
+ 
+-private:
+   /**
+    * @brief Local implementation of @ref set_parameter.
+    */
+diff --git a/src/script_interface/particle_data/ParticleHandle.cpp b/src/script_interface/particle_data/ParticleHandle.cpp
+index 504cd1d4623..79fba3db343 100644
+--- a/src/script_interface/particle_data/ParticleHandle.cpp
++++ b/src/script_interface/particle_data/ParticleHandle.cpp
+@@ -17,7 +17,7 @@
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+-#include "config/config.hpp"
++#include <config/config.hpp>
+ 
+ #include "ParticleHandle.hpp"
+ 
+@@ -65,18 +65,6 @@
+ namespace ScriptInterface {
+ namespace Particles {
+ 
+-static void particle_checks(int p_id, Utils::Vector3d const &pos) {
+-  if (p_id < 0) {
+-    throw std::domain_error("Invalid particle id: " + std::to_string(p_id));
+-  }
+-#ifndef __FAST_MATH__
+-  if (std::isnan(pos[0]) or std::isnan(pos[1]) or std::isnan(pos[2]) or
+-      std::isinf(pos[0]) or std::isinf(pos[1]) or std::isinf(pos[2])) {
+-    throw std::domain_error("Particle position must be finite");
+-  }
+-#endif // __FAST_MATH__
+-}
+-
+ #ifdef ESPRESSO_ROTATION
+ static auto const contradicting_arguments_quat = std::vector<
+     std::array<std::string, 3>>{{
+@@ -118,12 +106,6 @@ static uint8_t bitfield_from_flag(Utils::Vector3i const &flag) {
+   return bitfield;
+ }
+ 
+-static auto error_msg(std::string const &name, std::string const &reason) {
+-  std::stringstream msg;
+-  msg << "attribute '" << name << "' of 'ParticleHandle' " << reason;
+-  return msg.str();
+-}
+-
+ static auto quat2vector(Utils::Quaternion<double> const &q) {
+   return Utils::Vector4d{{q[0], q[1], q[2], q[3]}};
+ }
+@@ -150,28 +132,9 @@ static auto get_gamma_safe(Variant const &value) {
+ }
+ #endif // ESPRESSO_THERMOSTAT_PER_PARTICLE
+ 
+-static auto get_real_particle(boost::mpi::communicator const &comm, int p_id,
+-                              ::CellStructure &cell_structure) {
+-  if (p_id < 0) {
+-    throw std::domain_error("Invalid particle id: " + std::to_string(p_id));
+-  }
+-  auto ptr = cell_structure.get_local_particle(p_id);
+-  if (ptr != nullptr and ptr->is_ghost()) {
+-    ptr = nullptr;
+-  }
+-  auto const n_found = boost::mpi::all_reduce(
+-      comm, static_cast<int>(ptr != nullptr), std::plus<>());
+-  if (n_found == 0) {
+-    throw std::runtime_error("Particle with id " + std::to_string(p_id) +
+-                             " not found");
+-  }
+-  return ptr;
+-}
+-
+ template <typename T, class F>
+ T ParticleHandle::get_particle_property(F const &fun) const {
+-  auto cell_structure_si = get_cell_structure();
+-  auto &cell_structure = cell_structure_si->get_cell_structure();
++  auto &cell_structure = get_cell_structure()->get_cell_structure();
+   auto const &comm = context()->get_comm();
+   auto const ptr = const_cast<Particle const *>(
+       get_real_particle(comm, m_pid, cell_structure));
+@@ -193,8 +156,7 @@ T ParticleHandle::get_particle_property(T const &(Particle::*getter)()
+ 
+ template <class F>
+ void ParticleHandle::set_particle_property(F const &fun) const {
+-  auto cell_structure_si = get_cell_structure();
+-  auto &cell_structure = cell_structure_si->get_cell_structure();
++  auto &cell_structure = get_cell_structure()->get_cell_structure();
+   auto const &comm = context()->get_comm();
+   auto const ptr = get_real_particle(comm, m_pid, cell_structure);
+   if (ptr != nullptr) {
+@@ -332,7 +294,7 @@ ParticleHandle::ParticleHandle() {
+        [this](Variant const &value) {
+          set_particle_property([&value](Particle &p) {
+            auto const rotation_flag =
+-               Utils::Vector3i{(get_value<Utils::Vector3b>(value))};
++               Utils::Vector3i{get_value<Utils::Vector3b>(value)};
+            p.rotation() = bitfield_from_flag(rotation_flag);
+          });
+        },
+@@ -530,52 +492,6 @@ ParticleHandle::ParticleHandle() {
+   });
+ }
+ 
+-#ifdef ESPRESSO_EXCLUSIONS
+-/**
+- * @brief Locally add an exclusion to a particle.
+- * @param pid1 the identity of the first exclusion partner
+- * @param pid2 the identity of the second exclusion partner
+- * @param cell_structure the cell structure
+- */
+-static void local_add_exclusion(int pid1, int pid2,
+-                                ::CellStructure &cell_structure) {
+-  if (auto p1 = cell_structure.get_local_particle(pid1)) {
+-    add_exclusion(*p1, pid2);
+-  }
+-  if (auto p2 = cell_structure.get_local_particle(pid2)) {
+-    add_exclusion(*p2, pid1);
+-  }
+-}
+-
+-/**
+- * @brief Locally remove an exclusion to a particle.
+- * @param pid1 the identity of the first exclusion partner
+- * @param pid2 the identity of the second exclusion partner
+- * @param cell_structure the cell structure
+- */
+-static void local_remove_exclusion(int pid1, int pid2,
+-                                   ::CellStructure &cell_structure) {
+-  if (auto p1 = cell_structure.get_local_particle(pid1)) {
+-    delete_exclusion(*p1, pid2);
+-  }
+-  if (auto p2 = cell_structure.get_local_particle(pid2)) {
+-    delete_exclusion(*p2, pid1);
+-  }
+-}
+-
+-void ParticleHandle::particle_exclusion_sanity_checks(int pid1,
+-                                                      int pid2) const {
+-  if (pid1 == pid2) {
+-    throw std::runtime_error("Particles cannot exclude themselves (id " +
+-                             std::to_string(pid1) + ")");
+-  }
+-  auto cell_structure_si = get_cell_structure();
+-  auto &cell_structure = cell_structure_si->get_cell_structure();
+-  std::ignore = get_real_particle(context()->get_comm(), pid1, cell_structure);
+-  std::ignore = get_real_particle(context()->get_comm(), pid2, cell_structure);
+-}
+-#endif // ESPRESSO_EXCLUSIONS
+-
+ Variant ParticleHandle::do_call_method(std::string const &name,
+                                        VariantMap const &params) {
+   if (name == "set_param_parallel") {
+@@ -627,13 +543,14 @@ Variant ParticleHandle::do_call_method(std::string const &name,
+         exclusion_list = get_value<std::vector<int>>(params, "exclusions");
+       }
+       context()->parallel_try_catch([&]() {
++        auto &cell_structure = get_cell_structure()->get_cell_structure();
+         for (auto const pid : exclusion_list) {
+-          particle_exclusion_sanity_checks(m_pid, pid);
++          particle_exclusion_sanity_checks(m_pid, pid, cell_structure,
++                                           context()->get_comm());
+         }
+       });
+       set_particle_property([this, &exclusion_list](Particle &p) {
+-        auto cell_structure_si = get_cell_structure();
+-        auto &cell_structure = cell_structure_si->get_cell_structure();
++        auto &cell_structure = get_cell_structure()->get_cell_structure();
+         for (auto const pid : p.exclusions()) {
+           local_remove_exclusion(m_pid, pid, cell_structure);
+         }
+@@ -695,8 +612,7 @@ Variant ParticleHandle::do_call_method(std::string const &name,
+   }
+   if (name == "remove_particle") {
+     context()->parallel_try_catch([&]() {
+-      auto cell_structure_si = get_cell_structure();
+-      auto &cell_structure = cell_structure_si->get_cell_structure();
++      auto &cell_structure = get_cell_structure()->get_cell_structure();
+       std::ignore =
+           get_real_particle(context()->get_comm(), m_pid, cell_structure);
+       remove_particle(m_pid);
+@@ -745,8 +661,7 @@ Variant ParticleHandle::do_call_method(std::string const &name,
+ #ifdef ESPRESSO_EXCLUSIONS
+   } else if (name == "has_exclusion") {
+     auto const other_pid = get_value<int>(params, "pid");
+-    auto cell_structure_si = get_cell_structure();
+-    auto &cell_structure = cell_structure_si->get_cell_structure();
++    auto &cell_structure = get_cell_structure()->get_cell_structure();
+     auto const p =
+         get_real_particle(context()->get_comm(), m_pid, cell_structure);
+     if (p != nullptr) {
+@@ -755,21 +670,24 @@ Variant ParticleHandle::do_call_method(std::string const &name,
+   }
+   if (name == "add_exclusion") {
+     auto const other_pid = get_value<int>(params, "pid");
+-    auto cell_structure_si = get_cell_structure();
+-    auto &cell_structure = cell_structure_si->get_cell_structure();
+-    context()->parallel_try_catch(
+-        [&]() { particle_exclusion_sanity_checks(m_pid, other_pid); });
++    auto &cell_structure = get_cell_structure()->get_cell_structure();
++    context()->parallel_try_catch([&]() {
++      particle_exclusion_sanity_checks(m_pid, other_pid, cell_structure,
++                                       context()->get_comm());
++    });
+     local_add_exclusion(m_pid, other_pid, cell_structure);
+     get_system()->on_particle_change();
+   } else if (name == "del_exclusion") {
+     auto const other_pid = get_value<int>(params, "pid");
+-    auto cell_structure_si = get_cell_structure();
+-    auto &cell_structure = cell_structure_si->get_cell_structure();
+-    context()->parallel_try_catch(
+-        [&]() { particle_exclusion_sanity_checks(m_pid, other_pid); });
++    auto &cell_structure = get_cell_structure()->get_cell_structure();
++    context()->parallel_try_catch([&]() {
++      particle_exclusion_sanity_checks(m_pid, other_pid, cell_structure,
++                                       context()->get_comm());
++    });
+     local_remove_exclusion(m_pid, other_pid, cell_structure);
+     get_system()->on_particle_change();
+   } else if (name == "set_exclusions") {
++    auto &cell_structure = get_cell_structure()->get_cell_structure();
+     std::vector<int> exclusion_list;
+     try {
+       auto const pid = get_value<int>(params, "p_ids");
+@@ -779,12 +697,12 @@ Variant ParticleHandle::do_call_method(std::string const &name,
+     }
+     context()->parallel_try_catch([&]() {
+       for (auto const pid : exclusion_list) {
+-        particle_exclusion_sanity_checks(m_pid, pid);
++        particle_exclusion_sanity_checks(m_pid, pid, cell_structure,
++                                         context()->get_comm());
+       }
+     });
+     set_particle_property([this, &exclusion_list](Particle &p) {
+-      auto cell_structure_si = get_cell_structure();
+-      auto &cell_structure = cell_structure_si->get_cell_structure();
++      auto &cell_structure = get_cell_structure()->get_cell_structure();
+       for (auto const pid : p.exclusions()) {
+         local_remove_exclusion(m_pid, pid, cell_structure);
+       }
+@@ -828,10 +746,25 @@ Variant ParticleHandle::do_call_method(std::string const &name,
+   return {};
+ }
+ 
++std::size_t ParticleHandle::setup_hidden_args(VariantMap const &params) {
++  auto n_extra_args = params.size() - params.count("id");
++  if (params.contains("__cell_structure")) {
++    auto so = get_value<std::shared_ptr<CellSystem::CellSystem>>(
++        params, "__cell_structure");
++    so->configure(*this);
++    m_cell_structure = so;
++    --n_extra_args;
++  }
++  if (params.contains("__bonded_ias")) {
++    m_bonded_ias = get_value<std::shared_ptr<Interactions::BondedInteractions>>(
++        params, "__bonded_ias");
++    --n_extra_args;
++  }
++  return n_extra_args;
++}
++
+ void ParticleHandle::do_construct(VariantMap const &params) {
+-  auto const n_extra_args = params.size() - params.count("id") -
+-                            params.count("__cell_structure") -
+-                            params.count("__bonded_ias");
++  auto const n_extra_args = setup_hidden_args(params);
+   m_pid = (params.contains("id")) ? get_value<int>(params, "id")
+                                   : get_maximal_particle_id() + 1;
+ 
+@@ -843,17 +776,6 @@ void ParticleHandle::do_construct(VariantMap const &params) {
+   }
+ #endif
+ 
+-  if (params.contains("__cell_structure")) {
+-    auto so = get_value<std::shared_ptr<CellSystem::CellSystem>>(
+-        params, "__cell_structure");
+-    so->configure(*this);
+-    m_cell_structure = so;
+-  }
+-  if (params.contains("__bonded_ias")) {
+-    m_bonded_ias = get_value<std::shared_ptr<Interactions::BondedInteractions>>(
+-        params, "__bonded_ias");
+-  }
+-
+   // create a new particle if extra arguments were passed
+   if (n_extra_args == 0) {
+     return;
+@@ -862,8 +784,7 @@ void ParticleHandle::do_construct(VariantMap const &params) {
+   auto const pos = get_value<Utils::Vector3d>(params, "pos");
+   context()->parallel_try_catch([&]() {
+     particle_checks(m_pid, pos);
+-    auto cell_structure_si = get_cell_structure();
+-    auto &cell_structure = cell_structure_si->get_cell_structure();
++    auto &cell_structure = get_cell_structure()->get_cell_structure();
+     auto ptr = cell_structure.get_local_particle(m_pid);
+     if (ptr != nullptr) {
+       throw std::invalid_argument("Particle " + std::to_string(m_pid) +
+diff --git a/src/script_interface/particle_data/ParticleHandle.hpp b/src/script_interface/particle_data/ParticleHandle.hpp
+index 9b717202c92..3d24d74e9c2 100644
+--- a/src/script_interface/particle_data/ParticleHandle.hpp
++++ b/src/script_interface/particle_data/ParticleHandle.hpp
+@@ -19,16 +19,21 @@
+ 
+ #pragma once
+ 
+-#include "script_interface/ScriptInterface.hpp"
++#include "cell_system/CellStructure.hpp"
+ #include "script_interface/auto_parameters/AutoParameters.hpp"
+ #include "script_interface/interactions/BondedInteractions.hpp"
+ 
+ #include "core/Particle.hpp"
++#include "core/exclusions.hpp"
+ #include "core/system/System.hpp"
+ 
++#include <boost/mpi/collectives/all_reduce.hpp>
++
+ #include <cassert>
++#include <cstddef>
+ #include <functional>
+ #include <memory>
++#include <stdexcept>
+ #include <string>
+ 
+ namespace ScriptInterface {
+@@ -37,6 +42,89 @@ class CellSystem;
+ }
+ namespace Particles {
+ 
++class ParticleModifier;
++
++static auto error_msg(std::string const &name, std::string const &reason) {
++  std::stringstream msg;
++  msg << "attribute '" << name << "' of 'ParticleHandle' " << reason;
++  return msg.str();
++}
++
++inline auto get_real_particle(boost::mpi::communicator const &comm, int p_id,
++                              ::CellStructure &cell_structure) {
++  if (p_id < 0) {
++    throw std::domain_error("Invalid particle id: " + std::to_string(p_id));
++  }
++  auto ptr = cell_structure.get_local_particle(p_id);
++  if (ptr != nullptr and ptr->is_ghost()) {
++    ptr = nullptr;
++  }
++  auto const n_found = boost::mpi::all_reduce(
++      comm, static_cast<int>(ptr != nullptr), std::plus<>());
++  if (n_found == 0) {
++    throw std::runtime_error("Particle with id " + std::to_string(p_id) +
++                             " not found");
++  }
++  return ptr;
++}
++
++static void particle_checks(int p_id, Utils::Vector3d const &pos) {
++  if (p_id < 0) {
++    throw std::domain_error("Invalid particle id: " + std::to_string(p_id));
++  }
++#ifndef __FAST_MATH__
++  if (std::isnan(pos[0]) or std::isnan(pos[1]) or std::isnan(pos[2]) or
++      std::isinf(pos[0]) or std::isinf(pos[1]) or std::isinf(pos[2])) {
++    throw std::domain_error("Particle position must be finite");
++  }
++#endif // __FAST_MATH__
++}
++
++#ifdef ESPRESSO_EXCLUSIONS
++/**
++ * @brief Locally add an exclusion to a particle.
++ * @param pid1 the identity of the first exclusion partner
++ * @param pid2 the identity of the second exclusion partner
++ * @param cell_structure the cell structure
++ */
++inline void local_add_exclusion(int pid1, int pid2,
++                                ::CellStructure &cell_structure) {
++  if (auto p1 = cell_structure.get_local_particle(pid1)) {
++    add_exclusion(*p1, pid2);
++  }
++  if (auto p2 = cell_structure.get_local_particle(pid2)) {
++    add_exclusion(*p2, pid1);
++  }
++}
++
++/**
++ * @brief Locally remove an exclusion to a particle.
++ * @param pid1 the identity of the first exclusion partner
++ * @param pid2 the identity of the second exclusion partner
++ * @param cell_structure the cell structure
++ */
++inline void local_remove_exclusion(int pid1, int pid2,
++                                   ::CellStructure &cell_structure) {
++  if (auto p1 = cell_structure.get_local_particle(pid1)) {
++    delete_exclusion(*p1, pid2);
++  }
++  if (auto p2 = cell_structure.get_local_particle(pid2)) {
++    delete_exclusion(*p2, pid1);
++  }
++}
++
++inline void particle_exclusion_sanity_checks(int pid1, int pid2,
++                                             ::CellStructure &cell_structure,
++                                             auto const &comm) {
++  if (pid1 == pid2) {
++    throw std::runtime_error("Particles cannot exclude themselves (id " +
++                             std::to_string(pid1) + ")");
++  }
++  std::ignore = get_real_particle(comm, pid1, cell_structure);
++  std::ignore = get_real_particle(comm, pid2, cell_structure);
++}
++#endif // ESPRESSO_EXCLUSIONS
++
+ class ParticleHandle : public AutoParameters<ParticleHandle> {
+   std::function<Variant(VariantMap const &)> cb_get_bond;
+   int m_pid;
+@@ -68,12 +156,12 @@ class ParticleHandle : public AutoParameters<ParticleHandle> {
+                              Variant const &value) const;
+ 
+   template <class F> void set_particle_property(F const &fun) const;
+-#ifdef ESPRESSO_EXCLUSIONS
+-  void particle_exclusion_sanity_checks(int pid1, int pid2) const;
+-#endif // ESPRESSO_EXCLUSIONS
++
++  std::size_t setup_hidden_args(VariantMap const &params);
+ 
+ public:
+   ParticleHandle();
++  friend class ParticleModifier;
+ 
+   Variant do_call_method(std::string const &name,
+                          VariantMap const &params) override;
+@@ -86,5 +174,31 @@ class ParticleHandle : public AutoParameters<ParticleHandle> {
+   }
+ };
+ 
++/** @brief Thin wrapper to read and write particle attributes in batches. */
++class ParticleModifier : public ParticleHandle {
++public:
++  void do_construct(VariantMap const &params) override {
++    auto const n_extra_args = setup_hidden_args(params);
++    if (n_extra_args) {
++      throw std::logic_error(
++          "ParticleModifier is not meant to create new particles");
++    }
++    m_pid = params.contains("id") ? get_value<int>(params, "id") : -1;
++  }
++
++  void set_pid(int pid) {
++    assert(pid >= 0);
++    m_pid = pid;
++  }
++
++  Variant do_call_method(std::string const &name,
++                         VariantMap const &params) override {
++    if (name == "remove_particle") {
++      throw std::logic_error("ParticleModifier has no method '" + name + "'");
++    }
++    return ParticleHandle::do_call_method(name, params);
++  }
++};
++
+ } // namespace Particles
+ } // namespace ScriptInterface
+diff --git a/src/script_interface/particle_data/ParticleSlice.cpp b/src/script_interface/particle_data/ParticleSlice.cpp
+index efd9d95761a..d62d7cf74be 100644
+--- a/src/script_interface/particle_data/ParticleSlice.cpp
++++ b/src/script_interface/particle_data/ParticleSlice.cpp
+@@ -20,10 +20,20 @@
+ #include "ParticleSlice.hpp"
+ #include "ParticleHandle.hpp"
+ 
+-#include "script_interface/ScriptInterface.hpp"
+-
++#include "core/bonds.hpp"
+ #include "core/particle_node.hpp"
++#include "core/system/System.hpp"
++#include "nonbonded_interactions/nonbonded_interaction_data.hpp"
++
++#include "script_interface/Context.hpp"
++#include "script_interface/Exception.hpp"
++#include "script_interface/Variant.hpp"
++#include "script_interface/get_value.hpp"
+ 
++#include <utils/Vector.hpp>
++
++#include <algorithm>
++#include <iterator>
+ #include <memory>
+ #include <stdexcept>
+ #include <string>
+@@ -32,6 +42,108 @@
+ namespace ScriptInterface {
+ namespace Particles {
+ 
++static void set_particles_bonds(
++    std::vector<int> const &pids,
++    std::vector<std::vector<int>> const &all_bonds_ids,
++    std::vector<std::vector<std::vector<int>>> const &all_bonds_partner_ids,
++    ::CellStructure &cell_structure, ::System::System &system) {
++  for (std::size_t i = 0; i < pids.size(); ++i) {
++    auto const pid = pids[i];
++    auto const bonds_ids = all_bonds_ids[i];
++    auto const bonds_partner_ids = all_bonds_partner_ids[i];
++    // Remove old bonds
++    auto p = cell_structure.get_local_particle(pid);
++    if (p != nullptr and not p->is_ghost()) {
++      p->bonds().clear();
++    }
++    // Add new bonds
++    for (std::size_t j = 0; j < bonds_ids.size(); ++j) {
++      std::vector<int> particle_ids = {pid};
++      std::ranges::copy(bonds_partner_ids[j], std::back_inserter(particle_ids));
++      ::add_bond(system, bonds_ids[j], particle_ids);
++      system.on_particle_change();
++    }
++  }
++}
++
++#ifdef ESPRESSO_EXCLUSIONS
++static void
++set_particles_exclusions(std::vector<int> const &pids,
++                         std::vector<std::vector<int>> const &exclusion_lists,
++                         boost::mpi::communicator const &comm, Context *context,
++                         ::CellStructure &cell_structure,
++                         ::System::System &system) {
++  for (std::size_t i = 0; i < pids.size(); ++i) {
++    auto const pid = pids[i];
++    auto const &exclusion_list = exclusion_lists[i];
++    for (auto const excluded_pid : exclusion_list) { // collective communication
++      particle_exclusion_sanity_checks(pid, excluded_pid, cell_structure, comm);
++    }
++    auto p = cell_structure.get_local_particle(pid);
++    if (p != nullptr and not p->is_ghost()) {
++      // Remove all excluded ids of this particle
++      for (auto const old_excluded_pid : p->exclusions()) {
++        local_remove_exclusion(pid, old_excluded_pid, cell_structure);
++      }
++      // Add new excluded ids for this particle
++      for (auto const excluded_pid : exclusion_list) {
++        if (not p->has_exclusion(excluded_pid)) {
++          local_add_exclusion(pid, excluded_pid, cell_structure);
++        }
++      }
++    }
++  }
++  system.on_particle_change();
++}
++#endif // ESPRESSO_EXCLUSIONS
++
++static void
++set_particles_positions(std::vector<int> const &pids,
++                        std::vector<Utils::Vector3d> const &positions) {
++  for (std::size_t i = 0; i < pids.size(); ++i) {
++    auto const pid = pids[i];
++    auto const pos = positions[i];
++    particle_checks(pid, pos);
++    set_particle_pos(pid, pos);
++  }
++}
++
++static void set_particles_types(std::vector<int> const &pids,
++                                std::vector<int> const &types,
++                                CellStructure &cell_structure,
++                                ::System::System &system) {
++  for (std::size_t i = 0; i < pids.size(); ++i) {
++    auto const pid = pids[i];
++    auto p = cell_structure.get_local_particle(pid);
++    if (p != nullptr and not p->is_ghost()) {
++      auto const old_type = p->type();
++      auto const &new_type = types[i];
++      if (new_type < 0) {
++        throw std::domain_error(error_msg("type", "must be an integer >= 0"));
++      }
++      system.nonbonded_ias->make_particle_type_exist(new_type);
++      on_particle_type_change(pid, old_type, new_type);
++      p->type() = new_type;
++    }
++  }
++}
++
++#ifdef ESPRESSO_ELECTROSTATICS
++static void set_particles_charges(std::vector<int> const &pids,
++                                  std::vector<double> const &charges,
++                                  CellStructure &cell_structure,
++                                  ::System::System &system) {
++  for (std::size_t i = 0; i < pids.size(); ++i) {
++    auto const pid = pids[i];
++    auto p = cell_structure.get_local_particle(pid);
++    if (p != nullptr and not p->is_ghost()) {
++      p->q() = charges[i];
++    }
++  }
++  system.on_particle_charge_change();
++}
++#endif // ESPRESSO_ELECTROSTATICS
++
+ void ParticleSlice::do_construct(VariantMap const &params) {
+   if (params.contains("__cell_structure")) {
+     auto so = get_value<std::shared_ptr<CellSystem::CellSystem>>(
+@@ -58,6 +170,82 @@ void ParticleSlice::do_construct(VariantMap const &params) {
+ 
+ Variant ParticleSlice::do_call_method(std::string const &name,
+                                       VariantMap const &params) {
++  if (name == "set_param_parallel") {
++    auto const param_name = get_value<std::string>(params, "name");
++    if (not params.contains("values")) {
++      context()->parallel_try_catch([&]() {
++        if (param_name == "bonds") {
++          if (not params.contains("all_bonds_ids")) {
++            throw Exception("Parameter 'all_bonds_ids' is missing");
++          }
++          if (not params.contains("all_bonds_partner_ids")) {
++            throw Exception("Parameter 'all_bonds_partner_ids' is missing");
++          }
++        } else {
++          throw Exception("Parameter 'values' is missing");
++        }
++      });
++    }
++    // Handle parameters with special setters
++    if (m_special_parameters.contains(param_name)) {
++      context()->parallel_try_catch([&]() {
++        if (param_name == "pos") {
++          set_particles_positions(
++              m_id_selection,
++              get_value<std::vector<Utils::Vector3d>>(params, "values"));
++        } else if (param_name == "type") {
++          set_particles_types(m_id_selection,
++                              get_value<std::vector<int>>(params, "values"),
++                              *get_cell_structure(), *get_system());
++        }
++#ifdef ESPRESSO_ELECTROSTATICS
++        else if (param_name == "q") {
++          std::vector<double> charges;
++          if (is_type<std::vector<int>>(params.at("values"))) {
++            auto tmp = get_value<std::vector<int>>(params, "values");
++            charges = std::vector<double>(tmp.begin(), tmp.end());
++          } else {
++            charges = get_value<std::vector<double>>(params, "values");
++          }
++          set_particles_charges(m_id_selection, charges, *get_cell_structure(),
++                                *get_system());
++
++        }
++#endif // ESPRESSO_ELECTROSTATICS
++#ifdef ESPRESSO_EXCLUSIONS
++        else if (param_name == "exclusions") {
++          auto const excluded_pids =
++              get_value<std::vector<std::vector<int>>>(params, "values");
++          set_particles_exclusions(
++              m_id_selection,
++              get_value<std::vector<std::vector<int>>>(params, "values"),
++              context()->get_comm(), context(), *get_cell_structure(),
++              *get_system());
++        }
++#endif // ESPRESSO_EXCLUSIONS
++        else if (param_name == "bonds") {
++          set_particles_bonds(
++              m_id_selection,
++              get_value<std::vector<std::vector<int>>>(params, "all_bonds_ids"),
++              get_value<std::vector<std::vector<std::vector<int>>>>(
++                  params, "all_bonds_partner_ids"),
++              *get_cell_structure(), *get_system());
++        }
++      });
++    } else {
++      // Handle generic parameters
++      context()->parallel_try_catch([&]() {
++        std::visit(
++            [&](auto &&vals) {
++              SetParticleParametersVisitor{}(m_id_selection, param_name, vals,
++                                             context(), m_cell_structure.lock(),
++                                             m_bonded_ias.lock());
++            },
++            params.at("values"));
++      });
++    }
++    return {};
++  }
+   if (not context()->is_head_node()) {
+     return {};
+   }
+diff --git a/src/script_interface/particle_data/ParticleSlice.hpp b/src/script_interface/particle_data/ParticleSlice.hpp
+index 12b67e79c27..cb8dad90b39 100644
+--- a/src/script_interface/particle_data/ParticleSlice.hpp
++++ b/src/script_interface/particle_data/ParticleSlice.hpp
+@@ -24,6 +24,7 @@
+ #include "script_interface/ScriptInterface.hpp"
+ #include "script_interface/auto_parameters/AutoParameters.hpp"
+ #include "script_interface/cell_system/CellSystem.hpp"
++#include "script_interface/get_value.hpp"
+ #include "script_interface/interactions/BondedInteractions.hpp"
+ 
+ #include "core/system/System.hpp"
+@@ -35,12 +36,61 @@
+ namespace ScriptInterface {
+ namespace Particles {
+ 
++struct SetParticleParametersVisitor {
++  void operator()(std::vector<int> const &, std::string const &,
++                  auto const &values, Context *,
++                  std::shared_ptr<CellSystem::CellSystem>,
++                  std::shared_ptr<Interactions::BondedInteractions>) const {
++    throw Exception("Values must be of type vector, got " +
++                    detail::demangle::simplify_symbol(&values));
++  }
++  template <typename T>
++  void operator()(
++      std::vector<int> const &pids, std::string const &param_name,
++      std::vector<T> const &values, Context *context,
++      std::shared_ptr<CellSystem::CellSystem> cell_structure,
++      std::shared_ptr<Interactions::BondedInteractions> bonded_ias) const {
++    auto so = std::dynamic_pointer_cast<ParticleModifier>(context->make_shared(
++        "Particles::ParticleModifier", {{"id", -1},
++                                        {"__cell_structure", cell_structure},
++                                        {"__bonded_ias", bonded_ias}}));
++    for (std::size_t i = 0; i < pids.size(); ++i) {
++      so->set_pid(pids[i]);
++      so->do_set_parameter(param_name, values[i]);
++    }
++  }
++};
++
+ class ParticleSlice : public AutoParameters<ParticleSlice> {
+   std::vector<int> m_id_selection;
+   int m_chunk_size;
+   std::weak_ptr<CellSystem::CellSystem> m_cell_structure;
+   std::weak_ptr<Interactions::BondedInteractions> m_bonded_ias;
+   std::weak_ptr<::System::System> m_system;
++  /** @brief Data structure to store names of parameters with special setters.
++   */
++  std::set<std::string> m_special_parameters{
++      "pos",        "type", "bonds",
++#ifdef ESPRESSO_ELECTROSTATICS
++      "q",
++#endif // ESPRESSO_ELECTROSTATICS
++#ifdef ESPRESSO_EXCLUSIONS
++      "exclusions",
++#endif // ESPRESSO_EXCLUSIONS
++  };
++
++  auto get_cell_structure() const {
++    auto cell_structure_ptr = m_cell_structure.lock();
++    assert(cell_structure_ptr != nullptr);
++    auto &cell_structure = cell_structure_ptr->get_cell_structure();
++    return &cell_structure;
++  }
++
++  auto get_system() const {
++    auto ptr = m_system.lock();
++    assert(ptr != nullptr);
++    return ptr;
++  }
+ 
+ public:
+   ParticleSlice() {
+diff --git a/src/script_interface/particle_data/initialize.cpp b/src/script_interface/particle_data/initialize.cpp
+index f3b28ccf959..0e3be3fd9e8 100644
+--- a/src/script_interface/particle_data/initialize.cpp
++++ b/src/script_interface/particle_data/initialize.cpp
+@@ -31,6 +31,7 @@ void initialize(Utils::Factory<ObjectHandle> *om) {
+   om->register_new<ParticleHandle>("Particles::ParticleHandle");
+   om->register_new<ParticleList>("Particles::ParticleList");
+   om->register_new<ParticleSlice>("Particles::ParticleSlice");
++  om->register_new<ParticleModifier>("Particles::ParticleModifier");
+   om->register_new<Polymer>("Particles::Polymer");
+ }
+ 
+diff --git a/src/script_interface/tests/CMakeLists.txt b/src/script_interface/tests/CMakeLists.txt
+index dc34f91e1bf..35c0c5711d0 100644
+--- a/src/script_interface/tests/CMakeLists.txt
++++ b/src/script_interface/tests/CMakeLists.txt
+@@ -56,3 +56,6 @@ espresso_unit_test(
+ espresso_unit_test(
+   SRC ReactionEnsemble_test.cpp DEPENDS espresso::core
+   espresso::script_interface Boost::mpi MPI::MPI_CXX NUM_PROC 2)
++espresso_unit_test(
++  SRC ParticleSlice_test.cpp DEPENDS espresso::core espresso::script_interface
++  espresso::instrumentation Boost::mpi MPI::MPI_CXX NUM_PROC 1)
+diff --git a/src/script_interface/tests/ParticleSlice_test.cpp b/src/script_interface/tests/ParticleSlice_test.cpp
+new file mode 100644
+index 00000000000..1c14bfe20da
+--- /dev/null
++++ b/src/script_interface/tests/ParticleSlice_test.cpp
+@@ -0,0 +1,278 @@
++/*
++ * Copyright (C) 2016-2025 The ESPResSo project
++ *
++ * This file is part of ESPResSo.
++ *
++ * ESPResSo is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * ESPResSo is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#define BOOST_TEST_MODULE ParticleSlice test
++#define BOOST_TEST_DYN_LINK
++#include <boost/test/unit_test.hpp>
++
++#include "script_interface/Context.hpp"
++#include "script_interface/Exception.hpp"
++#include "script_interface/LocalContext.hpp"
++#include "script_interface/Variant.hpp"
++#include "script_interface/cell_system/CellSystem.hpp"
++#include "script_interface/get_value.hpp"
++#include "script_interface/particle_data/ParticleHandle.hpp"
++#include "script_interface/particle_data/ParticleSlice.hpp"
++
++#include "core/unit_tests/EspressoCoreGlobalConfig.hpp"
++#include "core/unit_tests/ParticleFactory.hpp"
++
++#include <utils/Vector.hpp>
++
++#include <boost/mpi/communicator.hpp>
++
++#include <cassert>
++#include <memory>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++using namespace ScriptInterface;
++
++static int coord(std::string const &s) {
++  if (s == "x")
++    return 0;
++  if (s == "y")
++    return 1;
++  if (s == "z")
++    return 2;
++  throw std::invalid_argument("Invalid Cartesian coordinate: '" + s + "'");
++}
++
++namespace espresso {
++// ESPResSo system instance
++static std::shared_ptr<::System::System> system;
++} // namespace espresso
++
++struct GlobalConfig : public EspressoCoreGlobalConfig {
++  GlobalConfig() {
++    espresso::system = ::System::System::create();
++    espresso::system->set_cell_structure_topology(CellStructureType::REGULAR);
++    ::System::set_system(espresso::system);
++  }
++  ~GlobalConfig() {
++    espresso::system.reset();
++    ::System::reset_system();
++  }
++};
++
++BOOST_TEST_GLOBAL_CONFIGURATION(GlobalConfig);
++
++BOOST_FIXTURE_TEST_CASE(set_slice_positions, ParticleFactory) {
++  // New positions for slice
++  Variant new_pos1 = Utils::Vector3d{1., 0., 0.};
++  Variant new_pos2 = Utils::Vector3d{0., 1., 0.};
++  std::vector<Variant> new_positions = {new_pos1, new_pos2};
++
++  Utils::Factory<ObjectHandle> f;
++  f.register_new<Particles::ParticleSlice>("ParticleSlice");
++  f.register_new<Particles::ParticleHandle>("ParticleHandle");
++  f.register_new<CellSystem::CellSystem>("CellSystem");
++
++  boost::mpi::communicator comm;
++  auto ctx = std::make_shared<LocalContext>(f, comm);
++
++  // Create TestCellSystem object
++  auto &&sp_cell_system{ctx->make_shared("CellSystem", {})};
++  std::shared_ptr<CellSystem::CellSystem> cell_system =
++      std::dynamic_pointer_cast<CellSystem::CellSystem>(sp_cell_system);
++
++  // Parameters for ScriptInterface objects
++  VariantMap p1_init_params{{"id", 0}, {"__cell_structure", cell_system}};
++  VariantMap p2_init_params{{"id", 1}, {"__cell_structure", cell_system}};
++  VariantMap p_slice_init_params{{"id_selection", std::vector<int>{0, 1}},
++                                 {"__cell_structure", cell_system}};
++
++  // Create particle core objects
++  create_particle(Utils::Vector3d{0., 0., 0.}, 0, 0);
++  create_particle(Utils::Vector3d{0., 0., 0.}, 1, 0);
++
++  // Create 2 ParticleHandle, and 1 ParticleSlice object
++  auto &&sp_p1_handle{ctx->make_shared("ParticleHandle", {p1_init_params})};
++  auto &&sp_p2_handle{ctx->make_shared("ParticleHandle", {p2_init_params})};
++  // Particle handle 1
++  auto p1_handle =
++      std::dynamic_pointer_cast<Particles::ParticleHandle>(sp_p1_handle);
++  // Particle handle 2
++  auto p2_handle =
++      std::dynamic_pointer_cast<Particles::ParticleHandle>(sp_p2_handle);
++  // Attach to system
++  p1_handle->attach(espresso::system);
++  p2_handle->attach(espresso::system);
++
++  // Particle slice
++  auto &&sp_p_slice{ctx->make_shared("ParticleSlice", {p_slice_init_params})};
++  auto p_slice =
++      std::dynamic_pointer_cast<Particles::ParticleSlice>(sp_p_slice);
++
++  // Check if old positions are actually zero
++  auto pos1_before_update =
++      get_value<Utils::Vector3d>(p1_handle->get_parameter("pos"));
++  auto pos2_before_update =
++      get_value<Utils::Vector3d>(p2_handle->get_parameter("pos"));
++  Utils::Vector3d zero_vector{};
++  BOOST_TEST(pos1_before_update == zero_vector);
++  BOOST_TEST(pos2_before_update == zero_vector);
++
++  // Set positions of slice
++  VariantMap params{{"name", std::string("pos")}, {"values", new_positions}};
++  p_slice->call_method("set_param_parallel", params);
++
++  // Check if positions are set as expected
++  auto pos1_after_update =
++      get_value<Utils::Vector3d>(p1_handle->get_parameter("pos"));
++  auto pos2_after_update =
++      get_value<Utils::Vector3d>(p2_handle->get_parameter("pos"));
++  BOOST_TEST(pos1_after_update == get_value<Utils::Vector3d>(new_pos1));
++  BOOST_TEST(pos2_after_update == get_value<Utils::Vector3d>(new_pos2));
++}
++
++BOOST_FIXTURE_TEST_CASE(set_particle_types, ParticleFactory) {
++  // New positions for slice
++  Variant new_type1 = 1;
++  Variant new_type2 = 2;
++  std::vector<Variant> new_types = {new_type1, new_type2};
++
++  Utils::Factory<ObjectHandle> f;
++  f.register_new<Particles::ParticleSlice>("ParticleSlice");
++  f.register_new<Particles::ParticleHandle>("ParticleHandle");
++  f.register_new<CellSystem::CellSystem>("CellSystem");
++
++  boost::mpi::communicator comm;
++  auto ctx = std::make_shared<LocalContext>(f, comm);
++
++  // Create TestCellSystem object
++  auto &&sp_cell_system{ctx->make_shared("CellSystem", {})};
++  auto cell_system =
++      std::dynamic_pointer_cast<CellSystem::CellSystem>(sp_cell_system);
++  cell_system->bind_system(espresso::system);
++
++  // Parameters for ScriptInterface objects
++  VariantMap p1_init_params{{"id", 0}, {"__cell_structure", cell_system}};
++  VariantMap p2_init_params{{"id", 1}, {"__cell_structure", cell_system}};
++  VariantMap p_slice_init_params{{"id_selection", std::vector<int>{0, 1}},
++                                 {"__cell_structure", cell_system}};
++
++  // Create particle core objects
++  create_particle(Utils::Vector3d{0., 0., 0.}, 0, 0);
++  create_particle(Utils::Vector3d{0., 0., 0.}, 1, 0);
++
++  // Create 2 ParticleHandle, and 1 ParticleSlice object
++  auto &&sp_p1_handle{ctx->make_shared("ParticleHandle", {p1_init_params})};
++  auto &&sp_p2_handle{ctx->make_shared("ParticleHandle", {p2_init_params})};
++  // Particle handle 1
++  auto p1_handle =
++      std::dynamic_pointer_cast<Particles::ParticleHandle>(sp_p1_handle);
++  // Particle handle 2
++  auto p2_handle =
++      std::dynamic_pointer_cast<Particles::ParticleHandle>(sp_p2_handle);
++
++  // Particle slice
++  auto &&sp_p_slice{ctx->make_shared("ParticleSlice", {p_slice_init_params})};
++  std::shared_ptr<Particles::ParticleSlice> p_slice =
++      std::dynamic_pointer_cast<Particles::ParticleSlice>(sp_p_slice);
++
++  // Check if old types are actually zero
++  auto type1_before_update = get_value<int>(p1_handle->get_parameter("type"));
++  auto type2_before_update = get_value<int>(p2_handle->get_parameter("type"));
++  BOOST_TEST(type1_before_update == 0);
++  BOOST_TEST(type2_before_update == 0);
++
++  // Set types of slice
++  VariantMap params{{"name", std::string("type")}, {"values", new_types}};
++  p_slice->call_method("set_param_parallel", params);
++
++  // Check if types are set as expected
++  auto type1_after_update = get_value<int>(p1_handle->get_parameter("type"));
++  auto type2_after_update = get_value<int>(p2_handle->get_parameter("type"));
++  BOOST_TEST(type1_after_update == get_value<int>(new_type1));
++  BOOST_TEST(type2_after_update == get_value<int>(new_type2));
++}
++
++BOOST_FIXTURE_TEST_CASE(particle_modifier, ParticleFactory) {
++  using Particles::ParticleModifier;
++  Utils::Factory<ObjectHandle> f;
++  f.register_new<ParticleModifier>("ParticleModifier");
++
++  boost::mpi::communicator comm;
++  auto ctx = std::make_shared<LocalContext>(f, comm);
++
++  {
++    auto &&sp{ctx->make_shared("ParticleModifier", {{"id", -2}})};
++    auto so = std::dynamic_pointer_cast<ParticleModifier>(sp);
++    auto const pid = get_value<int>(so->get_parameter("id"));
++    BOOST_CHECK_EQUAL(pid, -2);
++    BOOST_CHECK(is_none(so->do_call_method("unknown", {})));
++  }
++
++  {
++    auto &&sp{ctx->make_shared("ParticleModifier", {})};
++    auto so = std::dynamic_pointer_cast<ParticleModifier>(sp);
++    auto const pid = get_value<int>(so->get_parameter("id"));
++    BOOST_CHECK_EQUAL(pid, -1);
++    BOOST_CHECK_EXCEPTION(
++        (so->do_call_method("remove_particle", {})), std::logic_error,
++        [](auto const &err) {
++          return std::string{err.what()} ==
++                 "ParticleModifier has no method 'remove_particle'";
++        });
++  }
++
++  {
++    VariantMap const invalid_params = {{"pos", 0}};
++    BOOST_CHECK_EXCEPTION(
++        (ctx->make_shared("ParticleModifier", invalid_params)),
++        std::logic_error, [](auto const &err) {
++          return std::string{err.what()} ==
++                 "ParticleModifier is not meant to create new particles";
++        });
++  }
++}
++
++BOOST_FIXTURE_TEST_CASE(test_exceptions, ParticleFactory) {
++  Variant non_vector_variant{1};
++
++  Utils::Factory<ObjectHandle> f;
++  f.register_new<Particles::ParticleSlice>("ParticleSlice");
++
++  boost::mpi::communicator comm;
++  auto ctx = std::make_shared<LocalContext>(f, comm);
++
++  VariantMap p_slice_init_params{
++      {"id_selection", std::vector<int>{0, 1}},
++  };
++
++  // Create particle core objects
++  create_particle(Utils::Vector3d{0., 0., 0.}, 0, 0);
++  create_particle(Utils::Vector3d{1., 0., 0.}, 1, 0);
++
++  // Create particle slice
++  auto &&sp_p_slice{ctx->make_shared("ParticleSlice", {p_slice_init_params})};
++  auto p_slice =
++      std::dynamic_pointer_cast<Particles::ParticleSlice>(sp_p_slice);
++
++  VariantMap params{{"name", std::string("v")}, {"values", non_vector_variant}};
++
++  BOOST_CHECK_EXCEPTION(p_slice->call_method("set_param_parallel", params),
++                        Exception, [](auto const &err) {
++                          return std::string{err.what()} ==
++                                 "Values must be of type vector, got int";
++                        });
++}
+diff --git a/testsuite/python/particle_slice.py b/testsuite/python/particle_slice.py
+index c7d46fd7612..b87eb8fb3e3 100644
+--- a/testsuite/python/particle_slice.py
++++ b/testsuite/python/particle_slice.py
+@@ -123,6 +123,56 @@ def test_propagation(self):
+         self.assertEqual(props[0], Propagation.NONE)
+         self.assertEqual(props[1], Propagation.TRANS_NEWTON)
+ 
++    def test_types(self):
++        # Set types on slices
++
++        # scalar
++        self.all_partcls.type = 0
++        self.assertEqual(repr(self.all_partcls.type),
++                         repr(np.array([0, 0, 0, 0])))
++
++        # list
++        self.p0p1.type = [1, 2]
++        self.assertEqual(self.p0.type, 1)
++        self.assertEqual(self.p1.type, 2)
++        self.assertEqual(self.p2.type, 0)
++        self.assertEqual(self.p3.type, 0)
++        self.assertEqual(repr(self.all_partcls.type),
++                         repr(np.array([1, 2, 0, 0])))
++
++        self.all_partcls.type = 0
++
++        # tuple
++        self.p0p1.type = (1, 2)
++        self.assertEqual(self.p0.type, 1)
++        self.assertEqual(self.p1.type, 2)
++        self.assertEqual(self.p2.type, 0)
++        self.assertEqual(self.p3.type, 0)
++        self.assertEqual(repr(self.all_partcls.type),
++                         repr(np.array([1, 2, 0, 0])))
++
++        # invalid values
++        with self.assertRaisesRegex(ValueError, "attribute 'type' of 'ParticleHandle' must be an integer >= 0"):
++            self.all_partcls.type = -1
++        with self.assertRaisesRegex(RuntimeError, "Provided argument of type.* is not convertible to.* because it contains a value that is not convertible to 'int'"):
++            self.p2p3.type = 1.
++
++        # incorrect number of types
++        with self.assertRaisesRegex(Exception, r"Value shape \(2,\) does not broadcast to attribute shape \(\)"):
++            self.all_partcls.type = [1, 2]
++        with self.assertRaisesRegex(Exception, r"Value shape \(5,\) does not broadcast to attribute shape \(\)"):
++            self.all_partcls.type = [0, 1, 2, 3, 4]
++
++        # missing parameters
++        with self.assertRaisesRegex(RuntimeError, "Parameter 'all_bonds_ids' is missing"):
++            self.all_partcls.call_method("set_param_parallel", name="bonds",
++                                         all_bonds_partner_ids=[])
++        with self.assertRaisesRegex(RuntimeError, "Parameter 'all_bonds_partner_ids' is missing"):
++            self.all_partcls.call_method("set_param_parallel", name="bonds",
++                                         all_bonds_ids=[])
++        with self.assertRaisesRegex(RuntimeError, "Parameter 'values' is missing"):
++            self.all_partcls.call_method("set_param_parallel", name="type")
++
+     def test_bonds(self):
+ 
+         fene = espressomd.interactions.FeneBond(k=1, d_r_max=1, r_0=1)

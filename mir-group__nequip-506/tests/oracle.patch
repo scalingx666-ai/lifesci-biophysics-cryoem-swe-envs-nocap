@@ -1,0 +1,279 @@
+diff --git a/nequip/nn/_tp_scatter_oeq.py b/nequip/nn/_tp_scatter_oeq.py
+index 095f09afe..1b81c8a96 100644
+--- a/nequip/nn/_tp_scatter_oeq.py
++++ b/nequip/nn/_tp_scatter_oeq.py
+@@ -1,5 +1,6 @@
+ import torch
+ from ._tp_scatter_base import TensorProductScatter
++from .compile_utils import uses_custom_op
+ from openequivariance import (
+     TensorProductConv,
+     TPProblem,
+@@ -7,6 +8,7 @@
+ )
+ 
+ 
++@uses_custom_op("openequivariance")
+ class OpenEquivarianceTensorProductScatter(TensorProductScatter):
+ 
+     def __init__(
+diff --git a/nequip/nn/compile_utils.py b/nequip/nn/compile_utils.py
+new file mode 100644
+index 000000000..4e29909f3
+--- /dev/null
++++ b/nequip/nn/compile_utils.py
+@@ -0,0 +1,117 @@
++# This file is a part of the `nequip` package. Please see LICENSE and README at the root for information on using it.
++import torch
++from typing import Final, Callable, Type, Set, Union, List
++
++
++_CUSTOM_OP_ATTR_NAME: Final[str] = "_nequip_module_uses_custom_op_libraries"
++_GLOBAL_CUSTOM_OP_LIBRARIES: Set[str] = set()
++
++
++def uses_custom_op(
++    library_name: Union[str, List[str]],
++) -> Callable[[Type[torch.nn.Module]], Type[torch.nn.Module]]:
++    """Decorator to mark nn.Module classes that use custom ops from external libraries.
++
++    This decorator should be applied to nn.Module classes that use custom PyTorch
++    operations provided by external libraries. The library information is stored
++    as metadata on the class and can be retrieved later to ensure the necessary
++    libraries are loaded before using compiled/packaged models.
++
++    External libraries specified this way will also be automatically marked as
++    extern during packaging.
++
++    Note:
++        Modules that use custom Trition operations should not be marked with this
++        decorator and are supported out-of-the-box.
++
++    Args:
++        library_name: Name of the library/libraries that provides the custom op(s).
++            Can be a single string or a list of strings for multiple libraries.
++
++    Returns:
++        A decorator function that adds custom op metadata to the module class.
++
++    Example:
++        >>> @uses_custom_op("my_custom_ops")
++        >>> class MyModule(torch.nn.Module):
++        ...     def forward(self, x):
++        ...         return my_custom_ops.special_operation(x)
++
++        >>> @uses_custom_op(["library1", "library2"])
++        >>> class MultiOpModule(torch.nn.Module):
++        ...     def forward(self, x):
++        ...         x = library1.op1(x)
++        ...         return library2.op2(x)
++    """
++
++    def decorator(cls: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
++        # Normalize to list
++        libraries = (
++            [library_name] if isinstance(library_name, str) else list(library_name)
++        )
++
++        # Add to global registry
++        _GLOBAL_CUSTOM_OP_LIBRARIES.update(libraries)
++
++        # Check if the class already has custom op libraries (from parent class)
++        existing_libraries = getattr(cls, _CUSTOM_OP_ATTR_NAME, None)
++        if existing_libraries is not None:
++            # Merge with existing libraries
++            libraries = list(set(existing_libraries) | set(libraries))
++
++        # Set the attribute on the class
++        setattr(cls, _CUSTOM_OP_ATTR_NAME, libraries)
++
++        return cls
++
++    return decorator
++
++
++def _get_module_custom_op_libraries(module_class: Type[torch.nn.Module]) -> Set[str]:
++    libraries = getattr(module_class, _CUSTOM_OP_ATTR_NAME, None)
++    if libraries is None:
++        return set()
++    return set(libraries)
++
++
++def get_custom_op_libraries(model: torch.nn.Module) -> Set[str]:
++    """Walk the module tree and collect all required custom op libraries.
++
++    This function recursively traverses all submodules of the given model
++    and collects the names of all libraries that provide custom operations
++    used by any module in the tree.
++
++    Args:
++        model: The root module to analyze.
++
++    Returns:
++        A set of library names that must be imported before the model
++        can be used (especially in compiled/packaged form).
++
++    Example:
++        >>> model = MyComplexModel()
++        >>> required_libraries = get_custom_op_libraries(model)
++        >>> for lib in required_libraries:
++        ...     importlib.import_module(lib)
++    """
++    all_libraries = set()
++
++    # Walk through all modules (including the root)
++    for module in model.modules():
++        # Get libraries from this module's class
++        module_libraries = _get_module_custom_op_libraries(type(module))
++        all_libraries.update(module_libraries)
++
++    return all_libraries
++
++
++def get_all_registered_custom_op_libraries() -> Set[str]:
++    """Get all custom op libraries that have been registered.
++
++    This function returns the set of all libraries that have ever been
++    registered using the @uses_custom_op decorator up until now.
++
++    Returns:
++        A set of all library names that have been registered via @uses_custom_op.
++    """
++    return _GLOBAL_CUSTOM_OP_LIBRARIES.copy()
+diff --git a/nequip/nn/graph_model.py b/nequip/nn/graph_model.py
+index 27ed7e21e..1d03ebe79 100644
+--- a/nequip/nn/graph_model.py
++++ b/nequip/nn/graph_model.py
+@@ -3,6 +3,7 @@
+ 
+ from nequip.data import AtomicDataDict
+ from ._graph_mixin import GraphModuleMixin
++from .compile_utils import get_custom_op_libraries
+ 
+ from typing import List, Dict, Any, Optional, Final
+ 
+@@ -12,9 +13,10 @@
+ TYPE_NAMES_KEY: Final[str] = "type_names"
+ NUM_TYPES_KEY: Final[str] = "num_types"
+ MODEL_DTYPE_KEY: Final[str] = "model_dtype"
++CUSTOM_OP_LIBRARIES_KEY: Final[str] = "custom_op_libraries"
+ 
+ 
+-def _model_metadata_from_config(model_config: Dict[str, str]) -> Dict[str, Any]:
++def _model_metadata_from_config(model_config: Dict[str, str]) -> Dict[str, str]:
+     model_metadata_dict = {}
+     # manually process everything
+     model_metadata_dict[MODEL_DTYPE_KEY] = model_config[MODEL_DTYPE_KEY]
+@@ -50,6 +52,8 @@ class GraphModel(GraphModuleMixin, torch.nn.Module):
+     is_graph_model: Final[bool] = True
+     # ^ to identify `GraphModel` types from `nequip-package`d models (see https://pytorch.org/docs/stable/package.html#torch-package-sharp-edges)
+ 
++    _metadata: Dict[str, str]
++
+     def __init__(
+         self,
+         model: GraphModuleMixin,
+@@ -80,16 +84,27 @@ def __init__(
+ 
+         # the following logic is for backward compatibility and to simplify unittests
+         self.model_dtype = torch.get_default_dtype()
+-        self.metadata = {}
++        self._metadata = {}
+         self.type_names = []
+         if model_config is not None:
+-            self.metadata = _model_metadata_from_config(model_config)
+-            self.type_names = self.metadata[TYPE_NAMES_KEY].split(" ")
++            self._metadata = _model_metadata_from_config(model_config)
++            self.type_names = self._metadata[TYPE_NAMES_KEY].split(" ")
+             model_dtype = {"float32": torch.float32, "float64": torch.float64}[
+-                self.metadata[MODEL_DTYPE_KEY]
++                self._metadata[MODEL_DTYPE_KEY]
+             ]
+             assert self.model_dtype == model_dtype
+ 
++    @property
++    def metadata(self) -> Dict[str, str]:
++        # Note that this is a property so that the metadata can depend on the _current_ state
++        # of the model, and not just what happened at initialization. This is essential for
++        # get_custom_op_libraries, the results of which will often be changed by model modifiers
++        # that are applied after initialization. (See _tp_scatter_oeq.py for an example.)
++        # TODO: make other metadata keys dynamic rather than pre-set in _metadata?
++        out = self._metadata.copy()
++        out[CUSTOM_OP_LIBRARIES_KEY] = ",".join(get_custom_op_libraries(self))
++        return out
++
+     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
+         # restrict the input data to allowed keys to prevent the model from directly using the dict from the outside,
+         # preventing weird pass-by-reference bugs
+diff --git a/nequip/scripts/compile.py b/nequip/scripts/compile.py
+index 2915bac86..79332f7d0 100644
+--- a/nequip/scripts/compile.py
++++ b/nequip/scripts/compile.py
+@@ -204,10 +204,19 @@ def main(args=None):
+     # ^ `ModuleDict` of `GraphModel` is loaded, we then select the desired `GraphModel` (`args.model` defaults to work for single model case)
+ 
+     # === combine model and global options metadata ===
++    # note that model.metadata can be dynamic and so can account for things that change as a result of modifiers
++    # reference the implementation of model.metadata to check whether this is true for any particular metadata key
+     metadata = model.metadata.copy()
+-    metadata.update(get_latest_global_state(only_metadata_related=True))
+-    # ensure bool -> int for metadata
+-    metadata = {k: int(v) if isinstance(v, bool) else v for k, v in metadata.items()}
++    global_metadata_state = get_latest_global_state(only_metadata_related=True)
++    assert set(metadata.keys()).isdisjoint(global_metadata_state.keys())
++    metadata.update(global_metadata_state)
++    del global_metadata_state
++    assert all(isinstance(k, str) for k in metadata.keys())
++    assert all(isinstance(v, (str, bool)) for v in metadata.values())
++    # ensure bool -> str(int) for metadata
++    metadata = {
++        k: str(int(v)) if isinstance(v, bool) else v for k, v in metadata.items()
++    }
+ 
+     logger.debug(model)
+ 
+diff --git a/nequip/scripts/package.py b/nequip/scripts/package.py
+index 1f5741745..a3a4c5d9f 100644
+--- a/nequip/scripts/package.py
++++ b/nequip/scripts/package.py
+@@ -22,6 +22,7 @@
+     _EAGER_MODEL_KEY,
+ )
+ from nequip.nn.model_modifier_utils import is_persistent_model_modifier
++from nequip.nn.compile_utils import get_all_registered_custom_op_libraries
+ from nequip.model.modify_utils import get_all_modifiers, only_apply_persistent_modifiers
+ from nequip.utils.logger import RankedLogger
+ from nequip.utils.versions import get_current_code_versions, _TORCH_GE_2_6
+@@ -41,6 +42,13 @@
+ # `nequip-package` generates the archival format for NequIP framework models. This file contains the information necessary to track the archival format itself.
+ # whenever the archival format changes, `_CURRENT_NEQUIP_PACKAGE_VERSION` (counter to track the packaged model format) should be bumped up to the next number. We can then condition `ModelFromPackage` on the packaging format version to decide code paths to load the model appropriately.
+ # `nequip-package` format version index to condition other features upon when loading `nequip-package` from a specific version
++#
++# Package version high-level CHANGELOG:
++# (use git blame on this line to identify specific commits and details of changes)
++# 0:
++#   - Initial version
++# 1:
++#   - package_metadata.txt instead of package_metadata.pkl
+ _CURRENT_NEQUIP_PACKAGE_VERSION = 1
+ 
+ 
+@@ -258,6 +266,18 @@ def main(args=None):
+                 model = ModelFromCheckpoint(args.ckpt_path, compile_mode=compile_mode)
+             models_to_package.update({compile_mode: model})
+ 
++        # Find the complete set of custom op libraries used by _all_ models.
++        # Note that because non-persistent modifiers are not applied now at
++        # packaging time, we cannot look only for custom ops that are used
++        # in the actual model objects, since others may also be caught by
++        # the packaging process. Instead, we extern all custom op libraries
++        # that have been registered in the current process, which should
++        # ideally be a superset of the custom op libraries that
++        # torch.package will try to include here.
++        custom_op_libraries = get_all_registered_custom_op_libraries()
++        _EXTERNAL_MODULES.extend(custom_op_libraries)
++        logger.debug(f"Also externing custom op libraries: {custom_op_libraries}")
++
+         # == package ==
+         with _suppress_package_importer_warnings():
+ 

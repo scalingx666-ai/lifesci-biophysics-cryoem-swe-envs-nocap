@@ -1,0 +1,2354 @@
+diff --git a/Project.toml b/Project.toml
+index 34524d399..06911bd69 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -30,6 +30,7 @@ SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+ SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
++StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
+ Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+ UnitfulAtomic = "a7773ee8-282e-5fa2-be4e-bd808c38a91a"
+ 
+@@ -49,7 +50,7 @@ MollyKernelDensityExt = "KernelDensity"
+ MollyPythonCallExt = "PythonCall"
+ 
+ [compat]
+-AcceleratedKernels = "0.4.3"
++AcceleratedKernels = "0.4.2"
+ Atomix = "0.1, 1.0"
+ AtomsBase = "0.5"
+ AtomsCalculators = "0.2"
+@@ -81,6 +82,7 @@ SparseArrays = "1.9"
+ SpecialFunctions = "2"
+ StaticArrays = "1.8.2"
+ Statistics = "1.9"
++StructArrays = "0.7.1"
+ Unitful = "1"
+ UnitfulAtomic = "1"
+ julia = "1.10"
+diff --git a/docs/src/examples.md b/docs/src/examples.md
+index 036a637b8..220cb0f22 100644
+--- a/docs/src/examples.md
++++ b/docs/src/examples.md
+@@ -1062,7 +1062,6 @@ neighbor_finder = DistanceNeighborFinder(
+     eligible=trues(length(atoms), length(atoms)),
+     dist_cutoff=1.5*r_cut,
+ )
+-disable_constrained_interactions!(neighbor_finder, shake.clusters)
+ 
+ sys = System(
+     atoms=atoms,
+diff --git a/src/Molly.jl b/src/Molly.jl
+index 38bdc3c47..3fa357249 100644
+--- a/src/Molly.jl
++++ b/src/Molly.jl
+@@ -20,12 +20,14 @@ using FFTW
+ using GPUArrays
+ using Graphs
+ using KernelAbstractions
++import KernelAbstractions as KA
+ using NearestNeighbors
+ using PeriodicTable
+ using SimpleCrystals
+ using SpecialFunctions
+ using Unitful
+ using UnitfulAtomic
++using StructArrays
+ 
+ using LinearAlgebra
+ using Random
+@@ -57,8 +59,10 @@ include("interactions/ewald.jl")
+ include("interactions/implicit_solvent.jl")
+ include("interactions/muller_brown.jl")
+ include("energy.jl")
++include("constraints/constraints_kernel_helper.jl")
+ include("constraints/constraints.jl")
+ include("constraints/shake.jl")
++include("constraints/shake_kernels.jl")
+ include("simulators.jl")
+ include("coupling.jl")
+ include("neighbors.jl")
+diff --git a/src/constraints/constraints.jl b/src/constraints/constraints.jl
+index 6f2855b24..eacb554d6 100644
+--- a/src/constraints/constraints.jl
++++ b/src/constraints/constraints.jl
+@@ -1,66 +1,224 @@
+ export
+     DistanceConstraint,
++    AngleConstraint,
+     disable_constrained_interactions!,
+     apply_position_constraints!,
+-    apply_velocity_constraints!
++    apply_velocity_constraints!,
++    check_position_constraints,
++    check_velocity_constraints
++
++
++abstract type Constraint{D} end
+ 
+ """
+     DistanceConstraint(i, j, dist)
+ 
++
++    DistanceConstraint(i, j, dist)
++
+ Constraint between two atoms that maintains a fixed distance between the two atoms.
+ """
+-struct DistanceConstraint{D, I}
++struct DistanceConstraint{D, I <: Integer} <: Constraint{D}
+     i::I
+     j::I
+     dist::D
+ end
+ 
+-#=
+-    ConstraintCluster(constraints)
++"""
++    AngleConstraint(i, j, k, angle_jk, dist_ij, dist_ik)
+ 
+-A group of constraints.
++Constraint between three atoms that maintains a fixed angle, angle_jk, and two bond lengths. 
++Atoms j and k must be connected to a shared central atom with fixed bond distances given by
++dist_ij and dist_ik. Internally, an `AngleConstraint` is converted to 3 distance constraints. None
++of the atoms in this constraint are allowed to be constrained with another atom not
++included in this constraint. Angle can be passed as Unitful deg/rad, or as a plain
++number in radians. You cannot constrain linear molecules like CO2.
+ 
+-Atoms in a cluster do not participate in any other constraints outside of that cluster.
+-Larger clusters may incur a performance penalty.
+-=#
+-struct ConstraintCluster{N, C}
+-    constraints::SVector{N, C}
+-    n_unique_atoms::Int
++# Arguments
++- `i`, `j`, `k`: The indices of the atoms in the constraint.
++- `angle_jk`: The angle between atoms j and k in radians if not Unitful.
++- `dist_ij`: The distance between atoms i and j.
++- `dist_ik`: The distance between atoms i and k.
++
++For example, a water molecule can be defined as:
++```julia
++ac = AngleConstraint(1, 2, 3, 104.5u"°", 0.9572u"Å", 0.9572u"Å")
++ac = AngleConstraint(1, 2, 3, 104.5 * π / 180, 0.9572u"Å", 0.9572u"Å")
++```
++where atom 1 is oxygen and atoms 2/3 are hydrogen.
++"""
++struct AngleConstraint{D, I <: Integer} <: Constraint{D}
++    i::I # Central atom
++    j::I
++    k::I
++    dist_ij::D
++    dist_ik::D
++    dist_jk::D
+ end
+ 
+-function ConstraintCluster(constraints)
+-    atom_ids = typeof(constraints[1].i)[]
+-    for constraint in constraints
+-        push!(atom_ids, constraint.i)
+-        push!(atom_ids, constraint.j)
++function AngleConstraint(i, j, k, angle_jk, dist_ij, dist_ik)
++
++    cosθ = cos(angle_jk)
++
++    if cosθ == -1.0
++        error(ArgumentError("Cannot constrain linear molecules."))
+     end
+-    return ConstraintCluster{length(constraints), eltype(constraints)}(
+-                constraints, length(unique(atom_ids)))
++
++    dist_jk = sqrt((dist_ij*dist_ij) + (dist_ik*dist_ik) -
++                    (2 * dist_ij * dist_ik * cosθ))
++
++    return AngleConstraint{typeof(dist_ij), typeof(i)}(i, j, k, dist_ij, dist_ik, dist_jk)
+ end
+ 
+-Base.length(cc::ConstraintCluster) = length(cc.constraints)
++to_distance_constraints(ac::AngleConstraint) = (
++    DistanceConstraint(ac.i, ac.j, ac.dist_ij), # arm 1
++    DistanceConstraint(ac.i, ac.k, ac.dist_ik), # arm 2
++    DistanceConstraint(ac.j, ac.k, ac.dist_jk) # angle
++) 
+ 
+-"""
+-    disable_constrained_interactions!(neighbor_finder, constraint_clusters)
+ 
+-Disables neighbor list interactions between atoms in a constraint.
+-"""
+-function disable_constrained_interactions!(neighbor_finder, constraint_clusters)
+-    for cluster in constraint_clusters
+-        for constraint in cluster.constraints
+-            neighbor_finder.eligible[constraint.i, constraint.j] = false
+-            neighbor_finder.eligible[constraint.j, constraint.i] = false
++function to_cluster_data(ac::AngleConstraint)
++    return AngleClusterData(Int32(ac.i), Int32(ac.j), Int32(ac.k), 
++                            ac.dist_ij, ac.dist_ik, ac.dist_jk)
++end
++
++
++# This finds the unique atom indicies given a the lists (is and js)
++# of atoms that participate in a constraint clusters.
++# The first atom in the result is the atom at the center of the cluster
++function order_atoms(is, js)
++
++    counts = Dict{Int,Int}()
++    for atom in is
++        counts[atom] = get(counts, atom, 0) + 1
++    end
++
++    for atom in js
++        counts[atom] = get(counts, atom, 0) + 1
++    end
++
++    central_atoms = [atom for (atom, cnt) in counts if cnt > 1]
++    unique_atoms = collect(keys(counts))
++
++    if length(central_atoms) == 1
++        central = central_atoms[1]
++        unique_atoms = [central; filter(x -> x != central, unique_atoms)]
++        return unique_atoms
++    elseif length(central_atoms) == 0 # Will trigger if just 1 bond in constraint (e.g. C-C)
++        return unique_atoms
++    else
++        @error "Cannot find central atom. You are not permitted to constraint chains of 4 atoms (e.g., C-C-C-C)"
++    end
++end
++
++# This makes sure the first atom in each distance constraint
++# is the central atom of the cluster. It also calls `order_atoms`
++# which ensures that the first atom in the cluster is the central atom
++function make_cluster_data(raw_is, raw_js, raw_ds)
++
++    raw_unique_idxs = unique([raw_is; raw_js])
++    N_unique_atoms = length(raw_unique_idxs)
++    N_constraints = length(raw_is)
++
++    is_single_bond = (N_constraints == 1)
++    is_angle_cluster = (N_constraints == 3 && N_unique_atoms == 3)
++
++    if is_single_bond || is_angle_cluster # no central atom, order agnostic
++        return ConstraintKernelData(Int32.(raw_unique_idxs)..., raw_ds...)
++    else # order matters, need to place central atom first
++        unique_idxs = order_atoms(raw_is, raw_js)
++        central = unique_idxs[1]
++        others  = unique_idxs[2:end]
++        M       = length(others)
++
++        dists = Vector{eltype(raw_ds)}(undef, M)
++
++        # Figure out which distance goes with new pairings
++        for (a, o) in enumerate(others)
++            for (idx, (i0, j0)) in enumerate(zip(raw_is, raw_js))
++                if (i0 == central && j0 == o) || (j0 == central && i0 == o)
++                    dists[a] = raw_ds[idx]
++                    break
++                end
++            end
++        end 
++
++        return ConstraintKernelData(Int32.(unique_idxs)..., dists...)
++    end
++end
++
++
++# Kernel to support when neighbor finder is on GPU
++@kernel function disable_pairs!(eligible, idx_i, idx_j)
++    tid = @index(Global, Linear)
++    if tid <= length(idx_i)
++        i = idx_i[tid]
++        j = idx_j[tid]
++        @inbounds eligible[i, j] = false
++        @inbounds eligible[j, i] = false
++    end
++end
++
++
++function disable_constrained_interactions!(
++        neighbor_finder,
++        constraint_clusters::AbstractVector
++    )
++
++
++    atom_interactions = interactions.(constraint_clusters)
++
++    if isa(neighbor_finder.eligible, AbstractGPUArray)
++
++        # Collect pairs first
++        i_idx = Int[]
++        j_idx = Int[]
++
++        for interaction_list in atom_interactions
++            for (i, j, _) in interaction_list
++                push!(i_idx, i)
++                push!(j_idx, j)
++            end
++        end
++
++        nf_backend = get_backend(neighbor_finder.eligible)
++        is_backend = get_backend(i_idx)
++
++        i_idx = to_backend(i_idx, is_backend, nf_backend)
++        j_idx = to_backend(j_idx, is_backend, nf_backend)
++
++        # 1024 is block size
++        kernel = disable_pairs!(nf_backend, 1024)
++        kernel(neighbor_finder.eligible, i_idx, j_idx, ndrange = length(i_idx))
++
++        return neighbor_finder
++
++    else # KernelAbstractions does not like the BitMatrix used by eligible on CPU
++
++        for interaction_list in atom_interactions
++            for (i, j, _) in interaction_list
++                neighbor_finder.eligible[i, j] = false
++                neighbor_finder.eligible[j, i] = false
++            end
+         end
++
++        return neighbor_finder
+     end
+-    return neighbor_finder
++
+ end
+ 
+-function build_clusters(n_atoms, constraints)
+-    constraint_graph = SimpleDiGraph(n_atoms)
+-    idx_dist_pairs = spzeros(n_atoms, n_atoms) * unit(constraints[1].dist)
++# Check for interactions between angle and non-angle clusters,
++# builds only non-angle clusters
++function build_central_atom_clusters(
++        num_atoms::Integer,
++        dist_constraints::AbstractVector{<:DistanceConstraint{D}}
++    ) where D
+ 
+     # Store constraints as directed edges, direction is arbitrary but necessary
+-    for constraint in constraints
++    constraint_graph = SimpleDiGraph(num_atoms)
++    idx_dist_pairs = spzeros(float_type(D), num_atoms, num_atoms) * unit(D)
++    
++    for constraint in dist_constraints
+         edge_added = add_edge!(constraint_graph, constraint.i, constraint.j)
+         if edge_added
+             idx_dist_pairs[constraint.i, constraint.j] = constraint.dist
+@@ -72,31 +230,146 @@ function build_clusters(n_atoms, constraints)
+ 
+     # Get groups of constraints that are connected to eachother
+     cc = connected_components(constraint_graph)
++    
++    clusters12 = Cluster12Data{D}[]
++    clusters23 = Cluster23Data{D}[]
++    clusters34 = Cluster34Data{D}[]
+ 
+     # Loop through connected regions and convert to clusters
+-    clusters = []
+-    for (cluster_idx, atom_idxs) in enumerate(cc)
++    for (_, atom_idxs) in enumerate(cc)
+         # Loop over atoms in connected region to build cluster
+         if length(atom_idxs) > 1 # connected_components gives unconnected vertices as well
+-            connected_constraints = []
++            is = Int[]; js = Int[]; dists = []
+             for ai in atom_idxs
+                 neigh_idxs = neighbors(constraint_graph, ai)
+                 for neigh_idx in neigh_idxs
+-                    constraint = DistanceConstraint(ai, neigh_idx, idx_dist_pairs[ai, neigh_idx])
+-                    push!(connected_constraints, constraint)
++                    push!(is, ai)
++                    push!(js, neigh_idx)
++                    push!(dists, idx_dist_pairs[ai, neigh_idx])
+                 end
+             end
+-            push!(clusters, ConstraintCluster(SVector(connected_constraints...)))
++
++            cluster_data = make_cluster_data(is, js, [dists...])
++            N_constraint = n_constraints(cluster_data)
++            N_unique = n_atoms_cluster(cluster_data)
++
++            if N_constraint == 1 && N_unique == 2 # Single bond constraint between two atoms
++                push!(clusters12, cluster_data)
++            elseif N_constraint == 2 && N_unique == 3 # Central atom with 2 bonds constrained
++                push!(clusters23, cluster_data)
++            elseif N_constraint == 3 && N_unique == 4 # Central atom 3 bonds constrained
++                push!(clusters34, cluster_data)
++            elseif N_constraint == 3 && N_unique == 3 # angle constraint
++                # Skip angle constraints, we will build them later if needed
++                continue
++            else
++                @error "Constraint clusters with more than 3 constraints or too few unique atoms are not unsupported. Got $(N_constraint) constraints and $(N_unique) unique atoms."
++            end
+         end
+     end
+ 
+-    return [clusters...]
++    return StructArray(clusters12), StructArray(clusters23), StructArray(clusters34)
++end
++
++function build_clusters(
++        n_atoms::Integer,
++        dist_constraints::AbstractVector{<:DistanceConstraint{D}},
++        angle_constraints::AbstractVector{<:AngleConstraint{D}}
++    ) where D
++
++    #! avoid mutating input, dont love this...
++    dist_constraints = copy(dist_constraints)
++
++    # Convert angle constraints to distance constraints.
++    # This is purely to check if they are connected to other
++    # clusters in the DAG
++    for ac in angle_constraints
++        push!(dist_constraints, to_distance_constraints(ac)...)
++    end
++
++    # Check for interactions between clusters and build non-angle clusters
++    clusters12, clusters23, clusters34 = 
++        build_central_atom_clusters(n_atoms, dist_constraints)
++
++    # Now that we know angle_constraints do not interact with
++    # any of the distance constraints we can build their clusters
++    clusters_angle = StructArray(to_cluster_data(ac) for ac in angle_constraints)
++
++    return clusters12, clusters23, clusters34, clusters_angle
++end
++
++function build_clusters(
++        n_atoms::Integer,
++        dist_constraints::Nothing,
++        angle_constraints::AbstractVector{<:AngleConstraint{D}}
++    ) where D
++    acc = StructArray(to_cluster_data(ac) for ac in angle_constraints)
++    #* These are non-concrete...what should I do instead??
++    return NoClusterData[], NoClusterData[], NoClusterData[], acc
++end 
++
++function build_clusters(
++        n_atoms::Integer,
++        dist_constraints::AbstractVector{<:DistanceConstraint{D}}, 
++        angle_constraints::Nothing
++    ) where D
++
++    clusters12, clusters23, clusters34 = 
++        build_central_atom_clusters(n_atoms, dist_constraints)
++
++    return clusters12, clusters23, clusters34, NoClusterData[]
++
++end
++
++# Fallback
++function build_clusters(
++    n_atoms::Integer,
++    dist_constraints::Nothing,
++    angle_constraints::Nothing
++)
++    return NoClusterData[], NoClusterData[], NoClusterData[], NoClusterData[]
++end
++
++
++
++#=
++    n_dof_lost(D::Integer, constraint_clusters)
++
++Calculate the number of degrees of freedom lost from the system due to the constraints.
++
++All constrained molecules with 3 or more atoms are assumed to be non-linear.
++The table below shows the degrees of freedom for different types of structures in the
++system where D is the dimensionality.
++When using constraint algorithms the vibrational degrees of freedom are removed from a molecule.
++
++| DoF           | Monoatomic | Linear Molecule | Non-Linear Molecule |
++| ------------- | ---------- | --------------- | ------------------- |
++| Translational |     D      |       D         |        D            |
++| Rotational    |     0      |     D - 1       |        D            |
++| Vibrational   |     0      |  D*N - (2D - 1) |    D*N - 2D         |
++| Total         |     D      |      D*N        |       D*N           |
++
++=#
++function n_dof_lost(D::Integer, constraint_clusters::AbstractVector)
++    # Bond constraints remove vibrational DoFs
++    vibrational_dof_lost = 0
++    # Assumes constraints are a non-linear chain
++    for cluster in constraint_clusters
++        N = n_atoms_cluster(cluster)
++        # If N > 2 assume non-linear (e.g. breaks for CO2)
++        vibrational_dof_lost += ((N == 2) ? D*N - (2*D - 1) : D*(N - 2))
++    end
++    return vibrational_dof_lost
++end
++
++function n_dof(D::Integer, n_atoms::Integer, boundary)
++    return D * n_atoms - (D - n_infinite_dims(boundary))
+ end
+ 
++
+ """
+-    apply_position_constraints!(sys, coord_storage; n_threads::Integer=Threads.nthreads())
+-    apply_position_constraints!(sys, coord_storage, vel_storage, dt;
+-                                n_threads::Integer=Threads.nthreads())
++    apply_position_constraints!(sys, coord_storage)
++    apply_position_constraints!(sys, coord_storage, vel_storage, dt)
+ 
+ Applies the system constraints to the coordinates.
+ 
+@@ -104,18 +377,20 @@ If `vel_storage` and `dt` are provided then velocity corrections are applied as
+ """
+ function apply_position_constraints!(sys, coord_storage; n_threads::Integer=Threads.nthreads())
+     for ca in sys.constraints
+-        apply_position_constraints!(sys, ca, coord_storage; n_threads=n_threads)
++        apply_position_constraints!(sys, ca, coord_storage; n_threads = n_threads)
+     end
+     return sys
+ end
+ 
+ function apply_position_constraints!(sys, coord_storage, vel_storage, dt;
+-                                     n_threads::Integer=Threads.nthreads())
++                                        n_threads::Integer=Threads.nthreads())
++
+     if length(sys.constraints) > 0
++
+         vel_storage .= -sys.coords ./ dt
+ 
+         for ca in sys.constraints
+-            apply_position_constraints!(sys, ca, coord_storage; n_threads=n_threads)
++            apply_position_constraints!(sys, ca, coord_storage; n_threads = n_threads)
+         end
+ 
+         vel_storage .+= sys.coords ./ dt
+@@ -126,47 +401,128 @@ function apply_position_constraints!(sys, coord_storage, vel_storage, dt;
+ end
+ 
+ """
+-    apply_velocity_constraints!(sys; n_threads::Integer=Threads.nthreads())
++    apply_velocity_constraints!(sys)
+ 
+ Applies the system constraints to the velocities.
+ """
+ function apply_velocity_constraints!(sys; n_threads::Integer=Threads.nthreads())
+     for ca in sys.constraints
+-        apply_velocity_constraints!(sys, ca; n_threads=n_threads)
++        apply_velocity_constraints!(sys, ca)
+     end
+     return sys
+ end
+ 
+-#=
+-    n_dof_lost(D::Integer, constraint_clusters)
+ 
+-Calculate the number of degrees of freedom lost from the system due to the constraints.
++@kernel inbounds=true function max_dist_error(
++        @Const(clusters::StructArray{C}),
++        @Const(r),
++        @Const(boundary),
++        maximums::AbstractVector{T},
++    ) where {C <: ConstraintKernelData, T}
+ 
+-All constrained molecules with 3 or more atoms are assumed to be non-linear.
+-The table below shows the degrees of freedom for different types of structures in the
+-system where D is the dimensionality.
+-When using constraint algorithms the vibrational degrees of freedom are removed from a molecule.
++    cluster_idx = @index(Global, Linear)
+ 
+-| DoF           | Monoatomic | Linear Molecule | Non-Linear Molecule |
+-| ------------- | ---------- | --------------- | ------------------- |
+-| Translational |     D      |       D         |        D            |
+-| Rotational    |     0      |     D - 1       |        D            |
+-| Vibrational   |     0      |  D*N - (2D - 1) |    D*N - 2D         |
+-| Total         |     D      |      D*N        |       D*N           |
++    if cluster_idx <= length(clusters)
++        cluster_max = typemin(T)
++        for (i, j, dist) in interactions(clusters[cluster_idx])
++            dr = vector(r[i], r[j], boundary)
++            err = ustrip(abs(norm(dr) - dist))
++            cluster_max = ifelse(err > cluster_max, err, cluster_max)
++        end
++        maximums[cluster_idx] = cluster_max
++    end
+ 
+-=#
+-function n_dof_lost(D::Integer, constraint_clusters)
+-    # Bond constraints remove vibrational DoFs
+-    vibrational_dof_lost = 0
+-    # Assumes constraints are a non-linear chain
+-    for cluster in constraint_clusters
+-        N = cluster.n_unique_atoms
+-        # If N > 2 assume non-linear (e.g. breaks for CO2)
+-        vibrational_dof_lost += ((N == 2) ? D*N - (2*D - 1) : D*(N - 2))
++end
++
++@kernel inbounds=true function max_vel_error(
++        @Const(clusters::StructArray{C}),
++        @Const(r),
++        @Const(v),
++        @Const(boundary),
++        maximums::AbstractVector{T},
++    ) where {C <: ConstraintKernelData, T}
++
++    cluster_idx = @index(Global, Linear)
++
++    if cluster_idx <= length(clusters)
++        cluster_max = typemin(T)
++        for (i, j, _) in interactions(clusters[cluster_idx])
++            dr = vector(r[i], r[j], boundary)
++            v_diff = v[j] .- v[i]
++            err = ustrip(abs(dot(dr, v_diff)))
++            cluster_max = ifelse(err > cluster_max, err, cluster_max)
++        end
++        maximums[cluster_idx] = cluster_max
+     end
+-    return vibrational_dof_lost
++    
+ end
+ 
+-function n_dof(D::Integer, n_atoms::Integer, boundary)
+-    return D * n_atoms - (D - n_infinite_dims(boundary))
++
++"""
++    check_position_constraints(sys, constraints)
++
++Checks if the position constraints are satisfied by the current coordinates of `sys`.
++"""
++function check_position_constraints(sys, ca)
++
++    err_unit = unit(eltype(eltype(sys.coords)))
++    if err_unit != unit(ca.dist_tolerance)
++        error(ArgumentError("Distance tolerance units in SHAKE are inconsistent with system coordinates."))
++    end
++
++    FT = float_type(sys)
++    cluster_maxes = FT[]
++
++    backend = get_backend(sys.coords)    
++    err_kernel = max_dist_error(backend, 128) #128 is block size
++
++    for cluster_type in cluster_keys(ca)
++        clusters = getproperty(ca, cluster_type)
++        if length(clusters) > 0
++            max_storage = allocate(backend, FT, length(clusters))
++            err_kernel(clusters, sys.coords, sys.boundary, max_storage; ndrange = length(clusters))
++            # not efficient to move to GPU first, but the array
++            # is usually small and this function is for testing
++            push!(cluster_maxes, reduce(max, Array(max_storage)))
++        end
++    end
++
++    KernelAbstractions.synchronize(backend)
++
++    return maximum(cluster_maxes) < ustrip(ca.dist_tolerance)
++end
++
++
++"""
++    check_velocity_constraints(sys, constraints)
++
++Checks if the velocity constraints are satisfied by the current velocities of `sys`.
++"""
++function check_velocity_constraints(sys::System, ca)
++
++    err_unit = unit(eltype(eltype(sys.velocities))) * unit(eltype(eltype(sys.coords)))
++    if err_unit != unit(ca.vel_tolerance)
++        error(ArgumentError("Velocity tolerance units in RATTLE are inconsistent wwith system velocities and coordinates."))
++    end
++
++    FT = float_type(sys)
++    cluster_maxes = FT[]
++
++    backend = get_backend(sys.coords)
++    err_kernel = max_vel_error(backend, 128) #128 is block size
++
++    for cluster_type in cluster_keys(ca)
++        clusters = getproperty(ca, cluster_type)
++        if length(clusters) > 0
++            max_storage = allocate(backend, FT, length(clusters))
++            err_kernel(clusters, sys.coords, sys.velocities, sys.boundary, max_storage; ndrange = length(clusters))
++            # not efficient to move to GPU first, but the array
++            # is usually small and this function is for testing
++            push!(cluster_maxes, reduce(max, Array(max_storage)))
++        end
++    end
++
++    KernelAbstractions.synchronize(backend)
++
++    return maximum(cluster_maxes) < ustrip(ca.vel_tolerance)
+ end
+diff --git a/src/constraints/constraints_kernel_helper.jl b/src/constraints/constraints_kernel_helper.jl
+new file mode 100644
+index 000000000..ea60f9d4e
+--- /dev/null
++++ b/src/constraints/constraints_kernel_helper.jl
+@@ -0,0 +1,91 @@
++
++
++
++# No-op when backends are same
++to_backend(arr, old::T, new::T) where {T <: KA.Backend} = arr
++
++# Allocates and copies when backends are different
++function to_backend(arr, old::A, new::B) where {A <: KA.Backend, B <: KA.Backend}
++    out = allocate(new, eltype(arr), size(arr))
++    copy!(out, arr)
++    return out
++end
++
++
++# These types will enable coalesced memory access
++# via StructArray{ConstraintKernelData}
++abstract type ConstraintKernelData{D, N, M} end
++
++n_constraints(::ConstraintKernelData{D,N,M}) where {D,N,M} = N
++n_atoms_cluster(::ConstraintKernelData{D,N,M}) where {D,N,M} = M
++
++struct NoClusterData <: ConstraintKernelData{Nothing, 0, 0} end
++
++# This is effectivelly just a distance constraint
++struct Cluster12Data{D} <: ConstraintKernelData{D, 1, 2}
++    k1::Int32
++    k2::Int32
++    dist12::D
++end
++
++function ConstraintKernelData(k1::Int32, k2::Int32, dist12::D) where D
++    return Cluster12Data{D}(k1, k2, dist12)
++end
++
++interactions(kd::Cluster12Data) = ((kd.k1, kd.k2, kd.dist12), )
++
++
++struct Cluster23Data{D} <: ConstraintKernelData{D, 2, 3}
++    k1::Int32
++    k2::Int32
++    k3::Int32
++    dist12::D
++    dist13::D
++end
++
++function ConstraintKernelData(k1::Int32, k2::Int32, k3::Int32, dist12::D, dist13::D) where D
++    return Cluster23Data{D}(k1, k2, k3, dist12, dist13)
++end
++
++interactions(kd::Cluster23Data) = ((kd.k1, kd.k2, kd.dist12), (kd.k1, kd.k3, kd.dist13))
++idx_keys(::Type{<:Cluster23Data}) = (:k1, :k2, :k3)
++dist_keys(::Type{<:Cluster23Data}) = (:dist12, :dist13)
++
++struct Cluster34Data{D} <: ConstraintKernelData{D, 3, 4}
++    k1::Int32
++    k2::Int32
++    k3::Int32
++    k4::Int32
++    dist12::D
++    dist13::D
++    dist14::D
++end
++
++function ConstraintKernelData(k1::Int32, k2::Int32, k3::Int32, k4::Int32, dist12::D, dist13::D, dist14::D) where D
++    return Cluster34Data{D}(k1, k2, k3, k4, dist12, dist13, dist14)
++end
++
++interactions(kd::Cluster34Data) = ((kd.k1, kd.k2, kd.dist12), (kd.k1, kd.k3, kd.dist13), (kd.k1, kd.k4, kd.dist14))
++idx_keys(::Type{<:Cluster34Data}) = (:k1, :k2, :k3, :k4)
++dist_keys(::Type{<:Cluster34Data}) = (:dist12, :dist13, :dist14)
++
++struct AngleClusterData{D} <: ConstraintKernelData{D, 3, 3}
++    k1::Int32
++    k2::Int32
++    k3::Int32
++    dist12::D
++    dist13::D
++    dist23::D
++end
++
++function ConstraintKernelData(k1::Int32, k2::Int32, k3::Int32, dist12::D, dist13::D, dist23::D) where D
++    return AngleClusterData{D}(k1, k2, k3, dist12, dist13, dist23)
++end
++
++
++interactions(kd::AngleClusterData) = ((kd.k1, kd.k2, kd.dist12), (kd.k1, kd.k3, kd.dist13), (kd.k2, kd.k3, kd.dist23))
++idx_keys(::Type{<:AngleClusterData}) = (:k1, :k2, :k3)
++dist_keys(::Type{<:AngleClusterData}) = (:dist12, :dist13, :dist23)
++
++central_atom(kd::K) where {K <: ConstraintKernelData} = kd.k1
++float_type(::ConstraintKernelData{D}) where D = float_type(D)
+\ No newline at end of file
+diff --git a/src/constraints/shake.jl b/src/constraints/shake.jl
+index cbb8dd2d1..307a4bf5d 100644
+--- a/src/constraints/shake.jl
++++ b/src/constraints/shake.jl
+@@ -1,12 +1,19 @@
+ export
+     SHAKE_RATTLE,
+-    check_position_constraints,
+-    check_velocity_constraints
++    setup_constraints!
++
+ 
+ """
+-    SHAKE_RATTLE(constraints, n_atoms, dist_tolerance, vel_tolerance)
++    SHAKE_RATTLE(n_atoms,
++                dist_tolerance,
++                vel_tolerance;
++                dist_constraints = nothing,
++                angle_constraints = nothing,
++                gpu_block_size = 64,
++                max_iters = 25)
+ 
+-Constrain distances during a simulation using the SHAKE and RATTLE algorithms.
++Constrain distances during a simulation using the SHAKE and RATTLE algorithms. 
++Either or both of `dist_constraints` and `angle_constraitns` must be passed.
+ 
+ Velocity constraints will be imposed for simulators that integrate velocities such as
+ [`VelocityVerlet`](@ref).
+@@ -14,150 +21,136 @@ See [Ryckaert et al. 1977](https://doi.org/10.1016/0021-9991(77)90098-5) for SHA
+ [Andersen 1983](https://doi.org/10.1016/0021-9991(83)90014-1) for RATTLE and
+ [Elber et al. 2011](https://doi.org/10.1140%2Fepjst%2Fe2011-01525-9) for a derivation
+ of the linear system solved to satisfy the RATTLE algorithm.
++[Krautler et al. 2000](https://onlinelibrary.wiley.com/doi/10.1002/1096-987X(20010415)22:5%3C501::AID-JCC1021%3E3.0.CO;2-V) for the M-SHAKE algorithm
+ 
+-Not currently compatible with GPU simulation.
+ 
+ # Arguments
+-- `constraints`: a vector of constraints to be imposed on the system.
+-- `n_atoms::Integer`: the number of atoms in the system.
++- `n_atoms`: Total number of atoms in the system.
+ - `dist_tolerance`: the tolerance used to end the iterative procedure when calculating
+     position constraints, should have the same units as the coordinates.
+ - `vel_tolerance`: the tolerance used to end the iterative procedure when calculating
+     velocity constraints, should have the same units as the velocities * the coordinates.
++- `dist_constraints`: A vector of [`DistanceConstraint`](@ref) objects that define the
++    distance constraints to be applied. If `nothing`, no distance constraints are applied.
++- `angle_constraints`: A vector of [`AngleConstraint`](@ref) objects that define the
++    angle constraints to be applied. If `nothing`, no angle constraints are applied.
++- `gpu_block_size`: The number of threads per block to use for GPU calculations. Defaults to 128.
++- `max_iters`: The maximum number of iterations to perform when doing SHAKE. Defaults to 25.
+ """
+-struct SHAKE_RATTLE{C, D, V}
+-    clusters::C
+-    dist_tolerance::D
+-    vel_tolerance::V
++struct SHAKE_RATTLE{A, B, C, D, E, F, I <: Integer}
++    clusters12::A
++    clusters23::B
++    clusters34::C
++    angle_clusters::D
++    dist_tolerance::E
++    vel_tolerance::F
++    gpu_block_size::I
++    max_iters::I
+ end
+ 
+-function SHAKE_RATTLE(constraints, n_atoms::Integer, dist_tolerance, vel_tolerance)
+-    clusters = build_clusters(n_atoms, constraints)
+-    return SHAKE_RATTLE{typeof(clusters), typeof(dist_tolerance), typeof(vel_tolerance)}(
+-            clusters, dist_tolerance, vel_tolerance)
+-end
++function SHAKE_RATTLE(n_atoms,
++                     dist_tolerance,
++                     vel_tolerance;
++                     dist_constraints = nothing,
++                     angle_constraints = nothing,
++                     gpu_block_size = 128, max_iters = 25)
+ 
+-function apply_position_constraints!(sys, ca::SHAKE_RATTLE, coord_storage;
+-                                     n_threads::Integer=Threads.nthreads())
+-    # SHAKE updates
+-    converged = false
+-
+-    while !converged
+-        for cluster in ca.clusters # Cannot parallelize this
+-            for constraint in cluster.constraints
+-                k1, k2 = constraint.i, constraint.j
+-
+-                # Vector between the atoms after unconstrained update (s)
+-                s12 = vector(sys.coords[k1], sys.coords[k2], sys.boundary)
+-
+-                # Vector between the atoms before unconstrained update (r)
+-                r12 = vector(coord_storage[k1], coord_storage[k2], sys.boundary)
+-
+-                if abs(norm(s12) - constraint.dist) > ca.dist_tolerance
+-                    m1_inv = inv(mass(sys.atoms[k1]))
+-                    m2_inv = inv(mass(sys.atoms[k2]))
+-                    a = (m1_inv + m2_inv)^2 * sum(abs2, r12)
+-                    b = -2 * (m1_inv + m2_inv) * dot(r12, s12)
+-                    c = sum(abs2, s12) - (constraint.dist)^2
+-                    D = b^2 - 4*a*c
+-
+-                    if ustrip(D) < 0.0
+-                        @warn "SHAKE determinant negative, setting to 0.0"
+-                        D = zero(D)
+-                    end
+-
+-                    # Quadratic solution for g
+-                    α1 = (-b + sqrt(D)) / (2*a)
+-                    α2 = (-b - sqrt(D)) / (2*a)
+-
+-                    g = abs(α1) <= abs(α2) ? α1 : α2
+-
+-                    # Update positions
+-                    δri1 = r12 .* (g*m1_inv)
+-                    δri2 = r12 .* (-g*m2_inv)
+-
+-                    sys.coords[k1] += δri1
+-                    sys.coords[k2] += δri2
+-                end
+-            end
+-        end
++    dc_isnothing = isnothing(dist_constraints)
++    ac_isnothing = isnothing(angle_constraints)
++
++    dc_length = dc_isnothing ? 0 : length(dist_constraints)
++    ac_length = ac_isnothing ? 0 : length(angle_constraints)
+ 
+-        converged = check_position_constraints(sys, ca)
++    ustrip(dist_tolerance) <= 0.0 && throw(ArgumentError("dist_tolerance must be greater than zero"))
++    ustrip(vel_tolerance) <= 0.0 && throw(ArgumentError("vel_tolerance must be greater than zero"))
++    (dc_isnothing && ac_isnothing) && throw(ArgumentError("At least one of dist_constraints or angle_constraints must be provided"))
++    (dc_length == 0 && ac_length == 0) && throw(ArgumentError("At least one of dist_constraints or angle_constraints must be non-empty"))
++
++    if !dc_isnothing && dc_length == 0
++        @warn "You passed an empty vector for `dist_constraints`, no distance constraints will be applied."
++        dist_constraints = nothing
++    end
++
++    if !ac_isnothing && ac_length == 0
++        @warn "You passed an empty vector for `angle_constraints`, no angle constraints will be applied."
++        angle_constraints = nothing
+     end
+-    return sys
+-end
+ 
+-function apply_velocity_constraints!(sys, ca::SHAKE_RATTLE; n_threads::Integer=Threads.nthreads())
+-    # RATTLE updates
+-    converged = false
++    if float_type(dist_tolerance) isa Float32 
++        if ustrip(dist_tolerance) <= Float32(1e-6) 
++            @warn "Using Float32 with a SHAKE dist_tolerance less than 1e-6. Might have convergence issues."
++        end
++    end
+ 
+-    while !converged
+-        for cluster in ca.clusters # Cannot parallelize this
+-            for constraint in cluster.constraints
+-                k1, k2 = constraint.i, constraint.j
++    if float_type(vel_tolerance) isa Float32 
++        if ustrip(vel_tolerance) <= Float32(1e-6) 
++            @warn "Using Float32 with a RATTLE vel_tolerance less than 1e-6. Might have convergence issues."
++        end
++    end
+ 
+-                inv_m1 = inv(mass(sys.atoms[k1]))
+-                inv_m2 = inv(mass(sys.atoms[k2]))
++    if isa(dist_constraints, AbstractGPUArray) || isa(angle_constraints, AbstractGPUArray)
++        throw(ArgumentError("Constraints should be passd to SHAKE_RATTLE on CPU. Data will be moved to GPU later."))
++    end
+ 
+-                # Vector between the atoms after SHAKE constraint
+-                r_k1k2 = vector(sys.coords[k1], sys.coords[k2], sys.boundary)
++    clusters12, clusters23, clusters34, angle_clusters = build_clusters(n_atoms, dist_constraints, angle_constraints)
+ 
+-                # Difference between unconstrainted velocities
+-                v_k1k2 = sys.velocities[k2] .- sys.velocities[k1]
++    A = typeof(clusters12)
++    B = typeof(clusters23)
++    C = typeof(clusters34)
++    D = typeof(angle_clusters)
+ 
+-                err = abs(dot(r_k1k2, v_k1k2))
+-                if err > ca.vel_tolerance
+-                    # Re-arrange constraint equation to solve for Lagrange multiplier
+-                    # This has a factor of dt which cancels out in the velocity update
+-                    λₖ = -dot(r_k1k2, v_k1k2) / (dot(r_k1k2, r_k1k2) * (inv_m1 + inv_m2))
++    return SHAKE_RATTLE{A, B, C, D, typeof(dist_tolerance), typeof(vel_tolerance), typeof(max_iters)}(
++        clusters12, clusters23, clusters34, angle_clusters, dist_tolerance, vel_tolerance, gpu_block_size, max_iters)
++end
+ 
+-                    # Correct velocities
+-                    sys.velocities[k1] -= inv_m1 .* λₖ .* r_k1k2
+-                    sys.velocities[k2] += inv_m2 .* λₖ .* r_k1k2
+-                end
+-            end
+-        end
++function SHAKE_RATTLE(sr::SHAKE_RATTLE, clusters12, clusters23, clusters34, angle_clusters)
++    A = typeof(clusters12)
++    B = typeof(clusters23)
++    C = typeof(clusters34)
++    D = typeof(angle_clusters)
+ 
+-        converged = check_velocity_constraints(sys, ca)
+-    end
+-    return sys
++    return SHAKE_RATTLE{A, B, C, D, typeof(sr.dist_tolerance), typeof(sr.vel_tolerance), typeof(sr.max_iters)}(
++        clusters12, clusters23, clusters34, angle_clusters,
++        sr.dist_tolerance, sr.vel_tolerance, sr.gpu_block_size, sr.max_iters)
+ end
+ 
+-"""
+-    check_position_constraints(sys, constraints)
++cluster_keys(::SHAKE_RATTLE) = [:clusters12, :clusters23, :clusters34, :angle_clusters]
+ 
+-Checks if the position constraints are satisfied by the current coordinates of `sys`.
+-"""
+-function check_position_constraints(sys, ca::SHAKE_RATTLE)
+-    max_err = typemin(float_type(sys)) * unit(eltype(eltype(sys.coords)))
+-    for cluster in ca.clusters
+-        for constraint in cluster.constraints
+-            dr = vector(sys.coords[constraint.i], sys.coords[constraint.j], sys.boundary)
+-            err = abs(norm(dr) - constraint.dist)
+-            if max_err < err
+-                max_err = err
+-            end
+-        end
++function setup_constraints!(sr::SHAKE_RATTLE, neighbor_finder, arr_type)
++
++    # Disable Neighbor interactions that are constrained
++    if typeof(neighbor_finder) != NoNeighborFinder
++        disable_constrained_interactions!(neighbor_finder, sr.clusters12)
++        disable_constrained_interactions!(neighbor_finder, sr.clusters23)
++        disable_constrained_interactions!(neighbor_finder, sr.clusters34)
++        disable_constrained_interactions!(neighbor_finder, sr.angle_clusters)
+     end
+-    return max_err < ca.dist_tolerance
+-end
+ 
+-"""
+-    check_velocity_constraints(sys, constraints)
++    # Move to proper backend, if CPU do nothing
++    if arr_type <: AbstractGPUArray
+ 
+-Checks if the velocity constraints are satisfied by the current velocities of `sys`.
+-"""
+-function check_velocity_constraints(sys::System, ca::SHAKE_RATTLE)
+-    max_err = typemin(float_type(sys)) * unit(eltype(eltype(sys.velocities))) * unit(eltype(eltype(sys.coords)))
+-    for cluster in ca.clusters
+-        for constraint in cluster.constraints
+-            dr = vector(sys.coords[constraint.i], sys.coords[constraint.j], sys.boundary)
+-            v_diff = sys.velocities[constraint.j] .- sys.velocities[constraint.i]
+-            err = abs(dot(dr, v_diff))
+-            if max_err < err
+-                max_err = err
+-            end
++        clusters12_gpu = []; clusters23_gpu = []
++        clusters34_gpu = []; angle_clusters_gpu = []
++
++        if length(sr.clusters12) > 0
++            clusters12_gpu = replace_storage(arr_type, sr.clusters12)
+         end
++        if length(sr.clusters23) > 0
++            clusters23_gpu = replace_storage(arr_type, sr.clusters23)
++        end
++        if length(sr.clusters34) > 0
++            clusters34_gpu = replace_storage(arr_type, sr.clusters34)
++        end
++        if length(sr.angle_clusters) > 0
++            angle_clusters_gpu = replace_storage(arr_type, sr.angle_clusters)
++        end
++
++        sr = SHAKE_RATTLE(sr, clusters12_gpu, clusters23_gpu, clusters34_gpu, angle_clusters_gpu)
+     end
+-    return max_err < ca.vel_tolerance
++
++    # neighboor_finder is also modified
++    # but returning only sr makes life easier in types.jl
++    return sr
++
+ end
++
+diff --git a/src/constraints/shake_kernels.jl b/src/constraints/shake_kernels.jl
+new file mode 100644
+index 000000000..d5a079bc3
+--- /dev/null
++++ b/src/constraints/shake_kernels.jl
+@@ -0,0 +1,848 @@
++# The RATTLE Equations are modified from LAMMPS:
++# https://github.com/lammps/lammps/blob/develop/src/RIGID/fix_rattle.cpp
++
++@inline function solve2x2exactly(λ, A, C)
++
++    determinant = (A[1, 1] * A[2, 2]) - (A[1, 2] * A[2, 1])
++
++    if iszero(determinant)
++        error("SHAKE determinant is zero, cannot solve")
++    end
++
++    inv_det = inv(determinant)
++
++    λ[1] = inv_det * ((A[2, 2] * C[1]) - (A[1, 2] * C[2]))
++    λ[2] = inv_det * ((A[1, 1] * C[2]) - (A[2, 1] * C[1]))
++
++    return λ
++end
++
++@inline function solve3x3exactly!(λ, A, A′, C)
++
++    determinant = A[1,1]*A[2,2]*A[3,3] + A[1,2]*A[2,3]*A[3,1] + A[1,3]*A[2,1]*A[3,2] - 
++                    A[1,1]*A[2,3]*A[3,2] - A[1,2]*A[2,1]*A[3,3] - A[1,3]*A[2,2]*A[3,1]
++
++    if iszero(determinant)
++        error("SHAKE determinant is zero, cannot solve")
++    end
++
++    inv_det = inv(determinant)
++
++    A′[1,1] = inv_det * (A[2,2]*A[3,3] - A[2,3]*A[3,2])
++    A′[1,2] = -inv_det * (A[1,2]*A[3,3] - A[1,3]*A[3,2])
++    A′[1,3] = inv_det * (A[1,2]*A[2,3] - A[1,3]*A[2,2])
++    A′[2,1] = -inv_det * (A[2,1]*A[3,3] - A[2,3]*A[3,1])
++    A′[2,2] = inv_det * (A[1,1]*A[3,3] - A[1,3]*A[3,1])
++    A′[2,3] = -inv_det * (A[1,1]*A[2,3] - A[1,3]*A[2,1])
++    A′[3,1] = inv_det * (A[2,1]*A[3,2] - A[2,2]*A[3,1])
++    A′[3,2] = -inv_det * (A[1,1]*A[3,2] - A[1,2]*A[3,1])
++    A′[3,3] = inv_det * (A[1,1]*A[2,2] - A[1,2]*A[2,1])
++
++    # Assumes lambda is set to zeros initially
++    for i in 1:3
++        λ[i] += (A′[i,1] * C[1]) + (A′[i,2] * C[2]) + (A′[i,3] * C[3])
++    end
++
++    return λ
++
++end
++
++# 2 atoms, 1 constraint
++@kernel inbounds=true function rattle2_kernel!(
++    @Const(k1s),
++    @Const(k2s),
++    @Const(r),
++    v,
++    @Const(m_inv),
++    @Const(boundary))
++
++    idx = @index(Global, Linear) # Global Constraint Idx
++
++    if idx <= length(k1s)
++
++        # Step 2 : Perform RATTLE, for a 2 atom cluster we
++        # just re-arrange λ = A / c, since they are all scalars.
++        k1 = k1s[idx]
++        k2 = k2s[idx]
++
++        v_k1 = v[k1] # uncoalesced read
++        v_k2 = v[k2] # uncoalesced read
++    
++        m1_inv = m_inv[k1]; m2_inv = m_inv[k2]  # uncoalesced read
++        r_k1k2  = vector(r[k1], r[k2], boundary) # uncoalesced read
++        v_k1k2 = v_k2 .- v_k1
++
++        λₖ = -dot(r_k1k2, v_k1k2) / (dot(r_k1k2, r_k1k2) * (m1_inv + m2_inv))
++
++        # Step 3: Update velocities in global memory
++        v[k1] -= m1_inv .* λₖ .* r_k1k2
++        v[k2] += m2_inv .* λₖ .* r_k1k2
++    end
++end
++
++# 3 atoms 2 constraints
++# Assumes first atom is central atom
++@kernel inbounds=true function rattle3_kernel!(
++    @Const(k1s),
++    @Const(k2s),
++    @Const(k3s),
++    @Const(r::AbstractVector{<:AbstractVector{L}}),
++    v::AbstractVector{<:AbstractVector{V}},
++    @Const(m_inv::AbstractVector{M}),
++    @Const(boundary)) where {L, V, M}
++
++    idx = @index(Global, Linear) # Global Constraint Idx
++    @uniform A_type = typeof(zero(L)*zero(L)*zero(M))
++    @uniform C_type = typeof(zero(V)*zero(L))
++    @uniform L_type = typeof(zero(C_type) / zero(A_type))
++
++    if idx <= length(k1s)        
++        # Allocate thread-local memory
++        A = @MMatrix zeros(A_type, 2, 2) # Units are L^2 / M
++        C = @MVector zeros(C_type, 2) # Units are L^2 / T
++        λ = @MVector zeros(L_type, 2) # Units are M / T
++
++        k1 = k1s[idx] # central atom
++        k2 = k2s[idx]
++        k3 = k3s[idx]
++
++        r_k1 = r[k1]
++     
++        m1_inv = m_inv[k1]; m2_inv = m_inv[k2]; m3_inv = m_inv[k3] # uncoalesced read
++        r_k1k2  = vector(r_k1, r[k2], boundary)
++        r_k1k3  = vector(r_k1, r[k3], boundary)
++
++        v_k1 = v[k1] # uncoalesced read
++        v_k2 = v[k2] # uncoalesced read
++        v_k3 = v[k3] # uncoalesced read
++
++        v_k1k2 = v_k2 .- v_k1
++        v_k1k3 = v_k3 .- v_k1
++
++        A[1, 1] = dot(r_k1k2, r_k1k2) * (m1_inv + m2_inv)
++        A[1, 2] = dot(r_k1k2, r_k1k3) * (m1_inv)
++        A[2, 1] = A[1, 2]
++        A[2, 2] = dot(r_k1k3, r_k1k3) * (m1_inv + m3_inv)
++
++        C[1] = -dot(r_k1k2, v_k1k2)
++        C[2] = -dot(r_k1k3, v_k1k3)
++
++        solve2x2exactly(λ, A, C)
++
++        # Update global memory
++        v[k1] -= m1_inv .* ((λ[1] .* r_k1k2) .+ (λ[2] .* r_k1k3))
++        v[k2] -= m2_inv .* (-λ[1] .* r_k1k2)
++        v[k3] -= m3_inv .* (-λ[2] .* r_k1k3)
++
++    end
++end
++
++# 4 atoms 3 cosntraints
++# Assumes first atom is central atom
++@kernel inbounds=true function rattle4_kernel!(
++    @Const(k1s),
++    @Const(k2s),
++    @Const(k3s),
++    @Const(k4s),
++    @Const(r::AbstractVector{<:AbstractVector{L}}),
++    v::AbstractVector{<:AbstractVector{V}},
++    @Const(m_inv::AbstractVector{M}),
++    @Const(boundary)) where {L,V,M}
++
++    idx = @index(Global, Linear) # Global Constraint Idx
++    @uniform A_type = typeof(zero(L)*zero(L)*zero(M))
++    @uniform A_tmp_type = typeof(inv(zero(M)) / (zero(L)*zero(L)))
++    @uniform C_type = typeof(zero(V)*zero(L))
++    @uniform L_type = typeof(zero(C_type) / zero(A_type))
++
++    if idx <= length(k1s)
++        # Allocate thread-local memory
++        A = @MMatrix zeros(A_type, 3, 3)
++        A_tmp = @MMatrix zeros(A_tmp_type, 3, 3)
++        C = @MVector zeros(C_type, 3)
++        λ = @MVector zeros(L_type, 3)
++
++        k1 = k1s[idx] # central atom
++        k2 = k2s[idx]
++        k3 = k3s[idx]
++        k4 = k4s[idx]
++
++        r_k1 = r[k1] # uncoalesced read
++     
++        m1_inv = m_inv[k1]; m2_inv = m_inv[k2]; m3_inv = m_inv[k3]; m4_inv = m_inv[k4] # uncoalesced read
++        r_k1k2  = vector(r_k1, r[k2], boundary) # uncoalesced read
++        r_k1k3  = vector(r_k1, r[k3], boundary) # uncoalesced read
++        r_k1k4  = vector(r_k1, r[k4], boundary) # uncoalesced read
++
++        vk1 = v[k1] # uncoalesced read
++        vk2 = v[k2] # uncoalesced read
++        vk3 = v[k3] # uncoalesced read
++        vk4 = v[k4] # uncoalesced read
++
++        v_k1k2 = vk2 .- vk1
++        v_k1k3 = vk3 .- vk1
++        v_k1k4 = vk4 .- vk1
++
++        A[1, 1] = dot(r_k1k2, r_k1k2) * (m1_inv + m2_inv)
++        A[1, 2] = dot(r_k1k2, r_k1k3) * (m1_inv)
++        A[1, 3] = dot(r_k1k2, r_k1k4) * (m1_inv)
++        A[2, 1] = A[1, 2]
++        A[2, 2] = dot(r_k1k3, r_k1k3) * (m1_inv + m3_inv)
++        A[2, 3] = dot(r_k1k3, r_k1k4) * (m1_inv)
++        A[3, 1] = A[1, 3]
++        A[3, 2] = A[2, 3]
++        A[3, 3] = dot(r_k1k4, r_k1k4) * (m1_inv + m4_inv)
++
++        C[1] = -dot(r_k1k2, v_k1k2)
++        C[2] = -dot(r_k1k3, v_k1k3)
++        C[3] = -dot(r_k1k4, v_k1k4)
++
++        solve3x3exactly!(λ, A, A_tmp, C)
++
++        # Update global memory
++        v[k1] -= m1_inv .* ((λ[1] .* r_k1k2) .+ (λ[2] .* r_k1k3) .+ λ[3] .* r_k1k4)
++        v[k2] -= m2_inv .* (-λ[1] .* r_k1k2)
++        v[k3] -= m3_inv .* (-λ[2] .* r_k1k3)
++        v[k4] -= m4_inv .* (-λ[3] .* r_k1k4)
++
++    end
++end
++
++# 3 atoms 3 constraints
++@kernel inbounds=true function rattle3_angle_kernel!(
++    @Const(k1s),
++    @Const(k2s),
++    @Const(k3s),
++    @Const(r::AbstractVector{<:AbstractVector{L}}),
++    v::AbstractVector{<:AbstractVector{V}},
++    @Const(m_inv::AbstractVector{M}),
++    @Const(boundary)) where {L, V, M}
++
++    idx = @index(Global, Linear) # Global Constraint Idx
++    @uniform A_type = typeof(zero(L)*zero(L)*zero(M))
++    @uniform A_tmp_type = typeof(inv(zero(M)) / (zero(L)*zero(L)))
++    @uniform C_type = typeof(zero(V)*zero(L))
++    @uniform L_type = typeof(zero(C_type) / zero(A_type))
++
++    if idx <= length(k1s)
++
++        # Allocate thread-local memory
++        A = @MMatrix zeros(A_type, 3, 3)
++        A_tmp = @MMatrix zeros(A_tmp_type, 3, 3)
++        C = @MVector zeros(C_type, 3)
++        λ = @MVector zeros(L_type, 3)
++
++        k1 = k1s[idx] # central atom
++        k2 = k2s[idx]
++        k3 = k3s[idx]
++
++        r_k1 = r[k1]; v_k1 = v[k1]
++        r_k2 = r[k2]; v_k2 = v[k2]
++        r_k3 = r[k3]; v_k3 = v[k3]
++     
++        m1_inv = m_inv[k1]; m2_inv = m_inv[k2]; m3_inv = m_inv[k3] #uncoalesced read
++        r_k1k2  = vector(r_k1, r_k2, boundary) # uncoalesced read
++        r_k1k3  = vector(r_k1, r_k3, boundary) # uncoalesced read
++        r_k2k3  = vector(r_k2, r_k3, boundary) # uncoalesced read
++
++        v_k1k2 = v_k2 .- v_k1
++        v_k1k3 = v_k3 .- v_k1
++        v_k2k3 = v_k3 .- v_k2
++
++        A[1, 1] = dot(r_k1k2, r_k1k2) * (m1_inv + m2_inv)
++        A[1, 2] = dot(r_k1k2, r_k1k3) * (m1_inv)
++        A[1, 3] = dot(r_k1k2, r_k2k3) * (-m2_inv)
++        A[2, 1] = A[1, 2]
++        A[2, 2] = dot(r_k1k3, r_k1k3) * (m1_inv + m3_inv)
++        A[2, 3] = dot(r_k1k3, r_k2k3) * (m3_inv)
++        A[3, 1] = A[1, 3]
++        A[3, 2] = A[2, 3]
++        A[3, 3] = dot(r_k2k3, r_k2k3) * (m2_inv + m3_inv)
++
++        C[1] = -dot(r_k1k2, v_k1k2)
++        C[2] = -dot(r_k1k3, v_k1k3)
++        C[3] = -dot(r_k2k3, v_k2k3)
++
++        solve3x3exactly!(λ, A, A_tmp, C)
++
++        # Update global memory
++        v[k1] -= m1_inv .* ((λ[1] .* r_k1k2) .+ (λ[2] .* r_k1k3))
++        v[k2] -= m2_inv .* ((-λ[1] .* r_k1k2) .+ (λ[3] .* r_k2k3))
++        v[k3] -= m3_inv .* ((-λ[2] .* r_k1k3) .- (λ[3] .* r_k2k3))
++
++    end
++end
++
++# 2 atoms, 1 constraint
++@kernel inbounds=true function shake2_kernel!(
++    k1s,
++    k2s,
++    dists, 
++    r_t1::T,
++    r_t2::T,
++    @Const(m_inv),
++    @Const(boundary)) where T
++
++    @uniform FT = float_type(boundary)
++
++    idx = @index(Global, Linear) # Global Constraint Idx
++    
++    if idx <= length(k1s)
++
++        k1 = k1s[idx] # central atom
++        k2 = k2s[idx]
++        distance = dists[idx]
++
++        r_t2_k1 = r_t2[k1] # uncoalesced read
++        r_t2_k2 = r_t2[k2] # uncoalesced read
++        r_t1_k1 = r_t1[k1] # uncoalesced read
++        r_t1_k2 = r_t1[k2] # uncoalesced read
++        
++        # Vector between the atoms after unconstrained update (s)
++        s12 = vector(r_t2_k1, r_t2_k2, boundary) 
++
++        # Vector between the atoms before unconstrained update (r)
++        r12 = vector(r_t1_k1, r_t1_k2, boundary)
++
++        m1_inv = m_inv[k1]; m2_inv = m_inv[k2]
++        a = (m1_inv + m2_inv)^2 * sum(abs2, r12)
++        b = -FT(2.0) * (m1_inv + m2_inv) * dot(r12, s12)
++        c = sum(abs2, s12) - (distance)^2
++        D = b^2 - FT(4.0)*a*c
++        
++        # Just let the system blow up?? 
++        # This usually happens when timestep too large or over constrained
++        # if ustrip(D) < FT(0.0)
++        #     error("SHAKE determinant negative: $(D)")
++        # end
++
++        α1 = (-b + sqrt(D)) / (2*a)
++        α2 = (-b - sqrt(D)) / (2*a)
++        g = ifelse(α1 <= α2, α1, α2)
++
++        # Step 3: Update global memory
++        r_t2[k1] += r12 .* (g*m1_inv)
++        r_t2[k2] += r12 .* (-g*m2_inv)
++
++    end
++
++end
++
++@kernel inbounds=true function shake_step!( 
++        @Const(active_idxs),    
++        still_active::AbstractVector{Bool},
++        @Const(N_active),
++        @Const(shake_fn),
++        kernel_args...;
++    )
++
++    tid = @index(Global, Linear)
++        
++    if tid <= N_active
++        # Get cluster-idx this thread will work on
++        cluster_idx = active_idxs[tid]
++
++        # Do one M-SHAKE iteration and check if it is converged or not
++        is_active = shake_fn(
++            cluster_idx,
++            kernel_args...
++        )
++        still_active[cluster_idx] = is_active
++    end
++    
++end
++
++function shake_gpu!(
++        clusters::StructArray{C},
++        max_iters,
++        gpu_block_size,
++        backend,
++        shake_kernel,
++        other_kernel_args...,
++    ) where {C <: ConstraintKernelData}
++
++    N_active_clusters = length(clusters)
++
++    kern = shake_step!(backend, gpu_block_size)
++
++    active_idxs = allocate(backend, Int32, N_active_clusters)
++    active_idxs .= 1:N_active_clusters
++    # Doesnt need to be initialized, kernel will do that
++    still_active = allocate(backend, Bool, N_active_clusters)
++    KA.pagelock!(backend, still_active)
++
++    iter = 1
++    while iter <= max_iters
++
++        kern(
++            active_idxs,    
++            still_active,
++            N_active_clusters,
++            shake_kernel,
++            getproperty.(Ref(clusters), idx_keys(C))...,
++            getproperty.(Ref(clusters), dist_keys(C))...,
++            other_kernel_args...;
++            ndrange = N_active_clusters
++        )
++
++        #* This compaction can be done ON GPU with 
++        #* the scan imeplmented in AcceleratedKernels.jl + a scatter operation
++        #* for now this is easier and (probably) faster for smaller systems
++        #* On CUDA/AMD we could also pin this memory...
++        still_active_host = Array(still_active) #! MOVING FROM DEVICE TO HOST
++        active_idxs_host  = findall(still_active_host) 
++
++        isempty(active_idxs_host) && break
++
++        N_active_clusters = length(active_idxs_host)
++        # Move active indices to the start. Anything at the end
++        # is ignored by kernel as only N_active_clusters 
++        # threads are launched.
++        @views copy!(active_idxs[1:N_active_clusters], Int32.(active_idxs_host))#! MOVING FROM HOST TO DEVICE
++    
++        iter += 1
++    end
++
++    if iter == max_iters + 1
++        @warn "SHAKE, $(Symbol(shake_kernel)), did not converge after $(max_iters) iterations. Some constraints may not be satisfied."
++    end
++
++end
++
++# 3 atoms, 2 constraints
++# Constraints between 1-2 and 1-3
++@inline function shake3_kernel!(
++        cluster_idx,
++        k1s, k2s, k3s,
++        dist12s, dist13s,
++        r_t1::AbstractVector{<:AbstractVector{L}}, 
++        r_t2::AbstractVector{<:AbstractVector{L}},
++        m_inv::AbstractVector{M}, 
++        boundary,
++        dist_tol::L
++    ) where {L,M}
++
++    @uniform A_type = typeof(zero(L)*zero(L)*zero(M))
++    @uniform C_type = typeof(zero(L)*zero(L))
++    @uniform L_type = typeof(1 / zero(M))
++    @uniform FT = float_type(boundary)
++
++    # Allocate thread-local memory
++    A = @MMatrix zeros(A_type, 2, 2) # Units are L^2 / M
++    C = @MVector zeros(C_type, 2) # Units are L^2
++    λ = @MVector zeros(L_type, 2) # Units are M
++
++    k1 = k1s[cluster_idx] # central atom
++    k2 = k2s[cluster_idx]
++    k3 = k3s[cluster_idx]
++
++    dist12 = dist12s[cluster_idx]
++    dist13 = dist13s[cluster_idx]
++
++    m1_inv = m_inv[k1] # uncoalesced read
++    m2_inv = m_inv[k2] # uncoalesced read
++    m3_inv = m_inv[k3] # uncoalesced read
++
++    r_t2_k1 = r_t2[k1] # uncoalesced read
++    r_t1_k1 = r_t1[k1] # uncoalesced read
++    r_t2_k2 = r_t2[k2] # uncoalesced read
++    r_t2_k3 = r_t2[k3] # uncoalesced read
++
++    r_k1k2  = vector(r_t1_k1, r_t1[k2], boundary)
++    r_k1k3  = vector(r_t1_k1, r_t1[k3], boundary)
++
++    # Distance vectors after unconstrainted update
++    s_k1k2 = vector(r_t2_k1, r_t2_k2, boundary)
++    s_k1k3 = vector(r_t2_k1, r_t2_k3, boundary)
++
++    # A matrix element (i,j) represents interaction of constraint i with constraint j.
++    A[1,1] = -FT(2.0) * dot(r_k1k2, s_k1k2) * (m1_inv + m2_inv) # this sets constraint 1 as between k1-k2
++    A[2,2] = -FT(2.0) * dot(r_k1k3, s_k1k3) * (m1_inv + m3_inv) # this sets constraint 1 as between k1-k3
++    A[1,2] = -FT(2.0) * dot(r_k1k3, s_k1k2) * m1_inv
++    A[2,1] = -FT(2.0) * dot(r_k1k2, s_k1k3) * m1_inv
++
++    C[1] = (dot(s_k1k2, s_k1k2) - (dist12*dist12))
++    C[2] = (dot(s_k1k3, s_k1k3) - (dist13*dist13))
++
++    solve2x2exactly(λ, A, C)
++
++    # Compute Deltas
++    Δ1 = m1_inv .* ((λ[1] .* r_k1k2) .+ (λ[2] .* r_k1k3))
++    Δ2 = m2_inv .* (-λ[1] .* r_k1k2)
++    Δ3 = m3_inv .* (-λ[2] .* r_k1k3)
++
++    # Step 3: Update global memory
++    r_t2[k1] -= Δ1
++    r_t2[k2] -= Δ2
++    r_t2[k3] -= Δ3
++
++    # Check tolerances, just re-compute instead of uncoalesced read
++    r_t2_k1 -= Δ1 
++    r_t2_k2 -= Δ2
++    r_t2_k3 -= Δ3
++
++    s_k1k2 = vector(r_t2_k1, r_t2_k2, boundary)
++    s_k1k3 = vector(r_t2_k1, r_t2_k3, boundary)
++
++    tol12 = abs(norm(s_k1k2) - dist12)
++    tol13 = abs(norm(s_k1k3) - dist13)
++
++    # Constraint still active if either above tolerance
++    return (tol12 > dist_tol) || (tol13 > dist_tol)
++
++end
++
++# 4 atoms, 3 constraints
++# Constraints between 1-2, 1-3 and 1-4
++@inline function shake4_kernel!(
++        cluster_idx,
++        k1s, k2s, k3s, k4s,
++        dist12s, dist13s, dist14s,
++        r_t1::AbstractVector{<:AbstractVector{L}},
++        r_t2::AbstractVector{<:AbstractVector{L}},
++        m_inv::AbstractVector{M}, 
++        boundary,
++        dist_tol::L
++    ) where {L,M}   
++
++    @uniform FT = float_type(boundary)
++    @uniform A_type = typeof(zero(L)*zero(L)*zero(M))
++    @uniform A_tmp_type = typeof(inv(zero(M)) / (zero(L)*zero(L)))
++    @uniform C_type = typeof(zero(L)*zero(L))
++    @uniform L_type = typeof(inv(zero(M)))
++
++    # Allocate thread-local memory
++    A = @MMatrix zeros(A_type, 3, 3)
++    A_tmp = @MMatrix zeros(A_tmp_type, 3, 3)
++    C = @MVector zeros(C_type, 3)
++    λ = @MVector zeros(L_type, 3)
++
++    k1 = k1s[cluster_idx] # central atom
++    k2 = k2s[cluster_idx]
++    k3 = k3s[cluster_idx]
++    k4 = k4s[cluster_idx]
++
++    dist12 = dist12s[cluster_idx]
++    dist13 = dist13s[cluster_idx]
++    dist14 = dist14s[cluster_idx]
++
++
++    m1_inv = m_inv[k1]; m2_inv = m_inv[k2];# uncoalesced read
++    m3_inv = m_inv[k3]; m4_inv = m_inv[k4] # uncoalesced read
++
++    r_t1_k1 = r_t1[k1] # uncoalesced read
++    r_t2_k1 = r_t2[k1] # uncoalesced read
++    r_t2_k2 = r_t2[k2] # uncoalesced read
++    r_t2_k3 = r_t2[k3] # uncoalesced read
++    r_t2_k4 = r_t2[k4] # uncoalesced read
++
++    r_k1k2  = vector(r_t1_k1, r_t1[k2], boundary)
++    r_k1k3  = vector(r_t1_k1, r_t1[k3], boundary)
++    r_k1k4  = vector(r_t1_k1, r_t1[k4], boundary)
++
++    # Distance vectors after unconstrainted update
++    s_k1k2 = vector(r_t2_k1, r_t2_k2, boundary)
++    s_k1k3 = vector(r_t2_k1, r_t2_k3, boundary)
++    s_k1k4 = vector(r_t2_k1, r_t2_k4, boundary)
++
++    # A matrix element (i,j) represents interaction of constraint i with constraint j.
++    A[1,1] = -FT(2.0) * dot(r_k1k2, s_k1k2) * (m1_inv + m2_inv) # this sets constraint 1 as between k1-k2
++    A[2,2] = -FT(2.0) * dot(r_k1k3, s_k1k3) * (m1_inv + m3_inv) # this sets constraint 2 as between k1-k3
++    A[3,3] = -FT(2.0) * dot(r_k1k4, s_k1k4) * (m1_inv + m4_inv) # this sets constraint 3 as between k1-k4
++    A[1,2] = -FT(2.0) * dot(r_k1k3, s_k1k2) * m1_inv
++    A[2,1] = -FT(2.0) * dot(r_k1k2, s_k1k3) * m1_inv
++    A[1,3] = -FT(2.0) * dot(r_k1k4, s_k1k2) * m1_inv
++    A[3,1] = -FT(2.0) * dot(r_k1k2, s_k1k4) * m1_inv
++    A[2,3] = -FT(2.0) * dot(r_k1k4, s_k1k3) * m1_inv
++    A[3,2] = -FT(2.0) * dot(r_k1k3, s_k1k4) * m1_inv
++
++    C[1] = (dot(s_k1k2, s_k1k2) - (dist12*dist12))
++    C[2] = (dot(s_k1k3, s_k1k3) - (dist13*dist13))
++    C[3] = (dot(s_k1k4, s_k1k4) - (dist14*dist14))
++
++    solve3x3exactly!(λ, A, A_tmp, C)
++
++    # Compute coordinate deltas
++    Δ1 = m1_inv .* ((λ[1] .* r_k1k2) .+ (λ[2] .* r_k1k3) .+ (λ[3] .* r_k1k4))
++    Δ2 = m2_inv .* (-λ[1] .* r_k1k2)
++    Δ3 = m3_inv .* (-λ[2] .* r_k1k3)
++    Δ4 = m4_inv .* (-λ[3] .* r_k1k4)
++
++    # Step 3: Update global memory
++    r_t2[k1] -= Δ1
++    r_t2[k2] -= Δ2
++    r_t2[k3] -= Δ3
++    r_t2[k4] -= Δ4
++
++    # Check tolerances, just re-compute instead of uncoalesced read
++    r_t2_k1 -= Δ1 
++    r_t2_k2 -= Δ2
++    r_t2_k3 -= Δ3
++    r_t2_k4 -= Δ4
++
++    s_k1k2 = vector(r_t2_k1, r_t2_k2, boundary)
++    s_k1k3 = vector(r_t2_k1, r_t2_k3, boundary)
++    s_k1k4 = vector(r_t2_k1, r_t2_k4, boundary)
++
++    tol12 = abs(norm(s_k1k2) - dist12)
++    tol13 = abs(norm(s_k1k3) - dist13)
++    tol14 = abs(norm(s_k1k4) - dist14)
++
++    # Constraint still active if either above tolerance
++    still_active = (tol12 > dist_tol) || (tol13 > dist_tol) || (tol14 > dist_tol)
++    return  still_active
++
++end
++
++# 3 atoms, 3 constraints
++# Constraints between 1-2, 1-3 and 2-3
++@inline function shake3_angle_kernel!(
++        cluster_idx,
++        k1s, k2s, k3s,
++        dist12s, dist13s, dist23s,
++        r_t1::AbstractVector{<:AbstractVector{L}},
++        r_t2::AbstractVector{<:AbstractVector{L}},
++        m_inv::AbstractVector{M}, 
++        boundary,
++        dist_tol::L
++    ) where {L,M}
++
++    @uniform FT = float_type(boundary)
++    @uniform A_type = typeof(zero(L)*zero(L)*zero(M))
++    @uniform A_tmp_type = typeof(inv(zero(M)) / (zero(L)*zero(L)))
++    @uniform C_type = typeof(zero(L)*zero(L))
++    @uniform L_type = typeof(inv(zero(M)))
++
++    # Allocate thread-local memory
++    A = @MMatrix zeros(A_type, 3, 3)
++    A_tmp = @MMatrix zeros(A_tmp_type, 3, 3)
++    C = @MVector zeros(C_type, 3)
++    λ = @MVector zeros(L_type, 3)
++
++    k1 = k1s[cluster_idx] # central atom
++    k2 = k2s[cluster_idx]
++    k3 = k3s[cluster_idx]
++
++    dist12 = dist12s[cluster_idx]
++    dist13 = dist13s[cluster_idx]
++    dist23 = dist23s[cluster_idx]
++
++    m1_inv = m_inv[k1]; m2_inv = m_inv[k2]; m3_inv = m_inv[k3] # uncoalesced read
++
++    r_t2_k1 = r_t2[k1] # uncoalesced read
++    r_t2_k2 = r_t2[k2] # uncoalesced read
++    r_t2_k3 = r_t2[k3] # uncoalesced read
++
++    r_t1_k1 = r_t1[k1] # uncoalesced read
++    r_t1_k2 = r_t1[k2] # uncoalesced read
++    r_t1_k3 = r_t1[k3] # uncoalesced read
++
++    r_k1k2  = vector(r_t1_k1, r_t1_k2, boundary)
++    r_k1k3  = vector(r_t1_k1, r_t1_k3, boundary)
++    r_k2k3  = vector(r_t1_k2, r_t1_k3, boundary)
++
++    # Distance vectors after unconstrainted update
++    s_k1k2 = vector(r_t2_k1, r_t2_k2, boundary)
++    s_k1k3 = vector(r_t2_k1, r_t2_k3, boundary)
++    s_k2k3 = vector(r_t2_k2, r_t2_k3, boundary)
++
++    # A matrix element (i,j) represents interaction of constraint i with constraint j.
++    A[1,1] = -FT(2.0) * dot(r_k1k2, s_k1k2) * (m1_inv + m2_inv) # this sets constraint 1 as between k1-k2
++    A[2,2] = -FT(2.0) * dot(r_k1k3, s_k1k3) * (m1_inv + m3_inv) # this sets constraint 2 as between k1-k3
++    A[3,3] = -FT(2.0) * dot(r_k2k3, s_k2k3) * (m2_inv + m3_inv) # this sets constraint 3 as between k2-k3
++    A[1,2] = -FT(2.0) * dot(r_k1k3, s_k1k2) * m1_inv
++    A[2,1] = -FT(2.0) * dot(r_k1k2, s_k1k3) * m1_inv
++    A[1,3] = -FT(2.0) * dot(r_k2k3, s_k1k2) * (-m2_inv)
++    A[3,1] = -FT(2.0) * dot(r_k1k2, s_k1k3) * (-m2_inv)
++    A[2,3] = -FT(2.0) * dot(r_k2k3, s_k1k3) * m3_inv
++    A[3,2] = -FT(2.0) * dot(r_k1k3, s_k2k3) * m3_inv
++
++    C[1] = (dot(s_k1k2, s_k1k2) - (dist12*dist12))
++    C[2] = (dot(s_k1k3, s_k1k3) - (dist13*dist13))
++    C[3] = (dot(s_k2k3, s_k2k3) - (dist23*dist23))
++
++    solve3x3exactly!(λ, A, A_tmp, C)
++
++    # Compute coordinate deltas
++    Δ1 = m1_inv .* ((λ[1] .* r_k1k2) .+ (λ[2] .* r_k1k3))
++    Δ2 = m2_inv .* ((-λ[1] .* r_k1k2) .+ (λ[3] .* r_k2k3))
++    Δ3 = m3_inv .* ((-λ[2] .* r_k1k3) .- (λ[3] .* r_k2k3))
++
++    # Step 3: Update global memory
++    r_t2[k1] -= Δ1
++    r_t2[k2] -= Δ2
++    r_t2[k3] -= Δ3
++
++    # Check tolerances, just re-compute instead of uncoalesced read
++    r_t2_k1 -= Δ1 
++    r_t2_k2 -= Δ2
++    r_t2_k3 -= Δ3
++
++    s_k1k2 = vector(r_t2_k1, r_t2_k2, boundary)
++    s_k1k3 = vector(r_t2_k1, r_t2_k3, boundary)
++    s_k2k3 = vector(r_t2_k2, r_t2_k3, boundary)
++
++    tol12 = abs(norm(s_k1k2) - dist12)
++    tol13 = abs(norm(s_k1k3) - dist13)
++    tol23 = abs(norm(s_k2k3) - dist23)
++
++    # Constraint still active if either above tolerance
++    still_active = (tol12 > dist_tol) || (tol13 > dist_tol) || (tol23 > dist_tol)
++    return still_active
++
++end
++ 
++function apply_position_constraints!(
++        sys::System,
++        ca::SHAKE_RATTLE, 
++        r_pre_unconstrained_update;
++        kwargs...
++    )
++
++    backend = get_backend(r_pre_unconstrained_update)
++
++    N12_clusters = length(ca.clusters12)
++    N23_clusters = length(ca.clusters23)
++    N34_clusters = length(ca.clusters34)
++    N_angle_clusters = length(ca.angle_clusters)
++
++    KernelAbstractions.synchronize(backend)
++
++    if N12_clusters > 0
++        # 2 atom constraints are solved analytically, no need to iterate
++        s2_kernel = shake2_kernel!(backend, ca.gpu_block_size)
++        s2_kernel(
++            ca.clusters12.k1,
++            ca.clusters12.k2,
++            ca.clusters12.dist12, 
++            r_pre_unconstrained_update,
++            sys.coords,
++            sys.inv_masses,
++            sys.boundary,
++            ndrange = N12_clusters
++            )
++    end
++    if N23_clusters > 0 
++        shake_gpu!(
++            ca.clusters23,
++            ca.max_iters,
++            ca.gpu_block_size,
++            backend,
++            shake3_kernel!,
++            r_pre_unconstrained_update,
++            sys.coords,
++            sys.inv_masses,
++            sys.boundary,
++            ca.dist_tolerance
++        )
++    end
++
++    if N34_clusters > 0
++        shake_gpu!(
++            ca.clusters34,
++            ca.max_iters,
++            ca.gpu_block_size,
++            backend,
++            shake4_kernel!,
++            r_pre_unconstrained_update,
++            sys.coords,
++            sys.inv_masses,
++            sys.boundary,
++            ca.dist_tolerance
++        )
++    end
++    
++    if N_angle_clusters > 0 
++        shake_gpu!(
++            ca.angle_clusters,
++            ca.max_iters,
++            ca.gpu_block_size,
++            backend,
++            shake3_angle_kernel!,
++            r_pre_unconstrained_update,
++            sys.coords,
++            sys.inv_masses,
++            sys.boundary,
++            ca.dist_tolerance
++        )
++    end
++
++    KernelAbstractions.synchronize(backend)
++
++end
++
++function apply_velocity_constraints!(sys::System, ca::SHAKE_RATTLE; kwargs...)
++
++    backend = get_backend(sys.velocities)
++
++    N12_clusters = length(ca.clusters12)
++    N23_clusters = length(ca.clusters23)
++    N34_clusters = length(ca.clusters34)
++    N_angle_clusters = length(ca.angle_clusters)
++
++    #* TODO LAUNCH ON SEPARATE STREAMS/TASKS
++    KernelAbstractions.synchronize(backend)
++
++    if N12_clusters > 0
++        N12_blocks = cld(N12_clusters, ca.gpu_block_size)
++        r2_kernel = rattle2_kernel!(backend, N12_blocks, N12_clusters)
++        r2_kernel(
++            ca.clusters12.k1,
++            ca.clusters12.k2,
++            sys.coords,
++            sys.velocities,
++            sys.inv_masses,
++            sys.boundary,
++            ndrange = N12_clusters
++        )
++    end
++
++    if N23_clusters > 0
++        N23_blocks = cld(N23_clusters, ca.gpu_block_size)
++        r3_kernel = rattle3_kernel!(backend, N23_blocks, N23_clusters)
++        r3_kernel(
++            ca.clusters23.k1,
++            ca.clusters23.k2,
++            ca.clusters23.k3,
++            sys.coords,
++            sys.velocities,
++            sys.inv_masses,
++            sys.boundary,
++            ndrange = N23_clusters
++        )
++    end
++
++    if N34_clusters > 0
++        N34_blocks = cld(N34_clusters, ca.gpu_block_size)
++        r4_kernel = rattle4_kernel!(backend, N34_blocks, N34_clusters)
++        r4_kernel(
++            ca.clusters34.k1,
++            ca.clusters34.k2,
++            ca.clusters34.k3,
++            ca.clusters34.k4,
++            sys.coords,
++            sys.velocities, 
++            sys.inv_masses,
++            sys.boundary,
++            ndrange = N34_clusters
++        )
++    end
++
++    if N_angle_clusters > 0
++        N_angle_blocks = cld(N_angle_clusters, ca.gpu_block_size)
++        r3_angle_kernel = rattle3_angle_kernel!(backend, N_angle_blocks, N_angle_clusters)
++        r3_angle_kernel(
++            ca.angle_clusters.k1,
++            ca.angle_clusters.k2,
++            ca.angle_clusters.k3,
++            sys.coords,
++            sys.velocities,
++            sys.inv_masses,
++            sys.boundary,
++            ndrange = N_angle_clusters
++        )
++    end
++    
++    KernelAbstractions.synchronize(backend)
++
++end
+diff --git a/src/simulators.jl b/src/simulators.jl
+index cd6a99190..150a6aab4 100644
+--- a/src/simulators.jl
++++ b/src/simulators.jl
+@@ -165,6 +165,7 @@ end
+         end
+ 
+         sys.coords .+= sys.velocities .* sim.dt .+ accels_t .* dt_sq_div2
++
+         using_constraints && apply_position_constraints!(sys, cons_coord_storage, cons_vel_storage,
+                                                          sim.dt; n_threads=n_threads)
+         sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
+@@ -235,7 +236,9 @@ end
+     forces_t = zero_forces(sys)
+     forces_buffer = init_forces_buffer!(sys, n_threads)
+     accels_t = forces_t ./ masses(sys)
++
+     using_constraints = (length(sys.constraints) > 0)
++
+     if using_constraints
+         cons_coord_storage = zero(sys.coords)
+     end
+@@ -391,6 +394,7 @@ end
+     accels_t = forces_t ./ masses(sys)
+     noise = zero(sys.velocities)
+     using_constraints = (length(sys.constraints) > 0)
++
+     if using_constraints
+         cons_coord_storage = zero(sys.coords)
+         cons_vel_storage = zero(sys.velocities)
+@@ -405,7 +409,7 @@ end
+         apply_velocity_constraints!(sys; n_threads=n_threads)
+ 
+         if using_constraints
+-            cons_coord_storage .= sys.coords
++            copy!(cons_coord_storage, sys.coords)
+         end
+         sys.coords .+= sys.velocities .* dt_div2
+ 
+diff --git a/src/types.jl b/src/types.jl
+index aa661cbfd..2fbde1597 100644
+--- a/src/types.jl
++++ b/src/types.jl
+@@ -493,7 +493,7 @@ interface described there.
+ - `data::DA=nothing`: arbitrary data associated with the system.
+ """
+ mutable struct System{D, AT, T, A, C, B, V, AD, TO, PI, SI, GI, CN, NF,
+-                      L, F, E, K, M, DA} <: AtomsBase.AbstractSystem{D}
++                      L, F, E, K, M, IM, DA} <: AtomsBase.AbstractSystem{D}
+     atoms::A
+     coords::C
+     boundary::B
+@@ -511,6 +511,7 @@ mutable struct System{D, AT, T, A, C, B, V, AD, TO, PI, SI, GI, CN, NF,
+     energy_units::E
+     k::K
+     masses::M
++    inv_masses::IM
+     data::DA
+ end
+ 
+@@ -542,7 +543,6 @@ function System(;
+     PI = typeof(pairwise_inters)
+     SI = typeof(specific_inter_lists)
+     GI = typeof(general_inters)
+-    CN = typeof(constraints)
+     NF = typeof(neighbor_finder)
+     L = typeof(loggers)
+     F = typeof(force_units)
+@@ -571,13 +571,6 @@ function System(;
+         throw(ArgumentError("there are $(length(atoms)) atoms but $(length(atoms_data)) atom data entries"))
+     end
+ 
+-    df = n_dof(D, length(atoms), boundary)
+-    if length(constraints) > 0
+-        for ca in constraints
+-            df -= n_dof_lost(D, ca.clusters)
+-        end
+-    end
+-
+     if isa(atoms, AbstractGPUArray) && !isa(coords, AbstractGPUArray)
+         throw(ArgumentError("the atoms are on the GPU but the coordinates are not"))
+     end
+@@ -590,9 +583,6 @@ function System(;
+     if isa(vels, AbstractGPUArray) && !isa(atoms, AbstractGPUArray)
+         throw(ArgumentError("the velocities are on the GPU but the atoms are not"))
+     end
+-    if isa(atoms, AbstractGPUArray) && length(constraints) > 0
+-        @warn "Constraints are not currently compatible with simulation on the GPU"
+-    end
+ 
+     atom_masses = mass.(atoms)
+     M = typeof(atom_masses)
+@@ -604,13 +594,33 @@ function System(;
+         @warn "eltype of coords or velocities is not isbits, it is recomended to use a vector of SVector's for performance"
+     end
+ 
++    df = n_dof(D, length(atoms), boundary)
++    if length(constraints) > 0
++        for ca in constraints
++            for cluster_type in cluster_keys(ca)
++                clusters = getproperty(ca, cluster_type)
++                df -= n_dof_lost(D, clusters)
++            end
++        end
++    end
++    # Automatically disbales interactions between constrained atoms
++    # and whatever else is implemented for the constraint type.
++    # Constraints moved to GPU here if necessary.
++    constraints = Tuple(setup_constraints!(ca, neighbor_finder, AT) for ca in constraints)
++    CN = typeof(constraints)
++
++    # Useful to have pre-compute
++    inv_masses = T(1) ./ atom_masses
++    IM = typeof(inv_masses)
++
++
+     check_units(atoms, coords, vels, energy_units, force_units, pairwise_inters,
+                 specific_inter_lists, general_inters, boundary)
+ 
+-    return System{D, AT, T, A, C, B, V, AD, TO, PI, SI, GI, CN, NF, L, F, E, K, M, DA}(
++    return System{D, AT, T, A, C, B, V, AD, TO, PI, SI, GI, CN, NF, L, F, E, K, M, IM, DA}(
+                     atoms, coords, boundary, vels, atoms_data, topology, pairwise_inters,
+                     specific_inter_lists, general_inters, constraints, neighbor_finder, loggers,
+-                    df, force_units, energy_units, k_converted, atom_masses, data)
++                    df, force_units, energy_units, k_converted, atom_masses, inv_masses, data)
+ end
+ 
+ """
+@@ -1027,6 +1037,8 @@ function ReplicaSystem(;
+ 
+     atom_masses = mass.(atoms)
+     M = typeof(atom_masses)
++    inv_masses = T(1) ./ atom_masses
++    IM = typeof(inv_masses)
+ 
+     k_converted = convert_k_units(T, k, energy_units)
+     K = typeof(k_converted)
+@@ -1034,12 +1046,12 @@ function ReplicaSystem(;
+     replicas = Tuple(System{D, AT, T, A, C, B, V, AD, TO, typeof(replica_pairwise_inters[i]),
+                         typeof(replica_specific_inter_lists[i]), typeof(replica_general_inters[i]),
+                         typeof(replica_constraints[i]), NF, typeof(replica_loggers[i]), F, E, K,
+-                        M, Nothing}(
++                        M, IM, Nothing}(
+             atoms, replica_coords[i], boundary, replica_velocities[i], atoms_data,
+             replica_topology[i], replica_pairwise_inters[i], replica_specific_inter_lists[i],
+             replica_general_inters[i], replica_constraints[i],
+             deepcopy(neighbor_finder), replica_loggers[i], replica_dfs[i],
+-            force_units, energy_units, k_converted, atom_masses, nothing) for i in 1:n_replicas)
++            force_units, energy_units, k_converted, atom_masses, inv_masses, nothing) for i in 1:n_replicas)
+     R = typeof(replicas)
+ 
+     return ReplicaSystem{D, AT, T, A, AD, EL, F, E, K, R, DA}(
+@@ -1075,10 +1087,13 @@ is_on_gpu(::Union{System{D, AT}, ReplicaSystem{D, AT}, AT}) where {D, AT} = AT <
+ """
+     float_type(sys)
+     float_type(boundary)
++    float_type(unitful_quantity)
+ 
+-The float type a [`System`](@ref), [`ReplicaSystem`](@ref) or bounding box uses.
++The float type a [`System`](@ref), [`ReplicaSystem`](@ref) or bounding box or unitful uses.
+ """
+ float_type(::Union{System{D, AT, T}, ReplicaSystem{D, AT, T}}) where {D, AT, T} = T
++float_type(::Unitful.AbstractQuantity{T}) where T = T
++float_type(::Type{<:Unitful.AbstractQuantity{T}}) where T = T
+ 
+ """
+     masses(sys)
+diff --git a/src/units.jl b/src/units.jl
+index f97fc9971..bcb2a8363 100644
+--- a/src/units.jl
++++ b/src/units.jl
+@@ -15,6 +15,8 @@ Broadcasted form of `ustrip` from Unitful.jl, allowing e.g. `ustrip_vec.(coords)
+ """
+ ustrip_vec(x...) = ustrip.(x...)
+ 
++
++
+ # Parses the length, mass, velocity, energy and force units and verifies they are
+ #   correct and consistent with other parameters passed to the system
+ function check_units(atoms, coords, velocities, energy_units, force_units,
+diff --git a/test/simulation.jl b/test/simulation.jl
+index fb298b5c2..5dacca16e 100644
+--- a/test/simulation.jl
++++ b/test/simulation.jl
+@@ -723,14 +723,16 @@ end
+     bond_length = 0.74u"Å"
+     constraints = [DistanceConstraint(j, j + 1, bond_length) for j in 1:2:n_atoms]
+     atoms = [Atom(index=j, mass=atom_mass, σ=2.8279u"Å", ϵ=0.074u"kcal* mol^-1") for j in 1:n_atoms]
+-    cons = SHAKE_RATTLE(constraints, n_atoms, 1e-8u"Å", 1e-8u"Å^2 * ps^-1")
++    cons = SHAKE_RATTLE(n_atoms, 1e-8u"Å", 1e-8u"Å^2 * ps^-1"; dist_constraints = constraints)
++
++    @test length(cons.clusters12) == (n_atoms ÷ 2)
++
+     boundary = CubicBoundary(200.0u"Å")
+     lj = LennardJones(cutoff=ShiftedPotentialCutoff(r_cut), use_neighbors=true)
+     neighbor_finder = DistanceNeighborFinder(
+         eligible=trues(n_atoms, n_atoms),
+         dist_cutoff=1.5*r_cut,
+     )
+-    disable_constrained_interactions!(neighbor_finder, cons.clusters)
+ 
+     for simulator in simulators
+         coords = [SVector(coords_matrix[j, 1]u"Å", coords_matrix[j, 2]u"Å", coords_matrix[j, 3]u"Å") for j in 1:n_atoms]
+@@ -776,21 +778,15 @@ end
+     temp = 100.0u"K"
+     velocities = [random_velocity(atom_mass, temp) for i in 1:n_atoms]
+ 
+-    eligible = trues(n_atoms, n_atoms)
+-    for i in 1:(n_atoms ÷ 3)
+-        eligible[i, i + (n_atoms ÷ 3)] = false
+-        eligible[i + (n_atoms ÷ 3), i] = false
+-        eligible[i + (n_atoms ÷ 3), i + 2 * (n_atoms ÷ 3)] = false
+-        eligible[i + 2 * (n_atoms ÷ 3), i + (n_atoms ÷ 3)] = false
+-    end
+-
+-    neighbor_finder = DistanceNeighborFinder(eligible=eligible, n_steps=10, dist_cutoff=1.5u"nm")
+-    bond_length = 0.1u"nm"
++    neighbor_finder = DistanceNeighborFinder(eligible=trues(n_atoms, n_atoms),n_steps=10, dist_cutoff=1.5u"nm")
++    bond_length = 0.13u"nm"
+ 
+     is = collect(1:(2 * (n_atoms ÷ 3)))
+     js = collect(((n_atoms ÷ 3) + 1):n_atoms)
+     constraints = [DistanceConstraint(is[idx], js[idx], bond_length) for idx in eachindex(is)]
+-    cons = SHAKE_RATTLE(constraints, n_atoms, 1e-8u"nm",  1e-8u"nm^2/ps")
++    cons = SHAKE_RATTLE(n_atoms, 1e-8u"nm",  1e-8u"nm^2/ps"; dist_constraints = constraints)
++
++    @test length(cons.clusters23) == (n_atoms ÷ 3)
+ 
+     sys = System(
+         atoms=atoms,
+@@ -799,8 +795,7 @@ end
+         velocities=velocities,
+         pairwise_inters=(LennardJones(use_neighbors=true),),
+         constraints=(cons,),
+-        neighbor_finder=neighbor_finder,
+-        loggers=(coords=CoordinatesLogger(10),),
++        neighbor_finder=neighbor_finder
+     )
+ 
+     old_coords = copy(sys.coords)
+@@ -817,6 +812,209 @@ end
+     @test check_velocity_constraints(sys, cons)
+ end
+ 
++
++@testset "Constraints 4-atom" begin
++    n_atoms = 40
++    atom_mass = 10.0u"g/mol"
++    #central atom
++    atoms = [Atom(mass=atom_mass, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1") for i in 1:n_atoms]
++    boundary = CubicBoundary(3.0u"nm")
++
++    coords = place_atoms(n_atoms ÷ 4, boundary, min_dist=0.3u"nm")
++
++    for i in 1:(n_atoms ÷ 4)
++        push!(coords, coords[i] .+ [0.13, 0.0, 0.0]u"nm")
++    end
++
++    for i in 1:(n_atoms ÷ 4)
++        push!(coords, coords[i] .- [0.13, 0.0, 0.0]u"nm")
++    end
++
++    for i in 1:(n_atoms ÷ 4)
++        push!(coords, coords[i] .+ [0.0, 0.13, 0.0]u"nm")
++    end
++
++    temp = 100.0u"K"
++    velocities = [random_velocity(atom_mass, temp) for i in 1:n_atoms]
++
++    neighbor_finder = DistanceNeighborFinder(
++        eligible=trues(n_atoms, n_atoms),
++        n_steps=10,
++        dist_cutoff=1.5u"nm"
++    )
++    bond_length = 0.13u"nm"
++
++    is = repeat(1:(n_atoms ÷ 4), 3) # central atom in every cluster
++    js = collect(((n_atoms ÷ 4) + 1):n_atoms)
++    constraints = [DistanceConstraint(is[idx], js[idx], bond_length) for idx in eachindex(is)]
++    cons = SHAKE_RATTLE(n_atoms, 1e-8u"nm",  1e-8u"nm^2/ps"; dist_constraints = constraints)
++
++    @test length(cons.clusters34) == (n_atoms ÷ 4)
++
++    sys = System(
++        atoms=atoms,
++        coords=coords,
++        boundary=boundary,
++        velocities=velocities,
++        pairwise_inters=(LennardJones(use_neighbors=true),),
++        constraints=(cons,),
++        neighbor_finder=neighbor_finder
++    )
++
++    old_coords = copy(sys.coords)
++
++    for i in eachindex(sys.coords)
++        sys.coords[i]     += [rand()*0.01, rand()*0.01, rand()*0.01]u"nm"
++        sys.velocities[i] += [rand()*0.01, rand()*0.01, rand()*0.01]u"nm/ps"
++    end
++
++    apply_position_constraints!(sys, old_coords)
++    apply_velocity_constraints!(sys)
++
++    @test check_position_constraints(sys, cons)
++    @test check_velocity_constraints(sys, cons)
++end
++
++
++@testset "Constraints Angle" begin
++    n_atoms = 30
++    atom_mass = 10.0u"g/mol"
++    #central atom
++    atoms = [Atom(mass=atom_mass, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1") for i in 1:n_atoms]
++    boundary = CubicBoundary(3.0u"nm")
++
++    coords = place_atoms(n_atoms ÷ 3, boundary, min_dist=0.3u"nm")
++
++    for i in 1:(n_atoms ÷ 3)
++        push!(coords, coords[i] .- [0.13, 0.0, 0.0]u"nm")
++    end
++
++    θ = (2 * pi) / 3 
++    for i in 1:(n_atoms ÷ 3)
++        push!(coords, coords[i] .+ [0.13*cos(π - θ), 0.13*sin(π - θ), 0.0]u"nm")
++    end
++
++    temp = 100.0u"K"
++    velocities = [random_velocity(atom_mass, temp) for i in 1:n_atoms]
++
++    neighbor_finder = DistanceNeighborFinder(
++        eligible=trues(n_atoms, n_atoms),
++        n_steps=10,
++        dist_cutoff=1.5u"nm"
++    )
++    bond_length = 0.13u"nm"
++
++    is = collect(1:(n_atoms ÷ 3))
++    js = collect( ((n_atoms ÷ 3) + 1) : 2*(n_atoms ÷ 3))
++    ks = collect( (2*(n_atoms ÷ 3) + 1) : n_atoms)
++    angle_constraints = [AngleConstraint(is[idx], js[idx], ks[idx], θ, bond_length, bond_length) for idx in eachindex(is)]
++    cons = SHAKE_RATTLE(n_atoms, 1e-8u"nm",  1e-8u"nm^2/ps"; angle_constraints = angle_constraints)
++
++    @test length(cons.angle_clusters) == (n_atoms ÷ 3)
++
++    sys = System(
++        atoms=atoms,
++        coords=coords,
++        boundary=boundary,
++        velocities=velocities,
++        pairwise_inters=(LennardJones(use_neighbors=true),),
++        constraints=(cons,),
++        neighbor_finder=neighbor_finder
++    )
++
++    old_coords = copy(sys.coords)
++
++    for i in eachindex(sys.coords)
++        sys.coords[i]     += [rand()*0.01, rand()*0.01, rand()*0.01]u"nm"
++        sys.velocities[i] += [rand()*0.01, rand()*0.01, rand()*0.01]u"nm/ps"
++    end
++
++    apply_position_constraints!(sys, old_coords)
++    apply_velocity_constraints!(sys)
++
++    @test check_position_constraints(sys, cons)
++    @test check_velocity_constraints(sys, cons)
++end
++
++@testset "Angle + Dist Constraints" begin
++    n_atoms = 60
++    atom_mass = 10.0u"g/mol"
++    #central atom
++    atoms = [Atom(mass=atom_mass, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1") for i in 1:n_atoms]
++    boundary = CubicBoundary(3.0u"nm")
++
++    coords = place_atoms(20, boundary, min_dist=0.3u"nm")
++
++    # ANGLE CONSTRAINTS
++    for i in 1:(n_atoms ÷ 6) # Atoms 21 -30
++        push!(coords, coords[i] .- [0.13, 0.0, 0.0]u"nm")
++    end
++
++    θ = (2 * pi) / 3 
++    for i in 1:(n_atoms ÷ 6) # Atoms 31 - 40
++        push!(coords, coords[i] .+ [0.13*cos(π - θ), 0.13*sin(π - θ), 0.0]u"nm")
++    end
++
++    # CENTRAL ATOM CONSTRAINTS
++    for i in ((n_atoms ÷ 6) + 1):2*(n_atoms ÷ 6) # Atoms 41 - 50
++        push!(coords, coords[i] .+ [0.13, 0.0, 0.0]u"nm")
++    end
++
++    for i in ((n_atoms ÷ 6) + 1):2*(n_atoms ÷ 6) # Atoms 51 - 60
++        push!(coords, coords[i] .+ [0.26, 0.0, 0.0]u"nm")
++    end
++
++    temp = 100.0u"K"
++    velocities = [random_velocity(atom_mass, temp) for i in 1:n_atoms]
++
++    neighbor_finder = DistanceNeighborFinder(
++        eligible=trues(n_atoms, n_atoms),
++        n_steps=10,
++        dist_cutoff=1.5u"nm"
++    )
++    bond_length = 0.13u"nm"
++
++    is = collect(1:(n_atoms ÷ 6)) # 1 - 10
++    js = collect( (2*(n_atoms ÷ 6) + 1) : 3*(n_atoms ÷ 6)) # 21 - 30
++    ks = collect( (3*(n_atoms ÷ 6) + 1) : 4*(n_atoms ÷ 6)) # 31 - 40
++    angle_constraints = [AngleConstraint(is[idx], js[idx], ks[idx], θ, bond_length, bond_length) for idx in eachindex(is)]
++    
++    is = repeat(collect(((n_atoms ÷ 6) + 1):2*(n_atoms ÷ 6)), 2) # 11 - 20
++    js = collect( (4*(n_atoms ÷ 6) + 1) : n_atoms) # 41 - 60
++    distance_constraints = [DistanceConstraint(is[idx], js[idx], bond_length) for idx in eachindex(is)]
++
++    cons = SHAKE_RATTLE(n_atoms, 1e-8u"nm",  1e-8u"nm^2/ps"; 
++                        dist_constraints = distance_constraints, 
++                        angle_constraints = angle_constraints)
++
++    @test length(cons.angle_clusters) == length(angle_constraints)
++    @test length(cons.clusters23) == 10  
++
++    sys = System(
++        atoms=atoms,
++        coords=coords,
++        boundary=boundary,
++        velocities=velocities,
++        pairwise_inters=(LennardJones(use_neighbors=true),),
++        constraints=(cons,),
++        neighbor_finder=neighbor_finder
++    )
++
++    old_coords = copy(sys.coords)
++
++    for i in eachindex(sys.coords)
++        sys.coords[i]     += [rand()*0.01, rand()*0.01, rand()*0.01]u"nm"
++        sys.velocities[i] += [rand()*0.01, rand()*0.01, rand()*0.01]u"nm/ps"
++    end
++
++    apply_position_constraints!(sys, old_coords)
++    apply_velocity_constraints!(sys)
++
++    @test check_position_constraints(sys, cons)
++    @test check_velocity_constraints(sys, cons)
++
++end
++
+ @testset "Langevin splitting" begin
+     n_atoms = 400
+     n_steps = 2000

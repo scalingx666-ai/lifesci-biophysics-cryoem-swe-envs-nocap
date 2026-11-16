@@ -1,0 +1,304 @@
+diff --git a/src/coupling.jl b/src/coupling.jl
+index 2c79cbb50..a055c38db 100644
+--- a/src/coupling.jl
++++ b/src/coupling.jl
+@@ -6,7 +6,8 @@ export
+     AndersenThermostat,
+     RescaleThermostat,
+     BerendsenThermostat,
+-    MonteCarloBarostat
++    MonteCarloBarostat,
++    MonteCarloAnisotropicBarostat
+ 
+ """
+     apply_coupling!(system, coupling, simulator, neighbors=nothing,
+@@ -239,3 +240,158 @@ function apply_coupling!(sys::System{D, G, T}, barostat::MonteCarloBarostat, sim
+     end
+     return recompute_forces
+ end
++
++@doc raw"""
++    MonteCarloAnisotropicBarostat(pressure, temperature, boundary; n_steps=30,
++                       n_iterations=1, scale_factor=0.01, scale_increment=1.1,
++                       max_volume_frac=0.3, trial_find_neighbors=false)
++
++The Monte Carlo anisotropic barostat for controlling pressure.
++
++See [Chow and Ferguson 1995](https://doi.org/10.1016/0010-4655(95)00059-O),
++[Åqvist et al. 2004](https://doi.org/10.1016/j.cplett.2003.12.039) and the OpenMM
++source code.
++At regular intervals a Monte Carlo step is attempted by scaling the coordinates and
++the bounding box by a randomly chosen amount in a randomly selected axis.
++The step is accepted or rejected based on
++```math
++\Delta W = \Delta E + P \Delta V - N k_B T \ln \left( \frac{V + \Delta V}{V} \right)
++```
++where `ΔE` is the change in potential energy, `P` is the equilibrium pressure along the
++selected axis, `ΔV` is the change in volume, `N` is the number of molecules in the system,
++`T` is the equilibrium temperature and `V` is the system volume.
++If `ΔW ≤ 0` the step is always accepted, if `ΔW > 0` the step is accepted with probability
++`exp(-ΔW/kT)`.
++
++The scale factor is modified over time to maintain an acceptance rate of around half.
++If the topology of the system is set then molecules are moved as a unit so properties
++such as bond lengths do not change.
++
++The barostat assumes that the simulation is being run at a constant temperature but
++does not actively control the temperature.
++It should be used alongside a temperature coupling method such as the [`Langevin`](@ref)
++simulator or [`AndersenThermostat`](@ref) coupling.
++The neighbor list is not updated when making trial moves or after accepted moves.
++Note that the barostat can change the bounding box of the system.
++For 3D systems, `pressure` is a SVector of length 3 with components pressX, pressY,
++and pressZ representing the target pressure in each axis.
++For 2D systems, `pressure` is a SVector of length 2 with components pressX and pressY.
++To keep an axis fixed, set the corresponding pressure to `nothing`.
++
++Not currently compatible with automatic differentiation using Zygote.
++"""
++mutable struct MonteCarloAnisotropicBarostat{D, T, P, K, V}
++    pressure::SVector{D,P}
++    temperature::K
++    n_steps::Int
++    n_iterations::Int
++    volume_scale::V
++    scale_increment::T
++    max_volume_frac::T
++    trial_find_neighbors::Bool
++    n_attempted::Vector{Int}
++    n_accepted::Vector{Int}
++end
++
++function MonteCarloAnisotropicBarostat(
++    pressure::SVector{D},
++    temperature,
++    boundary;
++    n_steps=30,
++    n_iterations=1,
++    scale_factor=0.01,
++    scale_increment=1.1,
++    max_volume_frac=0.3,
++    trial_find_neighbors=false,
++) where {D}
++    volume_scale_factor = box_volume(boundary) * float_type(boundary)(scale_factor)
++    volume_scale = fill(volume_scale_factor, D)
++    length(boundary.side_lengths) != D && throw(ArgumentError("pressure vector length ($(D)) " *
++        "must match boundary dimensionality ($(length(boundary.side_lengths)))"))
++
++    return MonteCarloAnisotropicBarostat(
++        pressure,
++        temperature,
++        n_steps,
++        n_iterations,
++        volume_scale,
++        scale_increment,
++        max_volume_frac,
++        trial_find_neighbors,
++        fill(0, D),
++        fill(0, D),
++    )
++end
++
++function apply_coupling!(
++    sys::System{D, G, T},
++    barostat::MonteCarloAnisotropicBarostat{D},
++    sim,
++    neighbors=nothing,
++    step_n::Integer=0;
++    n_threads::Integer=Threads.nthreads()
++) where {D, G, T}
++
++    !iszero(step_n % barostat.n_steps) && return false
++    all(isnothing, barostat.pressure) && return false
++
++    kT = sys.k * barostat.temperature
++    n_molecules = isnothing(sys.topology) ? length(sys) : length(sys.topology.molecule_atom_counts)
++    recompute_forces = false
++
++    for attempt_n in 1:barostat.n_iterations
++        axis = 0
++        while true
++            axis = rand(1:D)
++            !isnothing(barostat.pressure[axis]) && break
++        end
++        mask1 = falses(D)
++        mask2 = trues(D)
++        mask1[axis] = true
++        mask2[axis] = false
++
++        E = potential_energy(sys, neighbors; n_threads=n_threads)
++        V = box_volume(sys.boundary)
++        dV = barostat.volume_scale[axis] * (2 * rand(T) - 1)
++        v_scale = (V + dV) / V
++        l_scale = SVector{D}(mask1 * (D == 2 ? sqrt(v_scale) : cbrt(v_scale)) + mask2)
++        old_coords = copy(sys.coords)
++        old_boundary = sys.boundary
++        scale_coords!(sys, l_scale)
++
++        if barostat.trial_find_neighbors
++            neighbors_trial = find_neighbors(sys, sys.neighbor_finder, neighbors, step_n, true;
++                                             n_threads=n_threads)
++        else
++            # Assume neighbors are unchanged by the change in coordinates
++            # This may not be valid for larger changes
++            neighbors_trial = neighbors
++        end
++        E_trial = potential_energy(sys, neighbors_trial; n_threads=n_threads)
++        dE = energy_remove_mol(E_trial - E)
++        dW = dE + uconvert(unit(dE), barostat.pressure[axis] * dV) - n_molecules * kT * log(v_scale)
++        if dW <= zero(dW) || rand(T) < exp(-dW / kT)
++            recompute_forces = true
++            barostat.n_accepted[axis] += 1
++        else
++            sys.coords = old_coords
++            sys.boundary = old_boundary
++        end
++        barostat.n_attempted[axis] += 1
++
++        # Modify size of volume change to keep accept/reject ratio roughly equal
++        if barostat.n_attempted[axis] >= 10
++          if barostat.n_accepted[axis] < 0.25 * barostat.n_attempted[axis]
++            barostat.volume_scale[axis] /= barostat.scale_increment
++                barostat.n_attempted[axis] = 0
++                barostat.n_accepted[axis] = 0
++              elseif barostat.n_accepted[axis] > 0.75 * barostat.n_attempted[axis]
++                barostat.volume_scale[axis] = min(barostat.volume_scale[axis] * barostat.scale_increment,
++                                            V * barostat.max_volume_frac)
++                barostat.n_attempted[axis] = 0
++                barostat.n_accepted[axis] = 0
++            end
++        end
++    end
++    return recompute_forces
++end
+diff --git a/src/spatial.jl b/src/spatial.jl
+index 78cdc094a..c1910ee50 100644
+--- a/src/spatial.jl
++++ b/src/spatial.jl
+@@ -22,7 +22,8 @@ export
+     virial,
+     pressure,
+     molecule_centers,
+-    scale_coords!
++    scale_coords!,
++    scale_vec
+ 
+ """
+     CubicBoundary(x, y, z)
+@@ -759,7 +760,7 @@ Not currently compatible with automatic differentiation using Zygote.
+ function scale_coords!(sys, scale_factor; ignore_molecules=false)
+     if ignore_molecules || isnothing(sys.topology)
+         sys.boundary = scale_boundary(sys.boundary, scale_factor)
+-        sys.coords = sys.coords .* scale_factor
++        sys.coords = scale_vec(sys.coords, scale_factor)
+     elseif sys.boundary isa TriclinicBoundary
+         error("scaling coordinates by molecule is not compatible with a TriclinicBoundary")
+     else
+@@ -779,7 +780,7 @@ function scale_coords!(sys, scale_factor; ignore_molecules=false)
+         end
+         # Move all atoms in a molecule by the same amount according to the molecule center
+         # Then move the atoms back to the molecule center and wrap in the scaled boundary
+-        shift_vecs = mol_centers .* (scale_factor - 1)
++        shift_vecs = scale_vec(mol_centers, scale_factor .- 1)
+         sys.boundary = scale_boundary(sys.boundary, scale_factor)
+         boundary_nounits = ustrip(sys.boundary)
+         for i in eachindex(sys)
+@@ -791,3 +792,12 @@ function scale_coords!(sys, scale_factor; ignore_molecules=false)
+     end
+     return sys
+ end
++
++"""
++    scale_vec(v, c)
++
++Broadcasted form of `.* c`, allowing scaling all the vectors in v by c, where c is
++either a constant or a vector.
++"""
++scale(v, c) = v .* c
++scale_vec(v, c) = scale.(v, Ref(c))
+diff --git a/test/simulation.jl b/test/simulation.jl
+index d11ea25ae..208a02055 100644
+--- a/test/simulation.jl
++++ b/test/simulation.jl
+@@ -942,6 +942,81 @@ end
+     end
+ end
+ 
++@testset "Monte Carlo anisotropic barostat" begin
++    # See http://www.sklogwiki.org/SklogWiki/index.php/Argon for parameters
++    n_atoms = 25
++    n_steps = 1_000_000
++    atom_mass = 39.947u"u"
++    boundary = CubicBoundary(8.0u"nm")
++    temp = 288.15u"K"
++    dt = 0.0005u"ps"
++    friction = 1.0u"ps^-1"
++    lang = Langevin(dt=dt, temperature=temp, friction=friction)
++    atoms = fill(Atom(mass=atom_mass, σ=0.3345u"nm", ϵ=1.0451u"kJ * mol^-1"), n_atoms)
++    coords = place_atoms(n_atoms, boundary; min_dist=1.0u"nm")
++    n_log_steps = 500
++    
++    box_volume_wrapper(sys, neighbors; kwargs...) = box_volume(sys.boundary)
++    VolumeLogger(n_steps) = GeneralObservableLogger(box_volume_wrapper, typeof(1.0u"nm^3"), n_steps)
++    
++    baro_f(pressure) = MonteCarloAnisotropicBarostat(pressure, temp, boundary)
++    lang_f(barostat) = Langevin(dt=dt, temperature=temp, friction=friction, coupling=barostat)
++    vand_f(barostat) = VelocityVerlet(dt=dt, coupling=(AndersenThermostat(temp, 1.0u"ps"), barostat))
++    
++    pressure_test_set = (
++        SVector(1.0u"bar", 1.0u"bar", 1.0u"bar"), # XYZ-axes coupled with the same pressure value
++        SVector(1.5u"bar", 0.5u"bar", 1.0u"bar"), # XYZ-axes coupled with different pressure values
++        SVector(nothing, 1.0u"bar", nothing), # Only Y-axis coupled
++        SVector(nothing, nothing, nothing), # Uncoupled
++    )
++    
++    simulator_test_set = (
++        lang_f,
++        vand_f,
++    )
++    
++    for sim_f in simulator_test_set
++        for gpu in gpu_list
++            gpu && sim_f == vand_f && continue
++            AT = gpu ? CuArray : Array
++            for press in pressure_test_set
++                sys = System(
++                    atoms=AT(atoms),
++                    coords=AT(coords),
++                    boundary=boundary,
++                    pairwise_inters=(LennardJones(),),
++                    loggers=(
++                        temperature=TemperatureLogger(n_log_steps),
++                        total_energy=TotalEnergyLogger(n_log_steps),
++                        kinetic_energy=KineticEnergyLogger(n_log_steps),
++                        potential_energy=PotentialEnergyLogger(n_log_steps),
++                        virial=VirialLogger(n_log_steps),
++                        pressure=PressureLogger(n_log_steps),
++                        box_volume=VolumeLogger(n_log_steps),
++                    ),
++                )
++            
++                sim = sim_f(baro_f(press))
++                simulate!(deepcopy(sys), sim, 100; n_threads=1)
++                @time simulate!(sys, sim, n_steps; n_threads=1)
++            
++                @test 260.0u"K" < mean(values(sys.loggers.temperature)) < 300.0u"K"
++                @test 50.0u"kJ * mol^-1" < mean(values(sys.loggers.total_energy)) < 120.0u"kJ * mol^-1"
++                @test 50.0u"kJ * mol^-1" < mean(values(sys.loggers.kinetic_energy)) < 120.0u"kJ * mol^-1"
++                @test -5.0u"kJ * mol^-1" < mean(values(sys.loggers.virial)) < 5.0u"kJ * mol^-1"
++                @test mean(values(sys.loggers.potential_energy)) < 0.0u"kJ * mol^-1"
++                all(!isnothing, press) && @test 0.7u"bar" < mean(values(sys.loggers.pressure)) < 1.3u"bar"
++                any(!isnothing, press) && @test 0.1u"bar" < std(values(sys.loggers.pressure)) < 0.5u"bar"
++                any(!isnothing, press) && @test 800.0u"nm^3" < mean(values(sys.loggers.box_volume)) < 1300u"nm^3"
++                any(!isnothing, press) && @test 80.0u"nm^3" < std(values(sys.loggers.box_volume)) < 300.0u"nm^3"
++                axis_is_uncoupled = isnothing.(press)
++                axis_is_unchanged = sys.boundary .== 8.0u"nm"
++                @test all(axis_is_uncoupled .== axis_is_unchanged)
++            end
++        end
++    end
++end
++
+ @testset "Crystals" begin
+     r_cut = 8.5u"Å"
+     a = 5.2468u"Å"

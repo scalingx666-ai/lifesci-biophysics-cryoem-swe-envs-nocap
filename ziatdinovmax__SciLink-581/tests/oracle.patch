@@ -1,0 +1,439 @@
+diff --git a/scilink/agents/exp_agents/_exec_env.py b/scilink/agents/exp_agents/_exec_env.py
+new file mode 100644
+index 000000000..de7239e5c
+--- /dev/null
++++ b/scilink/agents/exp_agents/_exec_env.py
+@@ -0,0 +1,209 @@
++"""Capability availability of the script-execution environment (#569).
++
++The planner and the verifier can prescribe — and even hard-mandate — fixes
++that call for an optional capability (a package, a model checkpoint, a
++GPU) without knowing whether the environment the generated script runs in
++actually has it. The load-bearing subtlety: scripts run in the
++``sys.executable`` subprocess (``executors.ScriptExecutor``), which can
++differ from the process that imported scilink — so the probe below is a
++script run *through the executor*, never an import in the parent.
++
++``probe_execution_environment`` runs it once per process (cached by the
++interpreter path; a session shares one executor) and returns a plain
++dict; ``exec_env_block`` renders that dict as a prompt section the
++planner / codegen / verifier read as a deterministic signal, with the
++rule that an optional capability may only be prescribed when it is
++listed available, advisory-with-fallback, and never hard-mandated when
++absent. ``capability_available`` is the programmatic check.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import sys
++import tempfile
++from typing import Any, Dict, Optional
++
++logger = logging.getLogger(__name__)
++
++# Optional capabilities worth knowing about before prescribing them. Keyed
++# by the import name; the label is what prompts and tools call it.
++OPTIONAL_PACKAGES = {
++    "segment_anything": "SAM (segment_anything)",
++    "torch": "PyTorch",
++    "cv2": "OpenCV",
++    "skimage": "scikit-image",
++    "sklearn": "scikit-learn",
++    "scipy": "SciPy",
++    "lmfit": "lmfit",
++    "hyperspy": "HyperSpy",
++    "atomai": "AtomAI",
++    "pymatgen": "pymatgen",
++    "ase": "ASE",
++    "mp_api": "Materials Project API client",
++    "networkx": "networkx",
++    "pandas": "pandas",
++    "matplotlib": "matplotlib",
++    "PIL": "Pillow",
++}
++
++_MARKER = "EXEC_ENV_JSON:"
++
++# Runs in the execution subprocess. Import failures are answers, not errors.
++PROBE_SCRIPT = r'''
++import importlib, json, os, sys, glob
++packages = {}
++for name in %(packages)s:
++    try:
++        mod = importlib.import_module(name)
++        packages[name] = getattr(mod, "__version__", None) or "present"
++    except Exception as exc:  # noqa: BLE001 - absence is the answer
++        packages[name] = None
++devices = {"cuda": False, "mps": False}
++try:
++    import torch
++    devices["cuda"] = bool(torch.cuda.is_available())
++    mps = getattr(torch.backends, "mps", None)
++    devices["mps"] = bool(mps is not None and mps.is_available())
++except Exception:  # noqa: BLE001
++    pass
++ckpt_dir = os.path.join(os.path.expanduser("~"), ".cache", "scilink", "checkpoints")
++checkpoints = sorted(os.path.basename(p) for p in glob.glob(os.path.join(ckpt_dir, "*.pth")))
++print("%(marker)s" + json.dumps({
++    "python": sys.executable,
++    "python_version": sys.version.split()[0],
++    "packages": packages,
++    "devices": devices,
++    "sam_checkpoints": checkpoints,
++    "checkpoint_dir": ckpt_dir,
++}))
++'''
++
++_cache: Dict[str, Dict[str, Any]] = {}
++
++
++def _cache_key(executor: Any) -> str:
++    # The executor runs scripts under sys.executable; a different executor
++    # object in the same process sees the same environment.
++    return str(getattr(executor, "python_executable", None) or sys.executable)
++
++
++def probe_execution_environment(executor: Any = None, *, force: bool = False,
++                                timeout: int = 120) -> Dict[str, Any]:
++    """Probe the script-execution environment once (cached per interpreter).
++
++    Never raises: a failed probe yields ``{"status": "unknown", ...}`` so a
++    caller degrades to "unknown, do not hard-mandate" rather than to a
++    crash. Pass the agent's ``ScriptExecutor`` so the probe runs exactly
++    where the generated scripts run; without one a default executor is
++    built (same interpreter).
++    """
++    key = _cache_key(executor)
++    if not force and key in _cache:
++        return _cache[key]
++    if executor is None:
++        try:
++            from ...executors import ScriptExecutor
++            executor = ScriptExecutor(timeout=timeout)
++        except Exception as exc:  # noqa: BLE001
++            env = {"status": "unknown", "error": f"no executor: {exc}"}
++            _cache[key] = env
++            return env
++    script = PROBE_SCRIPT % {"packages": json.dumps(sorted(OPTIONAL_PACKAGES)),
++                             "marker": _MARKER}
++    env: Dict[str, Any]
++    try:
++        with tempfile.TemporaryDirectory(prefix="scilink_env_probe_") as wd:
++            out = executor.execute_script(script, working_dir=wd, timeout=timeout)
++        env = _parse_probe_output(out)
++    except Exception as exc:  # noqa: BLE001
++        env = {"status": "unknown", "error": str(exc)[:300]}
++    _cache[key] = env
++    if env.get("status") == "ok":
++        missing = [n for n, v in env["packages"].items() if v is None]
++        logger.info(f"Execution environment probed: {env['python']} — "
++                    f"{len(env['packages']) - len(missing)} optional packages present, "
++                    f"missing: {', '.join(missing) or 'none'}; devices "
++                    f"cuda={env['devices'].get('cuda')} mps={env['devices'].get('mps')}")
++    else:
++        logger.warning(f"Execution environment probe failed: {env.get('error')}")
++    return env
++
++
++def _parse_probe_output(out: Any) -> Dict[str, Any]:
++    text = ""
++    if isinstance(out, dict):
++        if out.get("status") == "error":
++            return {"status": "unknown",
++                    "error": str(out.get("message") or out.get("error") or "probe failed")[:300]}
++        text = str(out.get("stdout") or out.get("output") or "")
++    else:
++        text = str(out or "")
++    m = re.search(re.escape(_MARKER) + r"(\{.*\})", text)
++    if not m:
++        return {"status": "unknown", "error": "probe printed no result"}
++    data = json.loads(m.group(1))
++    data["status"] = "ok"
++    return data
++
++
++def capability_available(env: Optional[Dict[str, Any]], name: str) -> Optional[bool]:
++    """True / False for a probed package or device (``"cuda"``, ``"mps"``,
++    ``"gpu"``, ``"sam_checkpoint"``); None when the environment is unknown."""
++    if not env or env.get("status") != "ok":
++        return None
++    if name in ("cuda", "mps"):
++        return bool(env.get("devices", {}).get(name))
++    if name == "gpu":
++        d = env.get("devices", {})
++        return bool(d.get("cuda") or d.get("mps"))
++    if name == "sam_checkpoint":
++        return bool(env.get("sam_checkpoints"))
++    return env.get("packages", {}).get(name) is not None
++
++
++def exec_env_block(env: Optional[Dict[str, Any]] = None, *, executor: Any = None,
++                   for_verifier: bool = False) -> str:
++    """The prompt section. ``env`` defaults to the cached probe (run now if
++    needed). Renders what is present and what is absent, then the rule."""
++    if env is None:
++        env = probe_execution_environment(executor)
++    lines = ["\n## Execution environment (probed in the script-execution interpreter)"]
++    if env.get("status") != "ok":
++        lines.append(
++            "Unknown — the probe did not run. Treat every optional capability "
++            "(SAM, GPU, optional packages) as UNVERIFIED: do not hard-mandate any of "
++            "them; if you prescribe one, keep a sanctioned fallback path.")
++        return "\n".join(lines) + "\n"
++    pk = env.get("packages", {})
++    present = [f"{OPTIONAL_PACKAGES.get(n, n)} {v}" if v not in (None, "present")
++               else OPTIONAL_PACKAGES.get(n, n)
++               for n, v in sorted(pk.items()) if v is not None]
++    absent = [OPTIONAL_PACKAGES.get(n, n) for n, v in sorted(pk.items()) if v is None]
++    d = env.get("devices", {})
++    device = "CUDA GPU" if d.get("cuda") else "Apple MPS GPU" if d.get("mps") else "CPU only"
++    lines.append(f"- Python: {env.get('python')} ({env.get('python_version')})")
++    lines.append(f"- Compute: {device}")
++    lines.append(f"- Available optional packages: {', '.join(present) or 'none'}")
++    lines.append(f"- ABSENT optional packages: {', '.join(absent) or 'none'}")
++    ck = env.get("sam_checkpoints") or []
++    sam_ok = pk.get("segment_anything") is not None
++    if sam_ok:
++        lines.append(f"- SAM checkpoints on disk: {', '.join(ck) if ck else 'none (first use downloads ~2.5 GB for vit_h)'}")
++    lines.append(
++        "RULE: only prescribe or mandate a capability listed as available. An "
++        "absent package, checkpoint or GPU cannot be fixed by the code generator — "
++        "do not prescribe it, and never make it the sole method. An optional "
++        "capability that IS available is still advisory: prescribe it WITH a "
++        "sanctioned fallback (the pipeline must still complete if the tool "
++        "returns status='unavailable' or fails)."
++        + (" A tool that reports status='unavailable' has said all it can — do not "
++           "re-prescribe it; change method." if for_verifier else ""))
++    return "\n".join(lines) + "\n"
++
++
++def reset_cache() -> None:
++    _cache.clear()
+diff --git a/scilink/agents/exp_agents/controllers/image_analysis_controllers.py b/scilink/agents/exp_agents/controllers/image_analysis_controllers.py
+index 627662b9f..c087e7eef 100644
+--- a/scilink/agents/exp_agents/controllers/image_analysis_controllers.py
++++ b/scilink/agents/exp_agents/controllers/image_analysis_controllers.py
+@@ -44,6 +44,7 @@
+ from ....utils.codegen_parse import parse_codegen_response
+ from ....utils.synthesis_parse import salvage_synthesis_from_response
+ from ....hitl import request_human_feedback
++from .._exec_env import exec_env_block
+ 
+ 
+ # Anthropic's API rejects images over 5 MB. Cap below that with headroom
+@@ -1240,6 +1241,9 @@ def _build_planning_prompt(self, state: dict, extra_suffix: str = "") -> list:
+ 
+         _append_auxiliary_context(prompt, state)
+         _append_tool_inventory(prompt, agent="image_analysis", active_skills=_active_skill_names(state))
++        # The planner sees what the execution interpreter can run (#569),
++        # right after the tool inventory it may draw from.
++        prompt.append(exec_env_block(executor=getattr(self, "executor", None)))
+         _append_skill_context(prompt, state, "planning")
+         _append_prior_knowledge_context(prompt, state)
+         _append_prior_analysis_state(prompt, state)
+@@ -1627,6 +1631,9 @@ def _refine_plan(self, state: dict, feedback: str) -> dict:
+ 
+         _append_auxiliary_context(prompt, state)
+         _append_tool_inventory(prompt, agent="image_analysis", active_skills=_active_skill_names(state))
++        # The planner sees what the execution interpreter can run (#569),
++        # right after the tool inventory it may draw from.
++        prompt.append(exec_env_block(executor=getattr(self, "executor", None)))
+         _append_skill_context(prompt, state, "planning")
+         _append_prior_knowledge_context(prompt, state)
+         _append_prior_analysis_state(prompt, state)
+@@ -2126,6 +2133,10 @@ def _generate_analysis_script(
+             )
+         if state.get("literature_context"):
+             context_parts.append(state["literature_context"])
++        # What the script-execution interpreter can actually run (#569):
++        # optional packages, checkpoints, GPU — so the generator never
++        # builds on a capability the subprocess lacks.
++        context_parts.append(exec_env_block(executor=getattr(self, "executor", None)))
+         # Codegen recipe from ALL co-active skills (not just the top-ranked):
+         # with several skills active each may own a different pipeline stage
+         # (e.g. flattening vs segmentation), so none is dropped. Single-skill
+@@ -2954,6 +2965,8 @@ def _verify_quality(
+ 
+         prompt_text += self._stalled_prescriptions_block(
+             state.get("_stalled_prescriptions"))
++        prompt_text += exec_env_block(executor=getattr(self, "executor", None),
++                                      for_verifier=True)
+ 
+         # Add history context
+         history_context = build_verification_prompt_with_history(
+@@ -3224,6 +3237,7 @@ def _apply_verification_feedback(
+ 
+ **RECOMMENDED ACTION:** {recommended_action}
+ {self._stalled_prescriptions_block(stalled)}
++{exec_env_block(executor=getattr(self, "executor", None), for_verifier=True)}
+ Return JSON with the refined analysis approach:
+ {{
+     "processing_pipeline": "updated pipeline description",
+diff --git a/scilink/skills/_shared/sam.py b/scilink/skills/_shared/sam.py
+index 7840f4f8e..bf69f2438 100644
+--- a/scilink/skills/_shared/sam.py
++++ b/scilink/skills/_shared/sam.py
+@@ -148,9 +148,23 @@ def run_sam_analysis(
+             - rgb_image: RGB version of the image
+             - parameters: Parameters used for this analysis
+     """
+-    # Get or create analyzer (uses cache if analyzer not provided)
++    # Get or create analyzer (uses cache if analyzer not provided). A missing
++    # optional dependency or checkpoint is reported as structured
++    # unavailability (#569) — the generated script can branch on it and the
++    # verifier can read it — instead of a raw ImportError traceback.
+     if analyzer is None:
+-        analyzer = get_or_create_sam_model(params)
++        try:
++            analyzer = get_or_create_sam_model(params)
++        except (ImportError, FileNotFoundError, OSError, RuntimeError) as exc:
++            logger.warning(f"SAM unavailable in this environment: {exc}")
++            return {
++                "status": "unavailable",
++                "capability": "segment_anything",
++                "reason": str(exc)[:500],
++                "particles": [], "masks": [], "areas": [],
++                "total_count": 0, "raw_mask_count": 0,
++                "parameters": params,
++            }
+     
+     # Run the analysis using atomai's ParticleAnalyzer
+     # This handles preprocessing, SAM inference, filtering, and property extraction
+@@ -505,7 +519,10 @@ def merge_sam_results(results: List[dict]) -> dict:
+     required=["image_array", "params"],
+     returns=(
+         "dict with 'particles' (list with 'mask' and 'area' per particle), "
+-        "'total_count' (int), 'masks' (list of binary arrays), 'areas' (list of ints)."
++        "'total_count' (int), 'masks' (list of binary arrays), 'areas' (list of ints). "
++        "When SAM cannot run in this environment (package or checkpoint missing) the "
++        "dict has status='unavailable', 'capability' and 'reason' with empty results — "
++        "check result.get('status') and keep a non-SAM fallback path."
+     ),
+     example=(
+         "result = run_sam_analysis(image_array, params={\n"
+diff --git a/tests/test_exec_env.py b/tests/test_exec_env.py
+new file mode 100644
+index 000000000..1b592d955
+--- /dev/null
++++ b/tests/test_exec_env.py
+@@ -0,0 +1,116 @@
++"""#569 — capability availability of the script-execution environment: the
++probe runs THROUGH the executor (the subprocess interpreter, not the parent
++process), is cached, degrades to "unknown" instead of raising, renders a
++prompt block with the advisory-with-fallback rule, and the SAM tool reports
++structured unavailability instead of a raw ImportError."""
++import json
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++from scilink.agents.exp_agents import _exec_env as ee
++
++
++class _Exec:
++    """A fake ScriptExecutor: records the script it ran, returns canned stdout."""
++    def __init__(self, stdout=None, status="success", message=None):
++        self.scripts = []
++        self.stdout, self.status, self.message = stdout, status, message
++
++    def execute_script(self, script, working_dir=None, timeout=None):
++        self.scripts.append(script)
++        if self.status != "success":
++            return {"status": "error", "message": self.message or "boom"}
++        return {"status": "success", "stdout": self.stdout, "stderr": ""}
++
++
++def _stdout(packages, cuda=False, mps=True, ckpts=()):
++    return "noise\n" + ee._MARKER + json.dumps({
++        "python": "/envs/exec/bin/python", "python_version": "3.12.1",
++        "packages": packages, "devices": {"cuda": cuda, "mps": mps},
++        "sam_checkpoints": list(ckpts), "checkpoint_dir": "/c"}) + "\n"
++
++
++@pytest.fixture(autouse=True)
++def _fresh_cache():
++    ee.reset_cache()
++    yield
++    ee.reset_cache()
++
++
++def test_probe_runs_through_the_executor_and_is_cached():
++    ex = _Exec(_stdout({"segment_anything": None, "torch": "2.1", "scipy": "1.11"}))
++    env = ee.probe_execution_environment(ex)
++    assert env["status"] == "ok" and env["python"] == "/envs/exec/bin/python"
++    assert env["packages"]["segment_anything"] is None and env["packages"]["torch"] == "2.1"
++    # the probe is a script the executor ran, importing in the subprocess
++    assert len(ex.scripts) == 1 and "importlib.import_module" in ex.scripts[0]
++    assert ee.capability_available(env, "segment_anything") is False
++    assert ee.capability_available(env, "torch") is True
++    assert ee.capability_available(env, "mps") is True and ee.capability_available(env, "gpu") is True
++    assert ee.capability_available(env, "sam_checkpoint") is False
++    # cached: a second call does not re-run
++    ee.probe_execution_environment(ex)
++    assert len(ex.scripts) == 1
++    ee.probe_execution_environment(ex, force=True)
++    assert len(ex.scripts) == 2
++
++
++def test_probe_failure_degrades_to_unknown():
++    env = ee.probe_execution_environment(_Exec(status="error", message="timed out"))
++    assert env["status"] == "unknown" and "timed out" in env["error"]
++    assert ee.capability_available(env, "torch") is None
++    block = ee.exec_env_block(env)
++    assert "Unknown" in block and "do not hard-mandate" in block
++    # a probe that printed nothing usable
++    env = ee.probe_execution_environment(_Exec("hello"), force=True)
++    assert env["status"] == "unknown"
++
++
++def test_block_lists_present_absent_devices_and_the_rule():
++    env = ee.probe_execution_environment(_Exec(_stdout(
++        {"segment_anything": "present", "torch": "2.1", "hyperspy": None, "cv2": "4.9"},
++        cuda=False, mps=False, ckpts=["sam_vit_h.pth"])))
++    block = ee.exec_env_block(env, for_verifier=True)
++    assert "Compute: CPU only" in block
++    assert "ABSENT optional packages: HyperSpy" in block
++    assert "SAM (segment_anything)" in block and "sam_vit_h.pth" in block
++    assert "only prescribe or mandate a capability listed as available" in block
++    assert "status='unavailable' has said all it can" in block
++    assert "said all it can" not in ee.exec_env_block(env)  # verifier-only sentence
++
++
++def test_sam_tool_reports_structured_unavailability(monkeypatch):
++    from scilink.skills._shared import sam
++    def _raise(params):
++        raise ImportError("No module named 'segment_anything'")
++    monkeypatch.setattr(sam, "get_or_create_sam_model", _raise)
++    out = sam.run_sam_analysis(np.zeros((16, 16), dtype=np.uint8), {"model_type": "vit_h"})
++    assert out["status"] == "unavailable" and out["capability"] == "segment_anything"
++    assert "segment_anything" in out["reason"] and out["total_count"] == 0 and out["masks"] == []
++    assert "status='unavailable'" in sam.TOOL_SPEC.returns
++
++
++def test_image_prompts_carry_the_environment_block(monkeypatch):
++    """Planner, codegen-refinement and verifier prompts all include it."""
++    from scilink.agents.exp_agents.controllers import image_analysis_controllers as ic
++    env = ee.probe_execution_environment(_Exec(_stdout({"segment_anything": None, "torch": "2.1"})))
++    monkeypatch.setattr(ic, "exec_env_block", lambda **kw: ee.exec_env_block(env, for_verifier=kw.get("for_verifier", False)))
++    host = ic.UnifiedImageProcessingController.__new__(ic.UnifiedImageProcessingController)
++    import logging
++    host.logger = logging.getLogger("t")
++    prompts = []
++    host.model = SimpleNamespace(generate_content=lambda **kw: prompts.append(kw["contents"][0]) or SimpleNamespace(text="{}"))
++    host.generation_config = None; host.safety_settings = None
++    host._parse = lambda r: ({}, "no json")
++    state = {"locked_analysis_config": {"processing_pipeline": "p", "analysis_approach": "a"}, "_annealing_level": 0}
++    host._apply_verification_feedback(state, {"recommended_action": "use SAM", "issues_found": []}, history=[])
++    assert "ABSENT optional packages: SAM (segment_anything)" in prompts[0]
++    assert "said all it can" in prompts[0]
++    planner = ic.ImagePlanningController.__new__(ic.ImagePlanningController)
++    planner._get_instructions = lambda st: "instructions"
++    planner.logger = logging.getLogger("t")
++    prompt = planner._build_planning_prompt({"original_image_bytes": b"x", "image_statistics": {},
++                                             "system_info": {}, "is_single_image": True})
++    assert any(isinstance(p, str) and "Execution environment" in p for p in prompt)

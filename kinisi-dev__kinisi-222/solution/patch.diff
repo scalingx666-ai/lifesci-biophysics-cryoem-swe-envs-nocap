@@ -1,0 +1,188 @@
+diff --git a/kinisi/diffusion.py b/kinisi/diffusion.py
+index 827fa4a7..fd065578 100644
+--- a/kinisi/diffusion.py
++++ b/kinisi/diffusion.py
+@@ -6,6 +6,8 @@
+ # Distributed under the terms of the MIT License.
+ # author: Andrew R. McCluskey (arm61) and Oskar G. Soulas (osoulas)
+ 
++import warnings
++
+ import numpy as np
+ import scipp as sc
+ from emcee import EnsembleSampler
+@@ -95,6 +97,8 @@ def bayesian_regression(
+         start_dt: sc.Variable,
+         cond_max: float = 1e16,
+         recondition: bool = False,
++        check_consistency: bool = True,
++        warn_threshold: float = 0.7,
+         fit_intercept: bool = True,
+         n_samples: int = 1000,
+         n_walkers: int = 32,
+@@ -109,6 +113,8 @@ def bayesian_regression(
+         :param start_dt: The time at which the diffusion regime begins.
+         :param cond_max: The maximum condition number of the covariance matrix. Optional, default is :py:attr:`1e16`.
+         :param recondition: Whether to recondition the covariance matrix. Optional, default is :py:attr:`False`.
++        :param check_consistency: Whether to compare the fitted gradient against an ordinary least squares estimate and warn if they disagree. Optional, default is :py:attr:`True`.
++        :param warn_threshold: The ratio below which a warning is raised. Optional, default is :py:attr:`0.7`.
+         :param fit_intercept: Whether to fit an intercept. Optional, default is :py:attr:`True`.
+         :param n_samples: The number of MCMC samples to take. Optional, default is :py:attr:`1000`.
+         :param n_walkers: The number of walkers to use in the MCMC. Optional, default is :py:attr:`32`.
+@@ -148,6 +154,7 @@ def log_likelihood(theta: np.ndarray) -> float:
+             return logl
+ 
+         ols = linregress(x_values, y_values)
++        self._ols_gradient = ols.slope
+         slope = ols.slope
+         intercept = 1e-20
+         if slope < 0:
+@@ -170,6 +177,56 @@ def log_likelihood(theta: np.ndarray) -> float:
+         if fit_intercept:
+             self.intercept = Samples(self._flatchain[:, 1], unit=self.dg['da'].unit)
+ 
++        if check_consistency:
++            self._check_consistency(warn_threshold)
++
++    def _check_consistency(self, warn_threshold: float = 0.7):
++        """
++        Compare the fitted gradient against an ordinary least squares estimate of the same data.
++
++        The generalised least squares fit performed by :py:func:`bayesian_regression` weights the
++        observations by the inverse of an estimated covariance matrix. Where sampling noise has
++        made that matrix numerically singular, the inversion can return a gradient in error by
++        several orders of magnitude without any other indication of failure.
++
++        An ordinary least squares fit to the same observations does not use the covariance and so
++        cannot be affected in the same way. It is a less precise estimator, but a robust one, and
++        a large disagreement between the two is evidence that the covariance is unreliable rather
++        than that the data are unusual.
++
++        :param warn_threshold: The ratio of the fitted gradient to the ordinary least squares
++            gradient below which a warning is raised. Optional, default is :py:attr:`0.7`.
++        """
++        if getattr(self, '_ols_gradient', None) is None or self._ols_gradient <= 0:
++            return
++
++        ratio = np.median(self.gradient.values) / self._ols_gradient
++        self._consistency_ratio = ratio
++
++        if ratio < warn_threshold:
++            warnings.warn(
++                f'The fitted gradient is {ratio:.3f} times the ordinary least squares estimate. '
++                'A ratio this low indicates that the covariance matrix may be numerically '
++                'singular and that the diffusion coefficient may be unreliable. Consider '
++                'refitting with recondition=True, or inspecting the eigenvalues of '
++                'Diffusion.covariance_matrix.',
++                UserWarning,
++                stacklevel=3,
++            )
++
++    @property
++    def consistency_ratio(self) -> float:
++        """
++        The ratio of the fitted gradient to an ordinary least squares estimate of the same data.
++
++        A value near unity indicates the two estimators agree. A value well below unity indicates
++        that the covariance-weighted fit has been affected by a numerically singular covariance
++        matrix. :py:attr:`None` if the check has not been run.
++
++        :return: The ratio of the two gradient estimates.
++        """
++        return getattr(self, '_consistency_ratio', None)
++
+     def _diffusion(self, start_dt: sc.Variable, **kwargs):
+         """
+         Calculation of the diffusion coefficient.
+diff --git a/kinisi/tests/test_diffusion.py b/kinisi/tests/test_diffusion.py
+index 6731274c..9634a6a3 100644
+--- a/kinisi/tests/test_diffusion.py
++++ b/kinisi/tests/test_diffusion.py
+@@ -7,12 +7,14 @@
+ # @author: Andrew R. McCluskey (arm61) & Harry Richardson (Harry-Rich)
+ 
+ import unittest
++import warnings
+ 
+ import numpy as np
+ import pytest
+ import scipp as sc
+ 
+ from kinisi.diffusion import Diffusion, _straight_line, eigenvalue_clipping, marchenkopastur, minimum_eigenvalue_method
++from kinisi.samples import Samples
+ from kinisi.tests import TEST_FILE_PATH
+ 
+ # Random seed setting not yet implemented into bayesian regression and so cannot almost_equal
+@@ -144,3 +146,72 @@ def test_posterior_predictive_error(self):
+ 
+         with pytest.raises(ValueError, match='Units of the covariance matrix and mu do not align correctly'):
+             diff_exc.posterior_predictive(n_posterior_samples=1, n_predictive_samples=400)
++
++
++class TestConsistencyCheck(unittest.TestCase):
++    """
++    Testing the covariance consistency check.
++    """
++
++    @staticmethod
++    def _datagroup(gradient=6.0, n_points=64, seed=0):
++        """
++        A DataGroup with a straight-line mean-squared displacement and a
++        realistic number of independent samples at each lag time.
++        """
++        rng = np.random.RandomState(seed)
++        dt = np.arange(2, 2 + n_points, dtype=float)
++        n_samples = 4096.0 / dt
++        variances = 24.0 * dt**2 / n_samples
++        values = gradient * dt + rng.normal(0, np.sqrt(variances) * 0.05)
++        da = sc.DataArray(
++            sc.array(dims=['time interval'], values=values, variances=variances, unit='angstrom**2'),
++            coords={
++                'time interval': sc.array(dims=['time interval'], values=dt, unit='ps'),
++                'n_samples': sc.array(dims=['time interval'], values=n_samples),
++            },
++        )
++        return sc.DataGroup({'da': da, 'dimensionality': sc.scalar(3)})
++
++    def _fit(self, **kwargs):
++        diff = Diffusion(self._datagroup(**kwargs))
++        diff.bayesian_regression(sc.scalar(2.0, unit='ps'), progress=False, n_samples=200, n_burn=100)
++        return diff
++
++    def test_ratio_is_near_unity_for_a_healthy_fit(self):
++        diff = self._fit()
++        assert 0.8 < diff.consistency_ratio < 1.25
++
++    def test_no_warning_for_a_healthy_fit(self):
++        with warnings.catch_warnings(record=True) as caught:
++            warnings.simplefilter('always')
++            self._fit(seed=1)
++        assert not [w for w in caught if 'ordinary least squares' in str(w.message)]
++
++    def test_warning_when_the_gradient_is_suppressed(self):
++        diff = self._fit()
++        diff.gradient = Samples(diff.gradient.values * 0.01, unit=diff.gradient.unit)
++        with warnings.catch_warnings(record=True) as caught:
++            warnings.simplefilter('always')
++            diff._check_consistency()
++        assert any('ordinary least squares' in str(w.message) for w in caught)
++        assert diff.consistency_ratio < 0.7
++
++    def test_threshold_is_respected(self):
++        diff = self._fit()
++        with warnings.catch_warnings(record=True) as caught:
++            warnings.simplefilter('always')
++            diff._check_consistency(warn_threshold=1.5)
++        assert any('ordinary least squares' in str(w.message) for w in caught)
++
++    def test_check_can_be_disabled(self):
++        diff = Diffusion(self._datagroup())
++        diff.bayesian_regression(
++            sc.scalar(2.0, unit='ps'), progress=False, n_samples=200, n_burn=100, check_consistency=False
++        )
++        assert diff.consistency_ratio is None
++
++    def test_check_is_safe_before_a_regression(self):
++        diff = Diffusion(self._datagroup())
++        diff._check_consistency()
++        assert diff.consistency_ratio is None

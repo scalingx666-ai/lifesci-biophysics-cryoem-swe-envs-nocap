@@ -1,0 +1,669 @@
+diff --git a/bin/martinize2 b/bin/martinize2
+index 46c66a55..845409ec 100755
+--- a/bin/martinize2
++++ b/bin/martinize2
+@@ -628,7 +628,7 @@ def entry():
+     )
+     water_group.add_argument(
+         "-id-regions",
+-        dest="water_idrs",
++        dest="id_regions",
+         default=[],
+         nargs='+',
+         help=("Intrinsically disordered regions specified by resid."
+@@ -992,7 +992,7 @@ def entry():
+         LOGGER.info("The -idr-tune argument has been deprecated since version v0.15.0. IDR parameters "
+                     "will automatically be applied when an idr has been specified in the "
+                     "-id-regions flag")
+-    idr_tune = any(args.water_idrs)
++    idr_tune = any(args.id_regions)
+     vermouth.SetMoleculeMeta(idr=idr_tune).run_system(system)
+     if idr_tune:
+         if not target_ff.has_feature("idr"):
+@@ -1023,7 +1023,7 @@ def entry():
+         mappings=known_mappings,
+         to_ff=known_force_fields[args.to_ff],
+         delete_unknown=True,
+-        disordered_regions=args.water_idrs
++        disordered_regions=args.id_regions
+     )
+     if 'bondedtypes' in known_force_fields[args.to_ff].variables:
+         LOGGER.info("Generating implicit interactions for RTP force field", type='step')
+@@ -1055,12 +1055,7 @@ def entry():
+         defines = ("GO_VIRT",)
+         itp_paths = {"atomtypes": "go_atomtypes.itp",
+                      "nonbond_params": "go_nbparams.itp"}
+-        if not args.water_bias:
+-            # this ensures that disordered-folded go bonds get removed regardless of force field.
+-            vermouth.processors.ComputeWaterBias(args.water_bias,
+-                                                 {s: float(eps) for s, eps in args.water_bias_eps},
+-                                                 args.water_idrs,
+-                                                ).run_system(system)
++
+     else:
+         # don't write non-bonded interactions
+         itp_paths = []
+@@ -1145,10 +1140,16 @@ def entry():
+ 
+         # now we add a bias by defining specific virtual-site water interactions
+         vermouth.processors.ComputeWaterBias(args.water_bias,
+-                                             { s:float(eps) for s, eps in args.water_bias_eps},
+-                                             args.water_idrs,
++                                             {s:float(eps) for s, eps in args.water_bias_eps},
++                                             args.id_regions,
+                                             ).run_system(system)
+ 
++    # remove any secondary structure interactions that cross disordered/folded domains.
++    vermouth.processors.IDRCrossDomainInteractionRemoval(go=args.go,
++                                                         elastic=args.elastic,
++                                                         id_regions=args.id_regions,
++                                                         ).run_system(system)
++
+     # Here we need to add the resids from the PDB back if that is needed
+     if args.resid_handling == "input":
+         for molecule in system.molecules:
+diff --git a/vermouth/processors/__init__.py b/vermouth/processors/__init__.py
+index 604df47f..6f034f72 100644
+--- a/vermouth/processors/__init__.py
++++ b/vermouth/processors/__init__.py
+@@ -48,3 +48,4 @@
+ from .cif_reader import CIFInput
+ from .rtp_polisher import RTPPolisher
+ from .stash_attributes import StashAttributes
++from .idr_cross_domain_interaction_removal import IDRCrossDomainInteractionRemoval
+diff --git a/vermouth/processors/idr_cross_domain_interaction_removal.py b/vermouth/processors/idr_cross_domain_interaction_removal.py
+new file mode 100644
+index 00000000..80afba64
+--- /dev/null
++++ b/vermouth/processors/idr_cross_domain_interaction_removal.py
+@@ -0,0 +1,158 @@
++# Copyright 2026 University of Groningen
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from itertools import compress
++from .processor import Processor
++from .annotate_idrs import parse_residues
++from ..graph_utils import make_residue_graph
++from ..rcsu.go_utils import get_go_type_from_attributes, _in_chain_and_resid_region
++import numpy as np
++from ..log_helpers import StyleAdapter, get_logger
++
++LOGGER = StyleAdapter(get_logger(__name__))
++
++class IDRCrossDomainInteractionRemoval(Processor):
++    def __init__(self, 
++                 go, 
++                 elastic,
++                 id_regions):
++        """
++        Parameters
++        ----------
++        go: bool
++            this system contains a go model
++        elastic: bool
++            this system contains an elastic network
++        id_regions: list
++            list of tuples of residue regions defining the IDRs
++        """
++        self.go = go
++        self.elastic = elastic
++        self.id_regions = []
++        for region in id_regions:
++            self.id_regions.append(parse_residues(region))
++
++    def remove_cross_nb_interactions(self, molecule, res_graph, nbparams):
++        """
++        Remove Go interactions between folded and disordered regions of a molecule
++
++        Parameters
++        ----------
++        molecule: :class:`vermouth.molecule.Molecule`
++            the molecule
++        res_graph: :class:`networkx.Graph`
++            the residue graph of the molecule
++        """
++        #list of all the Go pairs in the molecule
++        all_go_pairs = np.array([list(i.atoms) for i in nbparams if 'W' not in list(i.atoms)])
++        # list to record which items we don't want. cross = go potential between folded and disordered domain.
++        all_cross_pairs = []
++        # for each IDR that we have
++        for region in self.id_regions:
++            # for each residue in the molecule
++            for res_node in res_graph.nodes:
++                # get the current resid, the original one, and the chain
++                resid = res_graph.nodes[res_node]['resid']
++                _old_resid = res_graph.nodes[res_node]['stash']['resid']
++                chain = res_graph.nodes[res_node]['chain']
++                # if the region is in the original resid and chain
++                if _in_chain_and_resid_region(region, _old_resid, chain):
++                    # get the matching virtual site from the residue attrs
++                    vs_go_node = next(get_go_type_from_attributes(res_graph.nodes[res_node]['graph'],
++                                                                  resid=resid,
++                                                                  chain=chain,
++                                                                  prefix=molecule.meta.get('moltype')))
++                    all_cross_pairs.append(np.where(all_go_pairs == vs_go_node)[0]) #just need the first one
++
++        # make sure we only have one entry in case a site has more than one interaction
++        all_cross_pairs = np.unique([x for xs in all_cross_pairs for x in xs])
++
++        return all_cross_pairs
++
++    def remove_cross_elastic(self, molecule):
++        """
++        Remove elastic network bonds between folded and disordered regions of a molecule
++
++        Parameters
++        ----------
++        molecule: :class:`vermouth.molecule.Molecule`
++            the molecule
++        res_graph: :class:`networkx.Graph`
++            the residue graph of the molecule
++        """
++        # find elastic bonds by meta
++        elastic_bonds = [list(i.atoms) for i in molecule.interactions['bonds'] if i.meta.get('group') == "Rubber band"]
++        # list to record which items we don't want. cross = elastic bond between folded and disordered domain.
++        all_cross_pairs = []
++        # make a map between bond indicies and their residues. index starts from 1 so -1 for idx        
++        nodes_map = {i: {"resid": molecule.nodes[j].get('stash').get('resid'),                                
++                         "chain": molecule.nodes[j].get('chain')                                
++                         }                    
++                         for i,j in enumerate(molecule.nodes, 1)}
++                
++        # list of bonds, but which residues they link not nodes
++        residue_bonds = [[nodes_map[i].get('resid') for i in j] for j in elastic_bonds]
++        # same but for chains
++        chains = [[nodes_map[i].get('chain') for i in j] for j in elastic_bonds]
++        
++        for region in self.id_regions:
++            # get info about the region
++            lower, upper = sorted(region['resids'][0])
++            chain = region['chain']
++            # get bonds and chain in molecule which match this region
++            bond_in_region = [any([(i>= lower) & (i<= upper) for i in j]) for j in residue_bonds]
++            chain_in_region = [any([i == chain for i in j]) for j in chains]
++            # list of which residue bonds meet both criteria
++            bonds_rm_idx = [all([i,j]) for i,j in zip(bond_in_region, chain_in_region)]
++
++            # get the bonds that need to be removed
++            for_removal = compress(elastic_bonds, bonds_rm_idx) 
++            all_cross_pairs.extend(for_removal)
++
++        # delete the folded-disordered elastic network bonds from the list
++        # go backwards otherwise list order gets messed up.
++        for i in reversed(all_cross_pairs):
++            molecule.remove_interaction('bonds', tuple(i))
++
++
++    def _remove_nb_interactions(self, system, interactions_list):
++        """
++        remove non bonded interactions at the system level
++        """
++        # delete the folded-disordered Go interactions from the list.
++        # go backwards otherwise list order gets messed up.
++        for i in reversed(interactions_list):
++            del system.gmx_topology_params["nonbond_params"][i]
++
++
++    def run_system(self, system):
++        # no disordered regions, no bother
++        if not self.id_regions:
++            return system
++
++        for molecule in system.molecules:
++
++            if self.go:
++                if hasattr(molecule, 'res_graph'):
++                    res_graph = molecule.res_graph
++                else:
++                    res_graph = make_residue_graph(molecule)
++
++                interactions_for_removal = self.remove_cross_nb_interactions(molecule=molecule, 
++                                                                             res_graph=res_graph,
++                                                                             nbparams=system.gmx_topology_params["nonbond_params"])
++                self._remove_nb_interactions(system, interactions_for_removal)
++
++            elif self.elastic:
++                self.remove_cross_elastic(molecule=molecule)
+diff --git a/vermouth/processors/water_bias.py b/vermouth/processors/water_bias.py
+index d6af2bfb..077e1835 100644
+--- a/vermouth/processors/water_bias.py
++++ b/vermouth/processors/water_bias.py
+@@ -26,7 +26,7 @@ class ComputeWaterBias(Processor):
+ 
+     The water bias strength is defined per secondary
+     structure element in `water_bias` and assigned if
+-    `auto_bias` is set to True. Using the `idr_regions`
++    `auto_bias` is set to True. Using the `id_regions`
+     argument the water_bias can be changed for
+     intrinsically disordered regions (IDRs). The IDR
+     bias superseeds the auto bias.
+@@ -44,10 +44,8 @@ class ComputeWaterBias(Processor):
+     def __init__(self,
+                  auto_bias,
+                  water_bias,
+-                 idr_regions):
++                 id_regions):
+         """
+-
+-
+         Parameters
+         ----------
+         auto_bias: bool
+@@ -56,7 +54,7 @@ def __init__(self,
+         water_bias: dict[str, float]
+             a dict of secondary structure codes and
+             epsilon value for the water bias in kJ/mol
+-        idr_regions: list
++        id_regions: list
+             list of tuples of residue regions defining the IDRs
+         prefix: str
+             prefix of the Go virtual-site atomtypes
+@@ -66,9 +64,9 @@ def __init__(self,
+         """
+         self.water_bias = water_bias
+         self.auto_bias = auto_bias
+-        self.idr_regions = []
+-        for region in idr_regions:
+-            self.idr_regions.append(parse_residues(region))
++        self.id_regions = []
++        for region in id_regions:
++            self.id_regions.append(parse_residues(region))
+         self.system = None
+ 
+     def assign_residue_water_bias(self, molecule, res_graph):
+@@ -95,7 +93,7 @@ def assign_residue_water_bias(self, molecule, res_graph):
+             if self.auto_bias:
+                 sec_struc = res_graph.nodes[res_node]['cgsecstruct']
+                 eps = self.water_bias.get(sec_struc, 0.0)
+-            for region in self.idr_regions:
++            for region in self.id_regions:
+                 if _in_chain_and_resid_region(region, _old_resid, chain):
+                     eps = self.water_bias.get('idr', 0.0)
+                     sec_struc = res_graph.nodes[res_node]['cgsecstruct']
+@@ -121,42 +119,6 @@ def assign_residue_water_bias(self, molecule, res_graph):
+                                       meta={"comment": ["water bias", sec_struc]})
+             self.system.gmx_topology_params["nonbond_params"].append(water_bias)
+ 
+-    def remove_cross_nb_interactions(self, molecule, res_graph):
+-        """
+-        Remove Go bonds between folded and disordered regions of a molecule
+-
+-        Parameters
+-        ----------
+-        molecule: :class:`vermouth.molecule.Molecule`
+-            the molecule
+-        res_graph: :class:`vermouth.molecule.Molecule`
+-            the residue graph of the molecule
+-        """
+-        #list of all the Go pairs in the molecule
+-        all_go_pairs = np.array([list(i.atoms) for i in self.system.gmx_topology_params["nonbond_params"] if 'W' not in list(i.atoms)])
+-        # list to record which items we don't want. cross = go potential between folded and disordered domain.
+-        all_cross_pairs = []
+-
+-        for region in self.idr_regions:
+-            for res_node in res_graph.nodes:
+-                resid = res_graph.nodes[res_node]['resid']
+-                _old_resid = res_graph.nodes[res_node]['stash']['resid']
+-                chain = res_graph.nodes[res_node]['chain']
+-                if _in_chain_and_resid_region(region, _old_resid, chain):
+-                    vs_go_node = next(get_go_type_from_attributes(res_graph.nodes[res_node]['graph'],
+-                                                                  resid=resid,
+-                                                                  chain=chain,
+-                                                                  prefix=molecule.meta.get('moltype')))
+-                    all_cross_pairs.append(np.where(all_go_pairs == vs_go_node)[0]) #just need the first one
+-
+-
+-        # make sure we only have one entry in case a site has more than one interaction
+-        all_cross_pairs = np.unique([x for xs in all_cross_pairs for x in xs])
+-        # delete the folded-disordered Go interactions from the list going backwards.
+-        # otherwise list order gets messed up.
+-        for i in reversed(all_cross_pairs):
+-            del self.system.gmx_topology_params["nonbond_params"][i]
+-
+     def run_molecule(self, molecule):
+         """
+         Assign water bias for a single molecule
+@@ -173,7 +135,6 @@ def run_molecule(self, molecule):
+             res_graph = make_residue_graph(molecule)
+ 
+         self.assign_residue_water_bias(molecule, res_graph)
+-        self.remove_cross_nb_interactions(molecule, res_graph)
+ 
+         return molecule
+ 
+@@ -187,7 +148,7 @@ def run_system(self, system):
+         ----------
+         system: :class:`vermouth.system.System`
+         """
+-        if not (self.idr_regions or self.auto_bias):
++        if not (self.id_regions or self.auto_bias):
+             return system
+         self.system = system
+         super().run_system(system)
+diff --git a/vermouth/tests/test_idr_cross_domain_interaction_removal.py b/vermouth/tests/test_idr_cross_domain_interaction_removal.py
+new file mode 100644
+index 00000000..d4c101b4
+--- /dev/null
++++ b/vermouth/tests/test_idr_cross_domain_interaction_removal.py
+@@ -0,0 +1,170 @@
++# Copyright 2026 University of Groningen
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++import pytest
++import vermouth
++from vermouth.rcsu.go_vs_includes import VirtualSiteCreator
++from vermouth.processors.water_bias import ComputeWaterBias
++from vermouth.processors.idr_cross_domain_interaction_removal import IDRCrossDomainInteractionRemoval
++from vermouth.tests.helper_functions import create_sys_all_attrs, test_molecule
++from vermouth.gmx.topology import NonbondParam
++from vermouth.molecule import Interaction
++import networkx
++
++@pytest.mark.parametrize('id_regions, go_bonds, expected',
++         (
++            (#no idrs to remove
++             [],
++             [[1, 3], [2, 4]],
++             [[1, 3], [2, 4]]
++            ),
++            (#central idr to remove bonds from
++             ["A-2:3"],
++             [[1, 3], [2, 4], [1, 4]],
++             [[1, 4]]
++            ),
++            (#remove all bonds within a region
++            ["A-1:4"],
++            [[1, 2], [2, 3], [3, 4], [1, 4]],
++            []
++            )
++          ))
++def test_cross_go_bond_removal(test_molecule,
++                               id_regions,
++                               go_bonds,
++                               expected):
++    # bead sizes
++    sizes = {0: 0.47, 3: 0.41, 5: 0.38, 6: 0.47}
++    # the molecule atomtypes
++    atypes = {0: "P1", 1: "SN4a", 2: "SN4a",
++              3: "SP1", 4: "C1",
++              5: "TP1",
++              6: "P1", 7: "SN3a", 8: "SP4"}
++    # the molecule resnames
++    resnames = {0: "A", 1: "A", 2: "A",
++                3: "B", 4: "B",
++                5: "C",
++                6: "D", 7: "D", 8: "D"}
++    secstruc = {1: "H", 2: "H", 3: "H", 4: "H"}
++
++    system = create_sys_all_attrs(test_molecule,
++                                  moltype="molecule_0",
++                                  secstruc=secstruc,
++                                  defaults={"chain": "A"},
++                                  attrs={"resname": resnames,
++                                         "atype": atypes})
++
++    # generate the virtual sites
++    VirtualSiteCreator().run_system(system)
++
++    #add the go bonds between residues
++    for go_bond in go_bonds:
++        atypes = []
++        for index in go_bond:
++            for atom in [i for i in system.molecules[0].atoms]:
++                if (atom[1]['resid'] == index) and (atom[1]['atomname'] == 'CA'):
++                    atypes.append(atom[1]['atype'])
++        contact_bias = NonbondParam(atoms=(atypes[0], atypes[1]),
++                                sigma=0.5, #these values don't matter
++                                epsilon=0.5,
++                                meta={"comment": ["go bond"]})
++        system.gmx_topology_params["nonbond_params"].append(contact_bias)
++
++    # remove folded-disordered domain Go interactions
++    processor = IDRCrossDomainInteractionRemoval(go=True,
++                                                 elastic=False,
++                                                 id_regions=id_regions)
++    processor.run_system(system)
++
++    #find the go bonds which remain after removal, and don't involve water
++    remaining = [list(i.atoms) for i in system.gmx_topology_params["nonbond_params"] if 'W' not in list(i.atoms)]
++
++    assert len(remaining) == len(expected)
++    for i in expected:
++        expected_names = [f"molecule_0_{j}" for j in i]
++
++        assert expected_names in remaining
++ 
++ 
++@pytest.mark.parametrize('id_regions, el_bonds, expected',
++         (
++            (#no idrs to remove
++             [],
++             [[1, 6], [4, 7]],
++             [[1, 6], [4, 7]]
++            ),
++            (#central idr to remove bonds from
++             ["A-2:3"],
++             [[1, 6], [4, 7], [1, 7]],
++             [[1, 7]]
++            ),
++            (#remove all bonds within a region
++            ["A-1:4"],
++            [[1, 4], [4, 6], [6, 7], [1, 7]],
++            []
++            )
++          ))
++def test_cross_el_bond_removal(test_molecule,
++                               id_regions,
++                               el_bonds,
++                               expected):
++    # bead sizes
++    sizes = {0: 0.47, 3: 0.41, 5: 0.38, 6: 0.47}
++    # the molecule atomtypes
++    atypes = {1: "P1", 2: "SN4a", 3: "SN4a",
++              4: "SP1", 5: "C1",
++              6: "TP1",
++              7: "P1", 8: "SN3a", 9: "SP4"}
++    # the molecule resnames
++    resnames = {1: "A", 2: "A", 3: "A",
++                4: "B", 5: "B",
++                6: "C",
++                7: "D", 8: "D", 9: "D"}
++    stash = {'resid':{1: 1, 2: 1, 3: 1,
++                      4: 2, 5: 2,
++                      6: 3,
++                      7: 4, 8: 4, 9: 4}}
++    secstruc = {1: "H", 2: "H", 3: "H", 4: "H"}
++
++    # atom indices actually start from 1 and we use them when processing elastic networks
++    G = networkx.relabel_nodes(test_molecule, lambda x: x + 1)
++    system = create_sys_all_attrs(G,
++                                  moltype="molecule_0",
++                                  secstruc=secstruc,
++                                  defaults={"chain": "A"},
++                                  attrs={"resname": resnames,
++                                         "atype": atypes,
++                                         "stash": stash})
++    #add the elastic bonds between BB beads
++    for el_bond in el_bonds:
++        system.molecules[0].add_interaction(type_ = 'bonds',
++                                            atoms = tuple(el_bond),
++                                            parameters = ['1', '10', '5000'],
++                                            meta = {"group": "Rubber band"}
++                                            )
++
++    # remove folded-disordered domain bonds
++    processor = IDRCrossDomainInteractionRemoval(go=False,
++                                                 elastic=True,
++                                                 id_regions=id_regions)
++    processor.run_system(system)
++
++    # assert False
++    remaining = [i.atoms for i in system.molecules[0].interactions['bonds']]
++
++    assert len(remaining) == len(expected)
++    for i in expected:
++        assert tuple(i) in remaining
++        
++ 
++ 
+\ No newline at end of file
+diff --git a/vermouth/tests/test_water_bias.py b/vermouth/tests/test_water_bias.py
+index 01ce927f..2f41be03 100644
+--- a/vermouth/tests/test_water_bias.py
++++ b/vermouth/tests/test_water_bias.py
+@@ -22,7 +22,7 @@
+ from vermouth.tests.helper_functions import create_sys_all_attrs, test_molecule
+ from vermouth.gmx.topology import NonbondParam
+ 
+-@pytest.mark.parametrize('secstruc, water_bias, idr_regions, expected',
++@pytest.mark.parametrize('secstruc, water_bias, id_regions, expected',
+         ((
+         # only auto-bias single sec struct
+         {1: "H", 2: "H", 3: "H", 4: "H"},
+@@ -58,7 +58,7 @@
+ def test_assign_residue_water_bias(test_molecule,
+                                    secstruc,
+                                    water_bias,
+-                                   idr_regions,
++                                   id_regions,
+                                    expected):
+     # bead sizes
+     sizes = {0: 0.47, 3: 0.41, 5: 0.38, 6: 0.47}
+@@ -85,7 +85,7 @@ def test_assign_residue_water_bias(test_molecule,
+ 
+     processor = ComputeWaterBias(water_bias=water_bias,
+                                  auto_bias=True,
+-                                 idr_regions=idr_regions)
++                                 id_regions=id_regions)
+     processor.run_system(system)
+     for nb_params in system.gmx_topology_params['nonbond_params']:
+         assert nb_params.atoms[0] == "W"
+@@ -101,80 +101,6 @@ def test_assign_residue_water_bias(test_molecule,
+                 assert water_eps == nb_params.epsilon
+                 assert water_sig == nb_params.sigma
+ 
+-@pytest.mark.parametrize('idr_regions, go_bonds, expected',
+-         (
+-            (#no idrs to remove
+-             [],
+-             [[1, 3], [2, 4]],
+-             [[1, 3], [2, 4]]
+-            ),
+-            (#central idr to remove bonds from
+-             ["2:3"],
+-             [[1, 3], [2, 4], [1, 4]],
+-             [[1, 4]]
+-            ),
+-            (#remove all bonds within a region
+-            ["1:4"],
+-            [[1, 2], [2, 3], [3, 4], [1, 4]],
+-            []
+-            )
+-          ))
+-def test_cross_go_bond_removal(test_molecule,
+-                               idr_regions,
+-                               go_bonds,
+-                               expected):
+-    # bead sizes
+-    sizes = {0: 0.47, 3: 0.41, 5: 0.38, 6: 0.47}
+-    # the molecule atomtypes
+-    atypes = {0: "P1", 1: "SN4a", 2: "SN4a",
+-              3: "SP1", 4: "C1",
+-              5: "TP1",
+-              6: "P1", 7: "SN3a", 8: "SP4"}
+-    # the molecule resnames
+-    resnames = {0: "A", 1: "A", 2: "A",
+-                3: "B", 4: "B",
+-                5: "C",
+-                6: "D", 7: "D", 8: "D"}
+-    secstruc = {1: "H", 2: "H", 3: "H", 4: "H"}
+-
+-    system = create_sys_all_attrs(test_molecule,
+-                                  moltype="molecule_0",
+-                                  secstruc=secstruc,
+-                                  defaults={"chain": "A"},
+-                                  attrs={"resname": resnames,
+-                                         "atype": atypes})
+-
+-    # generate the virtual sites
+-    VirtualSiteCreator().run_system(system)
+-
+-    #add the go bonds between residues
+-    for go_bond in go_bonds:
+-        atypes = []
+-        for index in go_bond:
+-            for atom in [i for i in system.molecules[0].atoms]:
+-                if (atom[1]['resid'] == index) and (atom[1]['atomname'] == 'CA'):
+-                    atypes.append(atom[1]['atype'])
+-        contact_bias = NonbondParam(atoms=(atypes[0], atypes[1]),
+-                                sigma=0.5, #these values don't matter
+-                                epsilon=0.5,
+-                                meta={"comment": ["go bond"]})
+-        system.gmx_topology_params["nonbond_params"].append(contact_bias)
+-
+-    #apply water bias and remove folded-disordered domain bonds
+-    processor = ComputeWaterBias(water_bias={"idr": 1.1, "C": 3.1, "H": 2.1}, # doesn't matter
+-                                 auto_bias=True,
+-                                 idr_regions=idr_regions)
+-    processor.run_system(system)
+-
+-    #find the go bonds which remain after removal, and don't involve water
+-    remaining = [list(i.atoms) for i in system.gmx_topology_params["nonbond_params"] if 'W' not in list(i.atoms)]
+-
+-    assert len(remaining) == len(expected)
+-    for i in expected:
+-        expected_names = [f"molecule_0_{j}" for j in i]
+-
+-        assert expected_names in remaining
+-
+ def test_no_moltype_error(test_molecule):
+     """
+     Test that various high level errors are
+@@ -183,7 +109,7 @@ def test_no_moltype_error(test_molecule):
+     # set up processor
+     processor = ComputeWaterBias(water_bias={"C": 3.1},
+                                  auto_bias=True,
+-                                 idr_regions=[])
++                                 id_regions=[])
+     # no moltype set
+     system = vermouth.System()
+     system.add_molecule(test_molecule)
+@@ -198,7 +124,7 @@ def test_no_system_error(test_molecule):
+     # set up processor
+     processor = ComputeWaterBias(water_bias={"C": 3.1},
+                                  auto_bias=True,
+-                                 idr_regions=[])
++                                 id_regions=[])
+     test_molecule.meta['moltype'] = "random"
+     # no system
+     with pytest.raises(IOError):
+@@ -208,7 +134,7 @@ def test_clean_return(test_molecule):
+     # set up processor
+     processor = ComputeWaterBias(water_bias={"C": 3.1},
+                                  auto_bias=None,
+-                                 idr_regions=[])
++                                 id_regions=[])
+     test_molecule.meta['moltype'] = "random"
+     system = vermouth.System()
+     system.add_molecule(test_molecule)

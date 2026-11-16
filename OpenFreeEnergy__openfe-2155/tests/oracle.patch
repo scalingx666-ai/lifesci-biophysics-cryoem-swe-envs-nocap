@@ -1,0 +1,701 @@
+diff --git a/src/openfe/orchestration/__init__.py b/src/openfe/orchestration/__init__.py
+index 14999e2f2..070a6aba5 100644
+--- a/src/openfe/orchestration/__init__.py
++++ b/src/openfe/orchestration/__init__.py
+@@ -18,8 +18,10 @@
+ from openfe.storage.warehouse import FileSystemWarehouse
+ 
+ from .exorcist_utils import (
+-    alchemical_network_to_task_graph,
++    _alchemical_network_to_task_graph,
+     build_task_db_from_alchemical_network,
++    get_dependency_df,
++    get_task_df,
+ )
+ 
+ 
+@@ -189,7 +191,7 @@ def _get_task(self) -> tuple[str, ProtocolUnit]:
+         db, taskid, unit = task
+         return taskid, unit
+ 
+-    def execute_unit(self, scratch: Path) -> tuple[str, ProtocolUnitResult] | None:
++    def execute_unit(self, scratch: Path | str) -> tuple[str, ProtocolUnitResult] | None:
+         """Execute one checked-out protocol unit and persist its result.
+ 
+         Parameters
+@@ -209,7 +211,7 @@ def execute_unit(self, scratch: Path) -> tuple[str, ProtocolUnitResult] | None:
+             Re-raises any exception thrown during protocol unit execution after
+             marking the task as failed.
+         """
+-
++        scratch = Path(scratch)
+         # 1. Get task/unit
+         task = self._checkout_task()
+         if task is None:
+diff --git a/src/openfe/orchestration/exorcist_utils.py b/src/openfe/orchestration/exorcist_utils.py
+index 459877b9c..37a263fc7 100644
+--- a/src/openfe/orchestration/exorcist_utils.py
++++ b/src/openfe/orchestration/exorcist_utils.py
+@@ -9,13 +9,15 @@
+ import exorcist
+ import networkx as nx
+ import pandas as pd
+-from gufe import AlchemicalNetwork
++from gufe import AlchemicalNetwork, ProtocolDAG
+ 
++from openfe.orchestration import FileSystemWarehouse
+ from openfe.storage.warehouse import WarehouseBaseClass
+ 
+ 
+-def alchemical_network_to_task_graph(
+-    alchemical_network: AlchemicalNetwork, warehouse: WarehouseBaseClass
++def _alchemical_network_to_task_graph(
++    alchemical_network: AlchemicalNetwork,
++    warehouse: WarehouseBaseClass,
+ ) -> nx.DiGraph:
+     """Build a global task DAG from an alchemical network.
+ 
+@@ -30,9 +32,8 @@ def alchemical_network_to_task_graph(
+     Returns
+     -------
+     nx.DiGraph
+-        A directed acyclic graph where each node is a task ID in the form
+-        ``"<transformation_key>:<protocol_unit_key>"`` and edges encode
+-        protocol-unit dependencies.
++        A directed acyclic graph where each node is a task ID with the ProtocolUnit key as a name
++        and edges encode protocol-unit dependencies.
+ 
+     Raises
+     ------
+@@ -40,48 +41,52 @@ def alchemical_network_to_task_graph(
+         Raised if the assembled task graph is not acyclic.
+     """
+ 
+-    global_dag = nx.DiGraph()
++    if not isinstance(alchemical_network, AlchemicalNetwork):
++        raise ValueError(
++            f"alchemical_network must be an AlchemicalNetwork, not {type(alchemical_network)}."
++        )
++
++    warehouse.store_setup_tokenizable(alchemical_network)
++
++    global_task_dag = nx.DiGraph()
+     for transformation in alchemical_network.edges:
+-        dag = transformation.create()
++        dag: ProtocolDAG = transformation.create()
+         for unit in dag.protocol_units:
+-            node_id = str(unit.key)
+-            global_dag.add_node(node_id)
++            global_task_dag.add_node(str(unit.key))
+             warehouse.store_task(unit)
+-        # store the protocol_dag as a shallow dict, since all its units are
+-        # already written to disk
+-        warehouse.store_protocol_dag(dag)
+         for dependent_unit, dependency_unit in dag.graph.edges:
+             upstream_id = str(dependency_unit.key)
+             downstream_id = str(dependent_unit.key)
+-            global_dag.add_edge(upstream_id, downstream_id)
++            global_task_dag.add_edge(upstream_id, downstream_id)
++
++        # at this point, stored as a shallow dict since all its units are already stored
++        warehouse.store_protocol_dag(dag)
+ 
+-    if not nx.is_directed_acyclic_graph(global_dag):
++    if not nx.is_directed_acyclic_graph(global_task_dag):
+         raise ValueError("AlchemicalNetwork produced a task graph that is not a DAG.")
+ 
+-    return global_dag
++    return global_task_dag
+ 
+ 
+-# TODO: do we test adding a multiple alchemical networks to the same task graph?
+ def build_task_db_from_alchemical_network(
+     alchemical_network: AlchemicalNetwork,
+-    warehouse: WarehouseBaseClass,
+-    db_path: Path | None = None,
++    warehouse_dir: Path,  # TODO: make optional?
++    db_path: Path,  # TODO: make optional?
+     max_tries: int = 1,
+-) -> exorcist.TaskStatusDB:
+-    """Create and populate a task database from an alchemical network.
++) -> tuple[exorcist.TaskStatusDB, FileSystemWarehouse]:
++    """Create a task database and FileSystemWarehouse from an alchemical network.
+ 
+     Parameters
+     ----------
+     alchemical_network : AlchemicalNetwork
+-        Network containing transformations to convert into task records.
+-    warehouse : WarehouseBaseClass
+-        Warehouse used to persist protocol units while building the task DAG.
+-    db_path : pathlib.Path or None, optional
+-        Location of the SQLite-backed Exorcist database. If ``None``, defaults
+-        to {warehouse.name}.db in the current working directory.
++        ``AlchemicalNetwork`` containing transformations to convert into task records.
++    warehouse_dir : pathlib.Path
++        Root directory at which to create a FileSystemWarehouse (e.g. ``campaign_name/``).
++    db_path : pathlib.Path
++        Location to store the SQLite-backed Exorcist database (e.g. ``campaign_name.db``).
+     max_tries : int, default=1
+-        Maximum number of retries for each task before Exorcist marks it as
+-        ``TOO_MANY_RETRIES``.
++        Maximum number of times a task will attempt to be submitted before it
++        is labelled ``TOO_MANY_RETRIES``.
+ 
+     Returns
+     -------
+@@ -89,10 +94,47 @@ def build_task_db_from_alchemical_network(
+         Initialized task database populated with graph nodes and dependency
+         edges derived from ``alchemical_network``.
+     """
+-    if db_path is None:
+-        db_path = Path(f"{warehouse.name}.db")
+-
+-    global_dag: nx.DiGraph = alchemical_network_to_task_graph(alchemical_network, warehouse)
++    # require starting clean each time for now - guardrails around modifying existing state can come later
++    if Path(db_path).exists():
++        raise FileExistsError(f"Error: {db_path} cannot already exist.")
++    warehouse = FileSystemWarehouse(warehouse_dir, exist_ok=False)
++    global_task_dag: nx.DiGraph = _alchemical_network_to_task_graph(alchemical_network, warehouse)
+     db = exorcist.TaskStatusDB.from_filename(db_path)
+-    db.add_task_network(global_dag, max_tries)
+-    return db
++    db.add_task_network(global_task_dag, max_tries)
++    return db, warehouse
++
++
++def get_task_df(task_db: exorcist.TaskStatusDB) -> pd.DataFrame:
++    """Create a pandas Dataframe from task_db.
++
++    Parameters
++    ----------
++    task_db : exorcist.TaskStatusDB
++        A task database.
++
++    Returns
++    -------
++    pd.DataFrame
++        A dataframe of the tasks and their statuses
++    """
++    status_name_encoding = {e.value: e.name for e in exorcist.TaskStatus}
++    task_table = pd.read_sql_table("tasks", task_db.engine)
++    task_table.replace({"status": status_name_encoding}, inplace=True)
++    return task_table
++
++
++def get_dependency_df(task_db: exorcist.TaskStatusDB) -> pd.DataFrame:
++    """Create a pandas Dataframe from task_db.
++
++    Parameters
++    ----------
++    task_db : exorcist.TaskStatusDB
++        A task database.
++
++    Returns
++    -------
++    pd.DataFrame
++        A dataframe of the tasks and their dependencies.
++
++    """
++    return pd.read_sql_table("dependencies", task_db.engine)
+diff --git a/src/openfe/storage/warehouse.py b/src/openfe/storage/warehouse.py
+index 6f8acb537..649387d49 100644
+--- a/src/openfe/storage/warehouse.py
++++ b/src/openfe/storage/warehouse.py
+@@ -1,5 +1,7 @@
+ # This code is part of OpenFE and is licensed under the MIT license.
+ # For details, see https://github.com/OpenFreeEnergy/gufe
++from __future__ import annotations
++
+ import json
+ import pathlib
+ import re
+@@ -12,8 +14,6 @@
+     JSON_HANDLER,
+     GufeKey,
+     GufeTokenizable,
+-    from_dict,
+-    get_all_gufe_objs,
+     key_decode_dependencies,
+ )
+ 
+@@ -398,8 +398,8 @@ class FileSystemWarehouse(WarehouseBaseClass):
+ 
+     Parameters
+     ----------
+-    root_dir : str, optional
+-        Root directory for the warehouse storage, by default "warehouse".
++    root_dir : pathlib.Path, optional
++        Root directory in which to create the warehouse storage.
+ 
+     Notes
+     -----
+@@ -408,15 +408,18 @@ class FileSystemWarehouse(WarehouseBaseClass):
+     for results and other data types.
+     """
+ 
+-    def __init__(self, name):
+-        # TODO: should name and location be different?
+-        self.root_dir = pathlib.Path(f"{name}")
+-        setup_store = FileStorage(f"{self.root_dir}/setup")
+-        result_store = FileStorage(f"{self.root_dir}/result")
+-        shared_store = FileStorage(f"{self.root_dir}/shared")
+-        tasks_store = FileStorage(f"{self.root_dir}/tasks")
+-        # TODO: we can store dags in setup if we have a performant way of accessing them
+-        protocol_dag_store = FileStorage(f"{self.root_dir}/protocol_dags")
++    def __init__(self, root_dir: pathlib.Path, exist_ok=False):
++        self.root_dir = pathlib.Path(root_dir)
++        if self.root_dir.is_dir() and not exist_ok:
++            raise ValueError(
++                "`root_dir` already exists. To load an existing Warehouse, use FileSystemWarehouse.from_dir(`root_dir`)"
++            )
++        self.root_dir.mkdir(exist_ok=exist_ok)  # make parents?
++        setup_store = FileStorage(f"{self.root_dir}/setup", exist_ok=exist_ok)
++        result_store = FileStorage(f"{self.root_dir}/result", exist_ok=exist_ok)
++        shared_store = FileStorage(f"{self.root_dir}/shared", exist_ok=exist_ok)
++        tasks_store = FileStorage(f"{self.root_dir}/tasks", exist_ok=exist_ok)
++        protocol_dag_store = FileStorage(f"{self.root_dir}/protocol_dags", exist_ok=exist_ok)
+         stores = WarehouseStores(
+             setup=setup_store,
+             result=result_store,
+@@ -424,4 +427,30 @@ def __init__(self, name):
+             tasks=tasks_store,
+             protocol_dags=protocol_dag_store,
+         )
+-        super().__init__(stores, name)
++        name = self.root_dir.resolve().name
++        super().__init__(stores=stores, name=name)
++
++    @classmethod
++    def from_dir(cls, root_dir: pathlib.Path) -> FileSystemWarehouse:
++        """Initialize a FileSystemWarehouse from an existing directory.
++
++        Parameters
++        ----------
++        root_dir : pathlib.Path
++            Root directory of the Warehouse.
++
++        Returns
++        -------
++        FileSystemWarehouse
++
++        Raises
++        ------
++        ValueError
++            If `root_dir` is not an existing directory.
++        """
++        root_dir = pathlib.Path(root_dir)
++        if not root_dir.is_dir():
++            raise ValueError(
++                "`root_dir` must be an existing filepath. To create a new Warehouse, use FileSystemWarehouse(`root_dir`)"
++            )
++        return cls(root_dir=root_dir, exist_ok=True)
+diff --git a/src/openfe/tests/orchestration/test_exorcist_utils.py b/src/openfe/tests/orchestration/test_exorcist_utils.py
+index aea4df87f..a85c94083 100644
+--- a/src/openfe/tests/orchestration/test_exorcist_utils.py
++++ b/src/openfe/tests/orchestration/test_exorcist_utils.py
+@@ -1,18 +1,21 @@
+-from pathlib import Path
+ from typing import cast
+ from unittest import mock
+ 
+ import exorcist
+ import networkx as nx
++import pandas as pd
+ import pytest
+ import sqlalchemy as sqla
++from gufe import AlchemicalNetwork
+ from gufe.tokenization import GufeKey
+ 
+-from openfe.orchestration.exorcist_utils import (
+-    alchemical_network_to_task_graph,
++from openfe.orchestration import (
++    _alchemical_network_to_task_graph,
+     build_task_db_from_alchemical_network,
++    get_dependency_df,
++    get_task_df,
+ )
+-from openfe.storage.warehouse import FileSystemWarehouse, WarehouseBaseClass
++from openfe.storage.warehouse import WarehouseBaseClass
+ 
+ 
+ class _RecordingWarehouse:
+@@ -42,7 +45,7 @@ def test_alchemical_network_to_task_graph_stores_all_units(request, fixture):
+     warehouse = _RecordingWarehouse()
+     network = request.getfixturevalue(fixture)
+     expected_units = _network_units(network)
+-    alchemical_network_to_task_graph(network, cast(WarehouseBaseClass, warehouse))
++    _alchemical_network_to_task_graph(network, cast(WarehouseBaseClass, warehouse))
+ 
+     stored_unit_names = [str(unit.name) for unit in warehouse.stored_tasks]
+     expected_unit_names = [str(unit.name) for unit in expected_units]
+@@ -56,7 +59,7 @@ def test_alchemical_network_to_task_graph_uses_canonical_task_ids(request, fixtu
+     warehouse = _RecordingWarehouse()
+     network = request.getfixturevalue(fixture)
+ 
+-    graph = alchemical_network_to_task_graph(network, cast(WarehouseBaseClass, warehouse))
++    graph = _alchemical_network_to_task_graph(network, cast(WarehouseBaseClass, warehouse))
+ 
+     expected_protocol_unit_keys = sorted(str(unit.key) for unit in warehouse.stored_tasks)
+     observed_protocol_unit_keys = []
+@@ -73,7 +76,7 @@ def test_alchemical_network_to_task_graph_edges_reference_existing_nodes(request
+     warehouse = _RecordingWarehouse()
+     network = request.getfixturevalue(fixture)
+ 
+-    graph = alchemical_network_to_task_graph(network, cast(WarehouseBaseClass, warehouse))
++    graph = _alchemical_network_to_task_graph(network, cast(WarehouseBaseClass, warehouse))
+ 
+     assert len(graph.edges) > 0
+     for u, v in graph.edges:
+@@ -86,7 +89,7 @@ def test_alchemical_network_to_task_graph_edge_direction_matches_dependencies(re
+     warehouse = _RecordingWarehouse()
+     network = request.getfixturevalue(fixture)
+ 
+-    graph = alchemical_network_to_task_graph(network, cast(WarehouseBaseClass, warehouse))
++    graph = _alchemical_network_to_task_graph(network, cast(WarehouseBaseClass, warehouse))
+     units_by_key = {str(unit.key): unit for unit in warehouse.stored_tasks}
+ 
+     for upstream_id, downstream_id in graph.edges:
+@@ -118,23 +121,24 @@ def create(self):
+             dag.graph.add_edges_from([(unit_a, unit_b), (unit_b, unit_a)])
+             return dag
+ 
+-    network = mock.Mock()
++    network = mock.Mock(AlchemicalNetwork)
+     network.edges = [_Transformation()]
+     warehouse = mock.Mock()
+ 
+     with pytest.raises(ValueError, match="not a DAG"):
+-        alchemical_network_to_task_graph(network, warehouse)
++        _alchemical_network_to_task_graph(network, warehouse)
+ 
+ 
++# TODO: slow test
+ @pytest.mark.parametrize("fixture", ["benzene_variants_star_map"])
+ def test_build_task_db_checkout_order_is_dependency_safe(tmp_path, request, fixture):
+     network = request.getfixturevalue(fixture)
+-    warehouse = FileSystemWarehouse(str(tmp_path / "warehouse"))
+     # Build the real sqlite task DB from a real alchemical network fixture.
+-    db = build_task_db_from_alchemical_network(
++    wh_dir = tmp_path / "campaign"
++    db, warehouse = build_task_db_from_alchemical_network(
+         network,
+-        warehouse,
+-        db_path=tmp_path / "tasks.db",
++        warehouse_dir=wh_dir,
++        db_path=tmp_path / "campaign.db",
+     )
+ 
+     # Read task IDs and dependency edges from the persisted DB state.
+@@ -147,6 +151,7 @@ def test_build_task_db_checkout_order_is_dependency_safe(tmp_path, request, fixt
+     checkout_order = []
+     # Hard upper bound prevents infinite checkout loops.
+     max_checkouts = len(graph_taskids)
++
+     for _ in range(max_checkouts):
+         taskid = db.check_out_task()
+         if taskid is None:
+@@ -175,42 +180,42 @@ def test_build_task_db_checkout_order_is_dependency_safe(tmp_path, request, fixt
+     assert {row.status for row in task_rows} == {exorcist.TaskStatus.COMPLETED.value}
+ 
+ 
+-@pytest.mark.parametrize("fixture", ["benzene_variants_star_map"])
+-def test_build_task_db_default_path(request, fixture):
+-    network = request.getfixturevalue(fixture)
+-    warehouse = mock.Mock()
+-    fake_graph = nx.DiGraph()
+-    fake_db = mock.Mock()
+-
+-    with (
+-        mock.patch(
+-            "openfe.orchestration.exorcist_utils.alchemical_network_to_task_graph",
+-            return_value=fake_graph,
+-        ) as task_graph_mock,
+-        mock.patch(
+-            "openfe.orchestration.exorcist_utils.exorcist.TaskStatusDB.from_filename",
+-            return_value=fake_db,
+-        ) as db_ctor,
+-    ):
+-        result = build_task_db_from_alchemical_network(network, warehouse)
+-
+-    task_graph_mock.assert_called_once_with(network, warehouse)
+-    db_ctor.assert_called_once_with(Path(f"{warehouse.name}.db"))
+-    fake_db.add_task_network.assert_called_once_with(fake_graph, 1)
+-    assert result is fake_db
++# TODO: revisit this after deciding how we want to handle defaults
++# @pytest.mark.parametrize("fixture", ["benzene_variants_star_map"])
++# def test_build_task_db_default_path(request, fixture):
++#     network = request.getfixturevalue(fixture)
++#     warehouse = mock.Mock()
++#     fake_graph = nx.DiGraph()
++#     fake_db = mock.Mock()
++
++#     with (
++#         mock.patch(
++#             "openfe.orchestration.exorcist_utils._alchemical_network_to_task_graph",
++#             return_value=fake_graph,
++#         ) as task_graph_mock,
++#         mock.patch(
++#             "openfe.orchestration.exorcist_utils.exorcist.TaskStatusDB.from_filename",
++#             return_value=fake_db,
++#         ) as db_ctor,
++#     ):
++#         result = build_task_db_from_alchemical_network(network, warehouse)
++
++#     task_graph_mock.assert_called_once_with(network, warehouse)
++#     db_ctor.assert_called_once_with(Path(f"{warehouse.name}.db"))
++#     fake_db.add_task_network.assert_called_once_with(fake_graph, 1)
++#     assert result is fake_db
+ 
+ 
+ @pytest.mark.parametrize("fixture", ["benzene_variants_star_map"])
+ def test_build_task_db_forwards_graph_and_max_tries(request, tmp_path, fixture):
+     network = request.getfixturevalue(fixture)
+-    warehouse = mock.Mock()
+     fake_graph = nx.DiGraph()
+     fake_db = mock.Mock()
+-    db_path = tmp_path / "custom_tasks.db"
+-
++    db_path = tmp_path / "tmp_campaign.db"
++    wh_path = tmp_path / "tmp_campaign"
+     with (
+         mock.patch(
+-            "openfe.orchestration.exorcist_utils.alchemical_network_to_task_graph",
++            "openfe.orchestration.exorcist_utils._alchemical_network_to_task_graph",
+             return_value=fake_graph,
+         ) as task_graph_mock,
+         mock.patch(
+@@ -218,14 +223,48 @@ def test_build_task_db_forwards_graph_and_max_tries(request, tmp_path, fixture):
+             return_value=fake_db,
+         ) as db_ctor,
+     ):
+-        result = build_task_db_from_alchemical_network(
++        db, warehouse = build_task_db_from_alchemical_network(
+             network,
+-            warehouse,
++            wh_path,
+             db_path=db_path,
+             max_tries=7,
+         )
+-
+     task_graph_mock.assert_called_once_with(network, warehouse)
+     db_ctor.assert_called_once_with(db_path)
+     fake_db.add_task_network.assert_called_once_with(fake_graph, 7)
+-    assert result is fake_db
++    assert db is fake_db
++
++
++@pytest.fixture()
++def benzene_star_map_task_db(benzene_variants_star_map, tmp_path):
++    warehouse = _RecordingWarehouse()
++    network = benzene_variants_star_map
++    global_task_dag = _alchemical_network_to_task_graph(
++        network, cast(WarehouseBaseClass, warehouse)
++    )
++    db = exorcist.TaskStatusDB.from_filename(":memory:")
++    db.add_task_network(global_task_dag, 5)
++    return db
++
++
++def test_get_task_df(benzene_star_map_task_db):
++    df = get_task_df(benzene_star_map_task_db)
++    assert isinstance(df, pd.DataFrame)
++    assert list(df.columns) == [
++        "taskid",
++        "status",
++        "last_modified",
++        "tries",
++        "max_tries",
++        "task_type",
++    ]
++    assert len(df) == 276
++    assert len(df[df.status == "AVAILABLE"]) == 12
++    assert len(df[df.status == "BLOCKED"]) == 264
++
++
++def test_get_dependency_df(benzene_star_map_task_db):
++    df = get_dependency_df(benzene_star_map_task_db)
++    assert isinstance(df, pd.DataFrame)
++    assert list(df.columns) == ["from", "to", "blocking"]
++    assert len(df) == 504
+diff --git a/src/openfe/tests/orchestration/test_worker.py b/src/openfe/tests/orchestration/test_worker.py
+index 221e8de54..de07a67d1 100644
+--- a/src/openfe/tests/orchestration/test_worker.py
++++ b/src/openfe/tests/orchestration/test_worker.py
+@@ -55,10 +55,9 @@ def _get_dependency_free_unit(absolute_transformation):
+ @pytest.fixture
+ def worker_with_real_db(tmp_path, absolute_transformation):
+     warehouse_root = tmp_path / "warehouse"
+-    db_path = warehouse_root / "tasks.db"
+-    warehouse = FileSystemWarehouse(str(warehouse_root))
++    db_path = tmp_path / "tasks.db"
+     network = gufe.AlchemicalNetwork([absolute_transformation])
+-    db = build_task_db_from_alchemical_network(network, warehouse, db_path=db_path)
++    db, warehouse = build_task_db_from_alchemical_network(network, warehouse_root, db_path=db_path)
+     worker = Worker(warehouse=warehouse, task_db_path=db_path)
+     return worker, warehouse, db
+ 
+@@ -85,12 +84,14 @@ def worker_with_executable_task_db(tmp_path, absolute_transformation):
+ def test_get_task_uses_default_db_path_without_patching(
+     tmp_path, monkeypatch, absolute_transformation
+ ):
++    # TODO: tasks.db shouldn't exist _within_ the warehouse
+     monkeypatch.chdir(tmp_path)
+-    warehouse = FileSystemWarehouse("warehouse")
++    warehouse_root = "warehouse"
+     db_path = Path("warehouse/tasks.db")
+     network = gufe.AlchemicalNetwork([absolute_transformation])
+-    db = build_task_db_from_alchemical_network(network, warehouse, db_path=db_path)
++    db, warehouse = build_task_db_from_alchemical_network(network, warehouse_root, db_path=db_path)
+ 
++    warehouse = FileSystemWarehouse.from_dir("warehouse")
+     worker = Worker(warehouse=warehouse)
+     taskid, loaded = worker._get_task()
+ 
+@@ -156,7 +157,7 @@ def test_checkout_task_returns_none_when_no_available_tasks(tmp_path):
+     warehouse_root = tmp_path / "warehouse"
+     db_path = warehouse_root / "tasks.db"
+     warehouse_root.mkdir(parents=True, exist_ok=True)
+-    warehouse = FileSystemWarehouse(str(warehouse_root))
++    warehouse = FileSystemWarehouse.from_dir(str(warehouse_root))
+     exorcist.TaskStatusDB.from_filename(db_path)
+     worker = Worker(warehouse=warehouse, task_db_path=db_path)
+ 
+@@ -167,7 +168,7 @@ def test_execute_unit_returns_none_when_no_available_tasks(tmp_path):
+     warehouse_root = tmp_path / "warehouse"
+     db_path = warehouse_root / "tasks.db"
+     warehouse_root.mkdir(parents=True, exist_ok=True)
+-    warehouse = FileSystemWarehouse(str(warehouse_root))
++    warehouse = FileSystemWarehouse.from_dir(str(warehouse_root))
+     exorcist.TaskStatusDB.from_filename(db_path)
+     worker = Worker(warehouse=warehouse, task_db_path=db_path)
+ 
+diff --git a/src/openfe/tests/storage/test_warehouse.py b/src/openfe/tests/storage/test_warehouse.py
+index d55709b5b..a762e7a75 100644
+--- a/src/openfe/tests/storage/test_warehouse.py
++++ b/src/openfe/tests/storage/test_warehouse.py
+@@ -1,4 +1,3 @@
+-import os
+ import tempfile
+ from pathlib import Path
+ from typing import Literal
+@@ -42,7 +41,7 @@ def _test_store_load_same_process(
+         store_name: Literal["setup", "result", "tasks"],
+     ):
+         stores = TestWarehouseBaseClass._build_stores()
+-        client = WarehouseBaseClass(stores, "test_warehouse")
++        client = WarehouseBaseClass(stores=stores, name="test_warehouse")
+         store_func = getattr(client, store_func_name)
+         load_func = getattr(client, load_func_name)
+         assert stores["setup"]._data == {}
+@@ -64,7 +63,7 @@ def _test_store_load_different_process(
+         store_name: Literal["setup", "result", "tasks"],
+     ):
+         stores = TestWarehouseBaseClass._build_stores()
+-        client = WarehouseBaseClass(stores, "test_warehouse")
++        client = WarehouseBaseClass(stores=stores, name="test_warehouse")
+         store_func = getattr(client, store_func_name)
+         load_func = getattr(client, load_func_name)
+         assert stores["setup"]._data == {}
+@@ -182,24 +181,28 @@ class TestFileSystemWarehouse:
+     @staticmethod
+     def _test_store_load_same_process(obj, store_func_name, load_func_name):
+         with tempfile.TemporaryDirectory() as tmpdir:
+-            client = FileSystemWarehouse(tmpdir)
++            wh_dir = Path(tmpdir) / "warehouse_name"
++            client = FileSystemWarehouse(wh_dir)
+             store_func = getattr(client, store_func_name)
+             load_func = getattr(client, load_func_name)
+-            assert not any(Path(f"{tmpdir}").iterdir())
++            # TODO: top dirs should exist but be empty
++            # assert not any((Path(tmpdir)/store_func_name).iterdir())
+             store_func(obj)
+-            assert any(Path(f"{tmpdir}").iterdir())
++            assert any(Path(f"{wh_dir}").iterdir())
+             reloaded = load_func(obj.key)
+             assert reloaded is obj
+ 
+     @staticmethod
+     def _test_store_load_different_process(obj: GufeTokenizable, store_func_name, load_func_name):
+         with tempfile.TemporaryDirectory() as tmpdir:
+-            client = FileSystemWarehouse(tmpdir)
++            wh_dir = Path(tmpdir) / "warehouse_name"
++            client = FileSystemWarehouse(root_dir=wh_dir)
+             store_func = getattr(client, store_func_name)
+             load_func = getattr(client, load_func_name)
+-            assert not any(Path(f"{tmpdir}").iterdir())
++            # TODO: top dirs should exist but be empty
++            # assert not any(Path(f"{tmpdir}").iterdir())
+             store_func(obj)
+-            assert any(Path(f"{tmpdir}").iterdir())
++            assert any(Path(f"{wh_dir}").iterdir())
+             # make it look like we have an empty cache, as if this was a
+             # different process
+             key = obj.key
+@@ -225,7 +228,9 @@ def test_filesystemwarehouse_has_shared_and_tasks_stores(self, absolute_transfor
+         unit = TestWarehouseBaseClass._get_protocol_unit(absolute_transformation)
+ 
+         with tempfile.TemporaryDirectory() as tmpdir:
+-            client = FileSystemWarehouse(tmpdir)
++            wh_dir = Path(tmpdir) / "warehouse_name"
++            client = FileSystemWarehouse(wh_dir)
++            assert client.name == "warehouse_name"
+ 
+             assert "shared" in client.stores
+             assert "tasks" in client.stores
+@@ -237,6 +242,18 @@ def test_filesystemwarehouse_has_shared_and_tasks_stores(self, absolute_transfor
+             client.store_task(unit)
+             assert client.exists(unit.key)
+ 
++    def test_filesystem_warehouse_exists_error(self):
++        with tempfile.TemporaryDirectory() as tmpdir:
++            wh_dir = Path(tmpdir) / "warehouse_name"
++            client = FileSystemWarehouse(wh_dir)
++            # store some data so files are created
++            client.stores["shared"].store_bytes("sentinel", b"shared-data")
++
++            with pytest.raises(ValueError, match="already exists"):
++                _ = FileSystemWarehouse(wh_dir)
++
++            reloaded_client = FileSystemWarehouse.from_dir(root_dir=wh_dir)
++
+     @pytest.mark.parametrize(
+         "fixture",
+         ["absolute_transformation", "complex_equilibrium"],
+diff --git a/src/openfecli/commands/plan_rbfe_network.py b/src/openfecli/commands/plan_rbfe_network.py
+index 4c764250f..c13b93cb5 100644
+--- a/src/openfecli/commands/plan_rbfe_network.py
++++ b/src/openfecli/commands/plan_rbfe_network.py
+@@ -2,7 +2,6 @@
+ # For details, see https://github.com/OpenFreeEnergy/openfe
+ import click
+ 
+-from openfe.storage.warehouse import FileSystemWarehouse
+ from openfecli import OFECommandPlugin
+ from openfecli.parameters import (
+     COFACTORS,
+@@ -182,6 +181,7 @@ def plan_rbfe_network(
+     write("______________________")
+     write("")
+ 
++    from openfe.storage.warehouse import FileSystemWarehouse
+     from openfecli.plan_alchemical_networks_utils import plan_alchemical_network_output
+ 
+     write("Parsing in Files: ")
+diff --git a/src/openfecli/plan_alchemical_networks_utils.py b/src/openfecli/plan_alchemical_networks_utils.py
+index eea016f94..4fe73629d 100644
+--- a/src/openfecli/plan_alchemical_networks_utils.py
++++ b/src/openfecli/plan_alchemical_networks_utils.py
+@@ -21,9 +21,10 @@ def plan_alchemical_network_output(
+     """Write the contents of an alchemical network into the structure"""
+ 
+     if warehouse:
+-        warehouse.store_setup_tokenizable(alchemical_network)
+-        db_path = Path(warehouse.root_dir) / "tasks.db"
+-        _ = build_task_db_from_alchemical_network(alchemical_network, warehouse, db_path)
++        #  TODO: update this to match API user experience
++        _ = build_task_db_from_alchemical_network(
++            alchemical_network, warehouse_dir="campaign/", db_path="campaign.db"
++        )
+     else:
+         base_name = folder_path.name
+         folder_path.mkdir(parents=True, exist_ok=True)

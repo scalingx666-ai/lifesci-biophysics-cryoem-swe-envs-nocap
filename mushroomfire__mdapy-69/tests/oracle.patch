@@ -1,0 +1,456 @@
+diff --git a/docs/about/release-notes.md b/docs/about/release-notes.md
+index 4654631c..99cc5af8 100644
+--- a/docs/about/release-notes.md
++++ b/docs/about/release-notes.md
+@@ -56,7 +56,7 @@
+   with Gaussians of width `sigma`, on the irreducible wave vectors of a mesh. Its
+   `ThermalConductivity` holds `kappa`, the `q` and `weights` of the irreducible wave
+   vectors, and the `frequencies`, `group_velocities`, `gamma`, `lifetimes` and
+-  `heat_capacities` of their modes. See
++  `heat_capacities` of their modes, the scattering computed in parallel in C++. See
+   [Thermal conductivity](../user-guide/simulation/thermal-conductivity.md).
+ - `Phonons.thermal_displacements(temperatures, *, mesh=20)` gives the mean products of the
+   displacements of each atom along each pair of axes, with the zero point motion: the
+diff --git a/docs/user-guide/simulation/thermal-conductivity.md b/docs/user-guide/simulation/thermal-conductivity.md
+index 9a7935ab..47ca3697 100644
+--- a/docs/user-guide/simulation/thermal-conductivity.md
++++ b/docs/user-guide/simulation/thermal-conductivity.md
+@@ -75,7 +75,7 @@ Debye temperature, and the lifetimes of the modes of the irreducible wave vector
+ - `sigma`, which wants a denser mesh the narrower it is.
+ 
+ The time grows with the number of irreducible wave vectors times that of the whole
+-mesh: about 2 s for copper with a mesh of 11, 10 s with 15.
++mesh, and as the fourth power of the number of modes of the cell.
+ 
+ The conductivity is that of the phonons alone. In a metal such as copper the
+ electrons carry most of the heat, about 400 W/(m K), which this does not hold.
+diff --git a/src/cpp/analysis/phonon_scattering.cpp b/src/cpp/analysis/phonon_scattering.cpp
+new file mode 100644
+index 00000000..d74e4fb7
+--- /dev/null
++++ b/src/cpp/analysis/phonon_scattering.cpp
+@@ -0,0 +1,135 @@
++// Copyright (c) 2022-2026, Yongchao Wu
++// This Source Code Form is subject to the terms of the Mozilla Public License,
++// v. 2.0. If a copy of the MPL was not distributed with this file, You can
++// obtain one at https://mozilla.org/MPL/2.0/.
++
++#include "analysis/phonon_scattering.h"
++
++#include <cmath>
++#include <cstddef>
++#include <vector>
++
++namespace mdapy::analysis {
++
++namespace {
++
++using Complex = std::complex<double>;
++
++constexpr double kPi = 3.14159265358979323846;
++
++// The Gaussian of x of width sigma.
++double gaussian(double x, double sigma) {
++    const double z = x / sigma;
++    return std::exp(-0.5 * z * z) / (sigma * std::sqrt(2.0 * kPi));
++}
++
++}  // namespace
++
++void three_phonon_rates(const ScatteringInput& in, double* rates, const Control& control) {
++    const std::int64_t b = in.modes;
++    const std::int64_t t_count = in.temperatures;
++    const auto bb = static_cast<std::size_t>(b);
++    const std::size_t per_rates = static_cast<std::size_t>(t_count) * bb;
++    // the sums of each chunk of wave vectors, added in chunk order so that
++    // the result does not depend on the number of threads
++    std::vector<double> total = parallel_reduce(
++        in.count, 1, std::vector<double>(per_rates, 0.0),
++        [&](std::int64_t begin, std::int64_t end) {
++            std::vector<double> sums(per_rates, 0.0);
++            std::vector<Complex> step1(bb * bb * bb), step2(bb * bb * bb), phi(bb * bb * bb);
++            for (std::int64_t k = begin; k < end; ++k) {
++                const Complex* v = in.constants + static_cast<std::size_t>(k) * bb * bb * bb;
++                const Complex* w1 = in.second + static_cast<std::size_t>(k) * bb * bb;
++                const Complex* w2 = in.third + static_cast<std::size_t>(k) * bb * bb;
++                // step1[A, m, C] = sum_B v[A, B, C] w1[m, B]
++                for (std::size_t a = 0; a < bb; ++a) {
++                    for (std::size_t m = 0; m < bb; ++m) {
++                        for (std::size_t c = 0; c < bb; ++c) {
++                            Complex s = 0.0;
++                            for (std::size_t bi = 0; bi < bb; ++bi) {
++                                s += v[(a * bb + bi) * bb + c] * w1[m * bb + bi];
++                            }
++                            step1[(a * bb + m) * bb + c] = s;
++                        }
++                    }
++                }
++                // step2[A, m, n] = sum_C step1[A, m, C] w2[n, C]
++                for (std::size_t a = 0; a < bb; ++a) {
++                    for (std::size_t m = 0; m < bb; ++m) {
++                        for (std::size_t n = 0; n < bb; ++n) {
++                            Complex s = 0.0;
++                            for (std::size_t c = 0; c < bb; ++c) {
++                                s += step1[(a * bb + m) * bb + c] * w2[n * bb + c];
++                            }
++                            step2[(a * bb + m) * bb + n] = s;
++                        }
++                    }
++                }
++                // phi[l, m, n] = sum_A conj(w0[l, A]) step2[A, m, n]
++                for (std::size_t l = 0; l < bb; ++l) {
++                    for (std::size_t mn = 0; mn < bb * bb; ++mn) {
++                        Complex s = 0.0;
++                        for (std::size_t a = 0; a < bb; ++a) {
++                            s += std::conj(in.first[l * bb + a]) * step2[a * bb * bb + mn];
++                        }
++                        phi[l * bb * bb + mn] = s;
++                    }
++                }
++                const double* f1 = in.frequencies1 + static_cast<std::size_t>(k) * bb;
++                const double* f2 = in.frequencies2 + static_cast<std::size_t>(k) * bb;
++                for (std::size_t l = 0; l < bb; ++l) {
++                    const double w0 = in.frequencies0[l];
++                    if (w0 <= in.live) {
++                        continue;
++                    }
++                    for (std::size_t m = 0; m < bb; ++m) {
++                        if (f1[m] <= in.live) {
++                            continue;
++                        }
++                        for (std::size_t n = 0; n < bb; ++n) {
++                            if (f2[n] <= in.live) {
++                                continue;
++                            }
++                            const std::size_t at = (l * bb + m) * bb + n;
++                            const double strength = std::norm(phi[at]) / (w0 * f1[m] * f2[n]);
++                            double joined, parted;
++                            if (in.sigma > 0.0) {
++                                joined = gaussian(w0 - f1[m] - f2[n], in.sigma);
++                                parted = gaussian(w0 + f1[m] - f2[n], in.sigma) -
++                                         gaussian(w0 - f1[m] + f2[n], in.sigma);
++                            } else {
++                                const std::size_t flat =
++                                    static_cast<std::size_t>(k) * bb * bb * bb + at;
++                                joined = in.joined[flat];
++                                parted = in.parted[flat];
++                            }
++                            for (std::int64_t t = 0; t < t_count; ++t) {
++                                const std::size_t row =
++                                    (static_cast<std::size_t>(t) *
++                                         static_cast<std::size_t>(in.count) +
++                                     static_cast<std::size_t>(k)) *
++                                    bb;
++                                const double n1 = in.occupation1[row + m];
++                                const double n2 = in.occupation2[row + n];
++                                sums[static_cast<std::size_t>(t) * bb + l] +=
++                                    strength * ((n1 + n2 + 1.0) * joined + (n1 - n2) * parted);
++                            }
++                        }
++                    }
++                }
++            }
++            return sums;
++        },
++        [](std::vector<double> a, const std::vector<double>& b2) {
++            for (std::size_t i = 0; i < a.size(); ++i) {
++                a[i] += b2[i];
++            }
++            return a;
++        },
++        control);
++    for (std::size_t i = 0; i < per_rates; ++i) {
++        rates[i] += total[i];
++    }
++}
++
++}  // namespace mdapy::analysis
+diff --git a/src/cpp/analysis/phonon_scattering.h b/src/cpp/analysis/phonon_scattering.h
+new file mode 100644
+index 00000000..4225a287
+--- /dev/null
++++ b/src/cpp/analysis/phonon_scattering.h
+@@ -0,0 +1,61 @@
++// Copyright (c) 2022-2026, Yongchao Wu
++// This Source Code Form is subject to the terms of the Mozilla Public License,
++// v. 2.0. If a copy of the MPL was not distributed with this file, You can
++// obtain one at https://mozilla.org/MPL/2.0/.
++//
++// Three-phonon scattering: the rates at which the modes of one wave vector
++// scatter with the pairs of modes of the wave vectors q' of a mesh and
++// q'' = q - q', for the thermal conductivity in the relaxation-time
++// approximation.
++
++#pragma once
++
++#include <complex>
++#include <cstdint>
++
++#include "core/parallel.h"
++
++namespace mdapy::analysis {
++
++// The modes and the third order force constants of one wave vector q and of
++// count wave vectors q' with their q''. b = 3n is the number of modes.
++//
++// first (b x b): the polarization vectors of the modes of q over the square
++//   roots of the masses, mode by mode, components (atom, axis) last.
++// second, third (count x b x b): the same of q' and of q''.
++// constants (count x b x b x b): the third order force constants of q' and
++//   q'', components (atom, axis) of q, of q' and of q''.
++// frequencies0 (b), frequencies1, frequencies2 (count x b): the angular
++//   frequencies of the modes; modes at or below live carry nothing.
++// occupation1, occupation2 (temperatures x count x b): the Bose-Einstein
++//   occupations of the modes of q' and q''.
++// joined, parted: with sigma <= 0, (count x b x b x b) weights of the deltas
++//   of the frequencies, joined of w - w' - w'' and parted of
++//   (w + w' - w'') - (w - w' + w''), in seconds per radian; with sigma > 0,
++//   null and Gaussians of that width in rad/s.
++struct ScatteringInput {
++    std::int64_t count;
++    std::int64_t modes;
++    std::int64_t temperatures;
++    const std::complex<double>* first;
++    const std::complex<double>* second;
++    const std::complex<double>* third;
++    const std::complex<double>* constants;
++    const double* frequencies0;
++    const double* frequencies1;
++    const double* frequencies2;
++    const double* occupation1;
++    const double* occupation2;
++    const double* joined;
++    const double* parted;
++    double sigma;
++    double live;
++};
++
++// Adds to rates (temperatures x b) the sum over q', q'' and their modes of
++// |Phi|^2 / (w w' w'') times the deltas weighted by the occupations: the
++// rate of each mode of q is this sum times a constant.
++void three_phonon_rates(const ScatteringInput& input, double* rates,
++                        const Control& control = {});
++
++}  // namespace mdapy::analysis
+diff --git a/src/cpp/bindings/analysis.cpp b/src/cpp/bindings/analysis.cpp
+index b739dda0..ed6817af 100644
+--- a/src/cpp/bindings/analysis.cpp
++++ b/src/cpp/bindings/analysis.cpp
+@@ -11,6 +11,7 @@
+ #include <nanobind/stl/vector.h>
+ 
+ #include <algorithm>
++#include <complex>
+ #include <cstdint>
+ #include <optional>
+ #include <stdexcept>
+@@ -23,6 +24,7 @@
+ #include "analysis/tessellation.h"
+ #include "analysis/geometry.h"
+ #include "analysis/isosurface.h"
++#include "analysis/phonon_scattering.h"
+ #include "analysis/rings.h"
+ #include "analysis/soap.h"
+ #include "neighbor/frames.h"
+@@ -470,6 +472,62 @@ nb::tuple elastic_strain(Positions3 positions, Matrix3 matrix, Matrix3 inverse,
+     return nb::make_tuple(as_array(std::move(found.structure)), as_array(std::move(found.strain)));
+ }
+ 
++using Doubles = nb::ndarray<const double, nb::c_contig, nb::device::cpu>;
++
++// The complex numbers of an array of float64 pairs, real and imaginary.
++const std::complex<double>* complex_data(const Doubles& values) {
++    return reinterpret_cast<const std::complex<double>*>(values.data());
++}
++
++// The rates of three-phonon scattering of the modes of one wave vector with
++// those of count wave vectors q' and their q''; complex arrays come as
++// float64 pairs, last. joined and parted are None with sigma > 0.
++nb::object three_phonon_rates(Doubles first, Doubles second, Doubles third, Doubles constants,
++                              Doubles frequencies0, Doubles frequencies1, Doubles frequencies2,
++                              Doubles occupation1, Doubles occupation2,
++                              std::optional<Doubles> joined, std::optional<Doubles> parted,
++                              double sigma, double live, nb::handle progress,
++                              const CancelToken* cancel) {
++    analysis::ScatteringInput input{};
++    input.modes = static_cast<std::int64_t>(frequencies0.shape(0));
++    input.count = static_cast<std::int64_t>(frequencies1.shape(0));
++    input.temperatures = static_cast<std::int64_t>(occupation1.shape(0));
++    const auto b = static_cast<std::size_t>(input.modes);
++    const auto count = static_cast<std::size_t>(input.count);
++    const auto temperatures = static_cast<std::size_t>(input.temperatures);
++    if (first.size() != 2 * b * b || second.size() != 2 * count * b * b ||
++        third.size() != 2 * count * b * b || constants.size() != 2 * count * b * b * b ||
++        frequencies1.size() != count * b || frequencies2.size() != count * b ||
++        occupation1.size() != temperatures * count * b ||
++        occupation2.size() != temperatures * count * b) {
++        throw std::invalid_argument("three_phonon_rates: arrays of inconsistent sizes");
++    }
++    if (sigma <= 0.0) {
++        if (!joined || !parted || joined->size() != count * b * b * b ||
++            parted->size() != count * b * b * b) {
++            throw std::invalid_argument("three_phonon_rates: weights of the deltas needed");
++        }
++        input.joined = joined->data();
++        input.parted = parted->data();
++    }
++    input.first = complex_data(first);
++    input.second = complex_data(second);
++    input.third = complex_data(third);
++    input.constants = complex_data(constants);
++    input.frequencies0 = frequencies0.data();
++    input.frequencies1 = frequencies1.data();
++    input.frequencies2 = frequencies2.data();
++    input.occupation1 = occupation1.data();
++    input.occupation2 = occupation2.data();
++    input.sigma = sigma;
++    input.live = live;
++    std::vector<double> rates(temperatures * b, 0.0);
++    run_released(
++        [&](const Control& control) { analysis::three_phonon_rates(input, rates.data(), control); },
++        progress, cancel);
++    return as_array(std::move(rates));
++}
++
+ nb::object steinhardt_nearest(Positions3 positions, Matrix3 matrix, Origin3 origin,
+                               Periodic pbc, int k, const std::vector<int>& degrees,
+                               nb::handle progress, const CancelToken* cancel) {
+@@ -929,6 +987,11 @@ void bind_analysis(nb::module_& m) {
+     m.def("find_rings", &find_rings, nb::arg("offsets"), nb::arg("other"), nb::arg("shifts"),
+           nb::arg("min_size"), nb::arg("max_size"), nb::arg("progress") = nb::none(),
+           nb::arg("cancel").none() = nullptr);
++    m.def("three_phonon_rates", &three_phonon_rates, nb::arg("first"), nb::arg("second"),
++          nb::arg("third"), nb::arg("constants"), nb::arg("frequencies0"), nb::arg("frequencies1"),
++          nb::arg("frequencies2"), nb::arg("occupation1"), nb::arg("occupation2"),
++          nb::arg("joined").none(), nb::arg("parted").none(), nb::arg("sigma"), nb::arg("live"),
++          nb::arg("progress") = nb::none(), nb::arg("cancel").none() = nullptr);
+     m.def("isosurface", &isosurface, nb::arg("values"), nb::arg("pbc"), nb::arg("level"),
+           nb::arg("left_handed"));
+     m.def("elastic_strain", &elastic_strain, nb::arg("positions"), nb::arg("matrix"),
+diff --git a/src/mdapy/lattice_dynamics/_conductivity.py b/src/mdapy/lattice_dynamics/_conductivity.py
+index 6f332d0a..c30cd268 100644
+--- a/src/mdapy/lattice_dynamics/_conductivity.py
++++ b/src/mdapy/lattice_dynamics/_conductivity.py
+@@ -12,6 +12,7 @@
+ from numpy.typing import ArrayLike
+ 
+ from mdapy import units
++from mdapy._core import analysis as _scattering
+ from mdapy.analysis._symmetry import _rotations
+ from mdapy.errors import InvalidParameter
+ from mdapy.lattice_dynamics._force_constants import ForceConstants
+@@ -212,15 +213,15 @@ def thermal_conductivity(
+     )
+     occupation = np.where(live[None], 1.0 / np.expm1(x_), 0.0)  # (T, Q, 3n)
+ 
+-    def delta(apart: np.ndarray) -> np.ndarray:
+-        """The Gaussian of frequencies apart in THz, per rad/s."""
+-        return np.exp(-0.5 * (apart / sigma) ** 2) / (
+-            sigma * np.sqrt(2 * np.pi) * 2 * np.pi * 1e12
+-        )
++    def flat(values: np.ndarray) -> np.ndarray:
++        """Complex values as float64 pairs, for the kernel."""
++        return np.ascontiguousarray(values, dtype=complex).view(np.float64)
+ 
+-    gamma = np.zeros((len(temperatures), len(irreducible), modes))
++    rates = np.zeros((len(temperatures), len(irreducible), modes))
+     grid = np.round(q * counts).astype(np.int64)
++    angular = 2 * np.pi * 1e12  # rad/s per THz
+     for slot, index in enumerate(irreducible):
++        first = flat(weighted[index].reshape(modes, modes))
+         for start in range(0, total, _CHUNK):
+             chunk = np.arange(start, min(start + _CHUNK, total))
+             # -q + q' + q'' = 0: q'' = q - q', not moved back into the mesh
+@@ -231,48 +232,28 @@ def delta(apart: np.ndarray) -> np.ndarray:
+             g2 = (g2[:, 0] * counts[1] + g2[:, 1]) * counts[2] + g2[:, 2]
+             phase1 = np.exp(1j * (q[chunk] @ reciprocal) @ first_vector.T)
+             phase2 = np.exp(1j * (q2 @ reciprocal) @ second_vector.T)
+-            strength = np.zeros((len(chunk), modes, modes, modes), dtype=complex)
++            # the third order force constants of q' and q'', by the atoms
++            # and axes of q, q' and q''
++            tensor = np.zeros((len(chunk), n, 3, n, 3, n, 3), dtype=complex)
+             for x, y, z, members in groups:
+                 v3 = (phase1[:, members] * phase2[:, members]) @ values[members]
+-                strength += np.einsum(
+-                    "qabc,la,qmb,qnc->qlmn",
+-                    v3.reshape(-1, 3, 3, 3),
+-                    weighted[index, :, x].conj(),
+-                    weighted[chunk][:, :, y],
+-                    w2[:, :, z],
+-                    optimize=True,
+-                )
+-            live2 = f2 > _SAME_VELOCITY
+-            good = (
+-                live[index][None, :, None, None]
+-                & live[chunk][:, None, :, None]
+-                & live2[:, None, None, :]
+-            )
+-            denominator = np.where(
+-                good,
+-                omega[index][None, :, None, None]
+-                * omega[chunk][:, None, :, None]
+-                * (2 * np.pi * f2 * 1e12)[:, None, None, :],
+-                1.0,
+-            )
+-            strength = (
+-                np.where(good, np.abs(strength) ** 2 / denominator, 0.0)
+-                * (_HBAR / 2) ** 3
+-                / 36
+-                / total
+-            )
+-            f0 = frequencies[index][None, :, None, None]
+-            f1 = frequencies[chunk][:, None, :, None]
+-            f2_ = f2[:, None, None, :]
+-            joined = delta(f0 - f1 - f2_)
+-            parted = delta(f0 + f1 - f2_) - delta(f0 - f1 + f2_)
+-            for t in range(len(temperatures)):
+-                n1 = occupation[t][chunk][:, None, :, None]
+-                n2 = occupation[t][g2][:, None, None, :]
+-                weight = (n1 + n2 + 1) * joined + (n1 - n2) * parted
+-                gamma[t, slot] += (
+-                    18 * np.pi / _HBAR**2 * (strength * weight).sum(axis=(0, 2, 3))
+-                )
++                tensor[:, x, :, y, :, z, :] += v3.reshape(-1, 3, 3, 3)
++            rates[:, slot] += _scattering.three_phonon_rates(
++                first,
++                flat(weighted[chunk].reshape(len(chunk), modes, modes)),
++                flat(w2.reshape(len(chunk), modes, modes)),
++                flat(tensor),
++                np.ascontiguousarray(omega[index]),
++                np.ascontiguousarray(omega[chunk]),
++                np.ascontiguousarray(angular * f2),
++                np.ascontiguousarray(occupation[:, chunk]),
++                np.ascontiguousarray(occupation[:, g2]),
++                None,
++                None,
++                angular * sigma,
++                angular * _SAME_VELOCITY,
++            ).reshape(len(temperatures), modes)
++    gamma = rates * (18 * np.pi / _HBAR**2) * (_HBAR / 2) ** 3 / 36 / total
+     gamma /= 2 * np.pi * 1e12  # THz
+     # modes of one frequency share their width
+     reduced = frequencies[irreducible]
+diff --git a/tests/lattice_dynamics/test_conductivity.py b/tests/lattice_dynamics/test_conductivity.py
+index 5174e5d5..a582d458 100644
+--- a/tests/lattice_dynamics/test_conductivity.py
++++ b/tests/lattice_dynamics/test_conductivity.py
+@@ -87,6 +87,19 @@ def test_the_irreducible_wave_vectors_give_the_whole_mesh(copper):
+     )
+ 
+ 
++def test_the_same_for_any_number_of_threads(copper):
++    before = mdapy.get_num_threads()
++    try:
++        mdapy.set_num_threads(1)
++        one = thermal_conductivity(copper, [300.0], mesh=5, sigma=0.2)
++        mdapy.set_num_threads(4)
++        four = thermal_conductivity(copper, [300.0], mesh=5, sigma=0.2)
++    finally:
++        mdapy.set_num_threads(before)
++    np.testing.assert_array_equal(one.gamma, four.gamma)
++    np.testing.assert_array_equal(one.kappa, four.kappa)
++
++
+ def test_widths_go_as_the_square_of_the_third_order(copper):
+     doubled = ForceConstants(
+         copper.cell, copper.supercell, copper.second, 2 * copper.third

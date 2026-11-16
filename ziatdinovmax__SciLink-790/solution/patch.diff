@@ -1,0 +1,227 @@
+diff --git a/scilink/agents/sim_agents/base_analysis_agent.py b/scilink/agents/sim_agents/base_analysis_agent.py
+index f9655d43..d003e23b 100644
+--- a/scilink/agents/sim_agents/base_analysis_agent.py
++++ b/scilink/agents/sim_agents/base_analysis_agent.py
+@@ -21,6 +21,7 @@
+ import json
+ import os
+ import re
++import time
+ from abc import ABC, abstractmethod
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Union
+@@ -28,7 +29,8 @@
+ from ...auth import get_internal_proxy_key, require_vendor_credentials
+ from ...wrappers.openai_wrapper import OpenAIAsGenerativeModel
+ from ...wrappers.litellm_wrapper import LiteLLMGenerativeModel
+-from ...executors import ScriptExecutor, check_security_sandbox_indicators
++from ...executors import DEFAULT_TIMEOUT, ScriptExecutor, check_security_sandbox_indicators
++from ..exp_agents._locked_exec import escalate_timeouts
+ from ..exp_agents._qc_engine import CodegenQCEngine, QCEngineSpec, QCItemContext
+ from ._deprecation import normalize_params
+ 
+@@ -85,11 +87,12 @@ def __init__(
+         model_name: str = "claude-opus-4-6",
+         api_key: Optional[str] = None,
+         base_url: Optional[str] = None,
+-        executor_timeout: int = 120,
++        executor_timeout: int = DEFAULT_TIMEOUT,
+         max_refinement_attempts: int = 2,
+         google_api_key: Optional[str] = None,
+         local_model: Optional[str] = None,
+         max_verification_iterations: Optional[int] = None,
++        analysis_time_budget_s: Optional[float] = 3600.0,
+     ):
+         """Construct the agent and its LLM client + sandbox executor.
+ 
+@@ -101,7 +104,10 @@ def __init__(
+                 LiteLLM, which falls back to the vendor's env var.
+             base_url: OpenAI-compatible internal-proxy URL; when set, requests
+                 route through the proxy client, otherwise through LiteLLM.
+-            executor_timeout: Per-script sandbox timeout, in seconds.
++            executor_timeout: Per-script sandbox timeout, in seconds (the
++                same default as the experimental agents). A script that times
++                out is re-run unchanged with a longer limit before the refine
++                loop treats it as broken (``escalate_timeouts``).
+             max_refinement_attempts: How many times a script that *crashed*
+                 (or violated the output contract) is regenerated from its
+                 error before giving up. Bounds the initial attempt only.
+@@ -112,6 +118,12 @@ def __init__(
+                 feedback (each iteration is one generation, one execution and
+                 one verification, plus a final verification after the last).
+                 Defaults to ``max_refinement_attempts``.
++            analysis_time_budget_s: Wall-clock budget for computing ONE property
++                (all attempts, timeout re-runs and verification together). It
++                bounds the timeout re-runs and is the run deadline the QC engine
++                stops verifying at; ``None`` removes the bound. A script that has
++                started is never cut short by it (the first limit is never
++                clamped).
+ 
+         Raises:
+             ValueError: If ``base_url`` is set and no key can be resolved.
+@@ -122,6 +134,10 @@ def __init__(
+         self.max_refinement_attempts = max_refinement_attempts
+         self._max_verification_iterations = max_verification_iterations
+         self.state: Dict[str, Any] = {}
++        # The engine's opt-in verification-loop budget (CodegenQCEngine #358).
++        self.qc_time_budget_s = analysis_time_budget_s
++        self._deadline: Optional[float] = None      # per property, set in compute_property
++        self._timeout_floor: Optional[int] = None   # limit a timed-out script already reached
+ 
+         api_key, base_url = normalize_params(
+             api_key=api_key, google_api_key=google_api_key,
+@@ -245,6 +261,9 @@ def compute_property(
+                 "output_type %r is not one of %s; treating it as a non-scalar "
+                 "artifact output. Check the skill's `output:` frontmatter.",
+                 output_type, sorted(_OUTPUT_TYPES))
++        budget = self.qc_time_budget_s
++        self._deadline = time.monotonic() + budget if budget else None
++        self._timeout_floor = None
+         preamble = (
+             f"DATA_FILES = {json.dumps(data_files)}\n"
+             f"INPUT_DECKS = {json.dumps(input_decks or {})}\n"
+@@ -260,6 +279,7 @@ def compute_property(
+                 "verify": verify,
+                 "preamble": preamble,
+                 "input_decks": input_decks or {},
++                "_run_deadline": self._deadline,
+             },
+             data=data_files,
+             data_path=str(self.output_dir),
+@@ -607,8 +627,25 @@ def _execute_script(self, code: str, name: str) -> Dict[str, Any]:
+         # slug exceeds the 255-byte filename limit (ENAMETOOLONG).
+         slug = re.sub(r"[^0-9a-zA-Z]+", "_", name).strip("_")[:80].rstrip("_") \
+             or "analysis"
+-        exec_result = self.executor.execute_script(
+-            script_content=code, working_dir=str(self.output_dir))
++        # A timeout is rarely broken code — a long trajectory just needs longer.
++        # Re-run the SAME script with a growing limit (the shared policy the
++        # experimental agents use) before handing a timeout to the refine loop,
++        # which would otherwise "fix" code that was never wrong. The re-runs are
++        # bounded by the property's deadline; a rewrite after a timeout starts
++        # from the limit already reached instead of climbing again from 600 s.
++        deadline = self._deadline
++        exec_result, timeout_used = escalate_timeouts(
++            lambda timeout_s: self.executor.execute_script(
++                script_content=code, working_dir=str(self.output_dir),
++                timeout=timeout_s),
++            base_timeout=max(int(self.executor.timeout), self._timeout_floor or 0),
++            timed_out=lambda r: r.get("timed_out") is True,
++            logger=self.logger,
++            remaining_s=(None if deadline is None
++                         else lambda: deadline - time.monotonic()),
++        )
++        if exec_result.get("timed_out") is True:
++            self._timeout_floor = timeout_used
+         if exec_result.get("status") == "success":
+             (self.output_dir / f"{slug}.py").write_text(code, encoding="utf-8")
+             parsed = self._extract_json(exec_result.get("stdout", ""))
+diff --git a/scilink/executors.py b/scilink/executors.py
+index e05545a2..bb3bb891 100644
+--- a/scilink/executors.py
++++ b/scilink/executors.py
+@@ -844,7 +844,8 @@ def execute_script(self, script_content: str, working_dir: str = None,
+                 _end_leftover_group(proc)
+             except subprocess.TimeoutExpired:
+                 _kill_process_tree(proc, grace=0.5)
+-                return {"status": "error", "message": f"Script execution timed out after {effective_timeout} seconds."}
++                return {"status": "error", "timed_out": True,
++                        "message": f"Script execution timed out after {effective_timeout} seconds."}
+             except BaseException:
+                 # Interrupted while waiting (Ctrl-C, a stop): the script is in
+                 # its own session and would otherwise outlive us.
+diff --git a/tests/test_sim_base_analysis_agent.py b/tests/test_sim_base_analysis_agent.py
+index 816abb2e..a8100ad4 100644
+--- a/tests/test_sim_base_analysis_agent.py
++++ b/tests/test_sim_base_analysis_agent.py
+@@ -54,6 +54,90 @@ def test_execute_script_catches_syntax_error_before_run(self, agent):
+         r = agent._execute_script('print(json.dumps({"a": 1}))extra)', "t")
+         assert r["status"] == "error" and "SyntaxError" in r["concise_error"]
+ 
++    def test_default_timeout_matches_the_experimental_agents(self, agent):
++        from scilink.executors import DEFAULT_TIMEOUT
++        assert agent.executor.timeout == DEFAULT_TIMEOUT        # was 120 s (#698)
++
++    def test_a_slow_script_is_rerun_with_more_time_not_corrected(self, tmp_path):
++        """A real script that needs ~2.5 s under a 2 s limit: the SAME script is
++        re-run at 4 s and succeeds — no refine pass, no LLM call."""
++        a = _Concrete(output_dir=str(tmp_path), api_key="test-key", executor_timeout=2)
++        code = ("import time, json\ntime.sleep(2.5)\n"
++                "print(json.dumps({'status': 'success', 'value': 7}))")
++        r = a._execute_script(code, "slow")
++        assert r["ok"] and r["value"] == 7
++
++    def test_escalation_schedule_floor_and_what_is_not_escalated(self, agent):
++        calls = []
++
++        class FakeExecutor:
++            timeout = 600
++
++            def __init__(self, outcomes):
++                self.outcomes = list(outcomes)
++
++            def execute_script(self, script_content, working_dir=None, timeout=None):
++                calls.append(timeout)
++                return self.outcomes.pop(0)
++
++        timeout_msg = {"status": "error", "timed_out": True,
++                       "message": "Script execution timed out after 600 seconds."}
++        ok = {"status": "success", "stdout": '{"status": "success", "value": 1}'}
++        agent.executor = FakeExecutor([timeout_msg, ok])
++        assert agent._execute_script("x = 1", "t")["value"] == 1
++        assert calls == [600, 1200]                              # same script, doubled limit
++
++        calls.clear()
++        agent.executor = FakeExecutor([timeout_msg] * 5)
++        r = agent._execute_script("x = 1", "t")
++        assert calls == [600, 1200, 1800]                        # capped at 1800 s
++        assert r["ok"] is False and "timed out" in r["message"]  # then the refine loop decides
++
++        calls.clear()                                            # the rewrite starts at the reached limit
++        agent.executor = FakeExecutor([ok])
++        agent._execute_script("x = 2", "t")
++        assert calls == [1800]
++
++        calls.clear()
++        agent._timeout_floor = None
++        crash = {"status": "error", "message": "Traceback ...\nsocket.timeout: timed out"}
++        agent.executor = FakeExecutor([crash])
++        agent._execute_script("x = 1", "t")
++        assert calls == [600]               # a crash that merely SAYS "timed out" is not re-run
++
++    def test_reruns_are_bounded_by_the_property_deadline(self, agent):
++        calls = []
++
++        class FakeExecutor:
++            timeout = 600
++
++            def execute_script(self, script_content, working_dir=None, timeout=None):
++                calls.append(timeout)
++                return {"status": "error", "timed_out": True, "message": "timed out"}
++
++        import time as _t
++        agent.executor = FakeExecutor()
++        agent._deadline = _t.monotonic() + 700        # 700 s left on the property
++        agent._execute_script("x = 1", "t")
++        assert calls[0] == 600                         # the first limit is never clamped
++        assert all(c <= 700 for c in calls[1:])        # retries never run past the deadline
++
++    def test_compute_property_stamps_the_run_deadline(self, agent, monkeypatch):
++        seen = {}
++        from scilink.agents.sim_agents import base_analysis_agent as m
++
++        class FakeEngine:
++            def __init__(self, host, spec):
++                pass
++
++            def run_item(self, ctx):
++                seen.update(ctx.state)
++                return {"status": "success"}
++
++        monkeypatch.setattr(m, "CodegenQCEngine", FakeEngine)
++        agent.compute_property("x", {})
++        assert seen["_run_deadline"] is not None and agent.qc_time_budget_s == 3600.0
++
+     def test_execute_script_long_name_saves_capped_filename(self, agent):
+         name = "shear_viscosity for the research goal: " + "very long goal " * 30
+         r = agent._execute_script('print(\'{"status":"success","value":5}\')', name)

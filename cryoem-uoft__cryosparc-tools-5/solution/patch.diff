@@ -1,0 +1,390 @@
+diff --git a/cryosparc/core.pyx b/cryosparc/core.pyx
+index f812d225..a65304f9 100644
+--- a/cryosparc/core.pyx
++++ b/cryosparc/core.pyx
+@@ -1,8 +1,29 @@
+ from . cimport dataset
+ from cython.view cimport array
++from cpython.ref cimport PyObject
++
++
++# Mirror of equivalent C-datatype enumeration
++cpdef enum DsetType:
++    T_F32 = 1
++    T_F64 = 2
++    T_C32 = 3
++    T_C64 = 4
++    T_I8 = 5
++    T_I16 = 6
++    T_I32 = 7
++    T_I64 = 8
++    T_U8 = 9
++    T_U16 = 10
++    T_U32 = 11
++    T_U64 = 12
++    T_STR = 13
++    T_OBJ = 14
++
+ 
+ cdef class Data:
+     cdef dataset.Dset _handle
++    cdef dict _strcache
+ 
+     def __cinit__(self, other = None):
+         cdef Data othr
+@@ -20,6 +41,8 @@ cdef class Data:
+         if self._handle == 0:
+             raise MemoryError()
+ 
++        self._strcache = dict()
++
+     def __dealloc__(self):
+         if self._handle:
+             dataset.dset_del(self._handle)
+@@ -72,6 +95,63 @@ cdef class Data:
+         else:
+             return <unsigned char [:size]> mem
+ 
++    def getstr(self, str colkey, Py_ssize_t index):
++        return dataset.dset_getstr(self._handle, colkey.encode(), index)  # returns bytes
++
++    def tocstrs(self, str colkey):
++        # Convert Python strings to C strings in the given object column
++        cdef bytes colkey_b = colkey.encode()
++        cdef const char *colkey_c = colkey_b
++        cdef int prevtype = dataset.dset_type(self._handle, colkey_c)
++        cdef Py_ssize_t nrow = dataset.dset_nrow(self._handle)
++        cdef PyObject **pycol = <PyObject **> dataset.dset_get(self._handle, colkey_c)
++        cdef str pybytes
++
++        if prevtype != T_OBJ or not dataset.dset_changecol(self._handle, colkey_c, T_STR):
++            return False
++
++        for i in range(nrow):
++            pybytes = <str> (pycol[i])
++            pycol[i] = NULL  # so string is not deallocated
++            dataset.dset_setstr(self._handle, colkey_c, i, pybytes.encode())
++
++        return True
++
++    def topystrs(self, str colkey):
++        # Convert C strings to Python strings in the given column
++        cdef bytes colkey_b = colkey.encode()
++        cdef const char *colkey_c = colkey_b
++        cdef int prevtype = dataset.dset_type(self._handle, colkey_c)
++        cdef Py_ssize_t nrow = dataset.dset_nrow(self._handle)
++        cdef Py_ssize_t *pycol = <Py_ssize_t *> dataset.dset_get(self._handle, colkey_c)
++        cdef void **pystrcol = <void **> pycol
++        cdef dict strcache = dict()
++        cdef char *cstr
++        cdef bytes cbytes
++        cdef str pystr
++
++        if prevtype != T_STR:
++            return False
++
++        # Save computed strcache to prevent string handles from getting garbage
++        # collected (since no other Python reference to them is kept)
++        self._strcache[colkey] = strcache
++
++        for i in range(nrow):
++            if pycol[i] in strcache:
++                pystr = strcache[pycol[i]]
++            else:
++                cbytes = dataset.dset_getstr(self._handle, colkey_c, i)
++                pystr = cbytes.decode()
++                strcache[pycol[i]] = pystr
++
++            pystrcol[i] = <void *> pystr
++
++        if not dataset.dset_changecol(self._handle, colkey_c, T_OBJ):
++            return False
++
++        return True
++
+     def defrag(self, bint realloc_smaller):
+         return dataset.dset_defrag(self._handle, realloc_smaller)
+ 
+diff --git a/cryosparc/dataset.pxd b/cryosparc/dataset.pxd
+index 3bf7053a..f1207a0f 100644
+--- a/cryosparc/dataset.pxd
++++ b/cryosparc/dataset.pxd
+@@ -21,6 +21,7 @@ cdef extern from "cryosparc-tools/dataset.h":
+     bint dset_addrows(Dset dset, long num) nogil
+     bint dset_addcol_scalar(Dset dset, const char *key, int type) nogil
+     bint dset_addcol_array(Dset dset, const char *key, int type, int shape0, int shape1, int shape2) nogil
++    bint dset_changecol(Dset dset, const char *key, int type) nogil
+     bint dset_defrag(Dset dset, bint realloc_smaller) nogil
+ 
+     void dset_dumptxt(Dset dset) nogil
+diff --git a/cryosparc/dataset.py b/cryosparc/dataset.py
+index 3f30dd21..dcdcf7ae 100644
+--- a/cryosparc/dataset.py
++++ b/cryosparc/dataset.py
+@@ -50,12 +50,11 @@
+ if TYPE_CHECKING:
+     from numpy.typing import NDArray, ArrayLike, DTypeLike
+ 
+-from .core import Data
++from .core import Data, DsetType
+ from .dtype import (
+     NEVER_COMPRESS_FIELDS,
+     TYPE_TO_DSET_MAP,
+     DatasetHeader,
+-    DsetType,
+     Field,
+     decode_dataset_header,
+     get_data_field,
+@@ -1351,6 +1350,46 @@ def replace(self, query: Dict[str, "ArrayLike"], *others: "Dataset", assume_disj
+ 
+         return result
+ 
++    def to_cstrs(self, copy: bool = False):
++        """
++        Convert all Python string columns to C strings. Resulting dataset fields
++        that previously had dtype ``np.object_`` (or ``T_OBJ`` internally) will get
++        type ``np.uint64`` and may be accessed as via the dataset C API.
++
++        Note: This operation takes a long time for large datasets.
++
++        Args:
++            copy (bool, optional): If True, returns a modified copy of the
++                dataset instead of mutation. Defaults to False.
++
++        Returns:
++            Dataset: same dataset or copy if specified.
++        """
++        dset = self.copy() if copy else self
++        for k in dset:
++            if dset._data.type(k) == DsetType.T_OBJ:
++                assert dset._data.tocstrs(k), f"Could not convert column {k} to C strings"
++        return dset
++
++    def to_pystrs(self, copy: bool = False):
++        """
++        Convert all C string columns to Python strings. Resulting dataset fields
++        that previously had dtype ``np.uint64`` (and ``T_STR`` internally) will
++        get type ``np.object_``.
++
++        Args:
++            copy (bool, optional): If True, returns a modified copy of the
++                dataset instead of mutation. Defaults to False.
++
++        Returns:
++            Dataset: same dataset or copy if specified.
++        """
++        dset = self.copy() if copy else self
++        for k in dset:
++            if dset._data.type(k) == DsetType.T_STR:
++                assert dset._data.topystrs(k), f"Could not convert column {k} to Python strings"
++        return dset
++
+     def handle(self) -> int:
+         """
+         Numeric dataset handle for working with the dataset via C APIs
+diff --git a/cryosparc/dtype.py b/cryosparc/dtype.py
+index d52259e1..c38dd245 100644
+--- a/cryosparc/dtype.py
++++ b/cryosparc/dtype.py
+@@ -1,15 +1,15 @@
+ """
+ Utilities and type definitions for working with dataset fields and column types.
+ """
+-from enum import Enum
+ from typing import TYPE_CHECKING, Dict, List, Tuple, Type, Union
+ import json
+ from typing_extensions import Literal, TypedDict
+ import numpy as n
+ 
++from .core import Data, DsetType
++
+ if TYPE_CHECKING:
+     from numpy.typing import NDArray, DTypeLike
+-    from .core import Data
+ 
+ Shape = Tuple[int, ...]
+ """A numpy shape tuple from ndarray.shape"""
+@@ -48,27 +48,6 @@ class DatasetHeader(TypedDict):
+     compressed_fields: List[str]
+ 
+ 
+-class DsetType(int, Enum):
+-    """
+-    Mirror of equivalent C-datatype enumeration
+-    """
+-
+-    T_F32 = 1
+-    T_F64 = 2
+-    T_C32 = 3
+-    T_C64 = 4
+-    T_I8 = 5
+-    T_I16 = 6
+-    T_I32 = 7
+-    T_I64 = 8
+-    T_U8 = 9
+-    T_U16 = 10
+-    T_U32 = 11
+-    T_U64 = 12
+-    T_STR = 13
+-    T_OBJ = 14
+-
+-
+ DSET_TO_TYPE_MAP: Dict[DsetType, Type] = {
+     DsetType.T_F32: n.float32,
+     DsetType.T_F64: n.float64,
+@@ -81,8 +60,8 @@ class DsetType(int, Enum):
+     DsetType.T_U8: n.uint8,
+     DsetType.T_U16: n.uint16,
+     DsetType.T_U32: n.uint32,
++    DsetType.T_STR: n.uint64,  # Note: Prefer T_OBJ when working in Python
+     DsetType.T_U64: n.uint64,
+-    DsetType.T_STR: n.object0,  # Note: Prefer T_OBJ instead
+     DsetType.T_OBJ: n.object0,
+ }
+ 
+@@ -130,15 +109,15 @@ def dtypestr(dtype: "DTypeLike") -> str:
+         return dt.str
+ 
+ 
+-def get_data_field(data: "Data", field: str) -> Field:
++def get_data_field(data: Data, field: str) -> Field:
+     return makefield(field, get_data_field_dtype(data, field))
+ 
+ 
+-def get_data_field_dtype(data: "Data", field: str) -> "DTypeLike":
++def get_data_field_dtype(data: Data, field: str) -> "DTypeLike":
+     t = data.type(field)
+     if t not in DSET_TO_TYPE_MAP:
+         raise KeyError(f"Unknown dset field type {t}")
+-    dt = n.dtype(DSET_TO_TYPE_MAP[DsetType(t)])
++    dt = n.dtype(DSET_TO_TYPE_MAP[t])
+     shape = data.getshp(field)
+     return (dt.str, shape) if shape else dt.str
+ 
+diff --git a/cryosparc/include/cryosparc-tools/dataset.h b/cryosparc/include/cryosparc-tools/dataset.h
+index 53182d5d..5387a331 100755
+--- a/cryosparc/include/cryosparc-tools/dataset.h
++++ b/cryosparc/include/cryosparc-tools/dataset.h
+@@ -68,6 +68,7 @@ uint32_t    dset_getshp (uint64_t dset, const char * colkey);
+ int        dset_addrows       (uint64_t dset, uint32_t num);
+ int        dset_addcol_scalar (uint64_t dset, const char * key, int type);
+ int        dset_addcol_array  (uint64_t dset, const char * key, int type, int shape0, int shape1, int shape2);
++int        dset_changecol     (uint64_t dset, const char * key, int type);
+ 
+ int        dset_defrag (uint64_t dset, int realloc_smaller);
+ void       dset_dumptxt (uint64_t dset);
+@@ -1212,17 +1213,14 @@ int dset_type (uint64_t dset, const char * colkey)
+ 
+ void *dset_get (uint64_t dset, const char * colkey)
+ {
++	// Caution: T_STR columns cannot be used directly, actual strings must be
++	// retrieved through dset_getstr
+ 	const ds        *d  = handle_lookup(dset, colkey, 0, 0);
+ 	const ds_column *c  = column_lookup(d, colkey);
+ 	char * ptr = (char *) d;
+ 
+ 	if(!(d && c)) return 0;
+ 
+-	if (abs_i8(c->type) == T_STR) {
+-		nonfatal("dset_get: column '%s' is a string", colkey);
+-		return 0;
+-	}
+-
+ 	return ptr + d->arrheap_start + c->offset;
+ }
+ 
+@@ -1313,6 +1311,30 @@ int dset_addcol_array (uint64_t dset, const char * key, int type, int shape0, in
+ 	return 1;
+ }
+ 
++// Change the type of the given column. Type must be compatible in size
++// NOTE: This is unsafe! Does not cast existing values to expected values
++int dset_changecol (uint64_t dset, const char *key, int type) {
++	if (!tcheck(type)) {
++		nonfatal("invalid column data type: %i", type);
++		return 0;
++	}
++
++	const ds  *d  = handle_lookup(dset, key, 0, 0);
++	ds_column *c  = column_lookup(d, key);
++
++	if (!(d && c)) return 0;
++
++	int8_t current_size = abs_i8(type_size[c->type]);
++	int8_t proposed_size = abs_i8(type_size[type]);
++
++	if (current_size != proposed_size) {
++		nonfatal("cannot change column with type %i to incompatible type %i", c->type, type);
++		return 0;
++	}
++
++	c->type = type;
++	return 1;
++}
+ 
+ int dset_addrows (uint64_t dset, uint32_t num) {
+ 	uint64_t idx; 
+diff --git a/pyproject.toml b/pyproject.toml
+index 8ae380ac..025e06b9 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -40,20 +40,12 @@ dev = [
+ 
+ build = [
+     "build",
++    "black[jupyter]",
+     "autodocsumm",
+     "cython",
+     "jupyter-book",
+ ]
+ 
+-examples = [
+-    "pandas == 1.1.4",
+-    "matplotlib >=3.4<3.5",
+-    "numpy >=1.18<1.19",
+-    "black[jupyter]",
+-    "cryolo[c11]",
+-    "notebook",
+-]
+-
+ [project.urls]
+ Homepage = "https://tools.cryosparc.com"
+ Documentation = "https://tools.cryosparc.com"
+diff --git a/tests/test_dataset_bench.py b/tests/test_dataset_bench.py
+index 6781963b..63bca8ed 100644
+--- a/tests/test_dataset_bench.py
++++ b/tests/test_dataset_bench.py
+@@ -1,4 +1,5 @@
+ from io import BytesIO
++import os
+ import pytest
+ import numpy as n
+ import cryosparc.dataset as ds
+@@ -46,6 +47,11 @@ def fields():
+     ]
+ 
+ 
++@pytest.fixture
++def dset_cstrs(big_dset: Dataset):
++    return big_dset.to_cstrs(copy=True)
++
++
+ def test_len(big_dset: Dataset):
+     assert len(big_dset) == 1961726
+ 
+@@ -395,3 +401,15 @@ def load():
+ 
+     result = benchmark(load)
+     assert len(result) == len(big_dset)
++
++
++@pytest.mark.skipif(os.getenv("CI") == "true", reason="Too slow at the moment")
++def test_to_cstrs(benchmark, dset: Dataset):
++    result: Dataset = benchmark(dset.to_cstrs, copy=True)
++    assert result["ctf/type"].dtype.type == n.uint64
++
++
++@pytest.mark.skipif(os.getenv("CI") == "true", reason="Too slow at the moment")
++def test_to_pystrs(benchmark, dset_cstrs: Dataset):
++    result: Dataset = benchmark(dset_cstrs.to_pystrs, copy=True)
++    assert result["ctf/type"].dtype.type == n.object_

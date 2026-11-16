@@ -1,0 +1,344 @@
+diff --git a/platforms/metal/include/MetalKernel.h b/platforms/metal/include/MetalKernel.h
+index 593e809165..bea6d1c62c 100644
+--- a/platforms/metal/include/MetalKernel.h
++++ b/platforms/metal/include/MetalKernel.h
+@@ -44,8 +44,9 @@ class MetalKernel : public ComputeKernelImpl {
+      * @param context      the context this kernel belongs to
+      * @param pipeline     the pipeline state wrapping the kernel to be invoked
+      * @param name         the name of the kernel function
++     * @param packArgs     whether this kernel needs to have all its arguments packed into a single argument
+      */
+-    MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const std::string& name);
++    MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const std::string& name, bool packArgs);
+     ~MetalKernel();
+     /**
+      * Get the name of this kernel.
+@@ -113,8 +114,8 @@ class MetalKernel : public ComputeKernelImpl {
+     std::vector<mm_double4> primitiveArgs;
+     std::vector<int> primitiveArgSizes;
+     std::vector<MetalArray*> arrayArgs;
+-    std::vector<void*> argPointers;
+     int dynamicLocal;
++    bool packArgs;
+ };
+ 
+ } // namespace OpenMM
+diff --git a/platforms/metal/include/MetalProgram.h b/platforms/metal/include/MetalProgram.h
+index 4a8ae28988..412c370ec0 100644
+--- a/platforms/metal/include/MetalProgram.h
++++ b/platforms/metal/include/MetalProgram.h
+@@ -41,8 +41,9 @@ class MetalProgram : public ComputeProgramImpl {
+      * 
+      * @param context      the context this program belongs to
+      * @param library      the compiled library
++     * @param packArgs     whether kernels in this program need to have all their arguments packed into a single argument
+      */
+-    MetalProgram(MetalContext& context, MTL::Library* library);
++    MetalProgram(MetalContext& context, MTL::Library* library, bool packArgs);
+     /**
+      * Create a ComputeKernel for one of the kernels in this program.
+      * 
+@@ -52,6 +53,7 @@ class MetalProgram : public ComputeProgramImpl {
+ private:
+     MetalContext& context;
+     MTL::Library* library;
++    bool packArgs;
+ };
+ 
+ } // namespace OpenMM
+diff --git a/platforms/metal/src/MetalContext.cpp b/platforms/metal/src/MetalContext.cpp
+index cccdf22b13..6904de26c8 100644
+--- a/platforms/metal/src/MetalContext.cpp
++++ b/platforms/metal/src/MetalContext.cpp
+@@ -326,7 +326,7 @@ ComputeSort MetalContext::createSort(ComputeSortImpl::SortTrait* trait, unsigned
+     return shared_ptr<ComputeSortImpl>(new MetalSort(*this, trait, length, uniform));
+ }
+ 
+-static string rewriteKernelArgs(const string& source) {
++static string rewriteKernelArgs(const string& source, bool packArgs) {
+     static regex kernelMatcher("KERNEL void[\\s\\S]*?\\(([\\s\\S]*?)\\)");
+     static regex lineMatcher("[^\\s].*[^\\s]");
+     static regex argMatcher("\\#.*|[^,\\s#][^\\,#]*[^,\\s#]*");
+@@ -336,65 +336,87 @@ static string rewriteKernelArgs(const string& source) {
+ 
+     // Loop over all kernels declared in the file.
+ 
+-    sregex_iterator nextKernel(source.begin(), source.end(), kernelMatcher);
+     sregex_iterator end;
+-    while (nextKernel != end) {
++    for (sregex_iterator nextKernel(source.begin(), source.end(), kernelMatcher); nextKernel != end; ++nextKernel) {
+         smatch kernelMatch = *nextKernel;
+         result << source.substr(pos, kernelMatch.position(1)-pos);
+         string argList = kernelMatch[1].str();
+         pos = kernelMatch.position(1)+argList.size();
++        stringstream unpackArgs;
++        if (packArgs)
++            result << "constant uchar* _packedArgs";
+ 
+         // Loop over lines in the argument list.
+ 
+-        sregex_iterator nextLine(argList.begin(), argList.end(), lineMatcher);
+-        while (nextLine != end) {
++        for (sregex_iterator nextLine(argList.begin(), argList.end(), lineMatcher); nextLine != end; ++nextLine) {
+             smatch lineMatch = *nextLine;
+             string line = lineMatch.str();
+-            result << "\n";
+-            if (line[0] == ',')
+-                result << ",";
+-            if (line[0] == '#')
+-                result << line << "\n";
++            if (packArgs) {
++                if (line[0] == '#') {
++                    result << "\n" << line << "\n";
++                    unpackArgs << line << "\n";
++                }
++                else {
++                    // Loop over arguments in the line, packing all of them into a single argument.
++
++                    for (sregex_iterator nextArg(line.begin(), line.end(), argMatcher); nextArg != end; ++nextArg) {
++                        string arg = nextArg->str();
++                        if (arg.rfind("LOCAL", 0) == 0)
++                            result << ", " << arg;
++                        else {
++                            string type = arg.substr(0, arg.find_last_of(" *&")+1);
++                            unpackArgs << arg << " = *(" << type << " constant*) _packedArgs;\n";
++                            unpackArgs << "_packedArgs += " << sizeof(mm_double4) << ";\n";
++                        }
++                    }
++                }
++            }
+             else {
+-                // Loop over arguments in the line.
+-
+-                sregex_iterator nextArg(line.begin(), line.end(), argMatcher);
+-                bool addComma = false;
+-                while (nextArg != end) {
+-                    smatch argMatch = *nextArg;
+-                    string arg = argMatch.str();
+-                    if (addComma)
+-                        result << ", ";
+-                    addComma = true;
+-                    if (arg.rfind("GLOBAL", 0) == 0 || arg.rfind("LOCAL", 0) == 0)
+-                        result << arg;
+-                    else {
+-                        // This is a primitive value.  We need to transform it into reference to constant memory.
+-
+-                        result << "constant";
+-                        sregex_iterator nextWord(arg.begin(), arg.end(), wordMatcher);
+-                        bool addAmpersand = true;
+-                        while (nextWord != end) {
+-                            smatch wordMatch = *nextWord;
+-                            string word = wordMatch.str();
+-                            if (word != "const") {
+-                                result << " " << word;
+-                                if (addAmpersand && word != "unsigned") {
+-                                    result << "&";
+-                                    addAmpersand = false;
++                result << "\n";
++                if (line[0] == ',')
++                    result << ",";
++                if (line[0] == '#')
++                    result << line << "\n";
++                else {
++                    // Loop over arguments in the line.
++
++                    bool addComma = false;
++                    for (sregex_iterator nextArg(line.begin(), line.end(), argMatcher); nextArg != end; ++nextArg) {
++                        smatch argMatch = *nextArg;
++                        string arg = argMatch.str();
++                        if (addComma)
++                            result << ", ";
++                        addComma = true;
++                        if (arg.rfind("GLOBAL", 0) == 0 || arg.rfind("LOCAL", 0) == 0)
++                            result << arg;
++                        else {
++                            // This is a primitive value.  We need to transform it into reference to constant memory.
++
++                            result << "constant";
++                            bool addAmpersand = true;
++                            for (sregex_iterator nextWord(arg.begin(), arg.end(), wordMatcher); nextWord != end; ++nextWord) {
++                                smatch wordMatch = *nextWord;
++                                string word = wordMatch.str();
++                                if (word != "const") {
++                                    result << " " << word;
++                                    if (addAmpersand && word != "unsigned") {
++                                        result << "&";
++                                        addAmpersand = false;
++                                    }
+                                 }
+                             }
+-                            ++nextWord;
+                         }
+                     }
+-                    ++nextArg;
+                 }
++                if (line.back() == ',')
++                    result << ",";
+             }
+-            if (line.back() == ',')
+-                result << ",";
+-            ++nextLine;
+         }
+-        ++nextKernel;
++        if (packArgs) {
++            size_t brace = source.find('{', pos);
++            result << source.substr(pos, brace+1-pos) << "\n" << unpackArgs.str();
++            pos = brace+1;
++        }
+     }
+     result << source.substr(pos, source.size()-pos);
+     return result.str();
+@@ -431,7 +453,6 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
+     }
+     if (!defines.empty())
+         src << endl;
+-    src << rewriteKernelArgs(source) << endl;
+ 
+     // Compile the program.
+ 
+@@ -443,14 +464,20 @@ ComputeProgram MetalContext::compileProgram(const string source, const map<strin
+ #ifdef ENABLE_PRINTF
+     options->setEnableLogging(true);
+ #endif
+-    NS::Error* error = nullptr;
+-    MTL::Library* library = device->newLibrary(NS::String::string(src.str().c_str(), NS::UTF8StringEncoding), options, &error);
+-    options->release();
+-    string errorString = (error == nullptr ? "" : error->localizedDescription()->utf8String());
+-    pool->release();
+-    if (library == nullptr)
+-        throw OpenMMException("Error compiling program: "+errorString);
+-    return shared_ptr<ComputeProgramImpl>(new MetalProgram(*this, library));
++    for (bool packArgs : {false, true}) {
++        NS::Error* error = nullptr;
++        MTL::Library* library = device->newLibrary(NS::String::string((src.str()+rewriteKernelArgs(source, packArgs)).c_str(), NS::UTF8StringEncoding), options, &error);
++        string errorString = (error == nullptr ? "" : error->localizedDescription()->utf8String());
++        if (!packArgs && library == nullptr && errorString.find("resource location available") != string::npos) {
++            // Try compiling again, this time packing all arguments into a single argument.
++            continue;
++        }
++        options->release();
++        pool->release();
++        if (library == nullptr)
++            throw OpenMMException("Error compiling program: "+errorString);
++        return shared_ptr<ComputeProgramImpl>(new MetalProgram(*this, library, packArgs));
++    }
+ }
+ 
+ MetalArray& MetalContext::unwrap(ArrayInterface& array) const {
+diff --git a/platforms/metal/src/MetalKernel.cpp b/platforms/metal/src/MetalKernel.cpp
+index 1c39b7cfc3..4f4dc06af3 100644
+--- a/platforms/metal/src/MetalKernel.cpp
++++ b/platforms/metal/src/MetalKernel.cpp
+@@ -32,8 +32,8 @@
+ using namespace OpenMM;
+ using namespace std;
+ 
+-MetalKernel::MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const string& name) :
+-        context(context), pipeline(pipeline), name(name), dynamicLocal(0) {
++MetalKernel::MetalKernel(MetalContext& context, MTL::ComputePipelineState* pipeline, const string& name, bool packArgs) :
++        context(context), pipeline(pipeline), name(name), dynamicLocal(0), packArgs(packArgs) {
+ }
+ 
+ MetalKernel::~MetalKernel() {
+@@ -53,12 +53,26 @@ void MetalKernel::execute(int threads, int blockSize) {
+     MTL::ComputeCommandEncoder& encoder = queue.getEncoder();
+     encoder.setComputePipelineState(pipeline);
+     int numArgs = arrayArgs.size();
+-    argPointers.resize(numArgs);
+-    for (int i = 0; i < numArgs; i++) {
+-        if (arrayArgs[i] != NULL)
+-            encoder.setBuffer(arrayArgs[i]->getBuffer(), 0, i);
+-        else
+-            encoder.setBytes(&primitiveArgs[i], primitiveArgSizes[i], i);
++    if (packArgs) {
++        // There are too many arguments to pass individually, so we need to pack all of them into a single argument.
++
++        vector<mm_double4> args = primitiveArgs;
++        for (int i = 0; i < numArgs; i++) {
++            if (arrayArgs[i] != NULL) {
++                MTL::GPUAddress address = arrayArgs[i]->getBuffer()->gpuAddress();
++                memcpy(&args[i], &address, sizeof(address));
++                encoder.useResource(arrayArgs[i]->getBuffer(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
++            }
++        }
++        encoder.setBytes(args.data(), numArgs*sizeof(mm_double4), 0);
++    }
++    else {
++        for (int i = 0; i < numArgs; i++) {
++            if (arrayArgs[i] != NULL)
++                encoder.setBuffer(arrayArgs[i]->getBuffer(), 0, i);
++            else
++                encoder.setBytes(&primitiveArgs[i], primitiveArgSizes[i], i);
++        }
+     }
+     if (dynamicLocal > 0)
+         encoder.setThreadgroupMemoryLength(dynamicLocal, 0);
+diff --git a/platforms/metal/src/MetalProgram.cpp b/platforms/metal/src/MetalProgram.cpp
+index be83a6d4d3..5a41ea1322 100644
+--- a/platforms/metal/src/MetalProgram.cpp
++++ b/platforms/metal/src/MetalProgram.cpp
+@@ -28,7 +28,8 @@
+ using namespace OpenMM;
+ using namespace std;
+ 
+-MetalProgram::MetalProgram(MetalContext& context, MTL::Library* library) : context(context), library(library) {
++MetalProgram::MetalProgram(MetalContext& context, MTL::Library* library, bool packArgs) : context(context),
++        library(library), packArgs(packArgs) {
+ }
+ 
+ ComputeKernel MetalProgram::createKernel(const string& name) {
+@@ -49,5 +50,5 @@ ComputeKernel MetalProgram::createKernel(const string& name) {
+         throw OpenMMException(message);
+     }
+     pool->release();
+-    return shared_ptr<ComputeKernelImpl>(new MetalKernel(context, pipeline, name));
++    return shared_ptr<ComputeKernelImpl>(new MetalKernel(context, pipeline, name, packArgs));
+ }
+\ No newline at end of file
+diff --git a/platforms/metal/tests/TestMetalCustomNonbondedForce.cpp b/platforms/metal/tests/TestMetalCustomNonbondedForce.cpp
+index d59dab3cf5..2f7206ffc2 100644
+--- a/platforms/metal/tests/TestMetalCustomNonbondedForce.cpp
++++ b/platforms/metal/tests/TestMetalCustomNonbondedForce.cpp
+@@ -30,5 +30,42 @@
+ #include "MetalTests.h"
+ #include "TestCustomNonbondedForce.h"
+ 
++void testVeryManyParameters() {
++    // Test a force with enough parameters that the kernel takes more than 31 arguments.  This requires it to pack the
++    // arguments into a single object.
++
++    System system;
++    system.addParticle(1.0);
++    system.addParticle(1.0);
++    VerletIntegrator integrator(0.01);
++    CustomNonbondedForce* nb = new CustomNonbondedForce("");
++    string expression = "r*(0";
++    vector<double> params1, params2;
++    double force = 0;
++    for (int i = 0; i < 30; i++) {
++        string name(1, 'a'+i);
++        nb->addPerParticleParameter(name);
++        expression += "+"+name+"1*"+name+"2";
++        params1.push_back(i);
++        params2.push_back(0.1*i);
++        force += 0.1*i*i;
++    }
++    nb->setEnergyFunction(expression+")");
++    nb->addParticle(params1);
++    nb->addParticle(params2);
++    system.addForce(nb);
++    Context context(system, integrator, platform);
++    vector<Vec3> positions(2);
++    positions[0] = Vec3(0, 0, 0);
++    positions[1] = Vec3(2, 0, 0);
++    context.setPositions(positions);
++    State state = context.getState(State::Forces | State::Energy);
++    vector<Vec3> forces = state.getForces();
++    ASSERT_EQUAL_VEC(Vec3(force, 0, 0), forces[0], TOL);
++    ASSERT_EQUAL_VEC(Vec3(-force, 0, 0), forces[1], TOL);
++    ASSERT_EQUAL_TOL(2*force, state.getPotentialEnergy(), TOL);
++}
++
+ void runPlatformTests() {
++    testVeryManyParameters();
+ }

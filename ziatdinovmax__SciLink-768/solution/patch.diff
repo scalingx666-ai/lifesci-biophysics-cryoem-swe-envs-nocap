@@ -1,0 +1,167 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index bc659002..bdf834a6 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -958,7 +958,7 @@ Settled rules, each learned from a live run or a review:
+   best-of-N candidate all poll the thread's cancel
+   (`log_context.register_cancel`, `inherited_context`). A new agent that spawns
+   its own threads uses `attributed_to_current` or `inherited_context`, or its
+-  threads run on after their item is cancelled. And every process SciLink starts is stoppable: model-written code runs through the script executor (`ScriptExecutor`, or `executors.run_generated_script` where a caller needs `subprocess.run`'s shape — SciLink's interpreter, no provider keys, the sandbox limits, consent asked first), and an external engine through `executors.run_engine` (Stop registration, its whole tree killed on a timeout, the parent environment kept); a new call site never calls `subprocess.run` on generated code or an engine (#685).
++  threads run on after their item is cancelled. A chat turn's Stop is added to its thread's cancel for the turn (`register_turn_stop`), never in place of one the thread already carries, so a new wait that polls the cancel ends on the user's Stop and on an item's own cancel alike. And every process SciLink starts is stoppable: model-written code runs through the script executor (`ScriptExecutor`, or `executors.run_generated_script` where a caller needs `subprocess.run`'s shape — SciLink's interpreter, no provider keys, the sandbox limits, consent asked first), and an external engine through `executors.run_engine` (Stop registration, its whole tree killed on a timeout, the parent environment kept); a new call site never calls `subprocess.run` on generated code or an engine (#685).
+ - **The provider and the stores are shared.** At most `SCILINK_LLM_MAX_INFLIGHT`
+   calls per model are in flight (`wrappers/llm_limiter.py`, held per request,
+   never across a backoff); usage is charged per worker; the distill staging,
+diff --git a/scilink/agents/exp_agents/controllers/hyperspectral_series.py b/scilink/agents/exp_agents/controllers/hyperspectral_series.py
+index c56f438e..f86a5da3 100644
+--- a/scilink/agents/exp_agents/controllers/hyperspectral_series.py
++++ b/scilink/agents/exp_agents/controllers/hyperspectral_series.py
+@@ -1320,14 +1320,15 @@ def _norm_name(name: str) -> str:
+ #: prefix. Matched as a whole word of the original name, never as a
+ #: substring (``ci`` must not hit ``Specific_Area``).
+ _QUANTITY_PREFIX_WORDS = frozenset({"err", "error", "errors", "uncert", "uncertainty", "unc", "std", "stdev",
+-                                    "stddev", "sigma", "snr", "noise", "ci", "var", "variance"})
++                                    "stddev", "sigma", "snr", "noise", "ci", "var", "variance", "rms"})
+ 
+ 
+ def _words(name: str) -> List[str]:
+-    """The words of an original column name: split on separators and at a
+-    lower-to-upper case change (``Fit_R2`` and ``FitR2`` give the same)."""
++    """The words of an original column name, in their original case: split on
++    separators and at a lower-to-upper case change (``Fit_R2`` and ``FitR2``
++    give the same)."""
+     import re
+-    return [w.lower() for w in re.split(r"[^A-Za-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1_\2", str(name))) if w]
++    return [w for w in re.split(r"[^A-Za-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1_\2", str(name))) if w]
+ 
+ 
+ def _column_units(row: Dict[str, Any]) -> Dict[str, str]:
+@@ -1347,14 +1348,18 @@ def _column_units(row: Dict[str, Any]) -> Dict[str, str]:
+ 
+ def _is_quantity_word(word: str) -> bool:
+     """A listed quantity word up to its digits and a plural (``CI95``,
+-    ``Uncertainties``, ``Errors``); the four-letter floor keeps ``cis`` from
+-    reading as a plural of ``ci``."""
++    ``Uncertainties``, ``Errors``). The four-letter floor keeps ``cis`` from
++    reading as a plural of ``ci``; below it, only an upper-case acronym with a
++    lower-case ``s`` is a plural (``CIs``, not ``Cis`` of a cis isomer)."""
+     w = word.strip("0123456789")
+-    forms = [w]
+-    if len(w) >= 4 and w.endswith("ies"):
+-        forms.append(w[:-3] + "y")
+-    elif len(w) >= 4 and w.endswith("s"):
+-        forms.append(w[:-1])
++    lw = w.lower()
++    forms = [lw]
++    if len(lw) >= 4 and lw.endswith("ies"):
++        forms.append(lw[:-3] + "y")
++    elif len(lw) >= 4 and lw.endswith("s"):
++        forms.append(lw[:-1])
++    elif len(w) >= 3 and w.endswith("s") and w[:-1].isupper():
++        forms.append(lw[:-1])
+     return any(f in _QUANTITY_PREFIX_WORDS for f in forms)
+ 
+ 
+@@ -1390,7 +1395,7 @@ def _strip(name, u):
+                 if len(seen) >= n_prefix:
+                     break
+                 words.append(w)
+-                seen += w
++                seen += w.lower()
+             if seen != longer[:n_prefix]:
+                 words = [longer[:n_prefix]]            # boundaries do not align: judge it as one word
+             return not any(_is_quantity_word(w) for w in words)
+diff --git a/scilink/utils/log_context.py b/scilink/utils/log_context.py
+index c731403e..a5f15d8f 100644
+--- a/scilink/utils/log_context.py
++++ b/scilink/utils/log_context.py
+@@ -117,13 +117,38 @@ def current_cancel() -> Optional[threading.Event]:
+     return _CANCEL_EVENTS.get(threading.get_ident())
+ 
+ 
++class _AnyEvent(threading.Event):
++    """Set when any of its events is: a turn's Stop ADDED to the cancel the
++    thread already carried (a branch's or an item's budget, memory or
++    coordinator cancel), so neither goes quiet for the turn. Readers poll
++    ``is_set()`` or ``wait()`` it like the events it joins."""
++
++    def __init__(self, *events: threading.Event) -> None:
++        super().__init__()
++        self._events = events
++
++    def is_set(self) -> bool:
++        return super().is_set() or any(e.is_set() for e in self._events)
++
++    def wait(self, timeout: Optional[float] = None) -> bool:
++        import time
++        end = None if timeout is None else time.monotonic() + timeout
++        while not self.is_set():
++            left = None if end is None else end - time.monotonic()
++            if left is not None and left <= 0:
++                return False
++            super().wait(0.05 if left is None else min(0.05, left))
++        return True
++
++
+ def register_turn_stop(event: threading.Event) -> Optional[threading.Event]:
+-    """Make a turn's Stop event (a capture's) the current thread's cancel for
+-    the turn, so every wait that polls the cancel — an engine run about to
+-    start, an LLM slot, a backoff — ends on the user's Stop too. Returns the
+-    event it replaced, for :func:`restore_cancel`."""
++    """Add a turn's Stop event (a capture's) to the current thread's cancel
++    for the turn, so every wait that polls the cancel — an engine run about
++    to start, an LLM slot, a backoff — ends on the user's Stop too, and still
++    on a cancel the thread already carried. Returns that cancel, for
++    :func:`restore_cancel`."""
+     prev = current_cancel()
+-    register_cancel(event)
++    register_cancel(_AnyEvent(prev, event) if prev is not None else event)
+     return prev
+ 
+ 
+diff --git a/tests/test_hs_series.py b/tests/test_hs_series.py
+index a28b641b..1b22a3ed 100644
+--- a/tests/test_hs_series.py
++++ b/tests/test_hs_series.py
+@@ -1270,3 +1270,7 @@ def test_units_drift_only_on_one_side_and_quantity_words_are_whole_words():
+     assert not same("CI95_Area", "Area") and not same("Uncertainties_Depth", "Depth")
+     assert not same("Errors_Depth", "Depth") and not same("Sigmas_Depth", "Depth")
+     assert same("Cis_Isomer_Area", "Isomer_Area")
++    # an acronym's plural is the acronym (CIs), still not a cis isomer; RMS names a noise or a
++    # residual (#759 review)
++    assert not same("CIs_Area", "Area") and not same("SNRs_Map", "Map")
++    assert not same("Rms_Depth", "Depth") and not same("RMS_Depth", "Depth") and not same("rms_depth", "depth")
+diff --git a/tests/test_run_tracked.py b/tests/test_run_tracked.py
+index 55e1403b..e71592eb 100644
+--- a/tests/test_run_tracked.py
++++ b/tests/test_run_tracked.py
+@@ -242,7 +242,29 @@ def test_a_capture_restores_the_cancel_it_found():
+     log_context.register_cancel(outer)
+     try:
+         with OutputCapture() as cap:
+-            assert log_context.current_cancel() is cap._stop_event
++            assert not log_context.cancel_requested()
++            cap._stop_event.set()                           # the turn's Stop
++            assert log_context.cancel_requested()
++        assert log_context.current_cancel() is outer and not outer.is_set()
++    finally:
++        log_context.unregister_cancel()
++
++
++def test_a_capture_adds_the_turns_stop_to_the_cancel_it_found():
++    """A capture on a thread that already carries a cancel (a worker's budget
++    or memory cancel) keeps that cancel live for the turn: either ends a wait
++    (#760 review)."""
++    from scilink.ui.output_capture import AgentStoppedError, OutputCapture
++    from scilink.utils import log_context
++    outer = threading.Event()
++    log_context.register_cancel(outer)
++    try:
++        with OutputCapture():
++            log_context.raise_if_cancelled()                # nothing set yet
++            outer.set()                                     # the worker's own cancel, mid-turn
++            with pytest.raises(AgentStoppedError):
++                log_context.raise_if_cancelled()
++            assert log_context.current_cancel().wait(1.0)   # a wait on the cancel ends too
+         assert log_context.current_cancel() is outer
+     finally:
+         log_context.unregister_cancel()

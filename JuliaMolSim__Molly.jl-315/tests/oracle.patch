@@ -1,0 +1,717 @@
+diff --git a/src/interactions/charge_equilibration.jl b/src/interactions/charge_equilibration.jl
+index 5513cd76b..de91805b0 100644
+--- a/src/interactions/charge_equilibration.jl
++++ b/src/interactions/charge_equilibration.jl
+@@ -41,7 +41,6 @@ eem_coupling_cutoff(coupling) = nothing
+     colidx::VI          # column indices of non zero entries in CSR matrix
+     row_counts::VI      # number of entries in each row in CSR matrix
+     write_ptr::VI       # mutable cursor when modifying CSR arrays
+-    pair_ptr::VI        # pair_ptr[2*i] and pair_ptr[2*i - 1] locate the entries in colidx for pair i 
+ 
+     H_diag::VQ
+     H_diag_inv::VQ
+@@ -156,7 +155,6 @@ function ElectronegativityEqualizationMethod(
+     colidx = similar(type_ids, 0)           # resized later according to number of CSR entries (2*n_pairs)
+     row_counts = similar(type_ids, n_atoms)
+     write_ptr = similar(type_ids, n_atoms)
+-    pair_ptr = similar(type_ids, 0)         # resized later according to number of CSR entries (2*n_pairs)
+ 
+     fill!(rowptr, 0)
+     fill!(row_counts, 0)
+@@ -216,7 +214,6 @@ function ElectronegativityEqualizationMethod(
+         colidx=colidx,
+         row_counts=row_counts,
+         write_ptr=write_ptr,
+-        pair_ptr=pair_ptr,
+         H_diag=H_diag,
+         H_diag_inv=H_diag_inv,
+         r=r,
+@@ -300,36 +297,11 @@ end
+ end
+ 
+ 
+-# fills in colidx and pair_ptr arrays from write_ptr
+-# column order within each row is nondeterministic since pairs fill rows concurrently
+-@kernel function create_csr_colidx!(
+-    colidx,
+-    pair_ptr,
+-    write_ptr,
+-    neighbors
+-)
+-    ti = @index(Global, Linear)
+-
+-    @inbounds begin
+-        i, j, _ = neighbors[ti]
+-
+-        # first extracts the old value, then increments (fetch and add operation)
+-        write_ptr_i = first(Atomix.@atomic(write_ptr[i] + 1))
+-        write_ptr_j = first(Atomix.@atomic(write_ptr[j] + 1))
+-
+-        colidx[write_ptr_i] = j
+-        colidx[write_ptr_j] = i
+-
+-        pair_ptr[2*ti - 1] = write_ptr_i
+-        pair_ptr[2*ti] = write_ptr_j
+-    end
+-end
+-
+-
+ # updates both symmetric off-diagonal CSR values for every neighbor pair
+ @kernel function update_csr_values!(
+     H_nonzero,
+-    pair_ptr,
++    colidx,
++    write_ptr,
+     coupling,
+     neighbors,
+     type_ids,
+@@ -350,8 +322,12 @@ end
+         
+         hij = eem_hij(coupling, r, type_i, type_j)
+ 
+-        H_nonzero[pair_ptr[2*ti - 1]] = hij
+-        H_nonzero[pair_ptr[2*ti]] = hij
++        write_ptr_i = first(Atomix.@atomic(write_ptr[i] + 1))
++        write_ptr_j = first(Atomix.@atomic(write_ptr[j] + 1))
++        colidx[write_ptr_i] = j
++        colidx[write_ptr_j] = i
++        H_nonzero[write_ptr_i] = hij
++        H_nonzero[write_ptr_j] = hij
+     end
+ end
+ 
+@@ -916,7 +892,6 @@ function charge_equilibration!(
+     if length(eem.state.H_nonzero) < num_csr_entries
+         eem.state.H_nonzero = similar(eem.state.H_nonzero, num_csr_entries_buffered)
+         eem.state.colidx = similar(eem.state.colidx, num_csr_entries_buffered)
+-        eem.state.pair_ptr = similar(eem.state.pair_ptr, num_csr_entries_buffered)
+     end
+ 
+     requires_rebuild = true
+@@ -958,18 +933,6 @@ function charge_equilibration!(
+             workgroupsize=atom_workgroupsize
+         )
+ 
+-        # populate colidx and pair_ptr
+-        if n_pairs > 0
+-            create_colidx_kernel! = create_csr_colidx!(backend)
+-            create_colidx_kernel!(
+-                eem.state.colidx,
+-                eem.state.pair_ptr,
+-                eem.state.write_ptr,
+-                neighbors.list;
+-                ndrange=n_pairs,
+-                workgroupsize=pair_workgroupsize
+-            )
+-        end
+     end
+ 
+     # length conversion factor from System length units (coords) to General Interaction length units (parameter-compatible)
+@@ -980,7 +943,8 @@ function charge_equilibration!(
+         update_csr_kernel! = update_csr_values!(backend)
+         update_csr_kernel!(
+             eem.state.H_nonzero,
+-            eem.state.pair_ptr,
++            eem.state.colidx,
++            eem.state.write_ptr,
+             eem.coupling,
+             neighbors.list,
+             eem.type_ids,
+@@ -994,7 +958,7 @@ function charge_equilibration!(
+ 
+     eem.state.q_backup .= eem.state.q   # create backup in case of failure
+ 
+-    group_size = QEQ_THREADS_PER_GROUP
++    group_size = backend isa KernelAbstractions.GPU ? 128 : QEQ_THREADS_PER_GROUP
+     if backend isa KernelAbstractions.CPU && n_threads < Threads.nthreads()
+         group_size = max(group_size, nextpow(2, backend_workgroupsize(backend, n_atoms, n_threads)))
+     end
+diff --git a/src/interactions/reaxff.jl b/src/interactions/reaxff.jl
+index c84900529..b84d87669 100644
+--- a/src/interactions/reaxff.jl
++++ b/src/interactions/reaxff.jl
+@@ -362,6 +362,8 @@ mutable struct ReaxFF2008State{T, VI, MI, MT, VT}
+     n_valid_angles::VI      # 1-element device vector
+     valid_hbonds::MI        # shape=(3, capacity) containing j, k, idx_i
+     n_valid_hbonds::VI      # 1-element device vector
++    bond_pair_indices::VI
++    n_bond_pairs::VI
+ end
+ 
+ 
+@@ -423,6 +425,8 @@ function empty_state(
+         MI(undef, 4, 0),
+         VI(undef, 1),
+         MI(undef, 3, 0),
++        VI(undef, 1),
++        VI(undef, 0),
+         VI(undef, 1)
+     )
+ end
+@@ -1353,6 +1357,8 @@ function init_reaxff_state!(
+     n_valid_angles = zeros(Int, 1)
+     valid_hbonds = zeros(Int, 3, max(10 * n_atoms, 1))
+     n_valid_hbonds = zeros(Int, 1)
++    bond_pair_indices = zeros(Int, 0)
++    n_bond_pairs = zeros(Int, 1)
+ 
+     inter.state = ReaxFF2008State(
+         n_atoms,
+@@ -1402,7 +1408,9 @@ function init_reaxff_state!(
+         to_device(valid_angles, AT),
+         to_device(n_valid_angles, AT),
+         to_device(valid_hbonds, AT),
+-        to_device(n_valid_hbonds, AT)
++        to_device(n_valid_hbonds, AT),
++        to_device(bond_pair_indices, AT),
++        to_device(n_bond_pairs, AT)
+     )
+ end
+ 
+@@ -1573,6 +1581,9 @@ function write_force_rij(
+     end
+ end
+ 
++@inline reaxff_workgroupsize(backend, ndrange, n_threads) = backend_workgroupsize(backend, ndrange, n_threads)
++
++@inline reaxff_workgroupsize(::KernelAbstractions.GPU, ndrange, n_threads) = ndrange <= 50_000 ? 32 : 128
+ 
+ @kernel function resolve_forces_kernel(
+     fill_pos,
+@@ -1662,7 +1673,7 @@ function resolve_forces!(
+         inter.state.forces,
+         derivatives,
+         ndrange=length(nbrs),
+-        workgroupsize=backend_workgroupsize(backend, length(nbrs), n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, length(nbrs), n_threads)
+     )
+ end
+ 
+@@ -2009,8 +2020,41 @@ end
+ end
+ 
+ 
++@kernel function compact_bond_pairs_kernel!(
++    bond_pair_indices,
++    n_bond_pairs,
++    nbrs_list,
++    coords,
++    boundary,
++    conv_factor::T,
++    atid,
++    bndp,
++    bond_dist_cutoff_sq,
++) where T
++    ti = @index(Global, Linear)
++
++    @inbounds begin
++        i, j, _ = nbrs_list[ti]
++
++        qry = bndp[atid[i], atid[j]]
++
++        if qry.is_defined
++            r_vec_ij = map(x -> ustrip(x) * conv_factor, vector(coords[j], coords[i], boundary))
++            dr_sq = sum(abs2, r_vec_ij)
++
++            if dr_sq <= bond_dist_cutoff_sq
++                position = Atomix.@atomic n_bond_pairs[1] += 1
++                bond_pair_indices[position] = ti
++            end
++        end
++    end
++end
++
++
+ @kernel function bond_kernel(
+     nbrs_list,
++    bond_pair_indices,
++    n_bond_pairs,
+     bndp,
+     atid,
+     conv_factor::T,
+@@ -2034,8 +2078,14 @@ end
+ ) where T
+     ti = @index(Global, Linear)
+     
+-    @inbounds begin
+-        i, j, _ = nbrs_list[ti]
++    @inbounds if isnothing(bond_pair_indices) || ti <= n_bond_pairs[1]
++        if isnothing(bond_pair_indices)
++            pair_index = ti
++        else
++            pair_index = bond_pair_indices[ti]
++        end
++
++        i, j, _ = nbrs_list[pair_index]
+ 
+         qry = bndp[atid[i], atid[j]]
+ 
+@@ -2289,9 +2339,37 @@ function bonds!(
+ 
+     bond_dist_cutoff_sq = inter.device_params.global_parameters.bond_dist_cutoff^2
+ 
++    bond_pair_indices = nothing
++
++    if backend isa KernelAbstractions.GPU
++        if length(inter.state.bond_pair_indices) < length(neighbors)
++            resize!(inter.state.bond_pair_indices, length(neighbors))
++        end
++
++        fill!(inter.state.n_bond_pairs, 0)
++
++        compact_kernel = compact_bond_pairs_kernel!(backend, 128)
++        compact_kernel(
++            inter.state.bond_pair_indices,
++            inter.state.n_bond_pairs,
++            neighbors.list,
++            sys.coords,
++            sys.boundary,
++            conv_factor,
++            atid,
++            bndp,
++            bond_dist_cutoff_sq;
++            ndrange=length(neighbors)
++        )
++
++        bond_pair_indices = inter.state.bond_pair_indices
++    end
++
+     b_kernel = bond_kernel(backend)
+     b_kernel(
+         neighbors.list,
++        bond_pair_indices,
++        inter.state.n_bond_pairs,
+         bndp,
+         atid,
+         conv_factor,
+@@ -2313,7 +2391,7 @@ function bonds!(
+         bond_dist_cutoff_sq,
+         inter.smoothness_correction;
+         ndrange=length(neighbors),
+-        workgroupsize=backend_workgroupsize(backend, length(neighbors), n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, length(neighbors), n_threads)
+     )
+     synchronize(backend)
+ 
+@@ -2328,7 +2406,7 @@ function bonds!(
+         Δ′,
+         Δ′_boc;
+         ndrange=length(coordn′),
+-        workgroupsize=backend_workgroupsize(backend, length(coordn′), n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, length(coordn′), n_threads)
+     )
+ 
+     coordn = inter.state.coordn
+@@ -2389,7 +2467,7 @@ function bonds!(
+         Δ′_boc,
+         inter.smoothness_correction;
+         ndrange=n_atoms,
+-        workgroupsize=backend_workgroupsize(backend, n_atoms, n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, n_atoms, n_threads)
+     )
+ 
+     Δ       = inter.state.Δ        
+@@ -2407,12 +2485,16 @@ function bonds!(
+         Δ_angle,
+         Δ_boc;
+         ndrange=length(coordn),
+-        workgroupsize=backend_workgroupsize(backend, length(coordn), n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, length(coordn), n_threads)
+     )
+ 
+-    E_bond = sum(pair_energies)
+-    inter.state.energy += E_bond
+-    scalar_setindex!(inter.state.energy_components, E_bond, 1)
++    if backend isa KernelAbstractions.GPU
++        accumulate_reaxff_energy!(inter, (pair_energies,), (1,), backend)
++    else
++        E_bond = sum(pair_energies)
++        inter.state.energy += E_bond
++        scalar_setindex!(inter.state.energy_components, E_bond, 1)
++    end
+ end
+ 
+ 
+@@ -2518,12 +2600,20 @@ function lone_pairs!(
+         S_dE_dΔ,
+         atom_energies;
+         ndrange=n_atoms,
+-        workgroupsize=backend_workgroupsize(backend, n_atoms, n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, n_atoms, n_threads)
+     )
+-    synchronize(backend)
+-    E_lp = sum(atom_energies)
+-    inter.state.energy += E_lp
+-    scalar_setindex!(inter.state.energy_components, E_lp, 3)
++
++    if backend isa KernelAbstractions.CPU
++        synchronize(backend)
++    end
++
++    if backend isa KernelAbstractions.GPU
++        accumulate_reaxff_energy!(inter, (atom_energies,), (3,), backend)
++    else
++        E_lp = sum(atom_energies)
++        inter.state.energy += E_lp
++        scalar_setindex!(inter.state.energy_components, E_lp, 3)
++    end
+ end
+ 
+ 
+@@ -2731,15 +2821,18 @@ function over_under_coordination!(
+         overcoordination_energies,
+         undercoordination_energies;
+         ndrange=n_atoms,
+-        workgroupsize=backend_workgroupsize(backend, n_atoms, n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, n_atoms, n_threads)
+     )
+ 
+-    E_overcoordination = sum(overcoordination_energies)
+-    E_undercoordination = sum(undercoordination_energies)
+-    inter.state.energy += E_overcoordination
+-    inter.state.energy += E_undercoordination
+-    scalar_setindex!(inter.state.energy_components,
+-                    E_overcoordination + E_undercoordination, 2)
++    if backend isa KernelAbstractions.GPU
++        accumulate_reaxff_energy!(inter, (overcoordination_energies, undercoordination_energies), (2, 2), backend)
++    else
++        E_overcoordination = sum(overcoordination_energies)
++        E_undercoordination = sum(undercoordination_energies)
++        inter.state.energy += E_overcoordination
++        inter.state.energy += E_undercoordination
++        scalar_setindex!(inter.state.energy_components, E_overcoordination + E_undercoordination, 2)
++    end
+ end
+ 
+ 
+@@ -3218,9 +3311,12 @@ function valence_angles!(
+             atid,
+             inter.smoothness_correction;
+             ndrange=length(nbrs),
+-            workgroupsize=backend_workgroupsize(backend, length(nbrs), n_threads)
++            workgroupsize=reaxff_workgroupsize(backend, length(nbrs), n_threads)
+         )
+-        synchronize(backend)
++
++        if backend isa KernelAbstractions.CPU
++            synchronize(backend)
++        end
+     end
+ 
+     n_valid_angles = scalar_getindex(inter.state.n_valid_angles, 1)
+@@ -3242,9 +3338,12 @@ function valence_angles!(
+             atid,
+             inter.smoothness_correction;
+             ndrange=length(nbrs),
+-            workgroupsize=backend_workgroupsize(backend, length(nbrs), n_threads)
++            workgroupsize=reaxff_workgroupsize(backend, length(nbrs), n_threads)
+         )
+-        synchronize(backend)
++
++        if backend isa KernelAbstractions.CPU
++            synchronize(backend)
++        end
+         n_valid_angles = scalar_getindex(inter.state.n_valid_angles, 1)
+     end
+ 
+@@ -3286,19 +3385,23 @@ function valence_angles!(
+             inter.state.forces,
+             inter.smoothness_correction,
+             ndrange=n_valid_angles,
+-            workgroupsize=backend_workgroupsize(backend, n_valid_angles, n_threads)
++            workgroupsize=reaxff_workgroupsize(backend, n_valid_angles, n_threads)
+         )
+     end
+ 
+-    E_val = sum(val_energies)
+-    E_pen = sum(pen_energies)
+-    E_coa = sum(coa_energies)
+-    inter.state.energy += E_val
+-    inter.state.energy += E_pen
+-    inter.state.energy += E_coa
+-    scalar_setindex!(inter.state.energy_components, E_val, 4)
+-    scalar_setindex!(inter.state.energy_components, E_pen, 5)
+-    scalar_setindex!(inter.state.energy_components, E_coa, 6)
++    if backend isa KernelAbstractions.GPU
++        accumulate_reaxff_energy!(inter, (val_energies, pen_energies, coa_energies), (4, 5, 6), backend)
++    else
++        E_val = sum(val_energies)
++        E_pen = sum(pen_energies)
++        E_coa = sum(coa_energies)
++        inter.state.energy += E_val
++        inter.state.energy += E_pen
++        inter.state.energy += E_coa
++        scalar_setindex!(inter.state.energy_components, E_val, 4)
++        scalar_setindex!(inter.state.energy_components, E_pen, 5)
++        scalar_setindex!(inter.state.energy_components, E_coa, 6)
++    end
+ end
+ 
+ 
+@@ -3746,9 +3849,12 @@ function torsions!(
+             atid,
+             inter.smoothness_correction;
+             ndrange=length(nbrs),
+-            workgroupsize=backend_workgroupsize(backend, length(nbrs), n_threads)
++            workgroupsize=reaxff_workgroupsize(backend, length(nbrs), n_threads)
+         )
+-        synchronize(backend)
++
++        if backend isa KernelAbstractions.CPU
++            synchronize(backend)
++        end
+     end
+ 
+     n_valid_torsions = scalar_getindex(inter.state.n_valid_torsions, 1)
+@@ -3769,9 +3875,13 @@ function torsions!(
+             atid,
+             inter.smoothness_correction;
+             ndrange=length(nbrs),
+-            workgroupsize=backend_workgroupsize(backend, length(nbrs), n_threads)
++            workgroupsize=reaxff_workgroupsize(backend, length(nbrs), n_threads)
+         )
+-        synchronize(backend)
++
++        if backend isa KernelAbstractions.CPU
++            synchronize(backend)
++        end
++        
+         n_valid_torsions = scalar_getindex(inter.state.n_valid_torsions, 1)
+     end
+ 
+@@ -3799,16 +3909,20 @@ function torsions!(
+             BO_π,
+             inter.smoothness_correction;
+             ndrange=n_valid_torsions,
+-            workgroupsize=backend_workgroupsize(backend, n_valid_torsions, n_threads)
++            workgroupsize=reaxff_workgroupsize(backend, n_valid_torsions, n_threads)
+         )
+     end
+     
+-    E_tors = sum(torsion_energies)
+-    E_conj = sum(conj_energies)
+-    inter.state.energy += E_tors
+-    inter.state.energy += E_conj
+-    scalar_setindex!(inter.state.energy_components, E_tors, 8)
+-    scalar_setindex!(inter.state.energy_components, E_conj, 9)
++    if backend isa KernelAbstractions.GPU
++        accumulate_reaxff_energy!(inter, (torsion_energies, conj_energies), (8, 9), backend)
++    else
++        E_tors = sum(torsion_energies)
++        E_conj = sum(conj_energies)
++        inter.state.energy += E_tors
++        inter.state.energy += E_conj
++        scalar_setindex!(inter.state.energy_components, E_tors, 8)
++        scalar_setindex!(inter.state.energy_components, E_conj, 9)
++    end
+ end
+ 
+ 
+@@ -3987,17 +4101,19 @@ function corrections!(
+         trip_energies,
+         inter.smoothness_correction;
+         ndrange=n_atoms,
+-        workgroupsize=backend_workgroupsize(backend, n_atoms, n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, n_atoms, n_threads)
+     )
+ 
+-    E_c2 = sum(c2_energies)
+-    E_trip = sum(trip_energies)
+-    inter.state.energy += E_c2
+-    inter.state.energy += E_trip
+-    scalar_setindex!(inter.state.energy_components,
+-                    scalar_getindex(inter.state.energy_components, 1) + E_trip, 1)
+-    scalar_setindex!(inter.state.energy_components,
+-                    scalar_getindex(inter.state.energy_components, 3) + E_c2, 3)
++    if backend isa KernelAbstractions.GPU
++        accumulate_reaxff_energy!(inter, (c2_energies, trip_energies), (3, 1), backend)
++    else
++        E_c2 = sum(c2_energies)
++        E_trip = sum(trip_energies)
++        inter.state.energy += E_c2
++        inter.state.energy += E_trip
++        scalar_setindex!(inter.state.energy_components, scalar_getindex(inter.state.energy_components, 1) + E_trip, 1)
++        scalar_setindex!(inter.state.energy_components, scalar_getindex(inter.state.energy_components, 3) + E_c2, 3)
++    end
+ end
+ 
+ 
+@@ -4275,9 +4391,12 @@ function hydrogen_bonds!(
+             h_bond_donors,
+             h_bond_acceptors;
+             ndrange=length(far_nbrs),
+-            workgroupsize=backend_workgroupsize(backend, length(far_nbrs), n_threads)
++            workgroupsize=reaxff_workgroupsize(backend, length(far_nbrs), n_threads)
+         )
+-        synchronize(backend)
++
++        if backend isa KernelAbstractions.CPU
++            synchronize(backend)
++        end
+     end
+ 
+     n_valid_hbonds = scalar_getindex(inter.state.n_valid_hbonds, 1)
+@@ -4305,9 +4424,13 @@ function hydrogen_bonds!(
+             h_bond_donors,
+             h_bond_acceptors;
+             ndrange=length(far_nbrs),
+-            workgroupsize=backend_workgroupsize(backend, length(far_nbrs), n_threads)
++            workgroupsize=reaxff_workgroupsize(backend, length(far_nbrs), n_threads)
+         )
+-        synchronize(backend)
++
++        if backend isa KernelAbstractions.CPU
++            synchronize(backend)
++        end
++
+         n_valid_hbonds = scalar_getindex(inter.state.n_valid_hbonds, 1)
+     end
+ 
+@@ -4330,14 +4453,21 @@ function hydrogen_bonds!(
+             hbond_dist_cutoff,
+             inter.smoothness_correction,
+             ndrange=n_valid_hbonds,
+-            workgroupsize=backend_workgroupsize(backend, n_valid_hbonds, n_threads)
++            workgroupsize=reaxff_workgroupsize(backend, n_valid_hbonds, n_threads)
+         )
+-        synchronize(backend)
++
++        if backend isa KernelAbstractions.CPU
++            synchronize(backend)
++        end
+     end
+ 
+-    E_hb = sum(hb_energies)
+-    inter.state.energy += E_hb
+-    scalar_setindex!(inter.state.energy_components, E_hb, 7)
++    if backend isa KernelAbstractions.GPU
++        accumulate_reaxff_energy!(inter, (hb_energies,), (7,), backend)
++    else
++        E_hb = sum(hb_energies)
++        inter.state.energy += E_hb
++        scalar_setindex!(inter.state.energy_components, E_hb, 7)
++    end
+ end
+ 
+ 
+@@ -4479,7 +4609,10 @@ function non_bonded!(
+     fill!(vdW_energies, zero(T))
+     fill!(coulomb_energies, zero(T))
+ 
+-    synchronize(backend)
++    if backend isa KernelAbstractions.CPU
++        synchronize(backend)
++    end
++
+     nb_kernel = non_bonded_kernel(backend)
+     nb_kernel(
+         far_nbrs.list,
+@@ -4498,16 +4631,23 @@ function non_bonded!(
+         coulomb_energies,
+         upper_taper_radius;
+         ndrange=length(far_nbrs),
+-        workgroupsize=backend_workgroupsize(backend, length(far_nbrs), n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, length(far_nbrs), n_threads)
+     )
+-    synchronize(backend)
+ 
+-    E_vdW = sum(vdW_energies)
+-    E_coulomb = sum(coulomb_energies)
+-    inter.state.energy += E_vdW + E_coulomb
++    if backend isa KernelAbstractions.CPU
++        synchronize(backend)
++    end
++
++    if backend isa KernelAbstractions.GPU
++        accumulate_reaxff_energy!(inter, (vdW_energies, coulomb_energies), (10, 11), backend)
++    else
++        E_vdW = sum(vdW_energies)
++        E_coulomb = sum(coulomb_energies)
++        inter.state.energy += E_vdW + E_coulomb
+ 
+-    scalar_setindex!(inter.state.energy_components, E_vdW, 10)
+-    scalar_setindex!(inter.state.energy_components, E_coulomb, 11)
++        scalar_setindex!(inter.state.energy_components, E_vdW, 10)
++        scalar_setindex!(inter.state.energy_components, E_coulomb, 11)
++    end
+ end
+ 
+ 
+@@ -4671,6 +4811,57 @@ function print_energy_components(
+ end
+ 
+ 
++# sum energy arrays into their corresponding energy component slots
++@kernel unsafe_indices=true function reaxff_energy_reduction!(
++    components,
++    energies,
++    slots
++)
++    i, component = @index(Global, NTuple)
++    li = @index(Local, Linear)
++
++    group_size = @uniform prod(@groupsize())
++    T = eltype(components)
++    partial_sums = @localmem T (group_size,)
++    value = zero(T)
++
++    if i <= length(energies[component])
++        @inbounds value = energies[component][i]
++    end
++
++    @inbounds partial_sums[li] = value
++
++    for stage in 1:trailing_zeros(group_size)
++        @synchronize
++        offset = group_size >> stage
++        if li <= offset
++            @inbounds partial_sums[li] += partial_sums[li + offset]
++        end
++    end
++    
++    if li == 1
++        @inbounds Atomix.@atomic components[slots[component]] += partial_sums[1]
++    end
++end
++
++
++function accumulate_reaxff_energy!(inter, energies, slots, backend)
++    n = length(first(energies))
++
++    if n > 0
++        kernel = reaxff_energy_reduction!(backend, (256, 1))
++        kernel(
++            inter.state.energy_components, 
++            energies, 
++            slots;
++            ndrange=(cld(n, 256) * 256, length(energies))
++        )
++    end
++
++    return nothing
++end
++
++
+ function compute_reaxff_energy_forces!(
+     inter::ReaxFF{ReaxFF2008, T},
+     sys::System,
+@@ -4690,6 +4881,10 @@ function compute_reaxff_energy_forces!(
+     non_bonded!(inter, sys, neighbors, backend; n_threads=n_threads)
+     resolve_forces!(inter, sys, backend; n_threads=n_threads)
+ 
++    if backend isa KernelAbstractions.GPU
++        inter.state.energy = sum(inter.state.energy_components)
++    end
++
+     return inter.state.energy
+ end
+ 
+@@ -4835,7 +5030,7 @@ AtomsCalculators.@generate_interface function AtomsCalculators.forces!(fs, sys,
+         inter.state.forces,
+         unit_conv;
+         ndrange=inter.state.n_atoms,
+-        workgroupsize=backend_workgroupsize(backend, inter.state.n_atoms, n_threads)
++        workgroupsize=reaxff_workgroupsize(backend, inter.state.n_atoms, n_threads)
+     )
+ 
+     return fs

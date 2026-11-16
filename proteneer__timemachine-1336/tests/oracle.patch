@@ -1,0 +1,143 @@
+diff --git a/tests/test_single_topology_confgen.py b/tests/test_single_topology_confgen.py
+index 9cff2b5cf6..39938a61a2 100644
+--- a/tests/test_single_topology_confgen.py
++++ b/tests/test_single_topology_confgen.py
+@@ -139,3 +139,42 @@ def test_confgen_spot_edges():
+         mol_a = get_mol_by_name(mols, src)
+         mol_b = get_mol_by_name(mols, dst)
+         run_edge(mol_a, mol_b, protein_path, n_windows)
++
++
++@pytest.mark.parametrize("pair", [("35", "84")])
++@pytest.mark.parametrize("n_windows", [2])
++@pytest.mark.parametrize("seed", [2023])
++def test_min_cutoff_failure(pair, seed, n_windows):
++    """Verify that when minimizing within solvent only the ligand is considered for movement of atoms
++    during minimization. Expectation is that all atoms of the molecules will move beyond effectively zero cutoff"""
++    src, dst = pair
++    box_width = 4.0
++    # The cutoff is so small that any ligand pair should trigger the exception
++    min_cutoff = 1e-8
++
++    ligands = "timemachine/datasets/fep_benchmark/hif2a/ligands.sdf"
++    mols = read_sdf(ligands)
++    mol_a = get_mol_by_name(mols, src)
++    mol_b = get_mol_by_name(mols, dst)
++
++    all_cores = atom_mapping.get_cores(
++        mol_a,
++        mol_b,
++        **DEFAULT_ATOM_MAPPING_KWARGS,
++    )
++    core = all_cores[0]
++
++    ff = Forcefield.load_default()
++    st = SingleTopology(mol_a, mol_b, core, ff)
++
++    # Use the lambda grid as defined for Bisection
++    lambda_grid = np.linspace(0.0, 1.0, n_windows)
++
++    solvent_sys, solvent_conf, solvent_box, solvent_top = builders.build_water_system(box_width, ff.water_ff)
++    solvent_box += np.diag([0.1, 0.1, 0.1])  # remove any possible clashes
++    solvent_host_config = HostConfig(solvent_sys, solvent_conf, solvent_box, solvent_conf.shape[0])
++    solvent_host = setup_optimized_host(st, solvent_host_config)
++    ligand_idxs = np.arange(st.get_num_atoms()) + solvent_host.conf.shape[0]
++    with pytest.raises(AssertionError) as res:
++        setup_initial_states(st, solvent_host, DEFAULT_TEMP, lambda_grid, seed, min_cutoff=min_cutoff)
++    assert f"moved atoms {ligand_idxs.tolist()} >" in str(res.value)
+diff --git a/timemachine/fe/rbfe.py b/timemachine/fe/rbfe.py
+index 728cb0deb8..2b744462f7 100644
+--- a/timemachine/fe/rbfe.py
++++ b/timemachine/fe/rbfe.py
+@@ -173,12 +173,24 @@ def setup_initial_state(
+ 
+ 
+ def setup_optimized_host(st: SingleTopology, config: HostConfig) -> Host:
++    """
++    Optimize a SingleTopology host using minimize_host_4d
++
++    Parameters
++    ----------
++    st: SingleTopology
++        A single topology object
++
++    config: HostConfig
++        Host configuration
++
++    Returns
++    -------
++    Host
++        Minimized host state
++    """
+     system, masses = convert_omm_system(config.omm_system)
+-    conf = minimizer.minimize_host_4d(
+-        [st.mol_a, st.mol_b],
+-        config,
+-        st.ff,
+-    )
++    conf = minimizer.minimize_host_4d([st.mol_a, st.mol_b], config, st.ff)
+     return Host(system, masses, conf, config.box, config.num_water_atoms)
+ 
+ 
+@@ -250,10 +262,24 @@ def setup_optimized_initial_state(
+     temperature: float,
+     seed: int,
+ ) -> InitialState:
+-    # Use pre-optimized initial state with the closest value of lambda as a starting point for optimization.
++    """Setup an InitialState for the specified lambda and optimize the coordinates given a list of pre-optimized IntialStates.
++    If the specified lambda exists within the list of optimized_initial_states list, return the existing InitialState.
++    The coordinates of the pre-optimized initial state with the closest value of lambda will be optimized to the new lambda value.
++
++    Note
++    ----
++    When determining the nearest initial state, will only consider states on the same side of lambda=0.5 as the specified lambda value.
++    This imitates the behavior of `optimize_coordinates` which minimizes from the endstate conformations towards lambda 0.5, resulting
++    in a discontinuity in the conformation at lambda=0.5.
++
++    Returns
++    -------
++    InitialState
++        Optimized at the specified lambda value
++    """
+ 
+     # NOTE: The current approach for generating optimized conformations in `optimize_coordinates` creates a
+-    # discontinuity at lambda=0.5. Ensure that we pick a pre-optimized state on the same side of 0.5 as `lamb`:
++    # discontinuity at lambda=0.5. Ensure that we pick a pre-optimized state on the same side of 0.5 as `lamb`
+     states_subset = [s for s in optimized_initial_states if (s.lamb <= 0.5) == (lamb <= 0.5)]
+     nearest_optimized = min(states_subset, key=lambda s: abs(lamb - s.lamb))
+ 
+@@ -313,7 +339,7 @@ def _optimize_coords_along_states(initial_states: List[InitialState]) -> List[ND
+     return x_traj
+ 
+ 
+-def optimize_coordinates(initial_states, min_cutoff=0.7) -> List[NDArray]:
++def optimize_coordinates(initial_states: List[InitialState], min_cutoff: Optional[float] = 0.7) -> List[NDArray]:
+     """
+     Optimize geometries of the initial states.
+ 
+@@ -358,16 +384,18 @@ def optimize_coordinates(initial_states, min_cutoff=0.7) -> List[NDArray]:
+             all_xs.append(xs)
+ 
+     # sanity check that no atom has moved more than `min_cutoff` nm away
+-    for state, coords in zip(initial_states, all_xs):
+-        displacement_distances = jax_utils.distance_on_pairs(state.x0, coords, box=state.box0)
+-        if min_cutoff is not None:
++    if min_cutoff is not None:
++        for state, coords in zip(initial_states, all_xs):
+             # assert that ligand and protein atoms are not allowed to move more than min_cutoff
+             restricted_idxs = np.concatenate([state.ligand_idxs, state.protein_idxs])
+-
++            displacement_distances = jax_utils.distance_on_pairs(
++                state.x0[restricted_idxs], coords[restricted_idxs], box=state.box0
++            )
++            max_moved = np.max(displacement_distances)
++            moved_atoms = restricted_idxs[displacement_distances >= min_cutoff]
+             assert (
+-                displacement_distances[restricted_idxs] < min_cutoff
+-            ).all(), f"λ = {state.lamb} moved an atom > {min_cutoff*10} Å from initial state during minimization"
+-
++                len(moved_atoms) == 0
++            ), f"λ = {state.lamb} moved atoms {moved_atoms.tolist()} > {min_cutoff*10} Å from initial state during minimization. Largest displacement was {max_moved*10} Å"
+     return all_xs
+ 
+ 

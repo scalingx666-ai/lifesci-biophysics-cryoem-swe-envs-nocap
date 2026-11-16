@@ -1,0 +1,1202 @@
+diff --git a/Yank/commands/status.py b/Yank/commands/status.py
+index da7314eb..e95842f9 100644
+--- a/Yank/commands/status.py
++++ b/Yank/commands/status.py
+@@ -13,7 +13,11 @@
+ # MODULE IMPORTS
+ # =============================================================================================
+ 
+-from .. import utils
++import operator
++import itertools
++import collections
++
++from .. import experiment
+ 
+ # =============================================================================================
+ # COMMAND-LINE INTERFACE
+@@ -23,26 +27,104 @@
+ YANK status
+ 
+ Usage:
+-  yank status (-s=STORE | --store=STORE) [-v | --verbose]
++  yank status (-y FILEPATH | --yaml=FILEPATH) [--status=STRING] [--njobs=INTEGER] [-v | --verbose]
+ 
+ Description:
+-  Get the current status of a running or completed simulation
++  Print the current status of the experiments.
+ 
+ Required Arguments:
+-  -s=STORE, --store=STORE       Storage directory for NetCDF data files.
++  -y, --yaml=FILEPATH           Path to the YAML script specifying options and/or how to
++                                set up and run the experiment.
+ 
+ General Options:
+-  -v, --verbose                 Print verbose output
++  --status=STRING               Print only the jobs in a particular status. Accepted values
++                                are "completed", "ongoing", and "pending". This works only
++                                if verbose is set.
++  --njobs=INTEGER               Print the job id associated to each experiment assuming
++                                njobs to be the one specified here.
++  -v, --verbose                 Print status of each experiment individually. If this is
++                                not set, only a summary of the status of all experiments
++                                is printed.
+ 
+ """
+ 
++
+ # =============================================================================================
+ # COMMAND DISPATCH
+ # =============================================================================================
+ 
++def find_contiguous_ids(job_ids):
++    """Return the contiguous job ids in the given list.
++
++    Returns
++    -------
++    contiguous_job_ids : str
++        The job ids organized in contiguous sets.
++
++    """
++    contiguous_job_ids = []
++    for k, g in itertools.groupby(enumerate(job_ids), lambda x:x[0]-x[1]):
++        group = list(map(operator.itemgetter(1), g))
++        if len(group) == 1:
++            contiguous_job_ids.append(str(group[0]))
++        else:
++            contiguous_job_ids.append('{}-{}'.format(group[0], group[-1]))
++    return ','.join(contiguous_job_ids)
++
+ 
+ def dispatch(args):
+-    from .. import analyze
+-    utils.config_root_logger(args['--verbose'])
+-    success = analyze.print_status(args['--store'])
+-    return success
++    # Handle optional arguments.
++    if args['--njobs']:
++        n_jobs = int(args['--njobs'])
++    else:
++        n_jobs = None
++
++    # Turn off verbosity.
++    exp_builder = experiment.ExperimentBuilder(args['--yaml'], n_jobs=n_jobs)
++    exp_builder.verbose = False
++
++    # Count all experiment status.
++    job_ids_by_status = {
++        'completed': [],
++        'ongoing': [],
++        'pending': []
++    }
++    counter = collections.Counter()
++    for exp_status in exp_builder.status():
++        counter[exp_status.status] += 1
++
++        # Store job id.
++        job_ids_by_status[exp_status.status].append(exp_status.job_id)
++
++        # Print experiment and phases details.
++        if args['--verbose']:
++            # Filter by status if requested.
++            if args['--status'] and args['--status'] != exp_status.status:
++                continue
++
++            # Print experiment information.
++            exp_description = '{}: status={}'.format(exp_status.name,
++                                                     exp_status.status)
++            if n_jobs is not None:
++                exp_description += ', job_id={}'.format(exp_status.job_id)
++            print(exp_description)
++
++            # Print phases information.
++            for phase_name, phase_status in exp_status.phases.items():
++                if phase_status.iteration is not None:
++                    iteration = ', iteration={}/{}'.format(phase_status.iteration,
++                                                           exp_status.number_of_iterations)
++                else:
++                    iteration = ''
++                print('\t{}: status={}{}'.format(phase_name, phase_status.status, iteration))
++
++    # Print summary.
++    tot_n_experiments = sum(count for count in counter.values())
++    summary_msg = ', '.join('{} {}'.format(count, status) for status, count in counter.items())
++    print('Total number of experiments: {} ({})'.format(tot_n_experiments, summary_msg))
++
++    if n_jobs is not None:
++        for status, job_ids in job_ids_by_status.items():
++            print('{} job ids: {}'.format(status, find_contiguous_ids(job_ids)))
++
++    return True
+diff --git a/Yank/experiment.py b/Yank/experiment.py
+index c8c6a19a..cd1434a6 100644
+--- a/Yank/experiment.py
++++ b/Yank/experiment.py
+@@ -24,6 +24,7 @@
+ import yaml
+ import logging
+ import collections
++
+ import cerberus
+ import cerberus.errors
+ 
+@@ -122,6 +123,28 @@ def convert_if_quantity(value):
+     return quantity
+ 
+ 
++def _is_phase_completed(status, number_of_iterations):
++    """Check if the stored simulation is completed.
++
++    When the simulation is resumed, the number of iterations to run
++    in the YAML script could be updated, so we can't rely entirely on
++    the is_completed field in the ReplicaExchange.Status object.
++
++    Parameters
++    ----------
++    status : namedtuple
++        The status object returned by ``yank.AlchemicalPhase``.
++    number_of_iterations : int
++        The total number of iterations that the simulation must perform.
++
++    """
++    # TODO allow users to change online analysis options on resuming.
++    if status.target_error is None and status.iteration == number_of_iterations:
++        is_completed = True
++    else:
++        is_completed = status.is_completed
++    return is_completed
++
+ # ==============================================================================
+ # UTILITY CLASSES
+ # ==============================================================================
+@@ -446,9 +469,16 @@ def run(self, n_iterations=None):
+                 if isinstance(phase, AlchemicalPhaseFactory):
+                     alchemical_phase = phase.initialize_alchemical_phase()
+                     self.phases[phase_id] = phase.storage  # Should automatically be a Reporter class
+-                else:  # Resume previous simulation.
++                else:  # Resume previously created simulation.
++                    # Check the status before loading the full alchemical phase object.
++                    status = AlchemicalPhase.read_status(phase)
++                    if _is_phase_completed(status, self.number_of_iterations):
++                        self._are_phases_completed[phase_id] = True
++                        iterations_left[phase_id] = 0
++                        continue
+                     alchemical_phase = AlchemicalPhase.from_storage(phase)
+ 
++                # TODO allow users to change online analysis options on resuming.
+                 # Update total number of iterations. This may write the new number
+                 # of iterations in the storage file so we do it only if necessary.
+                 if alchemical_phase.number_of_iterations != self.number_of_iterations:
+@@ -598,8 +628,7 @@ class ExperimentBuilder(object):
+ 
+     def __init__(self, script=None, job_id=None, n_jobs=None):
+         """
+-        Constructor
+-
++        Constructor.
+ 
+         """
+         # Check consistency job_id and n_jobs.
+@@ -817,10 +846,103 @@ def setup_experiments(self):
+             self._check_resume(check_experiments=False)
+             self._setup_experiments()
+ 
++    def status(self):
++        """Iterate over the status of all experiments in dictionary form.
++
++        The status of each experiment is set to "completed" if both phases
++        in the experiments have been completed, "pending" if they are both
++        pending, and "ongoing" otherwise.
++
++        Yields
++        ------
++        experiment_status : namedtuple
++            The status of the experiment. It contains the following fields:
++
++            name : str
++                The name of the experiment.
++            status : str
++                One between "completed", "ongoing", or "pending".
++            number_of_iterations : int
++                The total number of iteration set for this experiment.
++            job_id : int or None
++                If njobs is specified, this includes the job id associated
++                to this experiment.
++            phases : dict
++                phases[phase_name] is a namedtuple describing the status
++                of phase ``phase_name``. The namedtuple has two fields:
++                ``iteration`` and ``status``.
++
++        """
++        # TODO use Python 3.6 namedtuple syntax when we drop Python 3.5 support.
++        PhaseStatus = collections.namedtuple('PhaseStatus', [
++            'status',
++            'iteration'
++        ])
++        ExperimentStatus = collections.namedtuple('ExperimentStatus', [
++            'name',
++            'status',
++            'phases',
++            'number_of_iterations',
++            'job_id'
++        ])
++
++        status = collections.OrderedDict()
++        for experiment_idx, (exp_path, exp_description) in enumerate(self._expand_experiments()):
++            # Determine the final number of iterations for this experiment.
++            _, _, sampler_options, _ = self._determine_experiment_options(exp_description)
++            number_of_iterations = sampler_options['number_of_iterations']
++
++            # Determine the phases status.
++            phases = collections.OrderedDict()
++            for phase_nc_path in self._get_nc_file_paths(exp_path, exp_description):
++
++                # Determine the status of the phase.
++                try:
++                    phase_status = AlchemicalPhase.read_status(phase_nc_path)
++                except FileNotFoundError:
++                    iteration = None
++                    phase_status = 'pending'
++                else:
++                    iteration = phase_status.iteration
++                    if _is_phase_completed(phase_status, number_of_iterations):
++                        phase_status = 'completed'
++                    else:
++                        phase_status = 'ongoing'
++                phase_name = os.path.splitext(os.path.basename(phase_nc_path))[0]
++                phases[phase_name] = PhaseStatus(status=phase_status, iteration=iteration)
++
++            # Determine the status of the whole experiment.
++            phase_statuses = [phase.status for phase in phases.values()]
++            if phase_statuses[0] == phase_statuses[1]:
++                # This covers the completed and pending status.
++                exp_status = phase_statuses[0]
++            else:
++                exp_status = 'ongoing'
++
++            # Determine jobid if requested.
++            if self._n_jobs is not None:
++                job_id = experiment_idx % self._n_jobs + 1
++            else:
++                job_id = None
++
++            yield ExperimentStatus(name=exp_path, status=exp_status,
++                                   phases=phases, job_id=job_id,
++                                   number_of_iterations=number_of_iterations)
++
+     # --------------------------------------------------------------------------
+     # Properties
+     # --------------------------------------------------------------------------
+ 
++    @property
++    def verbose(self):
++        """bool: the log verbosity."""
++        return self._options['verbose']
++
++    @verbose.setter
++    def verbose(self, new_verbose):
++        self._options['verbose'] = new_verbose
++        utils.config_root_logger(self._options['verbose'], log_file_path=None)
++
+     @property
+     def output_dir(self):
+         """The path to the main output directory."""
+@@ -876,7 +998,8 @@ def _determine_experiment_options(self, experiment):
+                    if name not in self.GENERAL_DEFAULT_OPTIONS}
+ 
+         # Then update with specific experiment options.
+-        options.update(experiment.get('options', {}))
++        options.update(self._validate_options(experiment.get('options', {}),
++                                              validate_general_options=False))
+ 
+         def _filter_options(reference_options):
+             return {name: value for name, value in options.items()
+@@ -1803,7 +1926,7 @@ def coerce_and_validate_options_here_against_existing(options):
+                     validated = ExperimentBuilder._validate_options({option:value}, validate_general_options=False)
+                     coerced_and_validated = {**coerced_and_validated, **validated}
+                 except YamlParseError as yaml_err:
+-                    # collecte all errors
++                    # Collect all errors.
+                     coerced_and_validated[option] = value
+                     errors += "\n{}".format(yaml_err)
+             if errors != "":
+@@ -2582,7 +2705,7 @@ def _build_experiment(self, experiment_path, experiment):
+             try:
+                 with open(yaml_script_file_path, 'r') as f:
+                     yaml_script = yaml.load(f, Loader=YankLoader)
+-            except EnvironmentError:  # TODO replace with FileNotFoundError when dropping Python 2 support
++            except FileNotFoundError:
+                 for phase_name in generated_alchemical_paths:
+                     protocol[phase_name]['alchemical_path'] = {}
+             else:
+diff --git a/Yank/repex.py b/Yank/repex.py
+index f677d089..a04fe5aa 100644
+--- a/Yank/repex.py
++++ b/Yank/repex.py
+@@ -42,15 +42,13 @@
+ # GLOBAL IMPORTS
+ # ==============================================================================
+ 
+-from simtk import openmm
+-from simtk import unit
+-
+ import os
+ import math
+ import copy
+ import time
+ import uuid
+ import yaml
++import typing
+ import inspect
+ import logging
+ import datetime
+@@ -59,6 +57,7 @@
+ import numpy as np
+ import mdtraj as md
+ import netCDF4 as netcdf
++from simtk import unit, openmm
+ 
+ import openmmtools as mmtools
+ from openmmtools.states import ThermodynamicState
+@@ -500,8 +499,9 @@ def unnest_thermodynamic_state(serialized):
+                         reference_state_name, len_serialization, len_serialization/1024.0,
+                         len_serialization/1024.0/1024.0))
+ 
+-                # Finally write the dictionary
+-                self.write_dict('{}/state{}'.format(state_type, state_id), serialized_state, fixed_dimension=True)
++                # Finally write the dictionary with fixed dimension to improve compression.
++                self._write_dict('{}/state{}'.format(state_type, state_id),
++                                 serialized_state, fixed_dimension=True)
+ 
+     def read_sampler_states(self, iteration, analysis_particles_only=False):
+         """Retrieve the stored sampler states on the checkpoint file
+@@ -856,92 +856,107 @@ def write_timestamp(self, iteration):
+         if checkpoint_iteration is not None:
+             self._storage_checkpoint.variables['timestamp'][checkpoint_iteration] = timestamp
+ 
+-    def read_dict(self, name):
++    def read_dict(self, path):
+         """Restore a dictionary from the storage file.
+ 
++        The method supports reading only specific dictionary keywords in
++        path notation. If the dictionary is large, this can be quicker.
++        However, note that, depending on how the dictionary was saved,
++        this may end up reading the whole dictionary anyway.
++
+         Parameters
+         ----------
+-        name : str
+-            The identifier of the dictionary used to stored the data.
++        path : str
++            The path to the dictionary or a keyword in the dictionary.
+ 
+         Returns
+         -------
+         data : dict
+             The restored data as a dict.
+ 
++        Examples
++        --------
++        >>> import os
++        >>> import openmmtools as mmtools
++        >>> data = {'info': [1, 2, 3]}
++        >>> with mmtools.utils.temporary_directory() as temp_dir_path:
++        ...     temp_file_path = os.path.join(temp_dir_path, 'temp.nc')
++        ...     reporter = Reporter(temp_file_path, open_mode='w')
++        ...     reporter.write_dict('data', data)
++        ...     reporter.read_dict('data')
++        {'info': [1, 2, 3]}
++        ...     reporter.read_dict('data/info')
++        [1, 2, 3]
++
+         """
+-        # Leaving the skeleton to extend this in for now
+         storage = 'analysis'
+-        if storage not in ['analysis', 'checkpoint']:
+-            raise ValueError("storage must be either 'analysis' or 'checkpoint'!")
+-        # Get NC variable.
+-        nc_variable = self._resolve_variable_path(name, storage)
+-        if nc_variable.dtype == 'S1':
+-            # Handle variables stored in fixed_dimensions
+-            data_chars = nc_variable[:]
+-            data_str = data_chars.tostring().decode()
++
++        # Get lowest possible NC variable/group. The path might refer
++        # to the keyword of a dictionary that was saved in a single variable.
++        dict_path = []
++        nc_element = None
++        while nc_element is None:
++            try:
++                nc_element = self._resolve_nc_path(path, storage)
++            except KeyError:
++                # Try the higher level.
++                path, dict_key = path.rsplit(sep='/', maxsplit=1)
++                dict_path.insert(0, dict_key)
++
++        # If this is a group, the dictionary has been nested.
++        if isinstance(nc_element, netcdf.Group):
++            data = {}
++            for elements in [nc_element.groups, nc_element.variables]:
++                for key in elements:
++                    data.update({key: self.read_dict(path + '/' + key)})
++
++        # Otherwise this is a variable.
+         else:
+-            data_str = str(nc_variable[0])
+-        data = yaml.load(data_str, Loader=_DictYamlLoader)
++            if nc_element.dtype == 'S1':
++                # Handle variables stored in fixed_dimensions
++                data_chars = nc_element[:]
++                data_str = data_chars.tostring().decode()
++            else:
++                data_str = str(nc_element[0])
++            data = yaml.load(data_str, Loader=_DictYamlLoader)
+ 
+         # Restore the title in the metadata.
+-        if name == 'metadata':
++        if path == 'metadata':
+             data['title'] = self._storage_dict[storage].title
++
++        # Resolve the rest of the path that was saved unnested.
++        for dict_key in dict_path:
++            data = data[dict_key]
+         return data
+ 
+-    def write_dict(self, name, data, fixed_dimension=False):
++    def write_dict(self, path, data):
+         """Store the contents of a dict.
+ 
+         Parameters
+         ----------
+-        name : str
+-            The identifier of the dictionary in the storage file.
++        path : str
++            The path to the dictionary in the storage file.
+         data : dict
+             The dict to store.
+-        fixed_dimension: bool, Defautlt: False
+-            Use a fixed length dimension instead of variable length one. A unique dimension name (sharing a name with
+-            "name") will be created and its length will be set equal to ``"fixedL{}".format(len(data_string))``
+-
+-            This method seems to allow NetCDF to actually compress strings.
+-
+-            Do NOT use this flag if you expect to constantly be changing the length of the data fed in, use only for
+-            static data
+ 
+         """
+-        # Leaving the skeleton to extend this in for now
+-        storage = 'analysis'
+-        if storage not in ['analysis', 'checkpoint']:
+-            raise ValueError("storage must be either 'analysis' or 'checkpoint'!")
+-        storage_nc = self._storage_dict[storage]
+-        # General NetCDF conventions assume the title of the dataset to be
+-        # specified as a global attribute, but the user can specify their
+-        # own titles only in metadata.
+-        if name == 'metadata':
+-            data = copy.deepcopy(data)
+-            self._storage_dict[storage].title = data.pop('title')
++        storage_name = 'analysis'
+ 
+-        # Activate flow style to save space.
+-        data_str = yaml.dump(data, Dumper=_DictYamlDumper)#, default_flow_style=True)
+-
+-        # Check if we are updating the dictionary or creating it.
+-        try:
+-            nc_variable = self._resolve_variable_path(name, storage)
+-        except KeyError:
+-            if fixed_dimension:
+-                len_dim = len(data_str)
+-                dim_str = "fixedL{}".format(len_dim)
+-                if dim_str not in storage_nc.dimensions:
+-                    storage_nc.createDimension(dim_str, len_dim)
+-                nc_variable = storage_nc.createVariable(name, 'S1', dim_str, zlib=True)
+-            else:
+-                nc_variable = storage_nc.createVariable(name, str, 'scalar', zlib=True)
+-        if fixed_dimension:
+-            data_char_array = np.array(list(data_str), dtype='S1')
+-            nc_variable[:] = data_char_array
++        if path == 'metadata':
++            # General NetCDF conventions assume the title of the dataset
++            # to be specified as a global attribute, but the user can
++            # specify their own titles only in metadata.
++            data = copy.deepcopy(data)
++            self._storage_dict[storage_name].title = data.pop('title')
++
++            # Metadata is pretty big, read-only attribute (it contains the
++            # reference state and the topography), and AlchemicalPhase has
++            # to read the name of the sampler for resuming and checking the
++            # status, so we store it compressed and in nested form.
++            self._write_dict(path, data, storage_name=storage_name,
++                             fixed_dimension=True, nested=True)
+         else:
+-            packed_data = np.empty(1, 'O')
+-            packed_data[0] = data_str
+-            nc_variable[:] = packed_data
++            self._write_dict(path, data, storage_name=storage_name)
+ 
+     def read_last_iteration(self, full_iteration=True):
+         """
+@@ -1059,17 +1074,23 @@ def write_mbar_free_energies(self, iteration, f_k, free_energy):
+     # Internal-usage.
+     # -------------------------------------------------------------------------
+ 
+-    def _resolve_variable_path(self, path, storage):
+-        """Return the NC variable at the end of the path.
++    def _resolve_nc_path(self, path, storage):
++        """Return the NC group or variable at the end of the path.
+ 
+-        This can be used to retrieve variables inside one or more groups.
++        This can be used to retrieve groups or variables that are nested
++        inside one or more groups.
+ 
+         """
+         path_split = path.split('/')
+         nc_group = self._storage_dict[storage]
+         for group_name in path_split[:-1]:
+             nc_group = nc_group.groups[group_name]
+-        return nc_group.variables[path_split[-1]]
++
++        # Check if this is a path to a group or a variable.
++        try:
++            return nc_group.groups[path_split[-1]]
++        except KeyError:
++            return nc_group.variables[path_split[-1]]
+ 
+     def _calculate_checkpoint_iteration(self, iteration):
+         """Compute the iteration on disk of the checkpoint file matching the iteration linked on the analysis iteration.
+@@ -1288,6 +1309,76 @@ def _read_sampler_states_from_given_file(self, iteration, storage_file='checkpoi
+         else:
+             return None
+ 
++    def _write_dict(self, path, data, storage_name='analysis',
++                    fixed_dimension=False, nested=False):
++        """Store the contents of a dict.
++
++        Parameters
++        ----------
++        path : str
++            The path to the dictionary in the storage file.
++        data : dict
++            The dict to store.
++        storage_name : 'analysis' or 'checkpoint'
++            The name of the storage file where to save the dict.
++        fixed_dimension : bool, default: False
++            Use a fixed length dimension instead of variable length one.
++            This method seems to allow NetCDF to actually compress strings.
++
++            A unique dimension name called ``"fixedL{}".format(len(data))``
++            will be created.
++
++            Do NOT use this flag if you expect to constantly be changing
++            the length of the data fed in. Use only for static data.
++        nested : bool, default False
++            In nested representation, dictionaries are represented as
++            groups, and values as strings. In this mode, it is possible
++            to retrieve a keyword without reading the whole dictionary.
++
++            In this mode, the dictionary can be overwritten, but ONLY if
++            the structure of the dict doesn't change, as it's impossible
++            to delete groups/variables from a netcdf database.
++
++        """
++        storage_nc = self._storage_dict[storage_name]
++
++        # Save nested dictionary into a group if requested, unless the dictionary is empty.
++        if nested and isinstance(data, dict) and len(data) > 0:
++            for key, value in data.items():
++                if not isinstance(key, str):
++                    raise ValueError('Cannot store dict in nested form with non-string keys.')
++                self._write_dict(path + '/' + key, value, storage_name,
++                                 fixed_dimension, nested)
++            return
++
++        # Activate flow style to save space.
++        data_str = yaml.dump(data, Dumper=_DictYamlDumper)#, default_flow_style=True)
++
++        # Check if we are updating the dictionary or creating it.
++        try:
++            nc_variable = self._resolve_nc_path(path, storage_name)
++        except KeyError:
++            if fixed_dimension:
++                variable_type = 'S1'
++                dimension_name = "fixedL{}".format(len(data_str))
++                # Create a new fixed dimension if necessary.
++                if dimension_name not in storage_nc.dimensions:
++                    storage_nc.createDimension(dimension_name, len(data_str))
++            else:
++                variable_type = str
++                dimension_name = 'scalar'
++            # Create variable.
++            nc_variable = storage_nc.createVariable(path, variable_type,
++                                                    dimension_name, zlib=True)
++
++        # Assign the value to the variable.
++        if fixed_dimension:
++            packed_data = np.array(list(data_str), dtype='S1')
++        else:
++            packed_data = np.empty(1, 'O')
++            packed_data[0] = data_str
++        nc_variable[:] = packed_data
++
+ 
+ # ==============================================================================
+ # REPLICA-EXCHANGE SIMULATION
+@@ -1509,18 +1600,11 @@ def from_storage(cls, storage):
+             last stored iteration.
+ 
+         """
+-        # Check if netcdf file exists, open data for read if it does
+-        if type(storage) is str:
+-            # Open a reporter to read the data.
+-            reporter = Reporter(storage, open_mode='r')
+-            file_name = storage
+-        else:
+-            reporter = storage
+-            reporter.open(mode='r')
+-            file_name = reporter.filepath
+-        if not reporter.storage_exists():
+-            reporter.close()
+-            raise RuntimeError('Storage file {} or its subfiles do not exist; cannot resume.'.format(file_name))
++        # Handle case in which storage is a string.
++        reporter = cls._reporter_from_storage(storage, check_exist=True)
++
++        # Open a reporter to read the data.
++        reporter.open(mode='r')
+ 
+         # Retrieve options and create new simulation.
+         options = reporter.read_dict('options')
+@@ -1535,7 +1619,7 @@ def from_storage(cls, storage):
+         iteration = reporter.read_last_iteration()
+ 
+         # Retrieve other attributes.
+-        logger.debug("Reading storage file {}...".format(file_name))
++        logger.debug("Reading storage file {}...".format(reporter.filepath))
+         thermodynamic_states, unsampled_states = reporter.read_thermodynamic_states()
+         sampler_states = reporter.read_sampler_states(iteration=iteration)
+         state_indices = reporter.read_replica_thermodynamic_states(iteration=iteration)
+@@ -1544,11 +1628,11 @@ def from_storage(cls, storage):
+         metadata = reporter.read_dict('metadata')
+ 
+         # Search for last cached free energies only if online analysis is activated.
+-        if repex._online_analysis_interval is not None:
+-            online_anaysis_info = repex._get_last_written_free_energy(reporter, iteration)
+-            last_mbar_f_k, (_, last_err_free_energy) = online_anaysis_info
++        if repex.online_analysis_interval is not None:
++            online_analysis_info = repex._read_last_free_energy(reporter, iteration)
++            last_mbar_f_k, (_, last_err_free_energy) = online_analysis_info
+         else:
+-            last_mbar_f_k, (_, last_err_free_energy) = None, (None, None)
++            last_mbar_f_k, last_err_free_energy = None, None
+ 
+         # Close reading reporter.
+         reporter.close()
+@@ -1575,6 +1659,59 @@ def from_storage(cls, storage):
+         # Don't write the new last iteration, we have not technically written anything yet, so there is no "junk"
+         return repex
+ 
++    # TODO use Python 3.6 namedtuple syntax when we drop Python 3.5 support.
++    Status = typing.NamedTuple('Status', [
++        ('iteration', int),
++        ('target_error', float),
++        ('is_completed', bool)
++    ])
++
++    @classmethod
++    def read_status(cls, storage):
++        """Read the status of the calculation from the storage file.
++
++        This class method can be used to quickly check the status of the
++        simulation before loading the full ``ReplicaExchange`` object
++        from disk.
++
++        Parameters
++        ----------
++        storage : str or Reporter
++            The path to the storage file or the reporter object.
++
++        Returns
++        -------
++        status : ReplicaExchange.Status
++            The status of the replica-exchange calculation. It has three
++            fields: ``iteration``, ``target_error``, and ``is_completed``.
++
++        """
++        # Handle case in which storage is a string.
++        reporter = cls._reporter_from_storage(storage, check_exist=True)
++
++        # Read iteration and online analysis info.
++        reporter.open(mode='r')
++        options = reporter.read_dict('options')
++        iteration = reporter.read_last_iteration(full_iteration=False)
++        # Search for last cached free energies only if online analysis is activated.
++        if options['online_analysis_interval'] is not None:
++            target_error = options['online_analysis_target_error']
++            last_err_free_energy = cls._read_last_free_energy(reporter, iteration)[1][1]
++        else:
++            target_error = None
++            last_err_free_energy = None
++        reporter.close()
++
++        # Check if the calculation is done.
++        number_of_iterations = options['number_of_iterations']
++        online_analysis_target_error = options['online_analysis_target_error']
++        is_completed = cls._is_completed_static(number_of_iterations, iteration,
++                                                last_err_free_energy,
++                                                online_analysis_target_error)
++
++        return cls.Status(iteration=iteration, target_error=target_error,
++                          is_completed=is_completed)
++
+     # -------------------------------------------------------------------------
+     # Public properties.
+     # -------------------------------------------------------------------------
+@@ -1718,6 +1855,7 @@ def _oa_min_iter_validator(instance, online_analysis_minimum_iterations):
+                                                    validate_function=_StoredProperty._oa_target_error_validator)
+     online_analysis_minimum_iterations = _StoredProperty('online_analysis_minimum_iterations',
+                                                          validate_function=_StoredProperty._oa_min_iter_validator)
++
+     @property
+     def metadata(self):
+         """A copy of the metadata dictionary passed on creation (read-only)."""
+@@ -1755,23 +1893,16 @@ def create(self, thermodynamic_states, sampler_states, storage, unsampled_thermo
+         metadata : dict, optional
+            Simulation metadata to be stored in the file.
+         """
++        # Handle case in which storage is a string.
++        reporter = self._reporter_from_storage(storage, check_exist=False)
++
+         # Check if netcdf files exist. This is run only on MPI node 0 and
+         # broadcasted. This is to avoid the case where the other nodes
+         # arrive to this line after node 0 has already created the storage
+         # file, causing an error.
+-        files_exist = False
+-        # Create temporary reporter
+-        if type(storage) is str:
+-            reporter = Reporter(storage, open_mode=None)
+-            file_string = storage
+-        else:
+-            reporter = storage
+-            file_string = reporter.filepath
+         if mpi.run_single_node(0, reporter.storage_exists, broadcast_result=True):
+-            files_exist = True
+-        if files_exist:
+-            raise RuntimeError("Storage file {} already exists; cowardly "
+-                               "refusing to overwrite.".format(file_string))
++            raise RuntimeError('Storage file {} already exists; cowardly '
++                               'refusing to overwrite.'.format(reporter.filepath))
+ 
+         # Make sure sampler_states is an iterable of SamplerStates for later.
+         if isinstance(sampler_states, mmtools.states.SamplerState):
+@@ -2149,6 +2280,26 @@ def _does_file_exist(file_path):
+         """Check if there is a file at the given path."""
+         return os.path.exists(file_path) and os.path.getsize(file_path) > 0
+ 
++    @staticmethod
++    def _reporter_from_storage(storage, check_exist=True):
++        """Return the Reporter object associated to this storage.
++
++        If check_exist is True, FileNotFoundError is raised if the files
++        are not found.
++        """
++        if isinstance(storage, str):
++            # Open a reporter to read the data.
++            reporter = Reporter(storage)
++        else:
++            reporter = storage
++
++        # Check if netcdf file exists.
++        if check_exist and not reporter.storage_exists():
++            reporter.close()
++            raise FileNotFoundError('Storage file {} or its subfiles do not exist; '
++                                    'cannot read status.'.format(reporter.filepath))
++        return reporter
++
+     @mpi.on_single_node(rank=0, broadcast_result=False, sync_nodes=True)
+     def _initialize_reporter(self):
+         """Initialize the reporter and store initial information.
+@@ -2532,30 +2683,42 @@ def _run_online_analysis(self):
+         return self._last_err_free_energy
+ 
+     @staticmethod
+-    def _get_last_written_free_energy(reporter, iteration):
++    def _read_last_free_energy(reporter, iteration):
+         """Get the last free energy computed from online analysis"""
+         last_f_k = None
+         last_free_energy = None
+-        try:
+-            for index in range(iteration, 0, -1):
++
++        # Search for a valid free energy from the given iteration
++        # to the start of the calculation.
++        for index in range(iteration, 0, -1):
++            try:
+                 last_f_k, last_free_energy = reporter.read_mbar_free_energies(index)
+-                # Find an f_k that is not all zeros (or masked and empty)
+-                if not (np.ma.is_masked(last_f_k) or np.all(last_f_k == 0)):
+-                    break  # Don't need to continue the loop if we already found one
+-        except (IndexError, KeyError):  # No such f_k written yet (or variable created), no need to do anything
+-            pass
++            except (IndexError, KeyError):
++                # No such f_k written yet (or variable created).
++                break
++            # Find an f_k that is not all zeros (or masked and empty)
++            if not (np.ma.is_masked(last_f_k) or np.all(last_f_k == 0)):
++                break  # Don't need to continue the loop if we already found one
++
+         return last_f_k, last_free_energy
+ 
+     def _is_completed(self, iteration_limit=None):
+         """Check if we have reached the required number of iterations or statistical error."""
+         if iteration_limit is None:
+-            iteration_limit = self._number_of_iterations
++            iteration_limit = self.number_of_iterations
++        return self._is_completed_static(iteration_limit, self._iteration,
++                                         self._last_err_free_energy,
++                                         self.online_analysis_target_error)
+ 
++    @staticmethod
++    def _is_completed_static(iteration_limit, iteration, last_err_free_energy,
++                             online_analysis_target_error):
++        """Check if we have reached the required number of iterations or statistical error."""
+         # Return if we have reached the number of iterations
+         # or the statistical error target required.
+-        if (self._iteration >= iteration_limit or
+-                (self._last_err_free_energy is not None and
+-                         self._last_err_free_energy <= self._online_analysis_target_error)):
++        if (iteration >= iteration_limit or
++                (last_err_free_energy is not None and
++                         last_err_free_energy <= online_analysis_target_error)):
+             return True
+         return False
+ 
+diff --git a/Yank/tests/test_experiment.py b/Yank/tests/test_experiment.py
+index e9738159..bff9deab 100644
+--- a/Yank/tests/test_experiment.py
++++ b/Yank/tests/test_experiment.py
+@@ -2197,6 +2197,8 @@ def test_run_experiment():
+                 well_radius: 5.2*nanometers
+                 restrained_receptor_atoms: 1644
+                 restrained_ligand_atoms: 2609
++            options:
++                temperature: 302.0*kelvin
+         """.format(tmp_dir, examples_paths()['lysozyme'], examples_paths()['p-xylene'],
+                    indent(standard_protocol))
+ 
+diff --git a/Yank/tests/test_repex.py b/Yank/tests/test_repex.py
+index 80ea746f..445d9009 100644
+--- a/Yank/tests/test_repex.py
++++ b/Yank/tests/test_repex.py
+@@ -462,6 +462,12 @@ def test_store_energies(self):
+ 
+     def test_store_dict(self):
+         """Check correct storage and restore of dictionaries."""
++        def compare_dicts(reference, restored):
++            # We need a deterministically-ordered dict to compare pickles.
++            sorted_reference = sorted(reference.items())
++            sorted_restored = sorted(restored.items())
++            assert pickle.dumps(sorted_reference) == pickle.dumps(sorted_restored)
++
+         data = {
+             'mybool': False,
+             'mystring': 'test',
+@@ -472,33 +478,38 @@ def test_store_dict(self):
+             'myquantityarray': unit.Quantity(np.array([[1, 2, 3], [4.0, 5, 6]]), unit=unit.angstrom),
+             'mynesteddict': {'field1': 'string', 'field2': {'field21': 3.0, 'field22': True}}
+         }
+-        with self.temporary_reporter() as reporter:
+ 
+-            def compare_dicts(reference, check):
+-                for key, value in reference.items():
+-                    restored_value = check[key]
+-                    err_msg = '{}, {}'.format(value, restored_value)
+-                    try:
+-                        assert value == restored_value, err_msg
+-                    except ValueError:  # array-like
+-                        assert np.all(value == restored_value)
+-                    else:
+-                        assert type(value) == type(restored_value), err_msg
+-
+-            reporter.write_dict('testdict', data)
+-            restored_data = reporter.read_dict('testdict')
+-            compare_dicts(data, restored_data)
+-
+-            # write_dict supports updates.
+-            data['mybool'] = True
+-            data['mystring'] = 'substituted'
+-            reporter.write_dict('testdict', data)
+-            restored_data = reporter.read_dict('testdict')
+-            assert restored_data['mybool'] is True
+-            assert restored_data['mystring'] == 'substituted'
++        with self.temporary_reporter() as reporter:
++            # Test both nested and single-string representations.
++            for name, nested in [('testdict', False), ('nested', True)]:
++                reporter._write_dict(name, data, nested=nested)
++                restored_data = reporter.read_dict(name)
++                compare_dicts(data, restored_data)
++
++                # Test reading a keyword inside a dict.
++                restored_data = reporter.read_dict(name + '/mynesteddict/field2')
++                compare_dicts(data['mynesteddict']['field2'], restored_data)
++
++                # write_dict supports updates, even with the nested representation
++                # if the structure of the dictionary doesn't change.
++                data['mybool'] = True
++                data['mystring'] = 'substituted'
++                reporter._write_dict(name, data, nested=nested)
++                restored_data = reporter.read_dict(name)
++                assert restored_data['mybool'] is True
++                assert restored_data['mystring'] == 'substituted'
++
++                # In nested representation, dictionaries are stored as groups and
++                # values as variables. Otherwise, there's only a single variable.
++                if nested:
++                    dict_group = reporter._storage_analysis.groups[name]
++                    assert 'mynesteddict' in dict_group.groups
++                    assert 'mylist' in dict_group.variables
++                else:
++                    assert name in reporter._storage_analysis.variables
+ 
+             # Write dict fixed_dimension creates static dimensions and read/writes correctly
+-            reporter.write_dict('fixed', data, fixed_dimension=True)
++            reporter._write_dict('fixed', data, fixed_dimension=True)
+             restored_fixed_data = reporter.read_dict('fixed')
+             compare_dicts(data, restored_fixed_data)
+ 
+@@ -1212,7 +1223,7 @@ def test_online_analysis_works(self):
+             repex.run()
+ 
+             # The stored values of online analysis should be up to date.
+-            last_written_free_energy = ReplicaExchange._get_last_written_free_energy(repex._reporter, repex.iteration)
++            last_written_free_energy = ReplicaExchange._read_last_free_energy(repex._reporter, repex.iteration)
+             last_mbar_f_k, (last_free_energy, last_err_free_energy) = last_written_free_energy
+ 
+             assert len(repex._last_mbar_f_k) == len(thermodynamic_states)
+diff --git a/Yank/yank.py b/Yank/yank.py
+index e9ad344a..6dfe9213 100644
+--- a/Yank/yank.py
++++ b/Yank/yank.py
+@@ -626,22 +626,46 @@ class IMultiStateSampler(mmtools.utils.SubhookedABCMeta):
+ 
+     """
+ 
++    @classmethod
++    @abc.abstractmethod
++    def read_status(cls, storage):
++        """Read the status of the calculation from the storage file.
++
++        Parameters
++        ----------
++        storage : str or Reporter
++            The path to the storage file or the reporter object to forward
++            to the sampler. In the future, this will be able to take a Storage
++            class as well.
++
++        Returns
++        -------
++        status : namedtuple
++            The status of the calculation.
++
++        """
++        pass
++
+     @property
++    @abc.abstractmethod
+     def number_of_iterations(self):
+         """int: the total number of iterations to run."""
+         pass
+ 
+-    @abc.abstractproperty
++    @property
++    @abc.abstractmethod
+     def iteration(self):
+         """int: the current iteration."""
+         pass
+ 
+-    @abc.abstractproperty
++    @property
++    @abc.abstractmethod
+     def metadata(self):
+         """dict: a copy of the metadata dictionary passed on creation."""
+         pass
+ 
+-    @abc.abstractproperty
++    @property
++    @abc.abstractmethod
+     def sampler_states(self):
+         """list of SamplerState: the sampler states at the current iteration."""
+         pass
+@@ -659,11 +683,9 @@ def create(self, thermodynamic_state, sampler_states, storage,
+             One or more sets of initial sampler states. If a list of SamplerStates,
+             they will be assigned to thermodynamic states in a round-robin fashion.
+         storage : str or Reporter
+-            If str: The path to the storage file. Reads defaults from the :class:`yank.repex.Reporter` class
+-
+-            If :class:`yank.repex.Reporter`: Reads the reporter settings for files and options
+-
+-            In the future this will be able to take a Storage class as well.
++            The path to the storage file or a Reporter object to forward
++            to the sampler. In the future, this will be able to take a
++            Storage class as well.
+         unsampled_thermodynamic_states : list of openmmtools.states.ThermodynamicState
+             These are ThermodynamicStates that are not propagated, but their
+             reduced potential is computed at each iteration for each replica.
+@@ -745,7 +767,7 @@ class AlchemicalPhase(object):
+ 
+     Parameters
+     ----------
+-    sampler : MultiStateSampler
++    sampler : IMultiStateSampler
+         The sampler instance implementing the :class:`IMultiStateSampler` interface.
+ 
+     Attributes
+@@ -758,18 +780,16 @@ class AlchemicalPhase(object):
+     def __init__(self, sampler):
+         self._sampler = sampler
+ 
+-    @staticmethod
+-    def from_storage(storage):
++    @classmethod
++    def from_storage(cls, storage):
+         """Static constructor from an existing storage file.
+ 
+         Parameters
+         ----------
+         storage : str or Reporter
+-            If str: The path to the primary storage file. Default checkpointing options are stored in this case
+-
+-            If :class:`yank.repex.Reporter`: loads from the reporter class, including checkpointing information
+-
+-            In the future this will be able to take a Storage class as well.
++            The path to the storage file or the reporter object to forward
++            to the sampler. In the future, this will be able to take a Storage
++            class as well.
+ 
+         Returns
+         -------
+@@ -778,30 +798,37 @@ def from_storage(storage):
+             last stored iteration.
+ 
+         """
+-        # Check if netcdf file exists.
+-        if type(storage) is str:
+-            reporter = repex.Reporter(storage)
+-        else:
+-            reporter = storage
+-        if not reporter.storage_exists():
+-            reporter.close()
+-            raise RuntimeError('Storage file at {} does not exists; cannot resume.'.format(reporter.filepath))
++        # Read the MultiStateSampler class from the storage.
++        sampler_class = cls._read_sampler_class(storage)
++        # Resume sampler and return new AlchemicalPhase.
++        sampler = sampler_class.from_storage(storage)
++        return AlchemicalPhase(sampler)
+ 
+-        # TODO: this should skip the Reporter and use the Storage to read storage.metadata.
+-        # Open Reporter for reading and read metadata.
+-        reporter.open(mode='r')
+-        metadata = reporter.read_dict('metadata')
+-        reporter.close()
++    @classmethod
++    def read_status(cls, storage):
++        """Read the status of the calculation from the storage file.
+ 
+-        # Retrieve the sampler class.
+-        sampler_full_name = metadata['sampler_full_name']
+-        module_name, cls_name = sampler_full_name.rsplit('.', 1)
+-        module = importlib.import_module(module_name)
+-        cls = getattr(module, cls_name)
++        This method can be used to quickly check the status of the
++        simulation before loading the full ``ReplicaExchange`` object
++        from disk.
+ 
+-        # Resume sampler and return new AlchemicalPhase.
+-        sampler = cls.from_storage(reporter)
+-        return AlchemicalPhase(sampler)
++        Parameters
++        ----------
++        storage : str or Reporter
++            The path to the storage file or the reporter object to forward
++            to the sampler. In the future, this will be able to take a Storage
++            class as well.
++
++        Returns
++        -------
++        status : namedtuple
++            The status of the calculation.
++
++        """
++        # Read the MultiStateSampler class from the storage.
++        sampler_class = cls._read_sampler_class(storage)
++        # Read sampler status.
++        return sampler_class.read_status(storage)
+ 
+     @property
+     def iteration(self):
+@@ -858,11 +885,10 @@ def create(self, thermodynamic_state, sampler_states, topography, protocol,
+             The dictionary ``{parameter_name: list_of_parameter_values}`` defining
+             the protocol. All the parameter values list must have the same
+             number of elements.
+-        storage : str or initialized Reporter class
+-            If str: Path to the storage file. The default checkpointing options (see the :class:`yank.repex.Reporter`
+-            class) will be used in this case
+-
+-            If :class:`yank.repex.Reporter`: Uses files and checkpointing options of the reporter class passed in
++        storage : str or Reporter
++            The path to the storage file or a Reporter object to forward
++            to the sampler. In the future, this will be able to take a
++            Storage class as well.
+         restraint : ReceptorLigandRestraint, optional
+             Restraint to add between protein and ligand. This must be specified
+             for ligand-receptor systems in non-periodic boxes.
+@@ -1188,6 +1214,33 @@ def extend(self, n_iterations):
+     # Internal-usage
+     # -------------------------------------------------------------------------
+ 
++    @staticmethod
++    def _read_sampler_class(storage):
++        """Retrieve the MultiStateSampler class used from the storage."""
++        # Handle str and Reporter argument value.
++        if isinstance(storage, str):
++            reporter = repex.Reporter(storage)
++        else:
++            reporter = storage
++
++        # Check if netcdf file exists.
++        if not reporter.storage_exists():
++            reporter.close()
++            raise FileNotFoundError('Storage file at {} does not exists; '
++                                    'cannot resume.'.format(reporter.filepath))
++
++        # TODO: this should skip the Reporter and use the Storage to read storage.metadata.
++        # Open Reporter for reading and read sampler class name.
++        reporter.open(mode='r')
++        sampler_full_name = reporter.read_dict('metadata/sampler_full_name')
++        reporter.close()
++
++        # Retrieve the sampler class.
++        module_name, sampler_class_name = sampler_full_name.rsplit('.', 1)
++        module = importlib.import_module(module_name)
++        sampler_class = getattr(module, sampler_class_name)
++        return sampler_class
++
+     @staticmethod
+     def _expand_state_cutoff(thermodynamic_state, expanded_cutoff_distance,
+                              replace_reaction_field=False, switch_width=None):
+diff --git a/docs/whatsnew.rst b/docs/whatsnew.rst
+index 365484d5..49598ab3 100644
+--- a/docs/whatsnew.rst
++++ b/docs/whatsnew.rst
+@@ -8,8 +8,11 @@ The full release history can be viewed `at the GitHub yank releases page <https:
+ 
+ 0.19.4 Schema and Parallel Setup Fixes
+ --------------------------------------
+-- Fixed bug in parallel molecule setup which caused the same molecule to be setup multiple times
+-- Fixed bug in Cerberus schema for LEaP where molecule parameters accumulated
++- Fixed bug in parallel molecule setup which caused the same molecule to be setup multiple times.
++- Fixed bug in Cerberus schema for LEaP where molecule parameters accumulated.
++- Fixed bug where options in experiment section were not coerced.
++- Fixed status command to print information about all combinatorial experiments.
++- Faster restart with combinatorial experiments.
+ 
+ 0.19.3 Support for Amber restart files
+ --------------------------------------

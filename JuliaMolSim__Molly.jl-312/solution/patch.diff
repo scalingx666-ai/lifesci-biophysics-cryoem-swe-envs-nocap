@@ -1,0 +1,1352 @@
+diff --git a/docs/src/documentation.md b/docs/src/documentation.md
+index c67f58224..86de591e6 100644
+--- a/docs/src/documentation.md
++++ b/docs/src/documentation.md
+@@ -431,7 +431,7 @@ The following tags are supported:
+ - `<CMAPTorsionForce>`
+ - `<NonbondedForce>`: `<UseAttributeFromResidue>` tags other than `<UseAttributeFromResidue name="charge"/>` are not supported, `useDispersionCorrection` is supported and is `true` by default
+ - `<CustomTorsionForce>`: the special case where `energy="k*(theta-theta0)^2"` is supported as it is used to define improper torsions in some force fields
+-- `<CustomNonbondedForce>`: the special case of the double exponential potential is supported with `bondCutoff="3"`, global parameters `alpha` and `beta`, and per-particle parameters `sigma` and `epsilon`
++- `<CustomNonbondedForce>`: the special case of the double exponential potential is supported with `bondCutoff="3"`, global parameters `alpha` and `beta`, and per-particle parameters `sigma` and `epsilon`. Its long-range dispersion correction, [`DExpDispersionCorrection`](@ref), is off by default but can be turned on with `dispersion_correction=true` in [`System`](@ref) or the `useDispersionCorrection` attribute of `<NonbondedForce>`
+ - `<LennardJonesForce>`: `<NBFixPair>` tags and `sigma14`/`epsilon14` attributes in `<Atom>` tags are supported, `useDispersionCorrection` is supported and is `true` by default
+ - `<AmoebaUreyBradleyForce>`: this defines the bond-like part of a general Urey-Bradley interaction and is not specific to the AMOEBA force field, note that `k` is equivalent to the `k/2` harmonic bond factor
+ - `<Include>`
+@@ -834,6 +834,7 @@ The available general interactions are:
+ - [`Ewald`](@ref)
+ - [`PME`](@ref)
+ - [`LJDispersionCorrection`](@ref)
++- [`DExpDispersionCorrection`](@ref)
+ - [`ImplicitSolventOBC`](@ref)
+ - [`ImplicitSolventGBN2`](@ref)
+ - [`ANIPotential`](@ref)
+diff --git a/src/energy.jl b/src/energy.jl
+index 1183701d0..acca77f88 100644
+--- a/src/energy.jl
++++ b/src/energy.jl
+@@ -271,14 +271,19 @@ function potential_energy(sys::System{<:Any, <:Any, <:Any, TH},
+     end
+ 
+     # visit_state lets history-dependent interactions (e.g. Metadynamics) update at this state
+-    for inter in values(general_inters)
+-        pe += uconvert(
++    # `map` over the tuple keeps each interaction concretely typed; a loop over general
++    #   interactions of different types gives a Union that Enzyme can not differentiate
++    pes_general = map(values(general_inters)) do inter
++        uconvert(
+             sys.energy_units,
+             AtomsCalculators.potential_energy(sys, inter; neighbors=neighbors, step_n=step_n,
+                                               n_threads=n_threads, strictness=strictness,
+                                               visit_state=visit_state),
+         )
+     end
++    for pe_general in pes_general
++        pe += pe_general
++    end
+ 
+     return pe
+ end
+@@ -539,14 +544,18 @@ function potential_energy(sys::System{<:Any, <:AbstractGPUArray},
+     pe = gpu_potential_energy(sys, neighbors, step_n, buffers, pairwise_inters,
+                               specific_inter_lists, n_threads)
+ 
+-    for inter in values(general_inters)
+-        pe += uconvert(
++    # `map` keeps each general interaction concretely typed for Enzyme, as on the CPU
++    pes_general = map(values(general_inters)) do inter
++        uconvert(
+             sys.energy_units,
+             AtomsCalculators.potential_energy(sys, inter; neighbors=neighbors, step_n=step_n,
+                                 n_threads=n_threads, strictness=strictness,
+                                 visit_state=visit_state),
+         )
+     end
++    for pe_general in pes_general
++        pe += pe_general
++    end
+ 
+     return pe
+ end
+diff --git a/src/force_field.jl b/src/force_field.jl
+index 23e12c4c7..ad028c29e 100644
+--- a/src/force_field.jl
++++ b/src/force_field.jl
+@@ -1248,6 +1248,7 @@ function MolecularForceField(ff_files::AbstractString...; units::Bool=true,
+     weight_14_coulomb = ff_param_array[2]
+     # Use LennardJonesForce 1-4 weighting if present
+     weight_14_lj = (ff_param_array[7] ? ff_param_array[6] : ff_param_array[4])
++    # As in OpenMM, a CustomNonbondedForce (the double exponential) has no correction by default
+     dispersion_correction = if isnothing(ff_param_array[12])
+         !ff_param_array[13]
+     else
+diff --git a/src/free_energy/alchemical_system.jl b/src/free_energy/alchemical_system.jl
+index dc0352e3a..c46f15e68 100644
+--- a/src/free_energy/alchemical_system.jl
++++ b/src/free_energy/alchemical_system.jl
+@@ -271,6 +271,10 @@ function lambda_general_inters(sys, atoms, boundary, scheduler, global_λ)
+             push!(inters, LJDispersionCorrectionλ(to_device(atoms, AT), inter.cutoff,
+                                                   MinimumMixing(), inter.σ_mix, inter.ϵ_mix;
+                                                   scheduler=scheduler))
++        elseif inter isa DExpDispersionCorrection
++            push!(inters, DExpDispersionCorrectionλ(to_device(atoms, AT), inter.cutoff, inter.α,
++                                                    inter.β, MinimumMixing(), inter.σ_mix,
++                                                    inter.ϵ_mix; scheduler=scheduler))
+         else
+             @warn "$(typeof(inter).name.name) has no alchemical version yet and is left out of " *
+                   "the system, so its contribution is missing at every λ, the end states included"
+@@ -286,7 +290,8 @@ Set the global λ of an alchemical system, as set up by [`AbsoluteFESystem`](@re
+ [`RelativeFESystem`](@ref), in place without rebuilding it.
+ 
+ Only the λ of the alchemical atoms, the mesh weight of [`Molly.PME_λ`](@ref) and the
+-precomputed factors of [`Molly.LJDispersionCorrectionλ`](@ref) depend on λ; the neighbor masks, the interaction
++precomputed factors of [`Molly.LJDispersionCorrectionλ`](@ref) and
++[`Molly.DExpDispersionCorrectionλ`](@ref) depend on λ; the neighbor masks, the interaction
+ lists, the topology, the constraints and the virtual sites do not, which is what makes this much
+ cheaper than building the system again. Environment atoms keep λ = 1.
+ 
+@@ -312,6 +317,9 @@ function set_lambda!(sys::System, λ)
+         elseif inter isa LJDispersionCorrectionλ
+             LJDispersionCorrectionλ(sys.atoms, inter.cutoff, MinimumMixing(), inter.σ_mix,
+                                     inter.ϵ_mix; scheduler=inter.scheduler)
++        elseif inter isa DExpDispersionCorrectionλ
++            DExpDispersionCorrectionλ(sys.atoms, inter.cutoff, inter.α, inter.β, MinimumMixing(),
++                                      inter.σ_mix, inter.ϵ_mix; scheduler=inter.scheduler)
+         else
+             inter
+         end
+diff --git a/src/interactions/double_exponential.jl b/src/interactions/double_exponential.jl
+index db2b0593e..f0c1d43e9 100644
+--- a/src/interactions/double_exponential.jl
++++ b/src/interactions/double_exponential.jl
+@@ -1,6 +1,9 @@
+ export 
+     DoubleExponential,
+-    DoubleExponentialSoftCore
++    DoubleExponentialSoftCore,
++    DExpDispersionCorrection
++
++@public DExpDispersionCorrectionλ
+ 
+ @doc raw"""
+     DoubleExponential(; cutoff, use_neighbors, α, β, shortcut, σ_mixing, ϵ_mixing,
+@@ -354,3 +357,325 @@ end
+     x = 1 - r / rm
+     return ϵ * (β * exp(α * x) - α * exp(β * x)) / (α - β)
+ end
++
++@doc raw"""
++    DExpDispersionCorrection(atoms, cutoff, α, β, σ_mixing=LorentzMixing(),
++                             ϵ_mixing=GeometricMixing())
++
++The long-range dispersion correction for the [`DoubleExponential`](@ref) interaction, the
++analogue of [`LJDispersionCorrection`](@ref).
++
++Use it with the same `α`, `β`, mixing rules and cutoff as the pairwise interaction.
++`cutoff` can be a [`DistanceCutoff`](@ref) (or a distance), a [`ShiftedPotentialCutoff`](@ref)
++or a [`PolynomialCutoff`](@ref).
++Assuming a uniform density beyond the cutoff, the potential energy for a
++[`DistanceCutoff`](@ref) is
++```math
++E = \frac{2 \pi N^2}{V} \left< \int_{r_c}^\infty r^2 V_{ij}(r) \, dr \right>
++  = \frac{2 \pi N^2}{V} \left< \frac{\varepsilon_{ij} r_m^3}{\alpha - \beta} \left[
++    \beta G_\alpha\left(\frac{r_c}{r_m}\right) - \alpha G_\beta\left(\frac{r_c}{r_m}\right)
++  \right] \right>
++```
++where
++```math
++G_k(x) = e^{k(1 - x)} \left( \frac{x^2}{k} + \frac{2x}{k^2} + \frac{2}{k^3} \right)
++```
++``V_{ij}`` is the pair potential, ``V`` the volume and ``r_c`` the cutoff distance. The
++averages run over all pairs, including excluded pairs and self pairs.
++The other cutoffs also include the switched-out or shifted part of the potential, as for
++[`LJDispersionCorrection`](@ref).
++The forces are zero, with an isotropic virial contribution.
++
++The number of atoms is assumed not to change after setup. [`inject_gradients`](@ref)
++recomputes the correction from injected σ, ϵ, `α` and `β`, which share their keys with the
++pairwise interaction, including its gradients.
++Only compatible with 3D systems.
++"""
++struct DExpDispersionCorrection{F, EC, C, T, S, E, P}
++    factor::F
++    factor_vir::F
++    energy_const::EC
++    cutoff::C
++    α::T
++    β::T
++    σ_mix::S
++    ϵ_mix::E
++    # As for `LJDispersionCorrection`
++    group_pairs::P
++end
++
++dexp_pe(r, α, β, rm, ϵ) = ϵ * (β * exp(α * (1 - r / rm)) - α * exp(β * (1 - r / rm))) / (α - β)
++
++# The integral of r^2 e^(k(1 - r / r_m)) from r_c to ∞ divided by r_m^3, with x = r_c / r_m
++dexp_tail_term(k, x) = exp(k * (1 - x)) * (x^2 / k + 2x / k^2 + 2 / k^3)
++
++# The integral of r^2 V(r) from r_c to ∞ for one pair
++function dexp_tail_integral(rc, α, β, rm, ϵ)
++    x = rc / rm
++    return ϵ * rm^3 * (β * dexp_tail_term(α, x) - α * dexp_tail_term(β, x)) / (α - β)
++end
++
++# The integral of r^2 (1 - S) V(r) from the activation distance to the cutoff for one pair, the
++#   part that the switching function of PolynomialCutoff leaves out, by the composite
++#   Gauss-Legendre quadrature of `switched_out_integrals` with the nodes and weights given
++function dexp_switched_out_integral(ra, rc, α, β, rm, ϵ, (xs, ws))
++    # One interval is exact to machine precision for usual activation distances, but an
++    #   activation distance within the repulsive core, where e^(α(1 - r / r_m)) grows steeply,
++    #   needs about 8; 16 keeps a margin at negligible cost
++    n_intervals = 16
++    h = (rc - ra) / n_intervals
++    j = 0.0
++    for m in 1:n_intervals, (xg, wg) in zip(xs, ws)
++        r = ra + (m - 1 + (xg + 1) / 2) * h
++        t = (r - ra) / (rc - ra)
++        j += wg * h / 2 * t^3 * (10 - 15t + 6t^2) * r^2 * dexp_pe(r, α, β, rm, ϵ)
++    end
++    return j
++end
++
++#=
++For one pair, without units, the parts of the energy and of each diagonal component of the
++    virial that are divided by the volume, both divided by 2πN^2, and the potential at the
++    cutoff that gives the part of the energy independent of the volume.
++Beyond the cutoff the virial component is -(1/3)∫r^3 V'(r), which integrates by parts to
++    ∫r^2 V(r) + r_c^3 V(r_c) / 3.
++The shifted potential leaves out V(r_c) for the pairs within the cutoff as well, which adds
++    r_c^3 V(r_c) / 3 to the energy but not to the virial, since the shift has no force.
++When the potential is continuous at the cutoff, as for the shifted and switched potentials, the
++    virial is therefore the energy, as for `disp_corr_virial_weights`.
++=#
++function dexp_disp_corr_pair(c::DistanceCutoff, α, β, rm, ϵ, quad)
++    rc = c.dist_cutoff
++    tail = dexp_tail_integral(rc, α, β, rm, ϵ)
++    return tail, tail + rc^3 * dexp_pe(rc, α, β, rm, ϵ) / 3, 0.0
++end
++
++function dexp_disp_corr_pair(c::ShiftedPotentialCutoff, α, β, rm, ϵ, quad)
++    rc = c.dist_cutoff
++    V_rc = dexp_pe(rc, α, β, rm, ϵ)
++    e = dexp_tail_integral(rc, α, β, rm, ϵ) + rc^3 * V_rc / 3
++    return e, e, V_rc
++end
++
++function dexp_disp_corr_pair(c::PolynomialCutoff, α, β, rm, ϵ, quad)
++    ra, rc = c.dist_activation, c.dist_cutoff
++    e = dexp_tail_integral(rc, α, β, rm, ϵ) + dexp_switched_out_integral(ra, rc, α, β, rm, ϵ, quad)
++    return e, e, 0.0
++end
++
++dexp_float_cutoff(c::DistanceCutoff, L) = DistanceCutoff(Float64(ustrip(L, c.dist_cutoff)))
++
++function dexp_float_cutoff(c::ShiftedPotentialCutoff, L)
++    return ShiftedPotentialCutoff(Float64(ustrip(L, c.dist_cutoff)))
++end
++
++function dexp_float_cutoff(c::PolynomialCutoff, L)
++    return PolynomialCutoff(Float64(ustrip(L, c.dist_activation)),
++                            Float64(ustrip(L, c.dist_cutoff)))
++end
++
++#=
++The factors of the correction from the atoms, summing over the pairs of groups of atoms in
++    `group_pairs`, with `n` atoms. `pair_params(atom_i, atom_j)` gives the coupling λ, the shape
++    parameters α and β, σ and ϵ of a pair.
++The sums are taken in Float64 and the factors are given in the types F and EC. This is also how
++    injected parameters are taken up, so it has to stay differentiable.
++The shifted potential subtracts V(r_c) from each pair within the cutoff, and as in GROMACS and
++    `disp_corr_energy_const` each atom is taken to have one fewer partner within the cutoff than
++    the uniform density gives.
++=#
++function dexp_disp_corr_factors(cutoff, group_pairs, atoms, n, pair_params, F, EC)
++    at = first(atoms)
++    L, EU = unit(first(at.σ)), unit(first(at.ϵ))
++    cutoff_f = dexp_float_cutoff(cutoff, L)
++    e_sum, w_sum, V_rc_sum = 0.0, 0.0, 0.0
++    for (i, j, n_pairs_group) in group_pairs
++        λ, α, β, σ, ϵ = pair_params(atoms[i], atoms[j])
++        rm = Float64(ustrip(L, σ)) * two_power_sixth
++        ϵ_f = Float64(ustrip(EU, ϵ))
++        # Pairs that the shortcut of the pairwise interaction turns off
++        (iszero(rm) || iszero(ϵ_f) || iszero(λ)) && continue
++        e, w, V_rc = dexp_disp_corr_pair(cutoff_f, Float64(α), Float64(β), rm, ϵ_f,
++                                         gauss_legendre_20)
++        e_sum    += n_pairs_group * λ * e
++        w_sum    += n_pairs_group * λ * w
++        V_rc_sum += n_pairs_group * λ * V_rc
++    end
++    n_pairs = n * (n + 1) / 2
++    # Every atom decoupled leaves no pairs, where the correction is zero rather than 0/0
++    mean(x) = (iszero(n_pairs) ? zero(x) : x / n_pairs)
++    factor     = convert(F, 2π * n^2 * mean(e_sum) * EU * L^3)
++    factor_vir = convert(F, 2π * n^2 * mean(w_sum) * EU * L^3)
++    energy_const = convert(EC, -n / 2 * mean(V_rc_sum) * EU)
++    return factor, factor_vir, energy_const
++end
++
++# The types of the factors of a double exponential dispersion correction for an atom
++dexp_disp_corr_types(at) = typeof(first(at.ϵ) * first(at.σ)^3), typeof(first(at.ϵ))
++
++function DExpDispersionCorrection(atoms::AbstractArray,
++                                  cutoff,
++                                  α,
++                                  β,
++                                  σ_mix=LorentzMixing(),
++                                  ϵ_mix=GeometricMixing())
++    cutoff_used = disp_corr_cutoff(cutoff)
++    atoms_cpu = from_device(atoms)
++    F, EC = dexp_disp_corr_types(first(atoms_cpu))
++    dc = DExpDispersionCorrection(zero(F), zero(F), zero(EC), cutoff_used, α, β, σ_mix, ϵ_mix,
++                                  identical_group_pairs(atoms_cpu))
++    return update_cached_parameters(dc, atoms_cpu)
++end
++
++# Recompute the factors from the atoms and α and β, which may have injected values
++function update_cached_parameters(dc::DExpDispersionCorrection, atoms)
++    pair_params(atom_i, atom_j) = (1, dc.α, dc.β, σ_mixing(dc.σ_mix, atom_i, atom_j),
++                                   ϵ_mixing(dc.ϵ_mix, atom_i, atom_j))
++    factor, factor_vir, energy_const = dexp_disp_corr_factors(dc.cutoff,
++            from_device(dc.group_pairs), atoms, Float64(length(atoms)), pair_params,
++            typeof(dc.factor), typeof(dc.energy_const))
++    return DExpDispersionCorrection(factor, factor_vir, energy_const, dc.cutoff, dc.α, dc.β,
++                                    dc.σ_mix, dc.ϵ_mix, dc.group_pairs)
++end
++
++function Base.zero(dc::DExpDispersionCorrection)
++    return DExpDispersionCorrection(zero(dc.factor), zero(dc.factor_vir), zero(dc.energy_const),
++                                    dc.cutoff, dc.α, dc.β, dc.σ_mix, dc.ϵ_mix, dc.group_pairs)
++end
++
++function Base.:+(dc1::DExpDispersionCorrection, dc2::DExpDispersionCorrection)
++    return DExpDispersionCorrection(
++        dc1.factor + dc2.factor,
++        dc1.factor_vir + dc2.factor_vir,
++        dc1.energy_const + dc2.energy_const,
++        dc1.cutoff,
++        dc1.α,
++        dc1.β,
++        dc1.σ_mix,
++        dc1.ϵ_mix,
++        dc1.group_pairs,
++    )
++end
++
++function Unitful.ustrip(dc::DExpDispersionCorrection)
++    return DExpDispersionCorrection(ustrip(dc.factor), ustrip(dc.factor_vir),
++                                    ustrip(dc.energy_const), ustrip_cutoff(dc.cutoff), dc.α,
++                                    dc.β, dc.σ_mix, dc.ϵ_mix, dc.group_pairs)
++end
++
++@doc raw"""
++    DExpDispersionCorrectionλ(atoms, cutoff, α, β, λ_mix, σ_mix, ϵ_mix; scheduler)
++
++The long-range dispersion correction for the [`DoubleExponentialSoftCore`](@ref) interaction,
++the λ version of [`DExpDispersionCorrection`](@ref).
++
++[`AbsoluteFESystem`](@ref) and [`RelativeFESystem`](@ref) convert each
++[`DExpDispersionCorrection`](@ref) to this type.
++For a [`DistanceCutoff`](@ref) the potential energy is
++```math
++E = \frac{2 \pi N^2}{V} \left< \lambda_{ij} \int_{r_c}^\infty r^2 V_{ij}(r; \alpha_s, \beta_s) \, dr \right>
++```
++where ``V_{ij}(r; \alpha_s, \beta_s)`` is the pair potential with the soft-core shape
++parameters of [`DoubleExponentialSoftCore`](@ref).
++Unlike for Lennard-Jones, the soft core changes the potential at every distance, so the
++coupling enters through ``\alpha_s`` and ``\beta_s`` as well as ``\lambda_{ij}``.
++The averages, ``\lambda_{ij}`` and the effective number of atoms ``N`` are as for
++[`Molly.LJDispersionCorrectionλ`](@ref), and the other cutoffs as for
++[`DExpDispersionCorrection`](@ref).
++The forces are zero, with an isotropic virial contribution.
++
++The factors are computed from the `λ` of `atoms` at setup; [`Molly.set_lambda!`](@ref)
++recomputes them.
++The number of atoms is otherwise assumed not to change after setup, and
++[`inject_gradients`](@ref) takes up injected σ, ϵ, `α` and `β` as for
++[`DExpDispersionCorrection`](@ref).
++Only compatible with 3D systems.
++"""
++struct DExpDispersionCorrectionλ{F, EC, C, T, L, S, E, SCH, P}
++    factor::F
++    factor_vir::F
++    energy_const::EC
++    cutoff::C
++    α::T
++    β::T
++    λ_mix::L
++    σ_mix::S
++    ϵ_mix::E
++    # Kept so that `set_lambda!` can rebuild the factors, which are precomputed from the coupling
++    scheduler::SCH
++    # As for `LJDispersionCorrectionλ`
++    class_pairs::P
++    n_eff::Float64
++end
++
++# α and β share their keys with the pairwise interaction, so they are injected with it
++parameter_prefix(::Union{DExpDispersionCorrection, DExpDispersionCorrectionλ}) = "inter_DEXP_"
++parameter_fields(::Type{<:Union{DExpDispersionCorrection, DExpDispersionCorrectionλ}}) =
++    ((:α, "alpha"), (:β, "beta"))
++
++function DExpDispersionCorrectionλ(atoms, cutoff, α, β, λ_mix, σ_mix, ϵ_mix; scheduler)
++    cutoff_used = disp_corr_cutoff(cutoff)
++    atoms_cpu = from_device(atoms)
++    F, EC = dexp_disp_corr_types(first(atoms_cpu))
++    class_pairs, n_eff = lambda_class_pairs(atoms_cpu, scheduler)
++    dc = DExpDispersionCorrectionλ(zero(F), zero(F), zero(EC), cutoff_used, α, β, λ_mix, σ_mix,
++                                   ϵ_mix, scheduler, class_pairs, n_eff)
++    return update_cached_parameters(dc, atoms_cpu)
++end
++
++function update_cached_parameters(dc::DExpDispersionCorrectionλ, atoms)
++    function pair_params(atom_i, atom_j)
++        λ, λR, _, σ, ϵ = λ_params_function(dc.scheduler, dc.λ_mix, dc.σ_mix, dc.ϵ_mix,
++                                           lambda_disp_corr_atom(dc.scheduler, atom_i),
++                                           lambda_disp_corr_atom(dc.scheduler, atom_j), false)
++        # The soft-core shape parameters, as in `DoubleExponentialSoftCore`
++        λ_soft = λ * λR
++        return λ, 1.1 + λ_soft * (dc.α - 1.1), 1 + λ_soft * (dc.β - 1), σ, ϵ
++    end
++    factor, factor_vir, energy_const = dexp_disp_corr_factors(dc.cutoff,
++            from_device(dc.class_pairs), atoms, dc.n_eff, pair_params, typeof(dc.factor),
++            typeof(dc.energy_const))
++    return DExpDispersionCorrectionλ(factor, factor_vir, energy_const, dc.cutoff, dc.α, dc.β,
++                                     dc.λ_mix, dc.σ_mix, dc.ϵ_mix, dc.scheduler,
++                                     dc.class_pairs, dc.n_eff)
++end
++
++function dexp_disp_corr_virial!(buffers, sys, inter)
++    w = inter.factor_vir / volume(sys)
++    for d in axes(buffers.virial, 1)
++        buffers.virial[d, d] += w
++    end
++    return buffers
++end
++
++AtomsCalculators.@generate_interface function AtomsCalculators.potential_energy(sys,
++                                                    inter::DExpDispersionCorrection; kwargs...)
++    return inter.factor / volume(sys) + inter.energy_const
++end
++
++AtomsCalculators.@generate_interface function AtomsCalculators.forces!(
++        fs, sys, inter::DExpDispersionCorrection;
++        buffers=nothing,
++        needs_vir=false,
++        kwargs...)
++    if needs_vir
++        dexp_disp_corr_virial!(buffers, sys, inter)
++    end
++    return fs
++end
++
++AtomsCalculators.@generate_interface function AtomsCalculators.potential_energy(sys,
++                                                    inter::DExpDispersionCorrectionλ; kwargs...)
++    return inter.factor / volume(sys) + inter.energy_const
++end
++
++AtomsCalculators.@generate_interface function AtomsCalculators.forces!(
++        fs, sys, inter::DExpDispersionCorrectionλ;
++        buffers=nothing,
++        needs_vir=false,
++        kwargs...)
++    if needs_vir
++        dexp_disp_corr_virial!(buffers, sys, inter)
++    end
++    return fs
++end
+diff --git a/src/interactions/lennard_jones.jl b/src/interactions/lennard_jones.jl
+index 9405649a7..5858263ef 100644
+--- a/src/interactions/lennard_jones.jl
++++ b/src/interactions/lennard_jones.jl
+@@ -163,17 +163,21 @@ GROMACS leaves excluded pairs out of the averages and only corrects the ``r^{-6}
+ its correction differs slightly.
+ The forces are zero, with an isotropic virial contribution.
+ 
+-The number of atoms and atom σ and ϵ values are assumed not to change after setup (the box
+-volume can change).
++The number of atoms is assumed not to change after setup, and changing the σ and ϵ of the
++atoms directly has no effect; [`inject_gradients`](@ref) recomputes the correction from
++injected values, including its gradients.
+ Only compatible with 3D systems.
+ """
+-struct LJDispersionCorrection{F6, F12, EC, C, S, E}
++struct LJDispersionCorrection{F6, F12, EC, C, S, E, P}
+     factor_6::F6
+     factor_12::F12
+     energy_const::EC
+     cutoff::C
+     σ_mix::S
+     ϵ_mix::E
++    # The pairs of groups of atoms with the same parameters, as the index of one atom of each
++    #   group and the number of atom pairs, so that injected parameters can be taken up
++    group_pairs::P
+ end
+ 
+ # The cutoffs that the dispersion correction supports, a distance meaning a DistanceCutoff
+@@ -181,7 +185,7 @@ disp_corr_cutoff(cutoff::Union{DistanceCutoff, ShiftedPotentialCutoff, Polynomia
+ disp_corr_cutoff(dist_cutoff) = DistanceCutoff(dist_cutoff)
+ 
+ function disp_corr_cutoff(cutoff::AbstractCutoff)
+-    throw(ArgumentError("the Lennard-Jones dispersion correction supports DistanceCutoff, " *
++    throw(ArgumentError("the dispersion correction supports DistanceCutoff, " *
+                         "ShiftedPotentialCutoff and PolynomialCutoff, found $cutoff"))
+ end
+ 
+@@ -213,8 +217,10 @@ For n = 6 and 12, the integral of (1 - S) x^(2 - n) from a to 1, where S is the
+ Composite Gauss-Legendre quadrature is used, which is accurate to near machine precision for
+     the smooth integrands found for any reasonable a.
+ =#
++const gauss_legendre_20 = gauss_legendre(20)
++
+ function switched_out_integrals(a)
+-    xs, ws = gauss_legendre(20)
++    xs, ws = gauss_legendre_20
+     n_intervals = 16
+     j6, j12 = 0.0, 0.0
+     h = (1 - a) / n_intervals
+@@ -279,71 +285,73 @@ ustrip_cutoff(c::PolynomialCutoff) = PolynomialCutoff(ustrip(c.dist_activation),
+                                                       ustrip(c.dist_cutoff))
+ 
+ # The correction from the pair averages of ϵσ^6 and ϵσ^12, as factors to be divided by the
+-#   volume and a part independent of the volume, in the types of the example terms
+-function disp_corr_factors(cutoff, ϵσ6_mean, ϵσ12_mean, n, term_6_example, term_12_example)
++#   volume and a part independent of the volume, in the given types
++function disp_corr_factors(cutoff, ϵσ6_mean, ϵσ12_mean, n, F6, F12, EC)
+     Tacc = Float64
+-    rc = cutoff.dist_cutoff
+     i6, i12 = disp_corr_integrals(cutoff)
+     factor_6_acc  = 8 * Tacc(π) * n^2 * (-ϵσ6_mean  * i6 )
+     factor_12_acc = 8 * Tacc(π) * n^2 * ( ϵσ12_mean * i12)
+     energy_const_acc = disp_corr_energy_const(cutoff, ϵσ6_mean, ϵσ12_mean, n)
+-    F6  = typeof(-(term_6_example / rc^3))
+-    F12 = typeof(term_12_example / rc^9)
+-    EC  = typeof(term_6_example / rc^6)
+     return convert(F6, factor_6_acc), convert(F12, factor_12_acc), convert(EC, energy_const_acc)
+ end
+ 
+-function LJDispersionCorrection(atoms::AbstractArray,
+-                                cutoff,
+-                                σ_mix=LorentzMixing(),
+-                                ϵ_mix=GeometricMixing())
+-    cutoff_used = disp_corr_cutoff(cutoff)
+-    n_atoms = length(atoms)
+-    atoms_cpu = from_device(atoms)
+-    at = atoms_cpu[1]
+-
+-    # Representative terms for units and final factor types.
+-    term_6_example  = at.ϵ * at.σ^6
+-    term_12_example = at.ϵ * at.σ^12
+-
+-    # Accumulate pair sums in Float64 for precision.
++#=
++The factors of a Lennard-Jones dispersion correction from the atoms, summing over the pairs of
++    groups of atoms in `group_pairs`, with `n` atoms. `pair_params(atom_i, atom_j)` gives the
++    coupling, σ and ϵ of a pair.
++The sums are accumulated in Float64, and this is also how injected parameters are taken up, so
++    it has to stay differentiable.
++=#
++function lj_disp_corr_factors(cutoff, group_pairs, atoms, n, pair_params, F6, F12, EC)
+     Tacc = Float64
+-
+-    ϵσ6_unit  = unit(term_6_example)
+-    ϵσ12_unit = unit(term_12_example)
+-
+-    # Accumulate with units, but keep the numerical values in Float64.
++    at = first(atoms)
++    ϵσ6_unit  = unit(first(at.ϵ) * first(at.σ)^6)
++    ϵσ12_unit = unit(first(at.ϵ) * first(at.σ)^12)
+     ϵσ6_sum  = zero(Tacc) * ϵσ6_unit
+     ϵσ12_sum = zero(Tacc) * ϵσ12_unit
+-
+-    # The sum runs over each unordered atom pair once, including the pairs of an atom
+-    #   with itself
+-    # Atoms that only differ in their index give the same terms, so the sum is taken over
+-    #   pairs of groups of such atoms weighted by the number of atom pairs, which avoids
+-    #   a loop over all n_atoms^2 pairs
+-    group_atoms, group_counts = identical_atom_groups(atoms_cpu)
+-    for gi in eachindex(group_atoms)
+-        atom_i = group_atoms[gi]
+-        n_i = group_counts[gi]
+-        for gj in 1:gi
+-            atom_j = group_atoms[gj]
+-            n_j = group_counts[gj]
+-            n_pairs_group = (gi == gj ? (n_i * (n_i + 1)) ÷ 2 : n_i * n_j)
+-            σ = σ_mixing(σ_mix, atom_i, atom_j)
+-            ϵ = ϵ_mixing(ϵ_mix, atom_i, atom_j)
+-            ϵσ6_sum  += Tacc(n_pairs_group) * Tacc(ustrip(ϵσ6_unit, ϵ * σ^6)) * ϵσ6_unit
+-            ϵσ12_sum += Tacc(n_pairs_group) * Tacc(ustrip(ϵσ12_unit, ϵ * σ^12)) * ϵσ12_unit
+-        end
++    for (i, j, n_pairs_group) in group_pairs
++        λ, σ, ϵ = pair_params(atoms[i], atoms[j])
++        ϵσ6_sum  += Tacc(n_pairs_group) * Tacc(ustrip(ϵσ6_unit,  λ * ϵ * σ^6 )) * ϵσ6_unit
++        ϵσ12_sum += Tacc(n_pairs_group) * Tacc(ustrip(ϵσ12_unit, λ * ϵ * σ^12)) * ϵσ12_unit
+     end
++    n_pairs = n * (n + 1) / 2
++    # Every atom decoupled leaves no pairs, where the correction is zero rather than 0/0
++    ϵσ6_mean  = iszero(n_pairs) ? zero(ϵσ6_sum)  : ϵσ6_sum  / n_pairs
++    ϵσ12_mean = iszero(n_pairs) ? zero(ϵσ12_sum) : ϵσ12_sum / n_pairs
++    return disp_corr_factors(cutoff, ϵσ6_mean, ϵσ12_mean, n, F6, F12, EC)
++end
++
++# The types of the factors of a Lennard-Jones dispersion correction for an atom
++function lj_disp_corr_types(cutoff, at)
++    rc = cutoff.dist_cutoff
++    term_6_example  = first(at.ϵ) * first(at.σ)^6
++    term_12_example = first(at.ϵ) * first(at.σ)^12
++    return typeof(-(term_6_example / rc^3)), typeof(term_12_example / rc^9),
++           typeof(term_6_example / rc^6)
++end
+ 
+-    n_pairs_acc = Tacc((n_atoms * (n_atoms + 1)) ÷ 2)
++lj_pair_params(dc) = (atom_i, atom_j) -> (1, σ_mixing(dc.σ_mix, atom_i, atom_j),
++                                          ϵ_mixing(dc.ϵ_mix, atom_i, atom_j))
+ 
+-    ϵσ6_mean = ϵσ6_sum / n_pairs_acc
+-    ϵσ12_mean = ϵσ12_sum / n_pairs_acc
++function LJDispersionCorrection(atoms::AbstractArray,
++                                cutoff,
++                                σ_mix=LorentzMixing(),
++                                ϵ_mix=GeometricMixing())
++    cutoff_used = disp_corr_cutoff(cutoff)
++    atoms_cpu = from_device(atoms)
++    F6, F12, EC = lj_disp_corr_types(cutoff_used, first(atoms_cpu))
++    dc = LJDispersionCorrection(zero(F6), zero(F12), zero(EC), cutoff_used, σ_mix, ϵ_mix,
++                                identical_group_pairs(atoms_cpu))
++    return update_cached_parameters(dc, atoms_cpu)
++end
+ 
+-    factor_6, factor_12, energy_const = disp_corr_factors(cutoff_used, ϵσ6_mean, ϵσ12_mean,
+-                                            Tacc(n_atoms), term_6_example, term_12_example)
+-    return LJDispersionCorrection(factor_6, factor_12, energy_const, cutoff_used, σ_mix, ϵ_mix)
++# Recompute the factors from the atoms, which may have injected parameters
++function update_cached_parameters(dc::LJDispersionCorrection, atoms)
++    factor_6, factor_12, energy_const = lj_disp_corr_factors(dc.cutoff,
++            from_device(dc.group_pairs), atoms, Float64(length(atoms)), lj_pair_params(dc),
++            typeof(dc.factor_6), typeof(dc.factor_12), typeof(dc.energy_const))
++    return LJDispersionCorrection(factor_6, factor_12, energy_const, dc.cutoff, dc.σ_mix,
++                                  dc.ϵ_mix, dc.group_pairs)
+ end
+ 
+ # The fields of an atom other than its index, as a tuple
+@@ -352,28 +360,35 @@ end
+     return Expr(:tuple, (:(getfield(atom, $(QuoteNode(fn)))) for fn in fields)...)
+ end
+ 
+-# Group atoms that are identical apart from their index, returning one atom from each
+-#   group and the number of atoms in each group, in order of first appearance
+-function identical_atom_groups(atoms)
+-    group_atoms = eltype(atoms)[]
++#=
++The pairs of groups of atoms that are identical apart from their index, as the index of the
++    first atom of each group and the number of atom pairs, including the pair of each atom
++    with itself, in order of first appearance.
++The sum over atom pairs is taken over these, which avoids a loop over all n_atoms^2 pairs.
++Atoms of the same type are given the same injected parameters, so a group stays identical.
++=#
++function identical_group_pairs(atoms)
++    group_firsts = Int32[]
+     group_counts = Int[]
+-    isempty(atoms) && return group_atoms, group_counts
+     K = (isconcretetype(eltype(atoms)) ? typeof(atom_group_key(first(atoms))) : Any)
+     group_inds = Dict{K, Int}()
+-    for atom in atoms
++    for (i, atom) in enumerate(atoms)
+         gi = get!(group_inds, atom_group_key(atom)) do
+-            push!(group_atoms, atom)
++            push!(group_firsts, i)
+             push!(group_counts, 0)
+-            length(group_atoms)
++            length(group_firsts)
+         end
+         group_counts[gi] += 1
+     end
+-    return group_atoms, group_counts
++    return [(group_firsts[gi], group_firsts[gj],
++             gi == gj ? (group_counts[gi] * (group_counts[gi] + 1)) ÷ 2 :
++                        group_counts[gi] * group_counts[gj])
++            for gi in eachindex(group_firsts) for gj in 1:gi]
+ end
+ 
+ function Base.zero(dc::LJDispersionCorrection)
+     return LJDispersionCorrection(zero(dc.factor_6), zero(dc.factor_12), zero(dc.energy_const),
+-                                  dc.cutoff, dc.σ_mix, dc.ϵ_mix)
++                                  dc.cutoff, dc.σ_mix, dc.ϵ_mix, dc.group_pairs)
+ end
+ 
+ function Base.:+(dc1::LJDispersionCorrection, dc2::LJDispersionCorrection)
+@@ -384,13 +399,14 @@ function Base.:+(dc1::LJDispersionCorrection, dc2::LJDispersionCorrection)
+         dc1.cutoff,
+         dc1.σ_mix,
+         dc1.ϵ_mix,
++        dc1.group_pairs,
+     )
+ end
+ 
+ function Unitful.ustrip(dc::LJDispersionCorrection)
+     return LJDispersionCorrection(ustrip(dc.factor_6), ustrip(dc.factor_12),
+                                   ustrip(dc.energy_const), ustrip_cutoff(dc.cutoff), dc.σ_mix,
+-                                  dc.ϵ_mix)
++                                  dc.ϵ_mix, dc.group_pairs)
+ end
+ 
+ function disp_corr_pe(inter, sys)
+@@ -451,101 +467,107 @@ plain Lennard-Jones potential, so no soft-core factor enters here.
+ 
+ The factors are computed once from the `λ` of `atoms`, so changing the `λ` of the atoms
+ directly has no effect; [`Molly.set_lambda!`](@ref) recomputes them.
+-The number of atoms and atom σ and ϵ values are assumed not to change after setup (the box
+-volume can change).
++The number of atoms is assumed not to change after setup, and [`inject_gradients`](@ref)
++recomputes the correction from injected σ and ϵ values, including its gradients.
+ Only compatible with 3D systems.
+ """
+-struct LJDispersionCorrectionλ{F6, F12, EC, C, S, E, SCH}
++struct LJDispersionCorrectionλ{F6, F12, EC, C, L, S, E, SCH, P}
+     factor_6::F6
+     factor_12::F12
+     energy_const::EC
+     cutoff::C
++    λ_mix::L
+     σ_mix::S
+     ϵ_mix::E
+     # Kept so that `set_lambda!` can rebuild the factors, which are precomputed from the coupling
+     scheduler::SCH
++    # The interacting pairs of classes of atoms, as in `lambda_class_pairs`, and the effective
++    #   number of atoms, so that injected parameters can be taken up
++    class_pairs::P
++    n_eff::Float64
+ end
+ 
+-# The scheduler is a keyword so that this does not clash with the type's own 6 field constructor
+-function LJDispersionCorrectionλ(atoms, cutoff, λ_mix, σ_mix, ϵ_mix; scheduler)
+-    cutoff_used = disp_corr_cutoff(cutoff)
+-    T = typeof(ustrip(cutoff_used.dist_cutoff))
+-    n_atoms = length(atoms)
+-    atoms_cpu = from_device(atoms)
+-    at = atoms_cpu[1]
+-
+-    # Representative terms for units and final factor types.
+-    if scheduler.dual
+-        term_6_example  = at.ϵ * at.σ^6
+-        term_12_example = at.ϵ * at.σ^12
+-    else
+-        term_6_example  = at.ϵ[1] * at.σ[1]^6
+-        term_12_example = at.ϵ[1] * at.σ[1]^12
+-    end
+-
+-    # Accumulate pair sums in Float64 for precision.
+-    Tacc = Float64
+-
+-    ϵσ6_unit  = unit(term_6_example)
+-    ϵσ12_unit = unit(term_12_example)
+-
+-    ϵσ6_sum  = zero(Tacc) * ϵσ6_unit
+-    ϵσ12_sum = zero(Tacc) * ϵσ12_unit
+-
+-    # Class the atoms by (σ, ϵ, λ, role) and count them. The counts are plain integer particle
+-    # counts: the coupling is applied once per class *pair* below. Folding it into the counts as
+-    # well would make a pair pick up s_i·s_j, i.e. λ² for alchemical–alchemical pairs.
+-    #
+-    # Every atom is classed on its own σ/ϵ. OpenFE zeroes ϵ for the alchemical roles here, but
+-    # only because it moves those atoms into a `CustomNonbondedForce` carrying a second
+-    # correction of its own; Molly has one correction covering every pair, so zeroing would
+-    # simply lose them.
+-    S = typeof(at.σ)
+-    E = typeof(at.ϵ)
+-    E0 = zero.(at.ϵ)
+-    classCounts = Dict{Tuple{S, E, T, Int32}, Int}()
+-    for i in 1:n_atoms
+-        atom_i = atoms_cpu[i]
+-        if scheduler isa OpenFEScheduler && atom_i.alch_role != EnvRole
+-            key = (atom_i.σ, E0, atom_i.λ, atom_i.alch_role)
+-        else
+-            key = (atom_i.σ, atom_i.ϵ, atom_i.λ, atom_i.alch_role)
++#=
++The pairs of classes of atoms with the same type, σ, ϵ, λ and alchemical role that interact, as
++    the index of the first atom of each class and the number of atom pairs, and the effective
++    number of atoms, for the λ dispersion corrections.
++The type is part of the class since atoms of the same type are given the same injected
++    parameters, so a class stays uniform.
++=#
++function lambda_class_pairs(atoms_cpu, scheduler)
++    # Class the atoms and count them. The counts are plain integer particle counts: the coupling
++    # is applied once per class *pair*. Folding it into the counts as well would make a pair pick
++    # up s_i·s_j, i.e. λ² for alchemical–alchemical pairs.
++    class_inds = Dict{Any, Int}()
++    class_firsts, class_counts = Int32[], Int[]
++    for (i, atom_i) in enumerate(atoms_cpu)
++        key = (atom_i.atom_type, atom_i.σ, atom_i.ϵ, atom_i.λ, atom_i.alch_role)
++        ci = get!(class_inds, key) do
++            push!(class_firsts, i)
++            push!(class_counts, 0)
++            length(class_firsts)
+         end
+-        classCounts[key] = get(classCounts, key, 0) + 1
++        class_counts[ci] += 1
+     end
+-    rep(key) = Atom(σ=key[1], ϵ=key[2], λ=key[3], alch_role=key[4])
+ 
+     # A dual topology hybrid excludes every pair of an A side atom with a B side atom, so those
+     #   class pairs carry no interaction and must not be counted
+     a_side, b_side = (DeleteRole, CoreDRole), (InsertRole, CoreIRole)
+     excluded_pair(r1, r2) = (r1 in a_side && r2 in b_side) || (r1 in b_side && r2 in a_side)
+-    ks = collect(keys(classCounts))
+-    for a in eachindex(ks), b in 1:a
+-        k1, k2 = ks[a], ks[b]
+-        excluded_pair(k1[4], k2[4]) && continue
+-        n1, n2 = classCounts[k1], classCounts[k2]
+-        npair = Tacc(a == b ? (n1 * (n1 + 1)) / 2 : n1 * n2)
+-        λ, _, _, σ, ϵ = λ_params_function(scheduler, λ_mix, σ_mix, ϵ_mix, rep(k1), rep(k2), false)
+-        ϵσ6_sum  += Tacc(ustrip(ϵσ6_unit,  λ * ϵ * σ^6 )) * npair * ϵσ6_unit
+-        ϵσ12_sum += Tacc(ustrip(ϵσ12_unit, λ * ϵ * σ^12)) * npair * ϵσ12_unit
+-    end
++    role(ci) = atoms_cpu[class_firsts[ci]].alch_role
++    class_pairs = [(class_firsts[a], class_firsts[b],
++                    a == b ? (class_counts[a] * (class_counts[a] + 1)) ÷ 2 :
++                             class_counts[a] * class_counts[b])
++                   for a in eachindex(class_firsts) for b in 1:a
++                   if !excluded_pair(role(a), role(b))]
+ 
+     # Dual topology duplicates every core site (a real atom plus a massless virtual site) and
+     # carries both ligands' unique atoms, so `length(atoms)` is not the physical particle count.
+     # Weighting by the steric coupling recovers it: (1-λ)·real + λ·virtual = 1 per site. Single
+     # topology returns one(λ) throughout, so this is just the atom count there.
+-    n_eff = Tacc(sum(n * first(scale_sterics(scheduler, key[3], key[4], Val(scheduler.dual)))
+-                     for (key, n) in classCounts))
+-    n_pairs = n_eff * (n_eff + 1) / 2
++    n_eff = Float64(sum(n * first(scale_sterics(scheduler, atoms_cpu[i].λ, atoms_cpu[i].alch_role,
++                                                Val(scheduler.dual)))
++                        for (i, n) in zip(class_firsts, class_counts)))
++    return class_pairs, n_eff
++end
++
++# An atom as it enters the λ dispersion corrections. OpenFE zeroes ϵ for the alchemical roles,
++#   since it moves those atoms into a `CustomNonbondedForce` with a correction of its own.
++function lambda_disp_corr_atom(scheduler, atom)
++    if scheduler isa OpenFEScheduler && atom.alch_role != EnvRole
++        return Atom(atom.index, atom.atom_type, atom.mass, atom.charge, atom.σ, zero.(atom.ϵ),
++                    atom.λ, atom.alch_role)
++    else
++        return atom
++    end
++end
+ 
+-    # Every atom decoupled leaves no pairs, where the correction is zero rather than 0/0
+-    ϵσ6_mean  = iszero(n_pairs) ? zero(ϵσ6_sum)  : ϵσ6_sum  / n_pairs
+-    ϵσ12_mean = iszero(n_pairs) ? zero(ϵσ12_sum) : ϵσ12_sum / n_pairs
++function lj_lambda_pair_params(dc)
++    return function (atom_i, atom_j)
++        λ, _, _, σ, ϵ = λ_params_function(dc.scheduler, dc.λ_mix, dc.σ_mix, dc.ϵ_mix,
++                                          lambda_disp_corr_atom(dc.scheduler, atom_i),
++                                          lambda_disp_corr_atom(dc.scheduler, atom_j), false)
++        return λ, σ, ϵ
++    end
++end
+ 
+-    factor_6, factor_12, energy_const = disp_corr_factors(cutoff_used, ϵσ6_mean, ϵσ12_mean,
+-                                            n_eff, term_6_example, term_12_example)
+-    return LJDispersionCorrectionλ(factor_6, factor_12, energy_const, cutoff_used, σ_mix,
+-                                   ϵ_mix, scheduler)
++# The scheduler is a keyword so that this does not clash with the type's own field constructor
++function LJDispersionCorrectionλ(atoms, cutoff, λ_mix, σ_mix, ϵ_mix; scheduler)
++    cutoff_used = disp_corr_cutoff(cutoff)
++    atoms_cpu = from_device(atoms)
++    F6, F12, EC = lj_disp_corr_types(cutoff_used, first(atoms_cpu))
++    class_pairs, n_eff = lambda_class_pairs(atoms_cpu, scheduler)
++    dc = LJDispersionCorrectionλ(zero(F6), zero(F12), zero(EC), cutoff_used, λ_mix, σ_mix,
++                                 ϵ_mix, scheduler, class_pairs, n_eff)
++    return update_cached_parameters(dc, atoms_cpu)
++end
++
++function update_cached_parameters(dc::LJDispersionCorrectionλ, atoms)
++    factor_6, factor_12, energy_const = lj_disp_corr_factors(dc.cutoff,
++            from_device(dc.class_pairs), atoms, dc.n_eff, lj_lambda_pair_params(dc),
++            typeof(dc.factor_6), typeof(dc.factor_12), typeof(dc.energy_const))
++    return LJDispersionCorrectionλ(factor_6, factor_12, energy_const, dc.cutoff, dc.λ_mix,
++                                   dc.σ_mix, dc.ϵ_mix, dc.scheduler, dc.class_pairs, dc.n_eff)
+ end
+ 
+ AtomsCalculators.@generate_interface function AtomsCalculators.potential_energy(sys,
+diff --git a/src/parameters.jl b/src/parameters.jl
+index f9c9eb698..a497ee7a6 100644
+--- a/src/parameters.jl
++++ b/src/parameters.jl
+@@ -309,6 +309,12 @@ inject_interaction(inter, args...) = inter
+ #   interaction that caches values computed from the charges
+ update_charges(inter, atoms) = inter
+ 
++# A copy of a general interaction that is consistent with the injected atoms (on the host) and
++#   its own injected parameters, for an interaction that caches values computed from them, such
++#   as the dispersion corrections. Called inside the function being differentiated, so the
++#   recomputation carries the gradients.
++update_cached_parameters(inter, atoms) = inter
++
+ # The values of the plan's parameters, in slot order
+ function plan_values(params_dic, plan::ParameterPlan{V}) where {V}
+     ks = plan.keys
+@@ -333,10 +339,15 @@ function parameter_flat(params_dic, plan::ParameterPlan{V}) where {V}
+     return flat
+ end
+ 
+-@inline function inject_atoms(sys, flat, plan, ::Type{AT}) where {AT}
+-    isempty(plan.ranges[1]) && return sys.atoms
++@inline function inject_atoms_host(flat, plan)
++    isempty(plan.ranges[1]) && return plan.atoms_host
+     m, q, s, e = target_views(flat, plan, 1, Val(4))
+-    return to_device(inject_atom.(plan.atoms_host, m, q, s, e), AT)
++    return inject_atom.(plan.atoms_host, m, q, s, e)
++end
++
++@inline function inject_atoms(sys, atoms_host, plan, ::Type{AT}) where {AT}
++    isempty(plan.ranges[1]) && return sys.atoms
++    return to_device(atoms_host, AT)
+ end
+ 
+ # Whether the dictionary sets the charge of any atom
+@@ -450,7 +461,9 @@ units that each parameter is stored with in `sys`, as returned by
+ Gradients are only supported for systems without units.
+ 
+ When charges are injected, the charge sums that a [`PME`](@ref) with `fixed_charges=true`
+-caches are recomputed from the new charges.
++caches are recomputed from the new charges. The dispersion corrections, such as
++[`LJDispersionCorrection`](@ref), are recomputed from the injected σ and ϵ values (and `α` and
++`β` for [`DExpDispersionCorrection`](@ref)), so their gradients are included.
+ """
+ inject_gradients(sys::System, params_dic) =
+     inject_gradients(sys, params_dic, ParameterPlan(sys, params_dic))
+@@ -462,7 +475,8 @@ function inject_gradients(sys::System{<:Any, AT}, params_dic, plan::ParameterPla
+                           coords) where {AT}
+     flat = parameter_flat(params_dic, plan)
+ 
+-    atoms = inject_atoms(sys, flat, plan, AT)
++    atoms_host = inject_atoms_host(flat, plan)
++    atoms = inject_atoms(sys, atoms_host, plan, AT)
+     # Walked recursively rather than with `ntuple`, so that the heterogeneous tuples are
+     # unrolled and each element keeps its concrete type
+     n_lists = length(sys.specific_inter_lists)
+@@ -474,6 +488,7 @@ function inject_gradients(sys::System{<:Any, AT}, params_dic, plan::ParameterPla
+     if injects_charges(plan)
+         gis = map(inter -> update_charges(inter, atoms), gis)
+     end
++    gis = map(inter -> update_cached_parameters(inter, atoms_host), gis)
+ 
+     masses, total_mass = injected_masses(sys, flat, plan, AT)
+     velocities = copy(sys.velocities)
+diff --git a/src/setup.jl b/src/setup.jl
+index 7a4dbca3d..4faf9fc0b 100644
+--- a/src/setup.jl
++++ b/src/setup.jl
+@@ -508,12 +508,13 @@ Each residue is matched to a residue template of the force field, and a
+     electrostatic interactions, including implicit solvent unless that sets its own.
+ - `lj_cutoff=nothing`: the cutoff method to use for the Lennard-Jones interaction,
+     by default uses `DistanceCutoff(dist_cutoff)`. The cutoff distance must not exceed
+-    `dist_cutoff`. If the long-range Lennard-Jones dispersion correction is being used,
+-    this must be a [`DistanceCutoff`](@ref), [`ShiftedPotentialCutoff`](@ref) or
+-    [`PolynomialCutoff`](@ref).
+-- `dispersion_correction=nothing`: whether to use the long-range Lennard-Jones
+-    dispersion correction, [`LJDispersionCorrection`](@ref). Defaults to the force
+-    field setting, which defaults to `true`.
++    `dist_cutoff`. If the long-range dispersion correction is being used, this must be a
++    [`DistanceCutoff`](@ref), [`ShiftedPotentialCutoff`](@ref) or [`PolynomialCutoff`](@ref).
++- `dispersion_correction=nothing`: whether to use the long-range dispersion correction,
++    [`LJDispersionCorrection`](@ref), or [`DExpDispersionCorrection`](@ref) for a double
++    exponential force field. Defaults to the force field setting, which defaults to `true`
++    for Lennard-Jones and `false` for the double exponential, as in OpenMM. Other `lj_cutoff`
++    values need `dispersion_correction=false`.
+ - `hydrogen_mass=false`: if set to a number or unitful value (e.g. `2` or `2u"g/mol"`)
+     then hydrogens are given the specified mass, which is transferred from the
+     atom they are bonded to. This is applied before constraints are generated.
+@@ -678,14 +679,12 @@ function System(coord_file::AbstractString,
+         end
+         disp_corr = dispersion_correction
+     end
+-    if disp_corr && force_field.custom_nonbonded
+-        throw(ArgumentError("dispersion correction is not supported with CustomNonbondedForce"))
+-    end
+     if disp_corr && !(isnothing(lj_cutoff) ||
+                       lj_cutoff isa Union{DistanceCutoff, ShiftedPotentialCutoff, PolynomialCutoff})
+         throw(ArgumentError("dispersion correction is not supported with lj_cutoff values " *
+                             "other than DistanceCutoff, ShiftedPotentialCutoff and " *
+-                            "PolynomialCutoff, found $lj_cutoff"))
++                            "PolynomialCutoff, found $lj_cutoff; pass " *
++                            "dispersion_correction=false to use this cutoff without it"))
+     end
+     dist_neighbors = dist_cutoff + dist_buffer
+     T, TH = float_type, float_type_high
+@@ -1736,7 +1735,12 @@ function System(T, TH, AT, atoms, coords, boundary, velocities, atoms_data, virt
+     end
+     # Infinite boundaries give infinite volume, hence no dispersion correction
+     if dispersion_correction && !has_infinite_boundary(boundary)
+-        general_inters_disp = (LJDispersionCorrection(atoms, cutoff_lj, σ_mix, ϵ_mix),)
++        if lj isa DoubleExponential
++            general_inters_disp = (DExpDispersionCorrection(atoms, cutoff_lj, lj.α, lj.β, σ_mix,
++                                                            ϵ_mix),)
++        else
++            general_inters_disp = (LJDispersionCorrection(atoms, cutoff_lj, σ_mix, ϵ_mix),)
++        end
+     else
+         general_inters_disp = ()
+     end
+diff --git a/test/basic.jl b/test/basic.jl
+index 54d1737d0..833f6314b 100644
+--- a/test/basic.jl
++++ b/test/basic.jl
+@@ -669,13 +669,24 @@ end
+     @test ff_garnet.dispersion_correction == false
+     @test ff_garnet.custom_nonbonded == true
+     @test ff_garnet.global_params == [12.159626, 4.326311]
+-    @test_throws ArgumentError System(
++    # The double exponential gets its own dispersion correction rather than the Lennard-Jones
++    #   one
++    sys_garnet_dc = System(
+         joinpath(data_dir, "ethanol_garnet.pdb"),
+-        ff_garnet;
++        MolecularForceField(
++            joinpath(ff_dir, "ethanol_garnet.xml");
++            custom_residue_templates=joinpath(ff_dir, "ethanol_garnet_residues.xml"),
++            units=false,
++        );
+         units=false,
+         dispersion_correction=true,
+         strictness=:nowarn,
+     )
++    dc_garnet = only(gi for gi in sys_garnet_dc.general_inters
++                     if gi isa DExpDispersionCorrection)
++    @test (dc_garnet.α, dc_garnet.β) == (12.159626, 4.326311)
++    @test !any(gi -> gi isa LJDispersionCorrection, sys_garnet_dc.general_inters)
++    @test potential_energy(sys_garnet_dc; pairwise_inters=(), specific_inter_lists=()) < 0
+ 
+     ff_tip3p = MolecularForceField(joinpath(ff_dir, "tip3p_standard.xml"); units=false)
+     @test ff_tip3p.custom_nonbonded == false
+diff --git a/test/conversion.jl b/test/conversion.jl
+index 13a395dcf..8ea584e26 100644
+--- a/test/conversion.jl
++++ b/test/conversion.jl
+@@ -443,6 +443,7 @@ end
+             Molly.EwaldExclusionData(T(1.0)),
+             Ewald(T(1.0)),
+             LJDispersionCorrection(atoms, T(1.0)),
++            DExpDispersionCorrection(atoms, T(1.0), T(16.766), T(4.427)),
+             MullerBrown(),
+         )
+         for inter in inters
+diff --git a/test/free_energy.jl b/test/free_energy.jl
+index f5f142f82..7c7b473f5 100644
+--- a/test/free_energy.jl
++++ b/test/free_energy.jl
+@@ -397,7 +397,7 @@ end
+                              custom_residue_templates=joinpath(ff_dir, "ethanol_garnet_residues.xml"))
+     for nonbonded in (SetupPME(), SetupCoulombReactionField())
+         sys = System(joinpath(data_dir, "ethanol_solv.pdb"), ff; nonbonded_method=nonbonded,
+-                     dist_cutoff=1.0u"nm", strictness=:nowarn)
++                     dist_cutoff=1.0u"nm", dispersion_correction=true, strictness=:nowarn)
+         @test any(inter isa DoubleExponential for inter in values(sys.pairwise_inters))
+         E_ref, F_ref = potential_energy(sys), forces(sys)
+         solvent = setdiff(eachindex(sys.atoms), solute)
+@@ -410,7 +410,16 @@ end
+         for S in lambda_schedulers, LJsoftcore in softcores
+             sys_0 = AbsoluteFESystem(sys, 0.0, solute; scheduler=S(dual=true), LJsoftcore=LJsoftcore)
+             @test any(inter isa DoubleExponentialSoftCore for inter in values(sys_0.pairwise_inters))
+-            @test abs(potential_energy(sys_0) - E_ref) < etol
++            # As in OpenFE, the OpenFE scheduler leaves the alchemical atoms out of the
++            #   dispersion correction, so it is compared without it
++            if S == Molly.OpenFEScheduler
++                no_disp(s) = Tuple(g for g in s.general_inters if !(g isa DExpDispersionCorrection ||
++                                                                g isa Molly.DExpDispersionCorrectionλ))
++                @test abs(potential_energy(sys_0; general_inters=no_disp(sys_0)) -
++                          potential_energy(sys; general_inters=no_disp(sys))) < etol
++            else
++                @test abs(potential_energy(sys_0) - E_ref) < etol
++            end
+             @test maximum(norm.(forces(sys_0) .- F_ref)) < ftol
+             sys_1 = AbsoluteFESystem(sys, 1.0, solute; scheduler=S(dual=true), LJsoftcore=LJsoftcore)
+             @test maximum(norm.(forces(sys_1)[solvent] .- F_decoupled[solvent])) < ftol
+@@ -418,6 +427,72 @@ end
+     end
+ end
+ 
++@testset "Double exponential dispersion correction" begin
++    # The soft core changes the shape of the double exponential at every distance, so the
++    #   correction is checked against the integrals of the soft-core pair potentials themselves
++    α, β, rs, rc = 16.766, 4.427, 0.6, 1.0
++    types = [(0.30, 0.5), (0.30, 0.5), (0.25, 0.1), (0.35, 0.8), (0.32, 0.6), (0.28, 0.3)]
++    atoms = [Atom(index=i, mass=10.0u"g/mol", σ=(σ * u"nm"), ϵ=(ϵ * u"kJ * mol^-1"))
++             for (i, (σ, ϵ)) in enumerate(types)]
++    coords = [SVector(0.5 + 1.2 * (i - 1), 1.0, 1.0)u"nm" for i in eachindex(atoms)]
++    disp(s) = potential_energy(s; pairwise_inters=(), specific_inter_lists=())
++    simpson(f, a, b, n) = (b - a) / 3n * sum((i in (0, n) ? 1 : (isodd(i) ? 4 : 2)) *
++                                             f(a + i * (b - a) / n) for i in 0:n)
++
++    for cutoff in (DistanceCutoff(rc * u"nm"), ShiftedPotentialCutoff(rc * u"nm"),
++                   PolynomialCutoff(rs * u"nm", rc * u"nm"))
++        sys = System(
++            atoms=atoms,
++            coords=coords,
++            boundary=CubicBoundary(8.0u"nm"),
++            atoms_data=[AtomData(element="C") for _ in atoms],
++            pairwise_inters=(DoubleExponential(α=α, β=β, cutoff=cutoff, use_neighbors=false),),
++            general_inters=(DExpDispersionCorrection(atoms, cutoff, α, β),),
++        )
++        for S in (Molly.DefaultLambdaScheduler, Molly.LinearLambdaScheduler,
++                  Molly.GROMACSLambdaABFEScheduler)
++            # λ = 0 is the coupled end state
++            @test disp(AbsoluteFESystem(sys, 0.0, [1, 2]; scheduler=S(dual=true))) ≈
++                  disp(sys) rtol=1e-12
++            for λ in (0.5, 0.8, 0.95, 1.0)
++                sys_λ = AbsoluteFESystem(sys, λ, [1, 2]; scheduler=S(dual=true))
++                sc = only(sys_λ.pairwise_inters)
++                sc_nocut = DoubleExponentialSoftCore(α=α, β=β, λ_mixing=sc.λ_mixing,
++                                                     scheduler=sc.scheduler)
++                atoms_λ = Array(sys_λ.atoms)
++                # Each atom counts by its steric coupling, so the decoupled solute counts as absent
++                n_eff = sum(first(Molly.scale_sterics(sc.scheduler, a.λ, a.alch_role, Val(true)))
++                            for a in atoms_λ)
++                # Over all pairs including the pairs of each atom with itself, the integral of
++                #   r^2 times the potential that the cutoff leaves out, and the potential at the
++                #   cutoff that the shifted potential leaves out
++                I_sum, V_rc_sum = 0.0, 0.0
++                for i in eachindex(atoms_λ), j in i:length(atoms_λ)
++                    V(r) = ustrip(potential_energy(sc_nocut, SVector(r, 0.0, 0.0)u"nm",
++                                                   atoms_λ[i], atoms_λ[j]))
++                    V_cut(r) = ustrip(potential_energy(sc, SVector(r, 0.0, 0.0)u"nm",
++                                                       atoms_λ[i], atoms_λ[j]))
++                    I_sum += simpson(r -> r^2 * V(r), rc, 13.0, 100_000)
++                    if cutoff isa ShiftedPotentialCutoff
++                        I_sum += simpson(r -> r^2 * (V(r) - V_cut(r)), 0.0, rc, 10_000)
++                        V_rc_sum += V(rc)
++                    elseif cutoff isa PolynomialCutoff
++                        I_sum += simpson(r -> r^2 * (V(r) - V_cut(r)), rs, rc, 10_000)
++                    end
++                end
++                n_pairs = n_eff * (n_eff + 1) / 2
++                # As in GROMACS each atom has one fewer partner within the shifted cutoff
++                E_ref = 2π * n_eff^2 / ustrip(volume(sys_λ)) * I_sum / n_pairs -
++                        n_eff / 2 * V_rc_sum / n_pairs
++                @test ustrip(disp(sys_λ)) ≈ E_ref rtol=1e-9
++                @test disp(Molly.set_lambda!(AbsoluteFESystem(sys, 0.0, [1, 2];
++                                                              scheduler=S(dual=true)), λ)) ≈
++                      disp(sys_λ) rtol=1e-12
++            end
++        end
++    end
++end
++
+ @testset "Double exponential relative end states" begin
+     # State B is the same ethanol with a different charge and double exponential parameters on
+     #   the oxygen; the hydroxyl hydrogen is unique to each state
+@@ -436,16 +511,24 @@ end
+             joinpath(data_dir, "ethanol_solv.pdb"),
+             MolecularForceField(file;
+                 custom_residue_templates=joinpath(ff_dir, "ethanol_garnet_residues.xml"));
+-            nonbonded_method=nonbonded, dist_cutoff=1.0u"nm", strictness=:nowarn,
++            nonbonded_method=nonbonded, dist_cutoff=1.0u"nm", dispersion_correction=true,
++            strictness=:nowarn,
+         )
+         sysA, sysB = build(garnet), build(garnet_B)
+         @test abs(potential_energy(sysA) - potential_energy(sysB)) > 1.0u"kJ * mol^-1"
++        is_disp(g) = g isa DExpDispersionCorrection || g isa Molly.DExpDispersionCorrectionλ
++        no_disp(s) = System(s; general_inters=Tuple(g for g in s.general_inters if !is_disp(g)))
++        disp(s) = potential_energy(s; pairwise_inters=(), specific_inter_lists=(),
++                                   general_inters=Tuple(g for g in s.general_inters if is_disp(g)))
+         for dual in (true, false), (λ, ref, state) in ((0.0, sysA, :A), (1.0, sysB, :B))
+             sys = RelativeFESystem(sysA, sysB, λ, deepcopy(mapping), core_mapAB;
+                                    scheduler=Molly.DefaultLambdaScheduler(dual=dual))
+             @test any(inter isa DoubleExponentialSoftCore for inter in values(sys.pairwise_inters))
+-            dE, dF, F_dummy = end_state_diff(sys, ref, end_state_map(mapping, core_mapAB,
+-                                                                     length(ref), dual, state)...)
++            # Single topology counts the dummy atom in the effective number of atoms of the
++            #   dispersion correction, so the correction is compared on its own
++            @test disp(sys) ≈ disp(ref) rtol=1e-7
++            dE, dF, F_dummy = end_state_diff(no_disp(sys), no_disp(ref),
++                                    end_state_map(mapping, core_mapAB, length(ref), dual, state)...)
+             @test dE < 1e-6u"kJ * mol^-1"
+             @test dF < 1e-6u"kJ * mol^-1 * nm^-1"
+             @test iszero(F_dummy)
+diff --git a/test/gradients_2.jl b/test/gradients_2.jl
+index 228a55036..e4c752512 100644
+--- a/test/gradients_2.jl
++++ b/test/gradients_2.jl
+@@ -1220,6 +1220,7 @@ end
+             float_type=Float64,
+             nonbonded_method=SetupCoulombReactionField(),
+             dist_cutoff=(units ? 1.0u"nm" : 1.0),
++            dispersion_correction=true,
+             strictness=:nowarn,
+         )
+     end
+@@ -1299,6 +1300,35 @@ end
+     @test ustrip(u"kJ * mol^-1", E_mod) ≈ pe(sys_mod_nounits) rtol=1e-12
+     @test map(f -> ustrip.(u"kJ * mol^-1 * nm^-1", f), fs(sys_mod)) ≈ fs(sys_mod_nounits) rtol=1e-12
+ 
++    # The dispersion correction takes up the injected α, σ and ϵ, as does its λ version, so
++    #   both match those of a system set up with the modified force field
++    xml = read(joinpath(ff_dir, "ethanol_garnet.xml"), String)
++    xml_mod = replace(xml,
++        "name=\"alpha\" defaultValue=\"12.159626\"" =>
++            "name=\"alpha\" defaultValue=\"$(modified["inter_DEXP_alpha"])\"",
++        "<Atom type=\"C1\" sigma=\"0.3358508050441742\"" =>
++            "<Atom type=\"C1\" sigma=\"$(modified["atom_C1_σ"])\"",
++        "epsilon=\"0.9317593574523926\"" => "epsilon=\"$(modified["atom_O1_ϵ"])\"",
++    )
++    @test count("$(modified["inter_DEXP_alpha"])", xml_mod) == 1
++    garnet_mod = joinpath(mktempdir(), "ethanol_garnet.xml")
++    write(garnet_mod, xml_mod)
++    sys_rebuilt = System(
++        joinpath(data_dir, "ethanol_garnet.pdb"),
++        MolecularForceField(garnet_mod; units=false,
++            custom_residue_templates=joinpath(ff_dir, "ethanol_garnet_residues.xml"));
++        units=false, float_type=Float64, nonbonded_method=SetupCoulombReactionField(),
++        dist_cutoff=1.0, dispersion_correction=true, strictness=:nowarn,
++    )
++    disp(s) = potential_energy(s; pairwise_inters=(), specific_inter_lists=())
++    @test disp(sys_mod_nounits) ≈ disp(sys_rebuilt) rtol=1e-12
++    @test !isapprox(disp(sys_mod_nounits), disp(sys_nounits); rtol=1e-3)
++    solute = collect(1:9)
++    sys_λ_mod = inject_gradients(AbsoluteFESystem(sys_nounits, 0.8, solute), params_mod)
++    @test disp(sys_λ_mod) ≈ disp(AbsoluteFESystem(sys_rebuilt, 0.8, solute)) rtol=1e-12
++    @test disp(Molly.set_lambda!(sys_λ_mod, 0.6)) ≈
++          disp(AbsoluteFESystem(sys_rebuilt, 0.6, solute)) rtol=1e-12
++
+     for AT in array_list[2:end]
+         sys_gpu = garnet_sys(AT, true)
+         plan_gpu = ParameterPlan(sys_gpu, params_dic)
+@@ -1348,6 +1378,7 @@ end
+             nonbonded_method=nonbonded_method,
+             dist_cutoff=1.0,
+             grad_safe=grad_safe,
++            dispersion_correction=true,
+             strictness=:nowarn,
+         )
+     end
+@@ -1398,8 +1429,11 @@ end
+         params_dic = extract_parameters(sys)
+         plan = ParameterPlan(sys, params_dic)
+         neighbors = find_neighbors(sys; n_threads=1)
++        # The dispersion correction alongside the PME checks that Enzyme handles general
++        #   interactions of different types
+         gis = sys.general_inters
+-        @test isempty(gis) || only(gis).grad_safe
++        @test any(gi -> gi isa DExpDispersionCorrection, gis)
++        @test all(gi -> !(gi isa PME) || gi.grad_safe, gis)
+         grads_enzyme = Dict(k => zero(v) for (k, v) in params_dic)
+         autodiff(
+             set_runtime_activity(Reverse),
+@@ -1410,7 +1444,7 @@ end
+             Const(plan),
+             Duplicated(copy(sys.coords), zero(sys.coords)),
+             Const(neighbors),
+-            isempty(gis) ? Const(gis) : Duplicated(gis, Enzyme.make_zero(gis)),
++            Duplicated(gis, Enzyme.make_zero(gis)),
+         )
+         for key in ("atom_O2_charge", "atom_H7_charge", "atom_O1_charge", "atom_C1_σ",
+                     "atom_C1_ϵ")
+@@ -1559,6 +1593,52 @@ end
+     end
+ end
+ 
++@testset "Dispersion correction gradients" begin
++    # The corrections are recomputed from the injected parameters inside the differentiated
++    #   function, so Enzyme gives their gradients, checked against finite differencing
++    function disp_injected(params_dic, sys_ref, plan)
++        sys = inject_gradients(sys_ref, params_dic, plan)
++        return potential_energy(sys, nothing; n_threads=1, pairwise_inters=(),
++                                specific_inter_lists=())
++    end
++    function build(ff_files, pdb; kwargs...)
++        ff = MolecularForceField(joinpath.(ff_dir, ff_files)...; units=false, kwargs...)
++        return System(joinpath(data_dir, pdb), ff; units=false, float_type=Float64,
++                      nonbonded_method=SetupCoulombReactionField(), dist_cutoff=1.0,
++                      dispersion_correction=true, strictness=:nowarn)
++    end
++    garnet_templates = joinpath(ff_dir, "ethanol_garnet_residues.xml")
++    sys_dexp = build(["ethanol_garnet.xml"], "ethanol_solv.pdb";
++                     custom_residue_templates=garnet_templates)
++    sys_lj = build(["tip3p_standard.xml", "benzene.xml"], "benzene_solv.pdb")
++    cases = (
++        ("DEXP", sys_dexp, ("inter_DEXP_alpha", "inter_DEXP_beta", "atom_C1_σ", "atom_O1_ϵ"),
++         DExpDispersionCorrection),
++        ("DEXP λ", AbsoluteFESystem(sys_dexp, 0.8, collect(1:9)),
++         ("inter_DEXP_alpha", "inter_DEXP_beta", "atom_C1_σ", "atom_O1_ϵ"),
++         Molly.DExpDispersionCorrectionλ),
++        ("LJ", sys_lj, ("atom_BZNC1_σ", "atom_BZNC1_ϵ", "atom_tip3p-O_σ"),
++         LJDispersionCorrection),
++        ("LJ λ", AbsoluteFESystem(sys_lj, 0.8, collect(1:12)),
++         ("atom_BZNC1_σ", "atom_BZNC1_ϵ", "atom_tip3p-O_ϵ"), Molly.LJDispersionCorrectionλ),
++    )
++    @testset "$name" for (name, sys, ks, DC) in cases
++        @test only(sys.general_inters) isa DC
++        params_dic = extract_parameters(sys; strictness=:nowarn)
++        plan = ParameterPlan(sys, params_dic)
++        grads_enzyme = Dict(k => zero(v) for (k, v) in params_dic)
++        autodiff(set_runtime_activity(Reverse), Const(disp_injected), Active,
++                 Duplicated(params_dic, grads_enzyme), Const(sys), Const(plan))
++        for key in ks
++            grad_fd = central_fdm(6, 1)(params_dic[key]) do val
++                disp_injected(merge(params_dic, Dict(key => val)), sys, plan)
++            end
++            @test !iszero(grad_fd)
++            @test abs(grads_enzyme[key] - grad_fd) <= 1e-6 * abs(grad_fd)
++        end
++    end
++end
++
+ @testset "Gradients of a converted system" begin
+     ff_dexp = MolecularForceField(joinpath(ff_dir, "ethanol_garnet.xml"))
+     ff_water = MolecularForceField(joinpath(ff_dir, "tip4pfb.xml"))
+diff --git a/test/interactions.jl b/test/interactions.jl
+index e5eddc0b1..ac2f4d32a 100644
+--- a/test/interactions.jl
++++ b/test/interactions.jl
+@@ -1887,6 +1887,52 @@
+     @test virial(sys_switch)[1, 1] ≈ potential_energy(sys_switch) rtol=1e-12
+     @test iszero(virial(sys_switch)[1, 2])
+ 
++    # The double exponential dispersion correction, compared with OpenMM, which integrates the
++    #   long-range correction of a CustomNonbondedForce numerically to about 1e-6
++    α_dexp, β_dexp = 16.766, 4.427
++    for (cutoff, E_openmm) in ((DistanceCutoff(1.0u"nm")             , -1.007956309089448e-03),
++                               (PolynomialCutoff(0.85u"nm", 1.0u"nm"), -2.2610114789034285e-03),
++                               (PolynomialCutoff(0.6u"nm" , 1.0u"nm"), -1.0006835524368521e-02))
++        dc = DExpDispersionCorrection(grid_atoms, cutoff, α_dexp, β_dexp)
++        sys_dc = System(atoms=grid_atoms, coords=(grid_coords .* u"nm"),
++                        boundary=CubicBoundary(10.0u"nm"), general_inters=(dc,))
++        @test potential_energy(sys_dc) ≈ E_openmm * u"kJ * mol^-1" rtol=1e-5
++    end
++    @test_throws ArgumentError DExpDispersionCorrection(grid_atoms, ShiftedForceCutoff(1.0u"nm"),
++                                                        α_dexp, β_dexp)
++
++    # One atom type, without units, against quadrature of the pair potential and its derivative
++    dexp_ref = DoubleExponential(α=α_dexp, β=β_dexp)
++    V_dexp(r) = potential_energy(dexp_ref, SVector(r, 0.0, 0.0), grid_atoms_1[1],
++                                 grid_atoms_1[1], NoUnits)
++    dV_dexp(r) = (V_dexp(r + 1e-6) - V_dexp(r - 1e-6)) / 2e-6
++    simpson(f, a, b) = (b - a) / 3n_quad * sum((i in (0, n_quad) ? 1 : (isodd(i) ? 4 : 2)) *
++                                               f(a + i * (b - a) / n_quad) for i in 0:n_quad)
++    function dexp_disp_sys(cutoff)
++        dc = DExpDispersionCorrection(grid_atoms_1, cutoff, α_dexp, β_dexp)
++        return System(atoms=grid_atoms_1, coords=grid_coords, boundary=CubicBoundary(10.0),
++                      general_inters=(dc,), energy_units=NoUnits, force_units=NoUnits)
++    end
++    sys_cut, sys_shift = dexp_disp_sys(DistanceCutoff(rc_dc)), dexp_disp_sys(ShiftedPotentialCutoff(rc_dc))
++    sys_switch = dexp_disp_sys(PolynomialCutoff(rs_dc, rc_dc))
++    E_factor = 2π * n_dc^2 / V_dc
++    V_rc = V_dexp(rc_dc)
++    I_tail = simpson(r -> r^2 * V_dexp(r), rc_dc, rc_dc + 10)
++    I_sw = simpson(r -> r^2 * (1 - S_sw(r)) * V_dexp(r), rs_dc, rc_dc)
++    @test potential_energy(sys_cut) ≈ E_factor * I_tail rtol=1e-9
++    # The shift is left out within the cutoff, with one fewer partner per atom as in GROMACS
++    @test potential_energy(sys_shift) ≈ E_factor * (I_tail + rc_dc^3 * V_rc / 3) -
++                                        n_dc / 2 * V_rc rtol=1e-9
++    @test potential_energy(sys_switch) ≈ E_factor * (I_tail + I_sw) rtol=1e-9
++    # The virial of the pairs left out, -r^3 times the derivative of the part left out
++    W_tail = simpson(r -> -r^3 * dV_dexp(r), rc_dc, rc_dc + 10) / 3
++    W_sw = simpson(r -> -r^3 * ((1 - S_sw(r)) * dV_dexp(r) - dS_sw(r) * V_dexp(r)),
++                   rs_dc, rc_dc) / 3
++    @test virial(sys_cut)[1, 1] ≈ E_factor * W_tail rtol=1e-7
++    @test virial(sys_shift) ≈ virial(sys_cut) rtol=1e-12
++    @test virial(sys_switch)[1, 1] ≈ E_factor * (W_sw + W_tail) rtol=1e-7
++    @test iszero(virial(sys_switch)[1, 2])
++
+     InteractionList2Atoms([1, 2], [3, 4], [0.0, 0.0])
+     @test_throws ArgumentError InteractionList2Atoms([1, 2], [3, 4], [0.0])
+ 

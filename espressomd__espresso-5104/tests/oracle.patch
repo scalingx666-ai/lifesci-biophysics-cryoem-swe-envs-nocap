@@ -1,0 +1,457 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b5a121e03c..afe1c6fdb60 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -222,7 +222,7 @@ if(ESPRESSO_BUILD_WITH_CUDA)
+       # 2. sm_75: RTX-2000 series (Turing)
+       # 3. sm_86: RTX-3000 series (Ampere)
+       # 4. sm_89: RTX-4000 series (Ada)
+-      set(ESPRESSO_CUDA_ARCHITECTURES "61;75")
++      set(ESPRESSO_CUDA_ARCHITECTURES "75;86;89")
+     else()
+       set(ESPRESSO_CUDA_ARCHITECTURES "$ENV{CUDAARCHS}")
+     endif()
+diff --git a/src/core/communication.cpp b/src/core/communication.cpp
+index 38b5ed84091..e3181ce18ce 100644
+--- a/src/core/communication.cpp
++++ b/src/core/communication.cpp
+@@ -34,6 +34,7 @@
+ #ifdef SHARED_MEMORY_PARALLELISM
+ #include <Cabana_Core.hpp>
+ #include <Kokkos_Core.hpp>
++#include <omp.h>
+ #endif
+ 
+ #include <utils/Vector.hpp>
+@@ -46,6 +47,8 @@
+ #include <mpi.h>
+ 
+ #include <cassert>
++#include <cstdlib>
++#include <cstring>
+ #include <memory>
+ #include <tuple>
+ #include <utility>
+@@ -76,6 +79,13 @@ int this_node = -1;
+ 
+ namespace Communication {
+ void init(std::shared_ptr<boost::mpi::environment> mpi_env) {
++#ifdef SHARED_MEMORY_PARALLELISM
++  const char *const env_omp_num_threads = std::getenv("OMP_NUM_THREADS");
++  if (not env_omp_num_threads or std::strlen(env_omp_num_threads) == 0ul) {
++    omp_set_num_threads(1);
++  }
++#endif
++
+   communicator.full_initialization();
+ 
+   Communication::m_callbacks =
+diff --git a/src/core/cuda/init.cpp b/src/core/cuda/init.cpp
+index 1912da31ff9..7bf83194caa 100644
+--- a/src/core/cuda/init.cpp
++++ b/src/core/cuda/init.cpp
+@@ -26,12 +26,15 @@
+ 
+ #include "communication.hpp"
+ 
++#include <utils/mpi/gather_buffer.hpp>
++
+ #include <mpi.h>
+ 
+ #include <algorithm>
+-#include <cstring>
+ #include <iterator>
+ #include <set>
++#include <string>
++#include <utility>
+ #include <vector>
+ 
+ /** Helper class for device sets.
+@@ -39,78 +42,51 @@
+ struct CompareDevices {
+   bool operator()(const EspressoGpuDevice &a,
+                   const EspressoGpuDevice &b) const {
+-    auto const name_comp = strncmp(a.proc_name, b.proc_name, 63);
++    auto const name_comp = a.proc_name.compare(b.proc_name);
+     /* if both devices are from the same node, order by id */
+     return (name_comp == 0) ? a.id < b.id : name_comp < 0;
+   }
+ };
+ 
+-/** Gather list of CUDA devices on all nodes on the head node.
++/** Gather list of CUDA devices from all nodes on the head node.
+  *  It relies on <tt>MPI_Get_processor_name()</tt> to get a unique identifier
+  *  of the physical node, as opposed to the logical rank of which there can
+  *  be more than one per node.
+  */
+ std::vector<EspressoGpuDevice> cuda_gather_gpus() {
+-  /* List of local devices */
+-  std::vector<EspressoGpuDevice> devices_local;
+-  /* Global unique device list (only relevant on the head node) */
+-  std::vector<EspressoGpuDevice> devices_global;
++  std::vector<EspressoGpuDevice> devices;
+ 
+   int n_devices = 0;
+   invoke_skip_cuda_exceptions(
+       [&n_devices]() { n_devices = cuda_get_n_gpus(); });
+ 
+-  int proc_name_len;
+-  char proc_name[MPI_MAX_PROCESSOR_NAME];
+-  MPI_Get_processor_name(proc_name, &proc_name_len);
+-  proc_name[63] = '\0';
+-
+-  invoke_skip_cuda_exceptions([&devices_local, n_devices, &proc_name]() {
++  invoke_skip_cuda_exceptions([&devices, n_devices]() {
+     for (int i = 0; i < n_devices; ++i) {
+-      auto device = cuda_get_device_props(i);
+-      std::strncpy(device.proc_name, proc_name, 64);
+-      device.proc_name[63] = '\0';
+-      device.node = this_node;
+-      devices_local.emplace_back(device);
++      devices.emplace_back(cuda_get_device_props(i));
+     }
+   });
+ 
+-  auto const n_gpus = static_cast<int>(devices_local.size());
+-  auto const n_nodes = ::communicator.size;
++  Utils::Mpi::gather_buffer(devices, ::comm_cart);
+ 
+   if (this_node == 0) {
+     std::set<EspressoGpuDevice, CompareDevices> device_set;
+-    int *n_gpu_array = new int[static_cast<unsigned int>(n_nodes)];
+-    MPI_Gather(&n_gpus, 1, MPI_INT, n_gpu_array, 1, MPI_INT, 0, MPI_COMM_WORLD);
+-
+-    /* insert local devices */
+-    std::ranges::copy(devices_local,
+-                      std::inserter(device_set, device_set.begin()));
+-
+-    EspressoGpuDevice device;
+-    MPI_Status s;
+-    /* Get devices from other nodes */
+-    for (int i = 1; i < n_nodes; ++i) {
+-      for (int j = 0; j < n_gpu_array[i]; ++j) {
+-        MPI_Recv(&device, sizeof(EspressoGpuDevice), MPI_BYTE, i, 0,
+-                 MPI_COMM_WORLD, &s);
+-        device_set.insert(device);
+-      }
+-    }
+-    /* Copy unique devices to result, if any */
+-    std::ranges::copy(device_set, std::back_inserter(devices_global));
+-    delete[] n_gpu_array;
++    std::ranges::copy(devices, std::inserter(device_set, device_set.begin()));
++    devices.clear();
++    std::ranges::copy(device_set, std::back_inserter(devices));
+   } else {
+-    /* Send number of devices to head node */
+-    MPI_Gather(&n_gpus, 1, MPI_INT, nullptr, 1, MPI_INT, 0, MPI_COMM_WORLD);
+-    /* Send devices to head node */
+-    for (auto const &device : devices_local) {
+-      MPI_Send(&device, sizeof(EspressoGpuDevice), MPI_BYTE, 0, 0,
+-               MPI_COMM_WORLD);
+-    }
++    devices.clear();
+   }
+-  return devices_global;
++  return devices;
++}
++
++namespace detail {
++std::pair<int, std::string> get_node_info() {
++  int proc_name_len;
++  char proc_name[MPI_MAX_PROCESSOR_NAME];
++  MPI_Get_processor_name(proc_name, &proc_name_len);
++  return {this_node, proc_name};
+ }
++} // namespace detail
+ 
+ void cuda_on_program_start() {
+   if (::communicator.this_node == 0) {
+diff --git a/src/core/cuda/init.hpp b/src/core/cuda/init.hpp
+index 429bab2e561..1f51c69a739 100644
+--- a/src/core/cuda/init.hpp
++++ b/src/core/cuda/init.hpp
+@@ -25,7 +25,11 @@
+ 
+ #include "utils.hpp"
+ 
++#include <boost/serialization/access.hpp>
++
+ #include <cstddef>
++#include <string>
++#include <utility>
+ #include <vector>
+ 
+ /** Struct to hold information relevant to ESPResSo
+@@ -36,9 +40,9 @@ struct EspressoGpuDevice {
+   /** Local CUDA device id */
+   int id;
+   /** Local CUDA device name */
+-  char name[256];
++  std::string name;
+   /** Node identification */
+-  char proc_name[64];
++  std::string proc_name;
+   /** MPI process identification */
+   int node;
+   /** Compute capability (major) */
+@@ -49,13 +53,21 @@ struct EspressoGpuDevice {
+   std::size_t total_memory;
+   /** Number of cores */
+   int n_cores;
++
++private:
++  friend boost::serialization::access;
++  template <typename Archive>
++  void serialize(Archive &ar, unsigned int const /* version */) {
++    ar & id & name & proc_name & node & compute_capability_major &
++        compute_capability_minor & total_memory & n_cores;
++  }
+ };
+ 
+ /** Initializes the CUDA stream.
+  */
+ void cuda_init();
+ 
+-/** Get the number of CUDA devices.
++/** Get the number of CUDA devices on the local host.
+  *
+  *  @return the number of GPUs.
+  */
+@@ -73,9 +85,8 @@ bool cuda_check_gpu_compute_capability(int dev);
+ /** Get the name of a CUDA device.
+  *
+  *  @param[in]  dev the CUDA device number to ask the name for
+- *  @param[out] name a buffer to write the name to, at least 256 characters
+  */
+-void cuda_get_gpu_name(int dev, char *name);
++std::string cuda_get_gpu_name(int dev);
+ 
+ /** Choose a device for future CUDA computations.
+  *
+@@ -114,4 +125,8 @@ EspressoGpuDevice cuda_get_device_props(int dev);
+ /** @brief Called on program start. */
+ void cuda_on_program_start();
+ 
++namespace detail {
++std::pair<int, std::string> get_node_info();
++} // namespace detail
++
+ #endif // CUDA
+diff --git a/src/core/cuda/init_cuda.cu b/src/core/cuda/init_cuda.cu
+index 0b33492e25d..d18854d7366 100644
+--- a/src/core/cuda/init_cuda.cu
++++ b/src/core/cuda/init_cuda.cu
+@@ -55,35 +55,24 @@ bool cuda_check_gpu_compute_capability(int dev) {
+            deviceProp.minor < computeCapabilityMinMinor));
+ }
+ 
+-/**
+- * @brief Safely copy the device name and pad the string with null characters.
+- */
+-static void cuda_copy_gpu_name(char *const name, cudaDeviceProp const &prop) {
+-  char buffer[256] = {'\0'};
+-  std::strncpy(buffer, prop.name, 256);
+-  name[255] = '\0';
+-  std::strncpy(name, buffer, 256);
+-}
+-
+-void cuda_get_gpu_name(int dev, char *const name) {
++std::string cuda_get_gpu_name(int dev) {
+   cudaDeviceProp deviceProp;
+   CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, dev))
+-  cuda_copy_gpu_name(name, deviceProp);
++  return {deviceProp.name};
+ }
+ 
+ EspressoGpuDevice cuda_get_device_props(const int dev) {
+   cudaDeviceProp deviceProp;
+   CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, dev))
+-  EspressoGpuDevice device{dev,
+-                           "",
+-                           "",
+-                           -1,
+-                           deviceProp.major,
+-                           deviceProp.minor,
+-                           deviceProp.totalGlobalMem,
+-                           deviceProp.multiProcessorCount};
+-  cuda_copy_gpu_name(device.name, deviceProp);
+-  return device;
++  auto const [node, hostname] = detail::get_node_info();
++  return {dev,
++          deviceProp.name,
++          hostname,
++          node,
++          deviceProp.major,
++          deviceProp.minor,
++          deviceProp.totalGlobalMem,
++          deviceProp.multiProcessorCount};
+ }
+ 
+ void cuda_set_device(int dev) {
+diff --git a/src/core/unit_tests/cuda_test.cu b/src/core/unit_tests/cuda_test.cu
+index 812638cfa96..52a7deb19ed 100644
+--- a/src/core/unit_tests/cuda_test.cu
++++ b/src/core/unit_tests/cuda_test.cu
+@@ -246,11 +246,9 @@ BOOST_AUTO_TEST_CASE(gpu_interface, *fixture) {
+   // -----------------------
+ 
+   BOOST_REQUIRE_GE(cuda_get_n_gpus(), 1);
+-  char gpu_name_buffer[260] = {'\0'};
+-  cuda_get_gpu_name(0, gpu_name_buffer);
+-  for (int i = 255; i < 260; ++i) {
+-    BOOST_REQUIRE_EQUAL(gpu_name_buffer[i], '\0');
+-  }
++  auto constexpr max_dev_name = sizeof(cudaDeviceProp::name) / sizeof(char);
++  auto const gpu_name = cuda_get_gpu_name(0);
++  BOOST_REQUIRE_LE(gpu_name.size(), max_dev_name);
+ }
+ 
+ #ifdef P3M
+diff --git a/src/python/espressomd/cuda_init.py b/src/python/espressomd/cuda_init.py
+index ac3aec17182..91266599f79 100644
+--- a/src/python/espressomd/cuda_init.py
++++ b/src/python/espressomd/cuda_init.py
+@@ -31,12 +31,12 @@ class CudaInitHandle(ScriptInterfaceHelper):
+     Methods
+     -------
+     list_devices()
+-        List devices.
++        List devices on the head node.
+ 
+         Returns
+         -------
+         :obj:`dict` :
+-            Available CUDA devices sorted by device id.
++            Available CUDA devices sorted by device id on the head node.
+ 
+     """
+     _so_name = "System::CudaInitHandle"
+diff --git a/src/script_interface/system/CudaInitHandle.cpp b/src/script_interface/system/CudaInitHandle.cpp
+index 8f670b5a4f9..d8c358c6542 100644
+--- a/src/script_interface/system/CudaInitHandle.cpp
++++ b/src/script_interface/system/CudaInitHandle.cpp
+@@ -58,15 +58,12 @@ Variant CudaInitHandle::do_call_method(std::string const &name,
+     std::unordered_map<int, std::string> devices{};
+ #ifdef CUDA
+     if (context()->is_head_node()) {
+-      // only GPUs on the head node can be used
++      // only GPUs on the head node can be displayed
+       auto n_gpus = 0;
+       invoke_skip_cuda_exceptions([&n_gpus]() { n_gpus = cuda_get_n_gpus(); });
+       for (int i = 0; i < n_gpus; ++i) {
+-        invoke_skip_cuda_exceptions([&devices, i]() {
+-          char gpu_name_buffer[256] = {'\0'};
+-          cuda_get_gpu_name(i, gpu_name_buffer);
+-          devices[i] = std::string{gpu_name_buffer};
+-        });
++        invoke_skip_cuda_exceptions(
++            [&devices, i]() { devices[i] = cuda_get_gpu_name(i); });
+       }
+     }
+ #endif // CUDA
+@@ -77,12 +74,12 @@ Variant CudaInitHandle::do_call_method(std::string const &name,
+ #ifdef CUDA
+     std::vector<EspressoGpuDevice> devices = cuda_gather_gpus();
+     for (auto const &dev : devices) {
+-      auto const hostname = std::string{dev.proc_name};
+-      if (dict.count(hostname) == 0) {
++      auto const hostname = dev.proc_name;
++      if (not dict.contains(hostname)) {
+         dict[hostname] = {};
+       }
+       std::unordered_map<std::string, Variant> dev_properties = {
+-          {"name", std::string{dev.name}},
++          {"name", dev.name},
+           {"compute_capability",
+            Variant{std::vector<int>{
+                {dev.compute_capability_major, dev.compute_capability_minor}}}},
+@@ -97,10 +94,8 @@ Variant CudaInitHandle::do_call_method(std::string const &name,
+   if (name == "get_n_gpus") {
+     auto n_gpus = 0;
+ #ifdef CUDA
+-    if (context()->is_head_node()) {
+-      // only GPUs on the head node can be used
+-      invoke_skip_cuda_exceptions([&n_gpus]() { n_gpus = cuda_get_n_gpus(); });
+-    }
++    auto const devices = cuda_gather_gpus();
++    n_gpus = static_cast<int>(devices.size());
+ #endif // CUDA
+     return n_gpus;
+   }
+diff --git a/testsuite/CMakeLists.txt b/testsuite/CMakeLists.txt
+index 9bf914472f3..30ec9a8d268 100644
+--- a/testsuite/CMakeLists.txt
++++ b/testsuite/CMakeLists.txt
+@@ -33,9 +33,13 @@ macro(ESPRESSO_IMPORTLIB_BASED_FIXTURE)
+   cmake_path(GET TEST_SRC STEM TEST_NAME)
+   add_test(NAME ${TEST_NAME} COMMAND ${CMAKE_BINARY_DIR}/pypresso
+                                      ${PYPRESSO_OPTIONS} ${TEST_SRC})
++  # cmake-format: off
+   set_tests_properties(
+     ${TEST_NAME} PROPERTIES FIXTURES_SETUP "FIXTURE_${TEST_TYPE}"
+-                            SKIP_RETURN_CODE 5)
++                            SKIP_RETURN_CODE 5
++                            ENVIRONMENT "OMP_PROC_BIND=false"
++                            ENVIRONMENT "OMP_NUM_THREADS=1")
++  # cmake-format: on
+ endmacro(ESPRESSO_IMPORTLIB_BASED_FIXTURE)
+ 
+ # setup tests for testsuites that dynamically load simulation scripts
+@@ -55,9 +59,13 @@ macro(ESPRESSO_IMPORTLIB_BASED_TEST)
+   add_test(NAME ${TEST_NAME}
+            COMMAND ${CMAKE_BINARY_DIR}/pypresso ${PYPRESSO_OPTIONS}
+                    ${TEST_FILE_CONFIGURED})
++  # cmake-format: off
+   set_tests_properties(
+     ${TEST_NAME} PROPERTIES FIXTURES_REQUIRED "FIXTURE_${TEST_TYPE}"
+-                            SKIP_RETURN_CODE 5 LABELS "${TEST_LABELS}")
++                            SKIP_RETURN_CODE 5 LABELS "${TEST_LABELS}"
++                            ENVIRONMENT "OMP_PROC_BIND=false"
++                            ENVIRONMENT "OMP_NUM_THREADS=1")
++  # cmake-format: on
+   if("gpu" IN_LIST TEST_LABELS AND ESPRESSO_BUILD_WITH_CUDA)
+     set_tests_properties(${TEST_NAME} PROPERTIES RESOURCE_LOCK GPU)
+   endif()
+diff --git a/testsuite/python/gpu_availability.py b/testsuite/python/gpu_availability.py
+index 3cba5a7a06f..7917c5e48d0 100644
+--- a/testsuite/python/gpu_availability.py
++++ b/testsuite/python/gpu_availability.py
+@@ -16,6 +16,7 @@
+ # You should have received a copy of the GNU General Public License
+ # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ #
++import socket
+ import unittest as ut
+ import unittest_decorators as utx
+ import espressomd
+@@ -62,8 +63,10 @@ def test_list_devices(self):
+         # check if GPU properties can be queried
+         device_list = self.system.cuda_init_handle.list_devices()
+         device_list_p = self.system.cuda_init_handle.list_devices_properties()
+-        self.assertEqual(len(device_list_p), 1)
+-        device_list_p_head = list(device_list_p.values())[0]
++        hostname = socket.gethostname()
++        self.assertGreaterEqual(len(device_list_p), 1)
++        self.assertIn(hostname, device_list_p)
++        device_list_p_head = device_list_p[hostname]
+         dev_keys = {'name', 'compute_capability', 'cores', 'total_memory'}
+         # check both dicts agree
+         self.assertEqual(device_list.keys(), device_list_p_head.keys())
+diff --git a/testsuite/python/sigint.py b/testsuite/python/sigint.py
+index 2354e6fa7df..48db944d02e 100644
+--- a/testsuite/python/sigint.py
++++ b/testsuite/python/sigint.py
+@@ -56,10 +56,12 @@ def check_signal_handling(self, process, sig):
+     def test_signal_handling(self):
+         signals = [signal.Signals.SIGINT, signal.Signals.SIGTERM]
+         processes = []
++        env = os.environ.copy()
++        env["OMP_NUM_THREADS"] = env.get("OMP_NUM_THREADS", "1")
+         # open asynchronous processes with non-blocking read access on stderr
+         for _ in range(len(signals)):
+             process = subprocess.Popen([sys.executable, self.script],
+-                                       stderr=subprocess.PIPE)
++                                       stderr=subprocess.PIPE, env=env)
+             os.set_blocking(process.stderr.fileno(), False)
+             processes.append(process)
+ 

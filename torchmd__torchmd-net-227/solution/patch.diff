@@ -1,0 +1,411 @@
+diff --git a/environment.yml b/environment.yml
+index b02866fd8..ddada89d6 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -19,5 +19,4 @@ dependencies:
+   - flake8
+   - pytest
+   - psutil
+-  - ninja
+   - gxx
+diff --git a/setup.py b/setup.py
+index 8950a7662..2f7e26303 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1,5 +1,8 @@
+ import subprocess
+ from setuptools import setup, find_packages
++import torch
++from torch.utils.cpp_extension import BuildExtension, CUDAExtension, include_paths, CppExtension
++import os
+ 
+ try:
+     version = (
+@@ -10,34 +13,46 @@
+ except:
+     print("Failed to retrieve the current version, defaulting to 0")
+     version = "0"
++# If CPU_ONLY is defined
++force_cpu_only = os.environ.get("CPU_ONLY", None) is not None
++use_cuda = torch.cuda._is_compiled() if not force_cpu_only else False
++def set_torch_cuda_arch_list():
++    """ Set the CUDA arch list according to the architectures the current torch installation was compiled for.
++    This function is a no-op if the environment variable TORCH_CUDA_ARCH_LIST is already set or if torch was not compiled with CUDA support.
++    """
++    if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
++        if use_cuda:
++            arch_flags = torch._C._cuda_getArchFlags()
++            sm_versions = [x[3:] for x in arch_flags.split() if x.startswith("sm_")]
++            formatted_versions = ";".join([f"{y[0]}.{y[1]}" for y in sm_versions])
++            formatted_versions += "+PTX"
++            os.environ["TORCH_CUDA_ARCH_LIST"] = formatted_versions
+ 
+-from setuptools import setup
+-from torch.utils.cpp_extension import BuildExtension, CUDAExtension, include_paths, CppExtension
+-import torch
+-
+-neighs = CppExtension(
+-    name='torchmdnet.neighbors.torchmdnet_neighbors',
+-    sources=["torchmdnet/neighbors/neighbors.cpp", "torchmdnet/neighbors/neighbors_cpu.cpp"],
+-    include_dirs=include_paths(),
+-    language='c++')
+-
+-if torch.cuda._is_compiled():
+-    neighs = CUDAExtension(
+-        name='torchmdnet.neighbors.torchmdnet_neighbors',
+-        sources=["torchmdnet/neighbors/neighbors.cpp", "torchmdnet/neighbors/neighbors_cpu.cpp", "torchmdnet/neighbors/neighbors_cuda.cu"],
+-        include_dirs=include_paths(),
+-        language='cuda'
+-        )
++set_torch_cuda_arch_list()
+ 
+-setup(
+-    name="torchmd-net",
+-    version=version,
+-    packages=find_packages(),
+-    ext_modules=[neighs,],
+-    cmdclass={
+-        'build_ext': BuildExtension.with_options(no_python_abi_suffix=True, use_ninja=False)},
+-    include_package_data=True,
+-    entry_points={"console_scripts": ["torchmd-train = torchmdnet.scripts.train:main"]},
+-    package_data={"torchmdnet": ["neighbors/torchmdnet_neighbors.so"]},
++extension_root= os.path.join("torchmdnet", "extensions")
++neighbor_sources=["neighbors_cpu.cpp"]
++if use_cuda:
++    neighbor_sources.append("neighbors_cuda.cu")
++neighbor_sources = [os.path.join(extension_root, "neighbors", source) for source in neighbor_sources]
+ 
++ExtensionType = CppExtension if not use_cuda else CUDAExtension
++extensions = ExtensionType(
++    name='torchmdnet.extensions.torchmdnet_extensions',
++    sources=[os.path.join(extension_root, "extensions.cpp")] + neighbor_sources,
++    include_dirs=include_paths(),
++    define_macros=[('WITH_CUDA', 1)] if use_cuda else [],
+ )
++
++if __name__ == "__main__":
++    setup(
++        name="torchmd-net",
++        version=version,
++        packages=find_packages(),
++        ext_modules=[extensions],
++        cmdclass={
++            'build_ext': BuildExtension.with_options(no_python_abi_suffix=True, use_ninja=False)},
++        include_package_data=True,
++        entry_points={"console_scripts": ["torchmd-train = torchmdnet.scripts.train:main"]},
++        package_data={"torchmdnet": ["extensions/torchmdnet_extensions.so"]},
++    )
+diff --git a/tests/test_model.py b/tests/test_model.py
+index 4b916c8dc..209339b65 100644
+--- a/tests/test_model.py
++++ b/tests/test_model.py
+@@ -107,22 +107,22 @@ def test_cuda_graph_compatible(model_name):
+             "reduce_op": "sum",
+             "precision": 32 }
+     model = create_model(args).to(device="cuda")
++    model.eval()
+     z = z.to("cuda")
+     pos = pos.to("cuda").requires_grad_(True)
+     batch = batch.to("cuda")
+-    model = torch.jit.script(model).to(device="cuda")
+-    #Save and load the model, do not use a file
+-    import io
+-    buffer = io.BytesIO()
+-    torch.jit.save(model, buffer)
+-    buffer.seek(0)
+-    model = torch.jit.load(buffer)
+-    for _ in range(0, 5):
+-        y, neg_dy = model(z, pos, batch=batch)
+-    model = torch.cuda.make_graphed_callables(model, (z, pos, batch), allow_unused_input=True)
++    with torch.cuda.stream(torch.cuda.Stream()):
++        for _ in range(0, 15):
++            y, neg_dy = model(z, pos, batch=batch)
++    g = torch.cuda.CUDAGraph()
+     y2, neg_dy2 = model(z, pos, batch=batch)
++    with torch.cuda.graph(g):
++        y, neg_dy = model(z, pos, batch=batch)
++    y.fill_(0.0)
++    neg_dy.fill_(0.0)
++    g.replay()
+     assert torch.allclose(y, y2)
+-    assert torch.allclose(neg_dy, neg_dy2)
++    assert torch.allclose(neg_dy, neg_dy2, atol=1e-5, rtol=1e-5)
+ 
+ @mark.parametrize("model_name", models.__all__)
+ def test_seed(model_name):
+diff --git a/torchmdnet/extensions/__init__.py b/torchmdnet/extensions/__init__.py
+new file mode 100644
+index 000000000..8b3c8fa1e
+--- /dev/null
++++ b/torchmdnet/extensions/__init__.py
+@@ -0,0 +1,41 @@
++# Place here any short extensions to torch that you want to use in your code.
++# The extensions present in extensions.cpp will be automatically compiled in setup.py and loaded here.
++# The extensions will be available under torch.ops.torchmdnet_extensions, but you can add wrappers here to make them more convenient to use.
++import os.path as osp
++import torch
++import importlib.machinery
++
++def _load_library(library):
++    """ Load a dynamic library containing torch extensions from the given path.
++    Args:
++        library (str): The name of the library to load.
++    """
++    # Find the specification for the library
++    spec = importlib.machinery.PathFinder().find_spec(
++        library, [osp.dirname(__file__)]
++    )
++    # Check if the specification is found and load the library
++    if spec is not None:
++        torch.ops.load_library(spec.origin)
++    else:
++        raise ImportError(f"Could not find module '{library}' in {osp.dirname(__file__)}")
++
++_load_library("torchmdnet_extensions")
++
++@torch.jit.script
++def is_current_stream_capturing():
++    """
++    Returns True if the current CUDA stream is capturing.
++    Returns False if CUDA is not available or the current stream is not capturing.
++
++    This utility is required because the builtin torch function that does this is not scriptable.
++    """
++    _is_current_stream_capturing = torch.ops.torchmdnet_extensions.is_current_stream_capturing
++    return _is_current_stream_capturing()
++
++get_neighbor_pairs_kernel = torch.ops.torchmdnet_extensions.get_neighbor_pairs
++
++# For some unknown reason torch.compile is not able to compile this function
++if int(torch.__version__.split('.')[0]) >= 2:
++    import torch._dynamo as dynamo
++    dynamo.disallow_in_graph(get_neighbor_pairs_kernel)
+diff --git a/torchmdnet/extensions/extensions.cpp b/torchmdnet/extensions/extensions.cpp
+new file mode 100644
+index 000000000..4752cd1a4
+--- /dev/null
++++ b/torchmdnet/extensions/extensions.cpp
+@@ -0,0 +1,36 @@
++/* Raul P. Pelaez 2023. Torch extensions to the torchmdnet library.
++ * You can expose functions to python here which will be compatible with TorchScript.
++ * Add your exports to the TORCH_LIBRARY macro below, see __init__.py to see how to access them from python.
++ * The WITH_CUDA macro will be defined when compiling with CUDA support.
++ */
++
++
++#include <torch/extension.h>
++#if defined(WITH_CUDA)
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime_api.h>
++#endif
++
++/* @brief Returns true if the current torch CUDA stream is capturing.
++ * This function is required because the one available in torch is not compatible with TorchScript.
++ * @return True if the current torch CUDA stream is capturing.
++ */
++bool is_current_stream_capturing() {
++#if defined(WITH_CUDA)
++  auto current_stream = at::cuda::getCurrentCUDAStream().stream();
++  cudaStreamCaptureStatus capture_status;
++  cudaError_t err = cudaStreamGetCaptureInfo(current_stream, &capture_status, nullptr);
++  if (err != cudaSuccess) {
++    throw std::runtime_error(cudaGetErrorString(err));
++  }
++  return capture_status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
++#else
++  return false;
++#endif
++}
++
++
++TORCH_LIBRARY(torchmdnet_extensions, m) {
++    m.def("is_current_stream_capturing", is_current_stream_capturing);
++    m.def("get_neighbor_pairs(str strategy, Tensor positions, Tensor batch, Tensor box_vectors, bool use_periodic, Scalar cutoff_lower, Scalar cutoff_upper, Scalar max_num_pairs, bool loop, bool include_transpose) -> (Tensor neighbors, Tensor distances, Tensor distance_vecs, Tensor num_pairs)");
++}
+diff --git a/torchmdnet/neighbors/common.cuh b/torchmdnet/extensions/neighbors/common.cuh
+similarity index 100%
+rename from torchmdnet/neighbors/common.cuh
+rename to torchmdnet/extensions/neighbors/common.cuh
+diff --git a/torchmdnet/neighbors/neighbors_cpu.cpp b/torchmdnet/extensions/neighbors/neighbors_cpu.cpp
+similarity index 99%
+rename from torchmdnet/neighbors/neighbors_cpu.cpp
+rename to torchmdnet/extensions/neighbors/neighbors_cpu.cpp
+index 9be737b02..3665d00fd 100644
+--- a/torchmdnet/neighbors/neighbors_cpu.cpp
++++ b/torchmdnet/extensions/neighbors/neighbors_cpu.cpp
+@@ -89,7 +89,7 @@ forward(const Tensor& positions, const Tensor& batch, const Tensor& box_vectors,
+     return {neighbors, deltas, distances, num_pairs_found};
+ }
+ 
+-TORCH_LIBRARY_IMPL(torchmdnet_neighbors, CPU, m) {
++TORCH_LIBRARY_IMPL(torchmdnet_extensions, CPU, m) {
+   m.impl("get_neighbor_pairs", [](const std::string &strategy,  const Tensor& positions, const Tensor& batch, const Tensor& box_vectors,
+ 				    bool use_periodic, const Scalar& cutoff_lower, const Scalar& cutoff_upper,
+               const Scalar& max_num_pairs, bool loop, bool include_transpose) {
+diff --git a/torchmdnet/neighbors/neighbors_cuda.cu b/torchmdnet/extensions/neighbors/neighbors_cuda.cu
+similarity index 98%
+rename from torchmdnet/neighbors/neighbors_cuda.cu
+rename to torchmdnet/extensions/neighbors/neighbors_cuda.cu
+index f7fd1d727..5d892e4b0 100644
+--- a/torchmdnet/neighbors/neighbors_cuda.cu
++++ b/torchmdnet/extensions/neighbors/neighbors_cuda.cu
+@@ -71,7 +71,7 @@ public:
+     }
+ };
+ 
+-TORCH_LIBRARY_IMPL(torchmdnet_neighbors, AutogradCUDA, m) {
++TORCH_LIBRARY_IMPL(torchmdnet_extensions, AutogradCUDA, m) {
+     m.impl("get_neighbor_pairs",
+            [](const std::string& strategy, const Tensor& positions, const Tensor& batch,
+               const Tensor& box_vectors, bool use_periodic, const Scalar& cutoff_lower,
+diff --git a/torchmdnet/neighbors/neighbors_cuda_brute.cuh b/torchmdnet/extensions/neighbors/neighbors_cuda_brute.cuh
+similarity index 100%
+rename from torchmdnet/neighbors/neighbors_cuda_brute.cuh
+rename to torchmdnet/extensions/neighbors/neighbors_cuda_brute.cuh
+diff --git a/torchmdnet/neighbors/neighbors_cuda_cell.cuh b/torchmdnet/extensions/neighbors/neighbors_cuda_cell.cuh
+similarity index 100%
+rename from torchmdnet/neighbors/neighbors_cuda_cell.cuh
+rename to torchmdnet/extensions/neighbors/neighbors_cuda_cell.cuh
+diff --git a/torchmdnet/neighbors/neighbors_cuda_shared.cuh b/torchmdnet/extensions/neighbors/neighbors_cuda_shared.cuh
+similarity index 100%
+rename from torchmdnet/neighbors/neighbors_cuda_shared.cuh
+rename to torchmdnet/extensions/neighbors/neighbors_cuda_shared.cuh
+diff --git a/torchmdnet/models/output_modules.py b/torchmdnet/models/output_modules.py
+index c87e2ea29..f60c9baf4 100644
+--- a/torchmdnet/models/output_modules.py
++++ b/torchmdnet/models/output_modules.py
+@@ -1,8 +1,9 @@
+ from abc import abstractmethod, ABCMeta
+ from torch_scatter import scatter
+ from typing import Optional
+-from torchmdnet.models.utils import act_class_mapping, GatedEquivariantBlock, check_stream_capturing
++from torchmdnet.models.utils import act_class_mapping, GatedEquivariantBlock
+ from torchmdnet.utils import atomic_masses
++from torchmdnet.extensions import is_current_stream_capturing
+ from torch_scatter import scatter
+ import torch
+ from torch import nn
+@@ -27,7 +28,7 @@ def pre_reduce(self, x, v, z, pos, batch):
+     def reduce(self, x, batch):
+         is_capturing = (
+             x.is_cuda
+-            and check_stream_capturing()
++            and is_current_stream_capturing()
+         )
+         if not x.is_cuda or not is_capturing:
+             self.dim_size = int(batch.max().item() + 1)
+diff --git a/torchmdnet/models/utils.py b/torchmdnet/models/utils.py
+index 3100125b1..134aa3906 100644
+--- a/torchmdnet/models/utils.py
++++ b/torchmdnet/models/utils.py
+@@ -6,6 +6,7 @@
+ import torch.nn.functional as F
+ from torch_geometric.nn import MessagePassing
+ from torch_cluster import radius_graph
++from torchmdnet.extensions import get_neighbor_pairs_kernel
+ import warnings
+ 
+ 
+@@ -107,8 +108,6 @@ def forward(
+     def message(self, x_j, W):
+         return x_j * W
+ 
+-from torchmdnet.neighbors import get_neighbor_pairs_kernel
+-
+ class OptimizedDistance(torch.nn.Module):
+     def __init__(
+         self,
+@@ -521,59 +520,6 @@ def forward(self, x, v):
+             x = self.act(x)
+         return x, v
+ 
+-def _compile_check_stream_capturing():
+-    """
+-    Compiles the check_stream_capturing function.
+-    This is required because the builtin torch function that does this is not scriptable.
+-    """
+-    # Check if the function is already compiled
+-    if hasattr(torch.ops.torch_extension, "is_stream_capturing"):
+-        return
+-    from torch.utils.cpp_extension import load_inline
+-    cpp_source = '''
+-#include <torch/script.h>
+-#if defined(WITH_CUDA)
+-#include <c10/cuda/CUDAStream.h>
+-#include <cuda_runtime_api.h>
+-#endif
+-bool is_stream_capturing() {
+-#if defined(WITH_CUDA)
+-  auto current_stream = at::cuda::getCurrentCUDAStream().stream();
+-  cudaStreamCaptureStatus capture_status;
+-  cudaError_t err = cudaStreamGetCaptureInfo(current_stream, &capture_status, nullptr);
+-  if (err != cudaSuccess) {
+-    throw std::runtime_error(cudaGetErrorString(err));
+-  }
+-  return capture_status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
+-#else
+-  return false;
+-#endif
+-}
+-
+-static auto registry = torch::RegisterOperators()
+-    .op("torch_extension::is_stream_capturing", &is_stream_capturing);
+-'''
+-
+-    # Create an inline extension
+-    load_inline(
+-        "is_stream_capturing",
+-        cpp_sources=cpp_source,
+-        functions=["is_stream_capturing"],
+-        with_cuda=torch.cuda.is_available(),
+-        extra_cflags=["-DWITH_CUDA"] if torch.cuda.is_available() else None,
+-        verbose=True,
+-    )
+-_compile_check_stream_capturing()
+-@torch.jit.script
+-def check_stream_capturing():
+-    """
+-    Returns True if the current CUDA stream is capturing.
+-    Returns False if CUDA is not available or the current stream is not capturing.
+-
+-    This utility is required because the builtin torch function that does this is not scriptable.
+-    """
+-    return torch.ops.torch_extension.is_stream_capturing()
+-
+ rbf_class_mapping = {"gauss": GaussianSmearing, "expnorm": ExpNormalSmearing}
+ 
+ act_class_mapping = {
+diff --git a/torchmdnet/neighbors/__init__.py b/torchmdnet/neighbors/__init__.py
+deleted file mode 100644
+index 7b9ac0f6f..000000000
+--- a/torchmdnet/neighbors/__init__.py
++++ /dev/null
+@@ -1,17 +0,0 @@
+-import os.path as osp
+-import torch
+-import importlib.machinery
+-library = "torchmdnet_neighbors"
+-# Find the specification for the library
+-spec = importlib.machinery.PathFinder().find_spec(
+-    library, [osp.dirname(__file__)]
+-)
+-# Check if the specification is found and load the library
+-if spec is not None:
+-    torch.ops.load_library(spec.origin)
+-else:
+-    raise ImportError(f"Could not find module '{library}' in {osp.dirname(__file__)}")
+-get_neighbor_pairs_kernel = torch.ops.torchmdnet_neighbors.get_neighbor_pairs
+-if int(torch.__version__.split('.')[0]) >= 2:
+-    import torch._dynamo as dynamo
+-    dynamo.disallow_in_graph(get_neighbor_pairs_kernel)
+diff --git a/torchmdnet/neighbors/neighbors.cpp b/torchmdnet/neighbors/neighbors.cpp
+deleted file mode 100644
+index febbbb5fd..000000000
+--- a/torchmdnet/neighbors/neighbors.cpp
++++ /dev/null
+@@ -1,5 +0,0 @@
+-#include <torch/extension.h>
+-
+-TORCH_LIBRARY(torchmdnet_neighbors, m) {
+-    m.def("get_neighbor_pairs(str strategy, Tensor positions, Tensor batch, Tensor box_vectors, bool use_periodic, Scalar cutoff_lower, Scalar cutoff_upper, Scalar max_num_pairs, bool loop, bool include_transpose) -> (Tensor neighbors, Tensor distances, Tensor distance_vecs, Tensor num_pairs)");
+-}

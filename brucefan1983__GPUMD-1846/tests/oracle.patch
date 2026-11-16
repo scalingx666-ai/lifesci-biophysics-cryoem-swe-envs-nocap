@@ -1,0 +1,237 @@
+diff --git a/doc/gpumd-replica/input_parameters/multi_replica_prd.rst b/doc/gpumd-replica/input_parameters/multi_replica_prd.rst
+index 96c168c4c..f5e029962 100644
+--- a/doc/gpumd-replica/input_parameters/multi_replica_prd.rst
++++ b/doc/gpumd-replica/input_parameters/multi_replica_prd.rst
+@@ -47,6 +47,7 @@ Caveats
+ 
+ * Choose the basin threshold, dephasing, and correlation times for the system of interest.
+   The displacement test does not align translations, rotations, or atom permutations.
+-* A detected escape triggers step-by-step block replay; simultaneous escapes select the lowest replica index.
+-  An escape followed by a return before a block-end check can be missed. Use ``event 1`` to check every step.
++* Escapes are detected only at block ends, for every replica alike: an escape followed by a return within a block is not an event.
++  Simultaneous escapes select the lowest replica index, and the physical clock has a resolution of ``event`` steps.
++  Use ``event 1`` to check every step; a larger interval saves quenches and should be much shorter than the mean escape time.
+ * ``run`` counts correlation and parallel MD steps, not accelerated physical time; see :ref:`replica_kw_run`.
+diff --git a/doc/gpumd-replica/input_parameters/run.rst b/doc/gpumd-replica/input_parameters/run.rst
+index c3ced8e5f..e9ec3cf45 100644
+--- a/doc/gpumd-replica/input_parameters/run.rst
++++ b/doc/gpumd-replica/input_parameters/run.rst
+@@ -15,7 +15,7 @@ Syntax
+ The step count must be positive. This command must appear once, at the end of ``run.in``.
+ 
+ * REMD: production steps per replica, excluding initial equilibration.
+-* PRD: correlation and parallel MD steps, excluding dephasing, minimization, and extra replay work.
++* PRD: correlation and parallel MD steps, excluding dephasing and minimization.
+ * Resume: additional steps beyond the saved state.
+ 
+ Example
+diff --git a/doc/gpumd-replica/output_files/prd_events.rst b/doc/gpumd-replica/output_files/prd_events.rst
+index 86f1f6bc8..c17ba4887 100644
+--- a/doc/gpumd-replica/output_files/prd_events.rst
++++ b/doc/gpumd-replica/output_files/prd_events.rst
+@@ -15,10 +15,12 @@ One row is written per accepted transition, with columns::
+ * ``correlated``: 1 during correlation, 0 during parallel dynamics.
+ * ``coincident``: number of replicas escaping at the selected step.
+ * ``replica``: selected replica index, starting at zero.
+-* ``search_steps``: steps searched within the current block up to the event.
++* ``search_steps``: length of the block in which the escape was detected.
+ * ``max_displacement_A``: maximum displacement from the previous quenched basin, in Angstrom.
+ * The final three columns give the selected quenched configuration's total potential energy (eV), largest absolute force component among the :math:`3N` force components (eV/Angstrom), and minimization steps.
+ 
+-For R replicas, a parallel block of s steps adds R*s clock steps if there is no escape, or R*(s-1)+r+1 if replica r escapes at step s.
+-The escape increment follows the discrete-time ParRep formula in [Aristoff2014]_, with the one-based replica index K=r+1.
++Escapes are tested on the quenched state at the end of each block of s steps (s = ``event`` interval).
++For R replicas, a parallel block adds R*s clock steps if there is no escape, or s*(r+1) if the lowest escaped replica index is r.
++This is the discrete-time ParRep formula in [Aristoff2014]_ for the chain observed every s steps, with the one-based replica index K=r+1.
++With ``event 1`` the clock is step-resolved.
+ Correlation adds one clock step per MD step; dephasing adds none.
+diff --git a/src/main_replica/replica_prd.cu b/src/main_replica/replica_prd.cu
+index 79631cd01..82bcf8287 100644
+--- a/src/main_replica/replica_prd.cu
++++ b/src/main_replica/replica_prd.cu
+@@ -332,7 +332,6 @@ struct PRD_Slot_Data {
+     : device_id(slot.device_id)
+     , hot(slot.device_id, slot.atom.number_of_atoms, true)
+     , dephase_start(slot.device_id, slot.atom.number_of_atoms, true)
+-    , block_start(slot.device_id, slot.atom.number_of_atoms, true)
+     , basin(slot.device_id, slot.atom.number_of_atoms, false)
+     , minimizer(slot.atom.number_of_atoms, quench_steps, force_tolerance)
+     , maximum_displacement_squared(1)
+@@ -345,12 +344,10 @@ struct PRD_Slot_Data {
+   int device_id;
+   Replica_State hot;
+   Replica_State dephase_start;
+-  Replica_State block_start;
+   Replica_State basin;
+   Minimizer_FIRE minimizer;
+   GPU_Vector<double> maximum_displacement_squared;
+   GPU_Pinned_Vector<double> host_maximum_displacement_squared;
+-  BDP_RNG_State block_rng_state;
+   Minimization_Result quench_result;
+   double maximum_displacement = 0.0;
+ };
+@@ -432,11 +429,8 @@ private:
+   void close_output();
+   long long global_dynamics_step() const;
+   std::vector<int> all_replicas() const;
+-  Ensemble_BDP& bdp(int replica_id);
+   void save_hot(const std::vector<int>& replica_ids);
+   void restore_hot(const std::vector<int>& replica_ids);
+-  void save_block_start(const std::vector<int>& replica_ids);
+-  void restore_block_start(const std::vector<int>& replica_ids);
+   void quench(const std::vector<int>& replica_ids);
+   std::vector<int> detect_events(
+     const std::vector<int>& replica_ids);
+@@ -504,12 +498,6 @@ std::vector<int> PRD_Driver::all_replicas() const
+   return replica_ids;
+ }
+ 
+-Ensemble_BDP& PRD_Driver::bdp(const int replica_id)
+-{
+-  Replica_Slot& slot = *runtime_.slots()[replica_id];
+-  return *slot.thermostat;
+-}
+-
+ void PRD_Driver::validate_input()
+ {
+   if (number_of_steps_ <= 0)
+@@ -762,29 +750,6 @@ void PRD_Driver::restore_hot(const std::vector<int>& replica_ids)
+   runtime_.compute_forces_selected(replica_ids);
+ }
+ 
+-void PRD_Driver::save_block_start(
+-  const std::vector<int>& replica_ids)
+-{
+-  for (const int replica_id : replica_ids) {
+-    Replica_Slot& slot = *runtime_.slots()[replica_id];
+-    PRD_Slot_Data& data = *slot_data_[replica_id];
+-    data.block_start.save(slot);
+-    data.block_rng_state = bdp(replica_id).get_rng_state();
+-  }
+-}
+-
+-void PRD_Driver::restore_block_start(
+-  const std::vector<int>& replica_ids)
+-{
+-  for (const int replica_id : replica_ids) {
+-    Replica_Slot& slot = *runtime_.slots()[replica_id];
+-    PRD_Slot_Data& data = *slot_data_[replica_id];
+-    data.block_start.restore(slot);
+-    bdp(replica_id).set_rng_state(data.block_rng_state);
+-  }
+-  runtime_.compute_forces_selected(replica_ids);
+-}
+-
+ void PRD_Driver::quench(const std::vector<int>& replica_ids)
+ {
+   std::vector<std::thread> threads;
+@@ -1007,11 +972,16 @@ Search_Result PRD_Driver::search_block(
+   if (replica_ids.empty() || maximum_steps <= 0)
+     PRINT_INPUT_ERROR("Invalid PRD event-search block.");
+ 
+-  save_block_start(replica_ids);
++  // Discrete-time ParRep on the chain observed at block ends (Aristoff,
++  // Lelievre, Simpson 2014 with time step = block length). Every replica uses
++  // the same stopping rule: it has escaped if its quenched block-end state is
++  // outside the basin. Excursions that return within a block are ignored for
++  // all replicas alike, so no replay is needed. Use event_interval 1 for
++  // step-resolved escapes.
+   runtime_.advance_selected(replica_ids, maximum_steps);
+   save_hot(replica_ids);
+   quench(replica_ids);
+-  std::vector<int> candidates = detect_events(replica_ids);
++  const std::vector<int> candidates = detect_events(replica_ids);
+ 
+   Search_Result result;
+   result.steps = maximum_steps;
+@@ -1020,32 +990,13 @@ Search_Result PRD_Driver::search_block(
+     return result;
+   }
+ 
+-  // Once an event is present at a check point, replay the block to locate its
+-  // first detected step. Exits that return before the check point are below
+-  // the configured event_interval resolution.
+-  restore_block_start(replica_ids);
+-  for (int step = 0; step < maximum_steps; ++step) {
+-    runtime_.advance_selected(replica_ids, 1);
+-    save_hot(replica_ids);
+-    quench(replica_ids);
+-    const std::vector<int> events = detect_events(replica_ids);
+-    if (!events.empty()) {
+-      result.event = true;
+-      // Discrete-time ParRep serializes each MD step in replica-ID order.
+-      // The winner and accelerated clock must use the same ordering.
+-      result.winner = *std::min_element(events.begin(), events.end());
+-      result.steps = step + 1;
+-      result.coincident = static_cast<int>(events.size());
+-      result.maximum_displacement =
+-        slot_data_[result.winner]->maximum_displacement;
+-      result.quench = slot_data_[result.winner]->quench_result;
+-      return result;
+-    }
+-    restore_hot(replica_ids);
+-  }
+-
+-  PRINT_INPUT_ERROR(
+-    "PRD event replay did not reproduce the block-end event.");
++  // Serialize the block in replica-ID order: the lowest escaped index wins.
++  result.event = true;
++  result.winner = *std::min_element(candidates.begin(), candidates.end());
++  result.coincident = static_cast<int>(candidates.size());
++  result.maximum_displacement =
++    slot_data_[result.winner]->maximum_displacement;
++  result.quench = slot_data_[result.winner]->quench_result;
+   return result;
+ }
+ 
+@@ -1598,9 +1549,11 @@ void PRD_Driver::run()
+         continue;
+ 
+       // Count complete rounds plus the successful replica's position in the
+-      // last round: N * (tau - 1) + K, with K numbered from 1.
+-      // See Aristoff, Lelievre, Simpson (2014), arXiv:1401.4500.
+-      clock_ -= config_.replicas - (result.winner + 1);
++      // last round, in units of the block length s: s * (N * (tau - 1) + K),
++      // with K numbered from 1. See Aristoff, Lelievre, Simpson (2014),
++      // arXiv:1401.4500. The block-end chain makes the step equal to s.
++      clock_ -= static_cast<long long>(result.steps) *
++                (config_.replicas - (result.winner + 1));
+ 
+       accept_event(result, false);
+       phase_ = PRD_Phase::correlation;
+diff --git a/tests_regression/replica/test_replica.py b/tests_regression/replica/test_replica.py
+index 0a286bf4b..a2dc14bef 100644
+--- a/tests_regression/replica/test_replica.py
++++ b/tests_regression/replica/test_replica.py
+@@ -160,15 +160,20 @@ def test_prd_initial_exits_are_counted_without_acceleration(self):
+             directory, "prd", 2, self.prd_options(correlation=5, distance=1e-8),
+             coupling=1e20,
+         )
++        # The two-step correlation block (interval 4) is checked once, at its end:
++        # one event, counted serially (clock 2, not accelerated by the 3 replicas).
+         rows = events(directory)
+-        self.assertEqual(len(rows), 2)
+-        self.assertEqual([int(row[1]) for row in rows], [1, 2])
++        self.assertEqual(len(rows), 1)
++        self.assertEqual([int(row[1]) for row in rows], [2])
+         self.assertTrue(all(row[4] == "1" and row[6] == "0" for row in rows))
+         self.assertEqual(metadata(directory, "prd")["correlation_quiet_steps"], "0")
+ 
+     def test_prd_clock_and_coincident_exit_order(self):
+         # All tests exit at step 2 or later, so both complete rounds and the
+         # winner's position in the final round contribute to the clock.
++        # Increments are for step-resolved checks (interval 1). With interval 4
++        # the two-step run is a single block of s = 2 steps that is checked only
++        # at its end, so an exit adds s * (winner + 1) and no exit adds 3 * s.
+         cases = [
+             ("middle", [0.06, 0.1, 0.06], 1, 1, 5),
+             ("last", [0.06, 0.06, 0.1], 2, 1, 6),
+@@ -195,6 +200,8 @@ def test_prd_clock_and_coincident_exit_order(self):
+                             for atom, velocity in zip(reference, velocities)
+                         ]) + "\n")
+                     self.run_md(directory, "prd", 2, options, resume=True, coupling=1e20)
++                    if interval > 1:
++                        increment = 2 * (3 if winner is None else winner + 1)
+                     self.assertEqual(int(metadata(directory, "prd")["clock"]),
+                                      clock_before + increment)
+                     rows = events(directory)

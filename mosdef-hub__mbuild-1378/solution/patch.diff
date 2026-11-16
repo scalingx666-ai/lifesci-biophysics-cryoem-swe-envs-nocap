@@ -1,0 +1,1993 @@
+diff --git a/environment.yml b/environment.yml
+index 52649fcf4..340ce9709 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -6,8 +6,8 @@ dependencies:
+   - numpy>=2.0,<2.6
+   - packmol>=20.15
+   - cgsmiles>=1.0.2
+-  - gmso>=0.16.2
+-  - garnett
++  - gmso>=0.17
++  - garnett>=0.7.1
+   - numba
+   - parmed>=3.4.3
+   - pycifrw
+diff --git a/mbuild/coarse_graining/backmap.py b/mbuild/coarse_graining/backmap.py
+index 0090918ab..d7e334dec 100644
+--- a/mbuild/coarse_graining/backmap.py
++++ b/mbuild/coarse_graining/backmap.py
+@@ -23,7 +23,7 @@
+ 
+ from .convert import _sorted_components, to_cgsmiles_graph
+ from .fragments import compound_to_fragment_graph
+-from .placement import generate_positions
++from .placement import generate_positions, minimum_image
+ 
+ __all__ = ["resolve", "backmap"]
+ 
+@@ -218,6 +218,7 @@ def backmap(
+     seed=42,
+     check_bonding=True,
+     all_atom=None,
++    box=None,
+ ):
+     """Backmap a coarse-grained system to an atomistic mbuild Compound.
+ 
+@@ -295,6 +296,12 @@ def backmap(
+         of the returned Compound is then a finer bead rather than an
+         atom. Every fragment then needs a template to supply its local
+         geometry, since there is no atomistic detail to embed.
++    box : mbuild.Box or array-like of shape (3,), optional
++        Periodic box of the CG system (orthorhombic). Defaults to
++        ``system.box`` for a ``Compound``; a ``Path`` has no box, so
++        pass one. Fragments stay centered on their (wrapped) beads and
++        are oriented toward bonded beads using the minimum image, so
++        bonds may cross the periodic boundary.
+ 
+     Returns
+     -------
+@@ -353,6 +360,13 @@ def backmap(
+     )
+ 
+     bead_positions = nx.get_node_attributes(cg_graph, "position")
++    if box is None and isinstance(system, Compound):
++        box = system.box
++    box_lengths = None
++    if box is not None:
++        if hasattr(box, "angles") and not np.allclose(box.angles, 90.0):
++            raise ValueError("backmap only supports orthorhombic boxes.")
++        box_lengths = np.asarray(getattr(box, "lengths", box), dtype=float)
+ 
+     # Anchor of each atom: mean position of the bead it descends from
+     anchors = {}
+@@ -363,7 +377,9 @@ def backmap(
+                 f"Atom {node} does not trace back to any CG bead; "
+                 "cannot assign a position."
+             )
+-        anchors[node] = np.mean([bead_positions[b] for b in beads], axis=0)
++        first = np.asarray(bead_positions[beads[0]], dtype=float)
++        offsets = [minimum_image(bead_positions[b] - first, box_lengths) for b in beads]
++        anchors[node] = first + np.mean(offsets, axis=0)
+ 
+     positions = generate_positions(
+         molecule=molecule,
+@@ -373,6 +389,7 @@ def backmap(
+         templates=templates,
+         seed=seed,
+         all_atom=all_atom,
++        box_lengths=box_lengths,
+     )
+ 
+     return _molecule_to_compound(cg_graph, molecule, node_to_beads, positions)
+@@ -395,7 +412,10 @@ def _molecule_to_compound(cg_graph, molecule, node_to_beads, positions):
+     for node in sorted(cg_graph.nodes):
+         bead_compounds[node] = Compound(name=cg_graph.nodes[node]["beadname"])
+ 
++    # Collect children per parent and add each list in one call; adding one
++    # at a time recomposes the parent's bond graph on every call.
+     particles = {}
++    bead_particles = {node: [] for node in bead_compounds}
+     for node, data in molecule.nodes(data=True):
+         symbol = data.get("element")
+         try:
+@@ -412,22 +432,34 @@ def _molecule_to_compound(cg_graph, molecule, node_to_beads, positions):
+             charge=data.get("charge", 0) or None,
+         )
+         particles[node] = particle
+-        bead_compounds[node_to_beads[node][0]].add(particle)
++        bead_particles[node_to_beads[node][0]].append(particle)
++
++    for bead_index, children in bead_particles.items():
++        if children:
++            bead_compounds[bead_index].add(children)
+ 
+     components = _sorted_components(cg_graph)
+     if len(components) == 1:
+-        for bead_index in sorted(bead_compounds):
+-            bead_compound = bead_compounds[bead_index]
+-            if bead_compound.children:
+-                root.add(bead_compound)
++        root.add(
++            [
++                bead_compounds[bead_index]
++                for bead_index in sorted(bead_compounds)
++                if bead_particles[bead_index]
++            ]
++        )
+     else:
++        molecules = []
+         for component in components:
+             molecule_compound = Compound(name="Molecule")
+-            for bead_index in component:
+-                bead_compound = bead_compounds[bead_index]
+-                if bead_compound.children:
+-                    molecule_compound.add(bead_compound)
+-            root.add(molecule_compound, label="Molecule[$]")
++            molecule_compound.add(
++                [
++                    bead_compounds[bead_index]
++                    for bead_index in component
++                    if bead_particles[bead_index]
++                ]
++            )
++            molecules.append(molecule_compound)
++        root.add(molecules, label=["Molecule[$]"] * len(molecules))
+ 
+     for u, v, data in molecule.edges(data=True):
+         root.add_bond((particles[u], particles[v]), bond_order=float(data["order"]))
+diff --git a/mbuild/coarse_graining/placement.py b/mbuild/coarse_graining/placement.py
+index c3186cfa3..34fd31259 100644
+--- a/mbuild/coarse_graining/placement.py
++++ b/mbuild/coarse_graining/placement.py
+@@ -24,6 +24,7 @@ def generate_positions(
+     templates,
+     seed,
+     all_atom=True,
++    box_lengths=None,
+ ):
+     """Compute a position for every atom in the resolved molecule.
+ 
+@@ -36,6 +37,10 @@ def generate_positions(
+     With ``all_atom=False`` the resolved nodes are finer coarse-grained
+     beads rather than atoms. Local geometry then comes only from
+     templates; a fragment without one raises ``ValueError``.
++
++    With ``box_lengths`` (orthorhombic), the directions toward
++    neighboring beads use the minimum image, so fragments bonded across
++    a periodic boundary point through it rather than across the box.
+     """
+     # Group atoms by primary bead
+     bead_to_atoms = {}
+@@ -88,7 +93,7 @@ def generate_positions(
+                 if neighbor in atom_set:
+                     continue
+                 source = local_xyz[rel_index[node]]
+-                target = anchors[neighbor] - group_anchor
++                target = minimum_image(anchors[neighbor] - group_anchor, box_lengths)
+                 source_norm = np.linalg.norm(source)
+                 target_norm = np.linalg.norm(target)
+                 if source_norm > 1e-8 and target_norm > 1e-8:
+@@ -103,6 +108,13 @@ def generate_positions(
+     return positions
+ 
+ 
++def minimum_image(vector, box_lengths):
++    """Return ``vector`` under the minimum image, or unchanged without a box."""
++    if box_lengths is None:
++        return vector
++    return vector - np.round(vector / box_lengths) * box_lengths
++
++
+ def _embedded_fragment_coords(molecule, atoms, rel_index, embed_cache, seed):
+     """Local fragment coordinates from a cached RDKit embedding.
+ 
+diff --git a/mbuild/path/bias.py b/mbuild/path/bias.py
+index 8e291d5c8..4acbed4e5 100644
+--- a/mbuild/path/bias.py
++++ b/mbuild/path/bias.py
+@@ -26,20 +26,29 @@ def __init__(self, weight):
+                 "weight should be larger than 0 and smaller than or equal to 1."
+             )
+         self.weight = weight
++        self.beta, self.noise_scale = self._score_params(weight)
++
++    @staticmethod
++    def _score_params(weight):
++        """Map a bias weight onto (beta, noise_scale) used to score candidates."""
+         # Large beta diminishes the effect of noise
+-        self.beta = self.weight / max(1e-6, (1.0 - self.weight))
+-        self.noise_scale = 1 - self.weight
++        return weight / max(1e-6, (1.0 - weight)), 1.0 - weight
+ 
+-    def _score(self, signal):
++    def _score(self, signal, weight=None):
+         """Score candidates by their signal plus noise scaled to the signal's spread.
+ 
++        Scores use `self.weight` unless `weight` overrides it for this step.
+         A flat signal is ordered by noise alone.
+         """
++        if weight is None:
++            beta, noise_scale = self.beta, self.noise_scale
++        else:
++            beta, noise_scale = self._score_params(weight)
+         spread = np.std(signal)
+         if spread == 0:
+             spread = 1.0
+-        noise = self.rng.normal(0.0, self.noise_scale * spread, size=signal.shape)
+-        return self.beta * signal + noise
++        noise = self.rng.normal(0.0, noise_scale * spread, size=signal.shape)
++        return beta * signal + noise
+ 
+     def _attach_path(self, path, state):
+         """Create access Path and RandomWalkState used by hard_sphere_random_walk."""
+@@ -64,12 +73,147 @@ def __call__(self, candidates, coordinates, names):
+ 
+ 
+ class TargetCoordinate(Bias):
+-    """Bias next-moves so that ones moving closer to a target coordinate are more likely to be accepted."""
++    """Bias next-moves so that ones moving closer to a target coordinate are more likely to be accepted.
++
++    Applies a fixed `weight` at every step unless `capture_radius` is set, in
++    which case the weight at a distance `d` from the target is::
++
++        r = clip((capture_radius - d) / (capture_radius - termination_radius), 0, 1)
++        weight_eff = weight + (1 - weight) * r ** adapt_sharpness
+ 
+-    def __init__(self, target_coordinate, weight):
++    Parameters
++    ----------
++    target_coordinate : array-like (3,), required
++        The target coordinate in units of nm.
++    weight : float, required
++        Bias weight in (0, 1]. Applied at every step when `capture_radius` is
++        None, otherwise while outside `capture_radius`.
++    capture_radius : float or "auto", optional, default=None
++        Distance (nm) at which the weight begins ramping up. "auto" resolves to
++        10 * bond_length when the bias is attached to a walk. Must be larger
++        than `termination_radius`.
++    termination_radius : float, optional, default=None
++        Distance (nm) at which the weight reaches 1. Required when
++        `capture_radius` is given, unless `terminator` supplies it.
++    terminator : mbuild.path.termination.WithinCoordinate, optional, default=None
++        Takes `termination_radius` from `terminator.distance` and validates
++        `terminator.target_coordinate` against `target_coordinate`. Mutually
++        exclusive with `termination_radius`.
++    adapt_sharpness : float, optional, default=1.0
++        Ramp exponent. 1.0 ramps linearly, > 1.0 ramps later and more sharply,
++        < 1.0 ramps earlier and more gradually.
++
++    Attributes
++    ----------
++    last_r : float or None
++        Ramp fraction in [0, 1] used on the most recent step.
++    last_weight : float or None
++        Weight used on the most recent step.
++    """
++
++    def __init__(
++        self,
++        target_coordinate,
++        weight,
++        capture_radius=None,
++        termination_radius=None,
++        terminator=None,
++        adapt_sharpness=1.0,
++    ):
+         self.target_coordinate = np.asarray(target_coordinate)
++        self.last_r = None
++        self.last_weight = None
+         super(TargetCoordinate, self).__init__(weight=weight)
+ 
++        if terminator is not None:
++            if termination_radius is not None:
++                raise ValueError(
++                    "Pass only one of `termination_radius` and `terminator`; "
++                    "`terminator.distance` is used as the termination radius."
++                )
++            if not np.allclose(terminator.target_coordinate, self.target_coordinate):
++                raise ValueError(
++                    "`terminator.target_coordinate` "
++                    f"{np.asarray(terminator.target_coordinate)} does not match "
++                    f"`target_coordinate` {self.target_coordinate}."
++                )
++            termination_radius = terminator.distance
++
++        self.capture_radius = capture_radius
++        self.termination_radius = termination_radius
++        self.adapt_sharpness = adapt_sharpness
++        # Resolved in _attach_path; equals capture_radius unless it is "auto".
++        self._capture_radius = (
++            None if isinstance(capture_radius, str) else capture_radius
++        )
++
++        if capture_radius is None:
++            if termination_radius is not None:
++                raise ValueError(
++                    "`termination_radius`/`terminator` are only used when "
++                    "`capture_radius` is set."
++                )
++            return
++
++        if isinstance(capture_radius, str):
++            if capture_radius != "auto":
++                raise ValueError(
++                    f"Unsupported {capture_radius=}; pass a float or 'auto'."
++                )
++        elif capture_radius <= 0:
++            raise ValueError("`capture_radius` should be larger than 0.")
++
++        if termination_radius is None:
++            raise ValueError(
++                "`capture_radius` requires `termination_radius` or `terminator` "
++                "to define the end of the weight ramp."
++            )
++        if termination_radius < 0:
++            raise ValueError("`termination_radius` should not be negative.")
++        if adapt_sharpness <= 0:
++            raise ValueError("`adapt_sharpness` should be larger than 0.")
++        if not isinstance(capture_radius, str):
++            self._validate_radii(capture_radius)
++
++    def _validate_radii(self, capture_radius):
++        if capture_radius <= self.termination_radius:
++            raise ValueError(
++                f"{capture_radius=} should be larger than "
++                f"termination_radius={self.termination_radius}."
++            )
++
++    def _attach_path(self, path, state):
++        """Create access Path and RandomWalkState used by hard_sphere_random_walk."""
++        super(TargetCoordinate, self)._attach_path(path, state)
++        if self.capture_radius == "auto":
++            self._capture_radius = 10.0 * state.bond_length
++            if self._capture_radius <= self.termination_radius:
++                raise ValueError(
++                    f"capture_radius='auto' resolves to 10 * bond_length = "
++                    f"{self._capture_radius:.3g}, which is not larger than "
++                    f"termination_radius={self.termination_radius}. "
++                    "Pass a float for `capture_radius` instead."
++                )
++
++    def _adaptive_weight(self, current_coordinate):
++        """Return the weight for this step, ramped by distance to the target."""
++        if getattr(self, "state", None) is None:
++            distance = np.linalg.norm(self.target_coordinate - current_coordinate)
++        else:
++            sq_distance = self._target_sq_distances(
++                self.target_coordinate,
++                np.asarray(current_coordinate).reshape(1, 3),
++                self.state.pbc,
++                self.state.box_lengths,
++            )
++            distance = np.sqrt(sq_distance[0])
++        span = max(self._capture_radius - self.termination_radius, 1e-12)
++        r = float(np.clip((self._capture_radius - distance) / span, 0.0, 1.0))
++        weight = self.weight + (1.0 - self.weight) * (r**self.adapt_sharpness)
++        self.last_r = r
++        self.last_weight = weight
++        return weight
++
+     def __call__(self, candidates, coordinates, names):
+         """Sorts a set of candidate coordinates according to the bias.
+ 
+@@ -87,13 +231,17 @@ def __call__(self, candidates, coordinates, names):
+         candidates : np.ndarray (N,3)
+             Returns the original candidate array, sorted according to the bias.
+         """
++        if self.capture_radius is None:
++            weight = None
++        else:
++            weight = self._adaptive_weight(coordinates[-1])
+         sq_distances = self._target_sq_distances(
+             self.target_coordinate,
+             candidates,
+             self.state.pbc,
+             self.state.box_lengths,
+         )
+-        scores = self._score(sq_distances)
++        scores = self._score(sq_distances, weight=weight)
+         # Target coordinate should favor short distances, sort in ascending order (np default)
+         sort_idx = np.argsort(scores)
+         return candidates[sort_idx]
+diff --git a/mbuild/path/build.py b/mbuild/path/build.py
+index 43e2ac0e2..24fe8890b 100644
+--- a/mbuild/path/build.py
++++ b/mbuild/path/build.py
+@@ -27,6 +27,7 @@
+     generate_trials,
+     get_initial_point,
+     get_second_point,
++    nearest_image,
+ )
+ from mbuild.path.termination import NumSites, Termination, Terminator
+ from mbuild.utils.io import import_
+@@ -229,26 +230,34 @@ def _extend_beads(self, bead_name):
+         self.beads = np.concatenate((self.beads, [bead_name] * diff))
+ 
+     # TODO: Can we accept negative attach indices?
+-    def _connect_edges(self, connectivity, indices=None, attach_index=-1):
+-        """Adds edges to self.bond_graph matching a given style `connectivity`."""
++    def _connect_edges(
++        self, connectivity, indices=None, attach_index=-1, pbc=None, box_lengths=None
++    ):
++        """Adds edges to self.bond_graph matching a given style `connectivity`.
++
++        ``pbc`` and ``box_lengths`` are passed to ``add_edge``.
++        """
+         if indices is None:
+             indices = np.arange(0, len(self.coordinates))
+ 
++        def add_edge(u, v):
++            self.add_edge(u, v, pbc=pbc, box_lengths=box_lengths)
++
+         if connectivity == "disconnected":
+             return
+         elif connectivity == "linear":
+             for idx1, idx in zip(indices, indices[1:]):
+-                self.add_edge(idx1, idx)
++                add_edge(idx1, idx)
+         elif connectivity == "link-linear":
+             for idx1, idx in zip(indices, indices[1:]):
+-                self.add_edge(idx1, idx)
++                add_edge(idx1, idx)
+             if attach_index in self.bond_graph.nodes:
+                 # link to previous node
+-                self.add_edge(attach_index, indices[0])
++                add_edge(attach_index, indices[0])
+         elif connectivity == "cycle":
+             for idx1, idx in zip(indices, indices[1:]):
+-                self.add_edge(idx1, idx)
+-            self.add_edge(indices[0], indices[-1])
++                add_edge(idx1, idx)
++            add_edge(indices[0], indices[-1])
+         else:
+             raise ValueError(
+                 f"Argument {connectivity=} is incorrect. Pass one of `linear`, `link-linear`, `cycle`"
+@@ -291,9 +300,33 @@ def form_linear_bond_graph(self, indices=None):
+                 )
+             self.add_edge(idx1, idx)
+ 
+-    def add_edge(self, u, v):
+-        """Add an edge to the Path's bond graph."""
+-        bond_vec = self.coordinates[v] - self.coordinates[u]
++    def add_edge(self, u, v, pbc=None, box_lengths=None):
++        """Add an edge to the Path's bond graph.
++
++        The edge stores the bond ``length`` and unit ``direction`` from site
++        ``u`` to site ``v``.
++
++        Parameters
++        ----------
++        u, v : int
++            Indices of the two sites to bond.
++        pbc : array-like of bool, shape (3,), optional
++            Periodic axes. Walks in a periodic volume store coordinates wrapped
++            into the box, so a bond across a face spans the box in raw
++            coordinates. When ``pbc`` and ``box_lengths`` are given, the length
++            and direction use the minimum-image convention on periodic axes.
++        box_lengths : array-like of float, shape (3,), optional
++            Box lengths used with ``pbc``.
++        """
++        pos_v = self.coordinates[v]
++        if pbc is not None and box_lengths is not None:
++            pos_v = nearest_image(
++                self.coordinates[u],
++                pos_v,
++                np.asarray(pbc, dtype=np.bool_),
++                np.asarray(box_lengths, dtype=np.float64),
++            )
++        bond_vec = pos_v - self.coordinates[u]
+         bond_length = np.linalg.norm(bond_vec)
+         bond_vec /= bond_length
+         self.bond_graph.add_edge(
+@@ -1426,9 +1459,11 @@ def hard_sphere_random_walk(
+     walk_finished = False
+     while not walk_finished:
+         batch_angles, batch_vectors = generate_trials(state)
++        pos1 = coordinates[state.count - 1]
++        pos2 = nearest_image(pos1, coordinates[state.count - 2], pbc, box_lengths)
+         candidates = next_step(
+-            pos1=coordinates[state.count - 1],
+-            pos2=coordinates[state.count - 2],
++            pos1=pos1,
++            pos2=pos2,
+             bond_length=bond_length,
+             thetas=batch_angles,
+             r_vectors=batch_vectors,
+@@ -1751,6 +1786,8 @@ def check_termination(self, path, coordinates, beads):
+                 self.connectivity,
+                 np.arange(self.previous_count, self.count),
+                 self.attach_index,
++                pbc=self.pbc,
++                box_lengths=self.box_lengths,
+             )
+             return True
+         return False
+diff --git a/mbuild/path/path_utils.py b/mbuild/path/path_utils.py
+index a9ed1be4d..2ca02e2c1 100644
+--- a/mbuild/path/path_utils.py
++++ b/mbuild/path/path_utils.py
+@@ -303,9 +303,26 @@ def find_candidates_within_radius(
+     return within_radius
+ 
+ 
++# The warning below reports whole percent, so a smaller rejected weight is noise.
++_MIN_REPORTED_FRACTION = 0.005
++
++
++def _choice_weights(angles_sampler):
++    """Return a choice sampler's angles and their normalized weights."""
++    angles = np.asarray(angles_sampler.kwargs["a"], dtype=float)
++    weights = angles_sampler.kwargs.get("p")
++    if weights is None:
++        weights = np.full(angles.shape, 1.0 / angles.size)
++    else:
++        weights = np.asarray(weights, dtype=float)
++        weights = weights / weights.sum()
++    return angles, weights
++
++
+ def _angle_range(angles_sampler):
+     """Return the smallest and largest angle a sampler can produce.
+ 
++    Angles a weighted choice sampler assigns zero probability are left out.
+     Returns None for distributions with unbounded support.
+     """
+     if angles_sampler.distribution == "uniform":
+@@ -314,8 +331,11 @@ def _angle_range(angles_sampler):
+             float(angles_sampler.kwargs["high"]),
+         )
+     if angles_sampler.distribution == "choice":
+-        angles = np.asarray(angles_sampler.kwargs["a"], dtype=float)
+-        return float(angles.min()), float(angles.max())
++        angles, weights = _choice_weights(angles_sampler)
++        sampled = angles[weights > 0]
++        if sampled.size == 0:
++            return None
++        return float(sampled.min()), float(sampled.max())
+     return None
+ 
+ 
+@@ -356,8 +376,10 @@ def check_angle_range(bond_length, radius, angles_sampler):
+         if angles_sampler.distribution == "uniform":
+             fraction = (critical_angle - low) / (high - low)
+         else:
+-            angles = np.asarray(angles_sampler.kwargs["a"], dtype=float)
+-            fraction = float(np.mean(angles < critical_angle))
++            angles, weights = _choice_weights(angles_sampler)
++            fraction = float(weights[angles < critical_angle].sum())
++        if fraction < _MIN_REPORTED_FRACTION:
++            return
+         logger.warning(
+             f"With {bond_length=} and {radius=}, bond angles below "
+             f"{np.degrees(critical_angle):.1f} degrees overlap the site two "
+diff --git a/mbuild/path/points.py b/mbuild/path/points.py
+index 63e2d4704..46fe8fdc3 100644
+--- a/mbuild/path/points.py
++++ b/mbuild/path/points.py
+@@ -3,7 +3,6 @@
+ import numpy as np
+ 
+ from mbuild.exceptions import PathConvergenceError
+-from mbuild.path.constraints import CuboidConstraint, CylinderConstraint
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -48,16 +47,21 @@ def get_second_point(state, existing_points, beads, check_path, next_step):
+     # Set pos1 and pos2 before checking include compound and combining coordinates
+     if state.connectivity == "link-linear" and state.attach_index >= 0:
+         pos1 = existing_points[-1]
+-        pos2 = existing_points[state.attach_index]
++        pos2 = nearest_image(
++            pos1, existing_points[state.attach_index], state.pbc, state.box_lengths
++        )
+     else:
+         pos1 = None
+         pos2 = existing_points[-1]
+-    # Update existing points and beads to include those in the compound.
++    # Include the compound's points. Biases read coordinates[-1] as the chain
++    # tip, so they get the compound first.
++    bias_points, bias_beads = existing_points, beads
+     if state.include_compound:
+         compound_xyz = state.include_compound.xyz
+         compound_names = np.array([p.name for p in state.include_compound.particles()])
++        bias_points = np.concat((compound_xyz, existing_points))
++        bias_beads = np.concat((compound_names, beads))
+         existing_points = np.concat((existing_points, compound_xyz))
+-        beads = np.concat((beads, compound_names))
+ 
+     xyzs = next_step(
+         pos1=pos1,
+@@ -73,7 +77,13 @@ def get_second_point(state, existing_points, beads, check_path, next_step):
+         xyzs = xyzs[is_inside_mask]
+ 
+     if state.bias:
+-        xyzs = state.bias(candidates=xyzs, coordinates=existing_points, names=beads)
++        xyzs = state.bias(candidates=xyzs, coordinates=bias_points, names=bias_beads)
++
++    if any(state.pbc):
++        xyzs = (
++            state.volume_constraint.mins
++            + np.mod(xyzs - state.volume_constraint.mins, state.box_lengths)
++        ).astype(np.float32)
+ 
+     excluded_indices = state.excluded_indices()
+     for xyz in xyzs:
+@@ -82,6 +92,8 @@ def get_second_point(state, existing_points, beads, check_path, next_step):
+             new_point=xyz,
+             radius=state.radius,
+             tolerance=state.tolerance,
++            pbc=state.pbc,
++            box_lengths=state.box_lengths,
+             excluded_indices=excluded_indices,
+         ):
+             return xyz
+@@ -161,6 +173,8 @@ def get_initial_point(state, existing_points, beads, check_path, next_step):
+             new_point=state.initial_point,
+             radius=state.radius,
+             tolerance=state.tolerance,
++            pbc=state.pbc,
++            box_lengths=state.box_lengths,
+             excluded_indices=excluded_indices,
+         ):
+             return state.initial_point
+@@ -202,34 +216,19 @@ def get_initial_point(state, existing_points, beads, check_path, next_step):
+                 candidates=xyzs, coordinates=bias_coords, names=bias_names
+             )
+ 
+-        # Set up PBC info from volume constraints
+-        if isinstance(state.volume_constraint, CuboidConstraint):
+-            pbc = state.volume_constraint.pbc
+-            box_lengths = state.volume_constraint.box_lengths.astype(np.float32)
+-        elif isinstance(state.volume_constraint, CylinderConstraint):
+-            pbc = (False, False, state.volume_constraint.periodic_height)
+-            box_lengths = np.array(
+-                [
+-                    state.volume_constraint.radius * 2,
+-                    state.volume_constraint.radius * 2,
+-                    state.volume_constraint.height,
+-                ]
+-            ).astype(np.float32)
+-        else:
+-            pbc = (None, None, None)
+-            box_lengths = (None, None, None)
+-
+         for i in range(len(xyzs)):
+             xyz = xyzs[i]
+-            if any(pbc):
++            if any(state.pbc):
+                 xyz = state.volume_constraint.mins + np.mod(
+-                    xyz - state.volume_constraint.mins, box_lengths
++                    xyz - state.volume_constraint.mins, state.box_lengths
+                 )
+             if check_path(  # check for overlaps
+                 existing_points=existing_points,
+                 new_point=xyz,
+                 radius=state.radius,
+                 tolerance=state.tolerance,
++                pbc=state.pbc,
++                box_lengths=state.box_lengths,
+                 excluded_indices=excluded_indices,
+             ):
+                 return xyz
+@@ -253,6 +252,8 @@ def get_initial_point(state, existing_points, beads, check_path, next_step):
+                 new_point=xyz,
+                 radius=state.radius,
+                 tolerance=state.tolerance,
++                pbc=state.pbc,
++                box_lengths=state.box_lengths,
+                 excluded_indices=excluded_indices,
+             ):
+                 return xyz
+@@ -276,6 +277,8 @@ def get_initial_point(state, existing_points, beads, check_path, next_step):
+                 new_point=xyz,
+                 radius=state.radius,
+                 tolerance=state.tolerance,
++                pbc=state.pbc,
++                box_lengths=state.box_lengths,
+                 excluded_indices=excluded_indices,
+             ):
+                 return xyz
+@@ -319,13 +322,26 @@ def sample(self, size=None):
+ 
+ 
+ def generate_trials(state):
+-    """Use normal or uniform sampling on angles, uniform sampling on radius."""
++    """Use normal or uniform sampling on angles, isotropic trial vectors."""
+     thetas = state.angles.sample(size=state.trial_batch_size).astype(np.float32)
+-    r = state.rng.uniform(-0.5, 0.5, size=(state.trial_batch_size, 3)).astype(
+-        np.float32
+-    )
++    # Only the direction of r is used; normal sampling is isotropic, giving a
++    # uniform azimuth around the chain direction.
++    r = state.rng.normal(size=(state.trial_batch_size, 3)).astype(np.float32)
+     return thetas, r
+ 
+ 
++def nearest_image(pos1, pos2, pbc, box_lengths):
++    """Return the periodic image of pos2 closest to pos1.
++
++    Stored coordinates are wrapped, but next_step measures the bond angle
++    from pos2 - pos1, so pos2 must sit on the same side of the box as pos1.
++    """
++    if not any(pbc):
++        return pos2
++    delta = pos2 - pos1
++    delta[pbc] -= np.round(delta[pbc] / box_lengths[pbc]) * box_lengths[pbc]
++    return pos1 + delta
++
++
+ def generate_crosslink_init_points():
+     pass
+diff --git a/mbuild/simulation.py b/mbuild/simulation.py
+index 37a9e57bc..a6a61c23f 100644
+--- a/mbuild/simulation.py
++++ b/mbuild/simulation.py
+@@ -1,5 +1,6 @@
+ """Simulation methods that operate on mBuild compounds and paths."""
+ 
++import copy
+ import logging
+ import numbers
+ import os
+@@ -56,6 +57,12 @@ class HoomdSimulation(hoomd.simulation.Simulation):
+     kick : bool, default True
+         Nudge coordinates before simulating. This can be critical to remove
+         flat dihedrals.
++    speedup_by_moltag : bool, default False
++        Passed to ``gmso.parameterization.apply`` when a foyer/gmso forcefield
++        is given. Atom-types only the first molecule of each name and copies
++        its types to the others, assuming same-named molecules have the same
++        atoms in the same order. Name molecules accordingly before setting it,
++        e.g. chains of different length need different names.
+     """
+ 
+     def __init__(
+@@ -70,6 +77,7 @@ def __init__(
+         integrate_compounds=None,
+         fixed_compounds=None,
+         kick=True,
++        speedup_by_moltag=False,
+     ):
+ 
+         if isinstance(integrate_compounds, Compound):
+@@ -99,10 +107,10 @@ def __init__(
+         elif run_on_gpu:
+             try:
+                 device = hoomd.device.GPU()
+-                print(f"GPU found, running on device {device.device}")
++                logger.info(f"GPU found, running on device {device.device}")
+             except RuntimeError:
+-                print(
+-                    "Unable to find compatible GPU device. "
++                logger.warning(
++                    "Unable to find compatible GPU device, running on CPU. "
+                     "Set `run_on_gpu = False` or see HOOMD documentation."
+                 )
+                 device = hoomd.device.CPU()
+@@ -116,32 +124,57 @@ def __init__(
+         self.fixed_compounds = fixed_compounds
+         self.box_buffer = box_buffer
+         self.box = box
++        self.speedup_by_moltag = speedup_by_moltag
+         self.energies = []
+-
+-        self._get_integrate_group()
++        box_has_origin = self._resolve_compound_box()
++        box_lengths = np.asarray(self.compound.box.lengths, dtype=float)
+ 
+         # State and forces are built together, so reuse them only when every
+-        # build input still matches.
++        # build input still matches. A reused snapshot is in the frame it was
++        # built in, so its frame is reused too rather than re-derived. A
++        # box_update resizes the cached snapshot, so it is only reused while
++        # its box still matches the one asked for.
+         last_snapshot, last_forces, last_params = compound._get_sim_data()
+-        if last_snapshot is not None and _same_build(self._build_params(), last_params):
++        reuse = (
++            last_snapshot is not None
++            and _same_build(self._build_params(), last_params)
++            and "frame" in last_params
++            and "orig_force_params" in last_params
++            and np.allclose(last_snapshot.configuration.box[:3], box_lengths)
++        )
++        if reuse:
++            self._centered, self._origin = last_params["frame"]
++        else:
++            self.compound.xyz, self._centered, self._origin = (
++                _normalize_to_box_convention(
++                    self.compound.xyz, box_lengths, has_origin=box_has_origin
++                )
++            )
++        self._frame_offset = self._frame_offset_for(box_lengths)
++        self._get_integrate_group()
++
++        # Cached forces may still carry a previous run's scaling, so their
++        # unscaled params are recorded once, when built, and cached with them.
++        if reuse:
+             snapshot = last_snapshot
+             self.forces = last_forces
++            self._orig_force_params = last_params["orig_force_params"]
+         else:
+             snapshot, self.forces = self._to_hoomd_snap_forces()
++            self._orig_force_params = self._snapshot_force_params()
+             compound._add_sim_data(
+-                state=snapshot, forces=self.forces, build_params=self._build_params()
++                state=snapshot,
++                forces=self.forces,
++                build_params={
++                    **self._build_params(),
++                    "frame": (self._centered, self._origin),
++                    "orig_force_params": self._orig_force_params,
++                },
+             )
+ 
+-        # Undo the translation to -L/2 L/2 used by HOOMD
+-        self._frame_offset = self.compound.xyz.mean(axis=0) - np.asarray(
+-            snapshot.particles.position
+-        ).mean(axis=0)
+-
+         self.active_forces = []
+-        self._orig_force_params = {}
+         super(HoomdSimulation, self).__init__(device=device, seed=seed)
+         self.create_state_from_snapshot(snapshot)
+-        self._orig_force_params = self._snapshot_force_params()
+ 
+     def nvt(
+         self,
+@@ -158,30 +191,30 @@ def nvt(
+         ----------
+         n_steps : int
+             Number of timesteps to run.
+-        kT : float
+-            Thermal energy of the thermostat.
++        kT : float or list of float
++            Thermal energy. A list of two values ramps between them (kT_start, kT_finish).
+         dt : float
+             Timestep size.
+         tau : float
+             Thermostat coupling time constant.
+         forces_handler : ForcesHandler or None, default None
+-            Scales the active forces before the run. If None, all forces are
+-            active at full strength.
++            Scales forces for this run only, relative to their original
++            params; see ForcesHandler. If None, all forces are active at
++            their original strength, whatever earlier runs used.
+         thermostat : hoomd thermostat class
+             Thermostat used by the integration method.
+         """
+         self.original_coords = np.copy(self.compound.xyz)
+-        if forces_handler is not None:
+-            forces_handler.scale_sim(self)
+-        else:
+-            self.active_forces = list(self.forces)
++        self._set_active_forces(forces_handler)
++
++        kT, thermal_kT = _kT_variant(kT, self.timestep, n_steps)
+ 
+         nvt_method = hoomd.md.methods.ConstantVolume(
+             filter=self._get_integrate_group(),
+             thermostat=thermostat(kT=kT, tau=tau),
+         )
+         self.set_integrator(method=nvt_method, dt=dt)
+-        self.state.thermalize_particle_momenta(filter=hoomd.filter.All(), kT=kT)
++        self.state.thermalize_particle_momenta(filter=hoomd.filter.All(), kT=thermal_kT)
+ 
+         if self.energies == []:
+             self.run(0)
+@@ -222,25 +255,16 @@ def box_update(
+         update_period : int
+             Number of timesteps between box resize updates.
+         forces_handler : ForcesHandler or None, default None
+-            Scales the active forces before the run. If None, all forces are
+-            active at full strength.
++            Scales forces for this run only, relative to their original
++            params; see ForcesHandler. If None, all forces are active at
++            their original strength, whatever earlier runs used.
+         thermostat : hoomd thermostat class
+             Thermostat used by the integration method.
+         """
+         self.original_coords = np.copy(self.compound.xyz)
+-        if forces_handler is not None:
+-            forces_handler.scale_sim(self)
+-        else:
+-            self.active_forces = list(self.forces)
++        self._set_active_forces(forces_handler)
+ 
+-        # Set kT ramp if user passed in a [start, finish] array:
+-        if isinstance(kT, (list, tuple, np.ndarray)):
+-            thermal_kT = kT[0]
+-            kT = hoomd.variant.Ramp(
+-                A=kT[0], B=kT[1], t_start=self.timestep, t_ramp=int(n_steps)
+-            )
+-        else:
+-            thermal_kT = kT
++        kT, thermal_kT = _kT_variant(kT, self.timestep, n_steps)
+ 
+         nvt_method = hoomd.md.methods.ConstantVolume(
+             filter=self._get_integrate_group(),
+@@ -263,23 +287,23 @@ def box_update(
+         )
+         self.operations.updaters.append(box_resizer)
+ 
+-        # HOOMD resizes the box about the origin. Track the box lengths so the
+-        # frame offset can be adjusted, keeping the compound's box corner fixed
+-        # when positions are synced back after the resize (see _update_positions).
+-        L_before = np.asarray(self.state.box.L)
+-
+         if self.energies == []:
+             self.run(0)
+             self._store_current_energies()
+ 
+         self.run(n_steps)
+         self.operations.updaters.remove(box_resizer)
+-        L_after = np.asarray(self.state.box.L)
+-        self._frame_offset = self._frame_offset + (L_after - L_before) / 2
++        # HOOMD resizes about the origin, so the offset must be re-derived.
++        self._frame_offset = self._frame_offset_for(np.asarray(self.state.box.L))
+         self._store_current_energies()
+         self.operations.integrator = None
+         self._update_positions()
+         self._update_snapshot()
++        # A resized bounding box still has no origin, so keep it marked.
++        if "bbox_lengths" in self.compound._hoomd_data:
++            self.compound._hoomd_data["bbox_lengths"] = np.asarray(
++                self.compound.box.lengths, dtype=float
++            )
+ 
+     def cap_displacement(
+         self,
+@@ -297,8 +321,9 @@ def cap_displacement(
+         dt : float
+             Timestep size.
+         forces_handler : ForcesHandler or None, default None
+-            Scales the active forces before the run. If None, all forces are
+-            active at full strength.
++            Scales forces for this run only, relative to their original
++            params; see ForcesHandler. If None, all forces are active at
++            their original strength, whatever earlier runs used.
+         max_displacement : float (nm), default 1e-3
+             Maximum distance a particle may move in a single timestep.
+ 
+@@ -311,10 +336,7 @@ def cap_displacement(
+         velocity and run away on stiff potentials.
+         """
+         self.original_coords = np.copy(self.compound.xyz)
+-        if forces_handler is not None:
+-            forces_handler.scale_sim(self)
+-        else:
+-            self.active_forces = list(self.forces)
++        self._set_active_forces(forces_handler)
+ 
+         displacement_capped = hoomd.md.methods.DisplacementCapped(
+             filter=self._get_integrate_group(),
+@@ -355,8 +377,9 @@ def fire(
+         n_steps : int
+             Number of timesteps per minimization iteration.
+         forces_handler : ForcesHandler or None, default None
+-            Scales the active forces before the run. If None, all forces are
+-            active at full strength.
++            Scales forces for this run only, relative to their original
++            params; see ForcesHandler. If None, all forces are active at
++            their original strength, whatever earlier runs used.
+         n_iterations : int, default 1
+             Number of minimization iterations, resetting the integrator between
+             each.
+@@ -383,10 +406,7 @@ def fire(
+             Energy convergence tolerance.
+         """
+         self.original_coords = np.copy(self.compound.xyz)
+-        if forces_handler is not None:
+-            forces_handler.scale_sim(self)
+-        else:
+-            self.active_forces = list(self.forces)
++        self._set_active_forces(forces_handler)
+ 
+         nvt_method = hoomd.md.methods.ConstantVolume(filter=self._get_integrate_group())
+         self._set_fire_integrator(
+@@ -430,7 +450,7 @@ def get_energy(self):
+         integration method (e.g., using ForcesHandler).
+         """
+         if not self.energies:
+-            print(f"No energies currently stored in {self}")
++            logger.info(f"No energies currently stored in {self}")
+             return None
+         returnDict = {}
+         n_frames = len(self.energies)
+@@ -475,8 +495,15 @@ def _build_params(self):
+             "r_cut": self.r_cut,
+         }
+ 
+-    def _to_hoomd_snap_forces(self):
+-        """Convert compound to HOOMD snapshot and forces."""
++    def _resolve_compound_box(self):
++        """Settle self.compound.box from the explicit box, or a bounding box.
++
++        Returns False when the box was made from the bounding box, which has
++        lengths but no origin to place the coordinates against. That box is
++        stored on the compound, so its lengths are remembered and a later
++        simulation of the same compound treats it the same way.
++        """
++        sim_data = self.compound._hoomd_data
+         if self.box is not None:
+             # Explicit box (e.g. a constraint's orthorhombic box_lengths) wins,
+             # so the periodic cell is stable across repeated MC/MD rounds.
+@@ -485,6 +512,31 @@ def _to_hoomd_snap_forces(self):
+             )
+         elif not self.compound.box:
+             self.compound.box = self.compound.get_boundingbox(pad_box=self.box_buffer)
++            sim_data["bbox_lengths"] = np.asarray(
++                self.compound.box.lengths, dtype=float
++            )
++            return False
++        else:
++            bbox_lengths = sim_data.get("bbox_lengths")
++            if bbox_lengths is not None and np.allclose(
++                self.compound.box.lengths, bbox_lengths
++            ):
++                return False
++        # Any other box is a periodic cell with an origin.
++        sim_data.pop("bbox_lengths", None)
++        return True
++
++    def _frame_offset_for(self, box_lengths):
++        """Translation from HOOMD's frame back to the compound's, for a box."""
++        return self._origin + np.where(
++            self._centered, 0.0, np.asarray(box_lengths, dtype=float) / 2.0
++        )
++
++    def _to_hoomd_snap_forces(self):
++        """Convert compound to HOOMD snapshot and forces."""
++        assert self.compound.box is not None, (
++            "box must be resolved before building the snapshot"
++        )
+ 
+         from mbuild.utils.simulation.path_forces import (
+             PathForcefield,
+@@ -503,7 +555,7 @@ def _to_hoomd_snap_forces(self):
+                 if isinstance(self.forcefield, PathForcefield)
+                 else PathForcefield()
+             )
+-            snap, _ = gmso.external.to_gsd_snapshot(top=top)
++            snap, _ = gmso.external.to_gsd_snapshot(top=top, shift_coords=False)
+             forces = generate_ff_from_path(
+                 snap,
+                 radius=pff.radius,
+@@ -519,17 +571,23 @@ def _to_hoomd_snap_forces(self):
+                 top,
+                 forcefields=self.forcefield,
+                 ignore_params=["dihedral", "improper"],
++                speedup_by_moltag=self.speedup_by_moltag,
+             )
+             forces, _ = gmso.external.to_hoomd_forcefield(top, r_cut=self.r_cut)
+-            snap, _ = gmso.external.to_gsd_snapshot(top=top)
++            snap, _ = gmso.external.to_gsd_snapshot(top=top, shift_coords=False)
+             forces = list(set().union(*forces.values()))
+         else:  # No GMSO/Foyer FF given, use the UFF-generated parameters
+             from mbuild.utils.simulation.uff import assign_uff_types, uff_forces
+ 
+             _, order_map = assign_uff_types(top, self.compound)
+-            snap, _ = gmso.external.to_gsd_snapshot(top=top)
++            snap, _ = gmso.external.to_gsd_snapshot(top=top, shift_coords=False)
+             forces = uff_forces(top, snap, order_map, r_cut=self.r_cut)
+ 
++        # gmso is told not to shift, so apply the translation into HOOMD's
++        # frame here, where the offset is known rather than inferred.
++        snap.particles.position = (
++            np.asarray(snap.particles.position) - self._frame_offset
++        ).astype(np.float32)
+         _wrap_into_box(snap)
+         return snap, forces
+ 
+@@ -539,11 +597,27 @@ def _snapshot_force_params(self):
+         for force in self.forces:
+             if not hasattr(force, "params"):
+                 continue
++            # Deep copy so table arrays are not shared with the live force.
+             orig[id(force)] = {
+-                param: dict(force.params[param]) for param in force.params
++                param: copy.deepcopy(dict(force.params[param]))
++                for param in force.params
+             }
+         return orig
+ 
++    def _restore_force_params(self):
++        """Reset every force to its unscaled params, undoing any ForcesHandler."""
++        for force in self.forces:
++            for param, values in self._orig_force_params.get(id(force), {}).items():
++                force.params[param] = copy.deepcopy(values)
++
++    def _set_active_forces(self, forces_handler):
++        """Activate forces for a run, scaled by forces_handler if given."""
++        if forces_handler is not None:
++            forces_handler.scale_sim(self)
++        else:
++            self._restore_force_params()
++            self.active_forces = list(self.forces)
++
+     def _particle_tags(self, compounds, name):
+         """Resolve Compounds or particle indices into a list of HOOMD tags."""
+         if all(isinstance(i, Compound) for i in compounds):
+@@ -996,6 +1070,10 @@ def _record_energies(self):
+ class ForcesHandler:
+     """Provides a quick method for tuning HOOMD forces.
+ 
++    Each ``scale_*`` value multiplies a force's original parameters, the ones
++    it was built with, for the run the handler is passed to. A value of 1 uses
++    the original force and 0 leaves the force out of the run.
++
+     Parameters
+     ----------
+     dpd : float, default 0.0
+@@ -1007,6 +1085,46 @@ class ForcesHandler:
+     scale_opls : float, default 0.0
+     scale_improper : float, default 0.0
+     scale_charge : float, default 0.0
++
++    Notes
++    -----
++    Scaling is never cumulative. Every run starts from the original
++    parameters, so a scale applies only to the run it is passed to:
++
++    - To return to full strength, run without a handler, or pass a scale of 1.
++      Do not pass the inverse of an earlier scale: after ``scale_bond=0.25``,
++      ``scale_bond=4`` gives bonds 4 times their original strength, not 1.
++    - Repeating a run, or creating a new ``HoomdSimulation`` of the same
++      compound, applies the same scale again rather than compounding it.
++
++    ``ForcesHandler()`` is not the same as no handler. The dihedral, improper
++    and charge scales default to 0, so a default handler turns those forces
++    off. Pass 1 explicitly to keep them.
++
++    Each scale applies to every force of these HOOMD types:
++
++    - ``scale_lj``: ``pair.LJ`` and the 1-4 ``special_pair.LJ``. With
++      ``dpd > 0``, DPD replaces both.
++    - ``scale_charge``: the 1-4 ``special_pair.Coulomb``, plus the
++      ``pair.Ewald`` and ``pppm.Coulomb`` halves of long-range electrostatics.
++      Those two have no per-type strength to scale, so any non-zero value
++      runs them at full strength, with a warning unless it is 1.
++    - ``scale_bond``: ``bond.Harmonic`` and ``bond.FENEWCA``. FENE ``k`` and
++      ``epsilon`` are both scaled; ``r0`` is not, so bonds still cannot
++      stretch past it.
++    - ``scale_angle``: ``angle.Harmonic`` and tabulated ``angle.Table``.
++    - ``scale_periodic``: ``dihedral.Periodic`` and tabulated
++      ``dihedral.Table``. Because it defaults to 0, the default handler turns
++      off the dihedral table of a path forcefield.
++    - ``scale_opls``: ``dihedral.OPLS``.
++    - ``scale_improper``: ``improper.Periodic``.
++
++    Forces of any other type are left out of runs that use a handler.
++
++    A path forcefield leaves angle and dihedral partners out of the LJ when a
++    table covers them, so the table is the only force keeping those beads
++    apart. Scaling it down or turning it off lets them overlap, which can be
++    useful during a soft push-off.
+     """
+ 
+     def __init__(
+@@ -1033,40 +1151,75 @@ def __init__(
+         self.forcesDict = {}
+ 
+     def scale_sim(self, sim):
+-        """Iterate through HOOMD force objects and apply scaling factors."""
++        """Reset sim's forces to their original params, then apply the scaling factors.
++
++        Sets ``sim.active_forces`` to the forces this handler keeps.
++        """
++        # Start from unscaled params, including forces this handler turns off,
++        # so every scale below multiplies the original values.
++        sim._restore_force_params()
+         sim.active_forces = []
+-        forcesDict = {
+-            "lj": (hoomd.md.pair.LJ, ("epsilon")),
+-            "charge": (hoomd.md.special_pair.Coulomb, ("alpha")),
+-            "bond": (hoomd.md.bond.Harmonic, ("k")),
+-            "angle": (hoomd.md.angle.Harmonic, ("k")),
+-            "opls": (hoomd.md.dihedral.OPLS, "k1", "k2", "k3", "k4"),
+-            "periodic": (hoomd.md.dihedral.Periodic, ("k")),
+-            "improper": (hoomd.md.improper.Periodic, ("k")),
+-        }
+         for key, scalar in self.scale_forces.items():
+             if not scalar:
+                 continue
+             if key == "lj" and self.dpd:
+                 dpd = sim._get_dpd_from_lj(A=self.dpd)
+                 sim.active_forces.append(dpd)
+-                self.forcesDict["lj"] = sim._get_force(forcesDict["lj"][0])
++                self.forcesDict["lj"] = sim._get_force(hoomd.md.pair.LJ)
+                 self.forcesDict["dpd"] = dpd
++                # DPD stands in for every LJ, including the 1-4 special pairs.
+                 continue
+ 
+-            try:
+-                force = sim._get_force(forcesDict[key][0])
+-            except ValueError:
+-                continue
+-            orig_params = sim._orig_force_params.get(id(force), {})
+-            for param in force.params:
+-                for term in forcesDict[key][1:]:
+-                    if param in orig_params and term in orig_params[param]:
+-                        force.params[param][term] = orig_params[param][term] * scalar
++            for instance, terms in _SCALED_FORCES[key]:
++                for force in sim.forces:
++                    if not isinstance(force, instance):
++                        continue
++                    if terms is None:
++                        if scalar != 1:
++                            logger.warning(
++                                f"scale_{key}={scalar} cannot scale "
++                                f"{type(force).__name__}, which has no "
++                                "per-type strength; it runs at full strength."
++                            )
+                     else:
+-                        force.params[param][term] *= scalar
+-            sim.active_forces.append(force)
+-            self.forcesDict[key] = force
++                        for param in force.params:
++                            values = dict(force.params[param])
++                            for term in terms:
++                                values[term] = np.multiply(values[term], scalar)
++                            force.params[param] = values
++                    sim.active_forces.append(force)
++                    self.forcesDict.setdefault(key, force)
++
++
++# Force classes each ForcesHandler scale applies to, with the params it
++# multiplies. None marks forces with no per-type strength to scale, such as
++# the two halves of PPPM electrostatics, which are only turned on or off.
++_SCALED_FORCES = {
++    "lj": (
++        (hoomd.md.pair.LJ, ("epsilon",)),
++        (hoomd.md.special_pair.LJ, ("epsilon",)),
++    ),
++    "charge": (
++        (hoomd.md.special_pair.Coulomb, ("alpha",)),
++        (hoomd.md.pair.Ewald, None),
++        (hoomd.md.long_range.pppm.Coulomb, None),
++    ),
++    "bond": (
++        (hoomd.md.bond.Harmonic, ("k",)),
++        # Scaling k and epsilon scales the whole bond; r0 still caps its length.
++        (hoomd.md.bond.FENEWCA, ("k", "epsilon")),
++    ),
++    "angle": (
++        (hoomd.md.angle.Harmonic, ("k",)),
++        (hoomd.md.angle.Table, ("U", "tau")),
++    ),
++    "opls": ((hoomd.md.dihedral.OPLS, ("k1", "k2", "k3", "k4")),),
++    "periodic": (
++        (hoomd.md.dihedral.Periodic, ("k",)),
++        (hoomd.md.dihedral.Table, ("U", "tau")),
++    ),
++    "improper": ((hoomd.md.improper.Periodic, ("k",)),),
++}
+ 
+ 
+ def _resolve_input(system):
+@@ -1123,6 +1276,70 @@ def _wrap_into_box(snap):
+     snap.particles.position = pos.astype(np.float32)
+ 
+ 
++def _kT_variant(kT, t_start, n_steps):
++    """Return (thermostat kT, initial kT), ramping if kT is [start, finish]."""
++    if not isinstance(kT, (list, tuple, np.ndarray)):
++        return kT, kT
++    if len(kT) != 2:
++        raise ValueError(
++            f"kT should be a single value or [kT_start, kT_finish], got {kT}."
++        )
++    ramp = hoomd.variant.Ramp(A=kT[0], B=kT[1], t_start=t_start, t_ramp=int(n_steps))
++    return ramp, kT[0]
++
++
++def _normalize_to_box_convention(xyz, box_lengths, has_origin=True):
++    """Wrap coordinates into whichever box convention the compound already uses.
++
++    Coordinates are written either centered on the origin, spanning
++    ``[-L/2, L/2)``, or from a corner, spanning ``[0, L)``. ``gmso``'s
++    ``coord_shift`` translates a system by ``L/2`` if any single coordinate
++    falls outside the centered range, so it must be handed coordinates that
++    satisfy one convention exactly.
++
++    Parameters
++    ----------
++    xyz : np.ndarray, shape (N, 3)
++        Compound coordinates.
++    box_lengths : array-like, shape (3,)
++        Box edge lengths.
++    has_origin : bool, default True
++        False when the box only carries lengths (e.g. a bounding box), so
++        no convention applies and every axis is shifted rather than wrapped.
++
++    Returns
++    -------
++    xyz : np.ndarray, shape (N, 3)
++        Coordinates wrapped into the compound's own convention.
++    centered : np.ndarray of bool, shape (3,)
++        True on axes written about the origin, False on axes written from 0.
++    origin : np.ndarray, shape (3,)
++        Rigid shift into HOOMD's centered frame on axes that follow neither
++        convention, zero elsewhere.
++    """
++    xyz = np.array(xyz, dtype=float, copy=True)
++    L = np.asarray(box_lengths, dtype=float)
++    outside_centered = ((xyz < -L / 2.0) | (xyz >= L / 2.0)).sum(axis=0)
++    outside_corner = ((xyz < 0.0) | (xyz >= L)).sum(axis=0)
++    centered = outside_centered <= outside_corner
++    # Coordinates mostly outside both ranges (e.g. a molecule away from the
++    # origin) follow neither convention. Wrapping them atom by atom would
++    # move and split molecules, so center them rigidly instead.
++    unplaced = np.minimum(outside_centered, outside_corner) > len(xyz) / 2.0
++    if not has_origin:
++        unplaced[:] = True
++    origin = np.where(unplaced, (xyz.max(axis=0) + xyz.min(axis=0)) / 2.0, 0.0)
++    centered = centered | unplaced
++    mins = np.where(centered, -L / 2.0, 0.0)
++    # A span wider than the box has no valid periodic image.
++    span = xyz.max(axis=0) - xyz.min(axis=0)
++    wrappable = (L > 0) & (span <= L) & ~unplaced
++    xyz[:, wrappable] = mins[wrappable] + np.mod(
++        xyz[:, wrappable] - mins[wrappable], L[wrappable]
++    )
++    return xyz, centered, origin
++
++
+ def _sync_back(compound, is_path, original):
+     """If the original was a Path, copy positions back."""
+     if is_path:
+diff --git a/mbuild/tests/test_bias.py b/mbuild/tests/test_bias.py
+index faf9ef0ee..a94d6e302 100644
+--- a/mbuild/tests/test_bias.py
++++ b/mbuild/tests/test_bias.py
+@@ -149,6 +149,199 @@ def test_target_direction(self):
+             head_tail_vec_target, np.array([1, 0, 0])
+         )
+ 
++    def test_target_coordinate_capture_radius_validation(self):
++        # capture_radius needs a termination radius to ramp toward
++        with pytest.raises(ValueError):
++            TargetCoordinate(
++                target_coordinate=(3, 3, 3), weight=1.0, capture_radius=2.0
++            )
++        # termination_radius is meaningless without capture_radius
++        with pytest.raises(ValueError):
++            TargetCoordinate(
++                target_coordinate=(3, 3, 3), weight=1.0, termination_radius=0.3
++            )
++        # capture_radius must be outside termination_radius
++        with pytest.raises(ValueError):
++            TargetCoordinate(
++                target_coordinate=(3, 3, 3),
++                weight=1.0,
++                capture_radius=0.3,
++                termination_radius=0.5,
++            )
++        with pytest.raises(ValueError):
++            TargetCoordinate(
++                target_coordinate=(3, 3, 3),
++                weight=1.0,
++                capture_radius=-1.0,
++                termination_radius=0.3,
++            )
++        with pytest.raises(ValueError):
++            TargetCoordinate(
++                target_coordinate=(3, 3, 3),
++                weight=1.0,
++                capture_radius="ten",
++                termination_radius=0.3,
++            )
++        with pytest.raises(ValueError):
++            TargetCoordinate(
++                target_coordinate=(3, 3, 3),
++                weight=0.5,
++                capture_radius=2.0,
++                termination_radius=0.3,
++                adapt_sharpness=0.0,
++            )
++
++    def test_target_coordinate_terminator(self):
++        terminator = WithinCoordinate(target_coordinate=(3, 3, 3), distance=0.3)
++        bias = TargetCoordinate(
++            target_coordinate=(3, 3, 3),
++            weight=1.0,
++            capture_radius=2.0,
++            terminator=terminator,
++        )
++        assert bias.termination_radius == terminator.distance
++        # terminator and termination_radius are mutually exclusive
++        with pytest.raises(ValueError):
++            TargetCoordinate(
++                target_coordinate=(3, 3, 3),
++                weight=1.0,
++                capture_radius=2.0,
++                termination_radius=0.3,
++                terminator=terminator,
++            )
++        # terminator target must match the bias target
++        with pytest.raises(ValueError):
++            TargetCoordinate(
++                target_coordinate=(1, 1, 1),
++                weight=1.0,
++                capture_radius=2.0,
++                terminator=terminator,
++            )
++
++    def test_target_coordinate_auto_capture_radius(self):
++        bias = TargetCoordinate(
++            target_coordinate=(3, 3, 3),
++            weight=1.0,
++            capture_radius="auto",
++            termination_radius=0.3,
++        )
++        assert bias._capture_radius is None
++        hard_sphere_random_walk(
++            termination=Termination([NumSites(15), NumAttempts(1e4)]),
++            bond_length=0.25,
++            bias=bias,
++            initial_point=(0, 0, 0),
++            radius=0.22,
++            seed=14,
++        )
++        assert bias._capture_radius == pytest.approx(2.5)
++        # An auto radius that would fall inside the termination radius is caught
++        bad_bias = TargetCoordinate(
++            target_coordinate=(3, 3, 3),
++            weight=1.0,
++            capture_radius="auto",
++            termination_radius=5.0,
++        )
++        with pytest.raises(ValueError, match="capture_radius='auto'"):
++            hard_sphere_random_walk(
++                termination=Termination([NumSites(15), NumAttempts(1e4)]),
++                bond_length=0.25,
++                bias=bad_bias,
++                initial_point=(0, 0, 0),
++                radius=0.22,
++                seed=14,
++            )
++
++    def test_target_coordinate_outside_capture_radius_matches_fixed_weight(self):
++        """Outside capture_radius the walk is identical to a fixed-weight walk."""
++        kwargs = dict(
++            termination=Termination([NumSites(15), NumAttempts(1e4)]),
++            bond_length=0.25,
++            initial_point=(0, 0, 0),
++            radius=0.22,
++            seed=14,
++        )
++        fixed = hard_sphere_random_walk(
++            bias=TargetCoordinate(target_coordinate=(3, 3, 3), weight=0.8), **kwargs
++        )
++        # A capture_radius this walk never reaches leaves the ramp at r = 0
++        never_captured = hard_sphere_random_walk(
++            bias=TargetCoordinate(
++                target_coordinate=(3, 3, 3),
++                weight=0.8,
++                capture_radius=0.301,
++                termination_radius=0.3,
++            ),
++            **kwargs,
++        )
++        assert np.allclose(fixed.coordinates, never_captured.coordinates)
++
++    def test_target_coordinate_capture_radius_ramp(self):
++        """The effective weight ramps from weight at capture_radius up to 1."""
++        bias = TargetCoordinate(
++            target_coordinate=(0, 0, 0),
++            weight=0.2,
++            capture_radius=2.0,
++            termination_radius=0.5,
++        )
++        assert bias.last_weight is None and bias.last_r is None
++
++        def weight_at(distance):
++            bias._adaptive_weight(np.array([distance, 0.0, 0.0]))
++            return bias.last_r, bias.last_weight
++
++        # Beyond capture_radius the ramp holds at weight
++        assert weight_at(5.0) == (0.0, pytest.approx(0.2))
++        assert weight_at(2.0) == (0.0, pytest.approx(0.2))
++        # At and inside termination_radius the ramp is pinned at 1
++        assert weight_at(0.5) == (1.0, pytest.approx(1.0))
++        assert weight_at(0.0) == (1.0, pytest.approx(1.0))
++        # Linear in between by default
++        assert weight_at(1.25) == (pytest.approx(0.5), pytest.approx(0.6))
++        # Monotonically increasing as the walk closes on the target
++        weights = [weight_at(d)[1] for d in np.linspace(2.0, 0.5, 20)]
++        assert np.all(np.diff(weights) >= 0)
++
++    def test_target_coordinate_adapt_sharpness(self):
++        """adapt_sharpness > 1 ramps later, < 1 ramps earlier."""
++
++        def weight_at(sharpness, distance):
++            bias = TargetCoordinate(
++                target_coordinate=(0, 0, 0),
++                weight=0.2,
++                capture_radius=2.0,
++                termination_radius=0.5,
++                adapt_sharpness=sharpness,
++            )
++            bias._adaptive_weight(np.array([distance, 0.0, 0.0]))
++            return bias.last_weight
++
++        assert weight_at(3.0, 1.25) < weight_at(1.0, 1.25) < weight_at(0.3, 1.25)
++        # Endpoints are unaffected by sharpness
++        for sharpness in (0.3, 1.0, 3.0):
++            assert weight_at(sharpness, 2.0) == pytest.approx(0.2)
++            assert weight_at(sharpness, 0.5) == pytest.approx(1.0)
++
++    def test_target_coordinate_capture_radius_reaches_target(self):
++        """A ramped walk terminates inside the terminator's distance."""
++        terminator = WithinCoordinate(target_coordinate=(2, 2, 2), distance=0.3)
++        termination = Termination([terminator, NumAttempts(5e4)])
++        kwargs = dict(
++            bond_length=0.25,
++            initial_point=(0, 0, 0),
++            radius=0.22,
++            seed=14,
++        )
++        adaptive = TargetCoordinate(
++            target_coordinate=(2, 2, 2),
++            weight=0.2,
++            capture_radius=1.5,
++            terminator=terminator,
++        )
++        path = hard_sphere_random_walk(termination=termination, bias=adaptive, **kwargs)
++        end_distance = np.linalg.norm(path.coordinates[-1] - np.array([2, 2, 2]))
++        assert end_distance <= 0.3 + terminator.tolerance
++
+     def test_score_affine_invariance(self):
+         """Scores rank candidates identically under any positive affine rescale."""
+         bias = TargetCoordinate(target_coordinate=(3, 3, 3), weight=0.6)
+@@ -227,3 +420,28 @@ class _State:
+         periodic = WithinCoordinate(target_coordinate=target, distance=0.3)
+         periodic.state = _State()
+         assert periodic.is_met(coordinates, names)
++
++    def test_target_coordinate_capture_radius_pbc(self):
++        """The capture-radius ramp measures distance to the target in minimum image."""
++        from mbuild.path.path_utils import target_sq_distances
++
++        L = 10.0
++        target = np.array([-4.9, 0.0, 0.0])
++        bias = TargetCoordinate(
++            target_coordinate=target,
++            weight=0.5,
++            capture_radius=2.0,
++            termination_radius=0.2,
++        )
++
++        class _State:
++            pbc = np.array([True, True, True])
++            box_lengths = np.array([L, L, L], dtype=np.float32)
++
++        # 0.2 nm from the target across the +x boundary, 9.8 nm from it directly
++        current = np.array([4.9, 0.0, 0.0])
++        assert bias._adaptive_weight(current) == pytest.approx(0.5)
++
++        bias.state = _State()
++        bias._target_sq_distances = target_sq_distances
++        assert bias._adaptive_weight(current) == pytest.approx(1.0)
+diff --git a/mbuild/tests/test_coarse_graining.py b/mbuild/tests/test_coarse_graining.py
+index 6e3b6bbc6..b6b760ead 100644
+--- a/mbuild/tests/test_coarse_graining.py
++++ b/mbuild/tests/test_coarse_graining.py
+@@ -110,6 +110,19 @@ def test_backmap_positions_centered(self):
+             centroid = np.mean([p.pos for p in child.particles()], axis=0)
+             assert np.linalg.norm(centroid - path.coordinates[i]) < 0.05
+ 
++    def test_backmap_periodic(self):
++        path = straight_line(spacing=0.35, N=6, bead_name="PE")
++        path.coordinates[:] = path.coordinates % 1.0
++        box = np.ones(3)
++        compound = path.backmap("{#PE=[>]CC[<]}", box=box)
++        for a, b in compound.bonds():
++            delta = a.pos - b.pos
++            assert np.linalg.norm(delta - np.round(delta / box) * box) < 0.35
++        # fragments stay centered on the wrapped beads
++        for i, child in enumerate(compound.children):
++            centroid = np.mean([p.pos for p in child.particles()], axis=0)
++            assert np.linalg.norm(centroid - path.coordinates[i]) < 0.05
++
+     @pytest.mark.skipif(not has_rdkit, reason="rdkit is not installed")
+     def test_backmap_rdkit_positions(self, branched_path):
+         compound = branched_path.backmap("{#A=[$]C([$])C[$],#B=[$]CC[$]}")
+diff --git a/mbuild/tests/test_path.py b/mbuild/tests/test_path.py
+index afbbc6989..ad68521f3 100644
+--- a/mbuild/tests/test_path.py
++++ b/mbuild/tests/test_path.py
+@@ -397,6 +397,106 @@ def walk_from_index(initial_point):
+         assert np.allclose(path.coordinates, expected.coordinates)
+         assert set(path.bond_graph.edges) == set(expected.bond_graph.edges)
+ 
++    @pytest.mark.parametrize("seed", [0, 3, 5, 7])
++    def test_initial_point_index_wraps_into_periodic_box(self, seed):
++        """A walk started from a site near a face stays inside a periodic box.
++
++        The site index branch places its first site a bond length off an
++        existing site, which can land outside the box. On a periodic axis that
++        point must be wrapped back in rather than stored as-is. These seeds all
++        place that site outside the box when the wrap is removed.
++        """
++        L = 4.0
++        box = CuboidConstraint(Lx=L, Ly=L, Lz=L, pbc=(True, True, True))
++        # A single site sitting hard against the +x face, so a bond length step
++        # off it falls outside the box for roughly half of the candidates.
++        path = Path(coordinates=np.array([[L / 2 - 0.01, 0.0, 0.0]]))
++        hard_sphere_random_walk(
++            path=path,
++            termination=Termination([NumSites(12), NumAttempts(1e4)]),
++            bond_length=0.25,
++            radius=0.22,
++            initial_point=0,
++            connectivity="link-linear",
++            volume_constraint=box,
++            seed=seed,
++        )
++        coords = path.coordinates
++        assert len(coords) > 1
++        outside = ((coords < -L / 2) | (coords >= L / 2)).any(axis=1)
++        assert not outside.any(), f"sites outside the periodic box: {coords[outside]}"
++
++    @pytest.mark.parametrize("seed", [0, 3, 5, 7])
++    def test_link_linear_angle_across_periodic_face(self, seed):
++        """The first bond angle of a linked walk is right when the link crosses a face.
++
++        Same setup as above, so the first site is often wrapped to the other
++        side of the box from the site it links to.
++        """
++        L = 4.0
++        theta = 2.0
++        box = CuboidConstraint(Lx=L, Ly=L, Lz=L, pbc=(True, True, True))
++        path = Path(coordinates=np.array([[L / 2 - 0.01, 0.0, 0.0]]))
++        hard_sphere_random_walk(
++            path=path,
++            termination=Termination([NumSites(3), NumAttempts(1e4)]),
++            bond_length=0.25,
++            radius=0.22,
++            rw_angles=AnglesSampler("choice", dict(a=[theta])),
++            initial_point=0,
++            connectivity="link-linear",
++            volume_constraint=box,
++            seed=seed,
++        )
++        a, b, c = path.coordinates[:3]
++        v1 = a - b
++        v2 = c - b
++        v1 -= np.round(v1 / L) * L
++        v2 -= np.round(v2 / L) * L
++        cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
++        assert np.isclose(np.arccos(cos), theta, atol=1e-3)
++
++    @pytest.mark.parametrize("connectivity", ["linear", "link-linear"])
++    def test_bond_attributes_across_periodic_face(self, connectivity):
++        """Stored bond length and direction use the minimum image under PBC."""
++        L = 2.5
++        box = CuboidConstraint(Lx=L, Ly=L, Lz=L, pbc=(True, True, True))
++        path = Path(coordinates=np.array([[L / 2 - 0.01, 0.0, 0.0]]))
++        hard_sphere_random_walk(
++            path=path,
++            termination=Termination([NumSites(200), NumAttempts(1e4)]),
++            bond_length=0.25,
++            radius=0.22,
++            initial_point=0,
++            connectivity=connectivity,
++            volume_constraint=box,
++            seed=3,
++        )
++        crossings = 0
++        for u, v, data in path.bond_graph.edges(data=True):
++            raw = path.coordinates[v] - path.coordinates[u]
++            crossings += np.linalg.norm(raw) > L / 2
++            image = raw - np.round(raw / L) * L
++            assert np.isclose(data["length"], 0.25, atol=1e-4)
++            assert np.allclose(
++                data["direction"], image / np.linalg.norm(image), atol=1e-4
++            )
++        assert (
++            crossings > 0
++        )  # the walk must actually cross a face for this to test anything
++
++    def test_add_edge_minimum_image(self):
++        L = 2.0
++        path = Path(coordinates=np.array([[0.9, 0.0, 0.0], [-0.85, 0.0, 0.0]]))
++        path.add_edge(0, 1)
++        assert np.isclose(path.bond_graph.edges[0, 1]["length"], 1.75)
++        path.add_edge(0, 1, pbc=(True, True, True), box_lengths=(L, L, L))
++        assert np.isclose(path.bond_graph.edges[0, 1]["length"], 0.25)
++        assert np.allclose(path.bond_graph.edges[0, 1]["direction"], [1, 0, 0])
++        # A non-periodic axis is left alone
++        path.add_edge(0, 1, pbc=(False, True, True), box_lengths=(L, L, L))
++        assert np.isclose(path.bond_graph.edges[0, 1]["length"], 1.75)
++
+     def test_initial_point_bad_type(self):
+         for bad in [2.5, np.array([1, 2]), "2"]:
+             with pytest.raises(ValueError):
+diff --git a/mbuild/tests/test_simulation.py b/mbuild/tests/test_simulation.py
+index 0c35b5734..6cb598c5b 100644
+--- a/mbuild/tests/test_simulation.py
++++ b/mbuild/tests/test_simulation.py
+@@ -160,6 +160,128 @@ def test_scale_restores_on_second_call(self, sim):
+         for p in angle.params:
+             assert np.isclose(angle.params[p]["k"], orig_angle_params[p]["k"])
+ 
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_scaling_does_not_compound_across_sims(self, sim, octane, oplsaa):
++        """Regression: a new sim reusing cached forces must scale from the originals."""
++        bond = sim._get_force(hoomd.md.bond.Harmonic)
++        orig_bond_params = {p: dict(bond.params[p]) for p in bond.params}
++        for _ in range(3):
++            ForcesHandler(scale_bond=0.5, scale_angle=0).scale_sim(sim)
++            sim = HoomdSimulation(octane, oplsaa, r_cut=0.3, run_on_gpu=False)
++            assert sim._get_force(hoomd.md.bond.Harmonic) is bond
++
++        ForcesHandler(scale_bond=0.5, scale_angle=0).scale_sim(sim)
++        for p in bond.params:
++            assert np.isclose(bond.params[p]["k"], orig_bond_params[p]["k"] * 0.5)
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    @pytest.mark.parametrize("last_scale", [0.5, 0])
++    def test_run_without_handler_restores_params(self, sim, last_scale):
++        """A run without a handler uses unscaled forces, even ones last turned off."""
++        bond = sim._get_force(hoomd.md.bond.Harmonic)
++        orig_bond_params = {p: dict(bond.params[p]) for p in bond.params}
++        run = dict(n_steps=10, kT=1.0, dt=1e-4, tau=1e-2)
++
++        sim.nvt(**run, forces_handler=ForcesHandler(scale_bond=0.5))
++        sim.nvt(**run, forces_handler=ForcesHandler(scale_bond=last_scale))
++        sim.nvt(**run)
++        assert bond in sim.active_forces
++        for p in bond.params:
++            assert np.isclose(bond.params[p]["k"], orig_bond_params[p]["k"])
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_run_without_handler_restores_angle_table(self):
++        """A scaled angle table returns to full strength in a run without a handler."""
++        from mbuild.path.points import AnglesSampler
++        from mbuild.utils.simulation.path_forces import PathForcefield
++
++        path = _make_two_type_path(n=6)
++        sampler = AnglesSampler("normal", {"loc": 2.5, "scale": 0.2})
++        pff = PathForcefield(radius=0.15, angles=sampler)
++        sim = HoomdSimulation(path, forcefield=pff, r_cut=0.5, run_on_gpu=False)
++        angle = sim._get_force(hoomd.md.angle.Table)
++        orig_U = {p: np.array(angle.params[p]["U"]) for p in angle.params}
++        run = dict(n_steps=10, kT=1.0, dt=1e-4, tau=1e-2)
++
++        sim.nvt(**run, forces_handler=ForcesHandler(scale_angle=0.25))
++        for p in angle.params:
++            assert np.allclose(angle.params[p]["U"], orig_U[p] * 0.25)
++        sim.nvt(**run)
++        for p in angle.params:
++            assert np.allclose(angle.params[p]["U"], orig_U[p])
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_scale_lj_includes_special_pairs(self, sim):
++        """scale_lj scales the 1-4 special pair LJ along with the pair LJ."""
++        pair_lj = sim._get_force(hoomd.md.pair.LJ)
++        special_lj = sim._get_force(hoomd.md.special_pair.LJ)
++        orig_pair = {p: dict(pair_lj.params[p]) for p in pair_lj.params}
++        orig_special = {p: dict(special_lj.params[p]) for p in special_lj.params}
++
++        ForcesHandler(scale_lj=0.5).scale_sim(sim)
++        assert pair_lj in sim.active_forces
++        assert special_lj in sim.active_forces
++        for p in pair_lj.params:
++            assert np.isclose(
++                pair_lj.params[p]["epsilon"], orig_pair[p]["epsilon"] * 0.5
++            )
++        for p in special_lj.params:
++            assert np.isclose(
++                special_lj.params[p]["epsilon"], orig_special[p]["epsilon"] * 0.5
++            )
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_dpd_replaces_special_pair_lj(self, sim):
++        """With dpd, neither LJ runs, so overlapping 1-4 pairs cannot blow up."""
++        ForcesHandler(dpd=1.0).scale_sim(sim)
++        force_types = [type(f) for f in sim.active_forces]
++        assert hoomd.md.pair.DPDConservative in force_types
++        assert hoomd.md.pair.LJ not in force_types
++        assert hoomd.md.special_pair.LJ not in force_types
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    @pytest.mark.parametrize("scale_charge", [0, 1])
++    def test_scale_charge_toggles_long_range(self, sim, scale_charge):
++        """scale_charge turns the Ewald and PPPM halves on or off together."""
++        ForcesHandler(scale_charge=scale_charge).scale_sim(sim)
++        force_types = [type(f) for f in sim.active_forces]
++        for force_type in (
++            hoomd.md.special_pair.Coulomb,
++            hoomd.md.pair.Ewald,
++            hoomd.md.long_range.pppm.Coulomb,
++        ):
++            assert (force_type in force_types) == bool(scale_charge)
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_partial_scale_charge_warns(self, sim, caplog):
++        """Long-range electrostatics can't be scaled, so they run at full strength."""
++        ewald = sim._get_force(hoomd.md.pair.Ewald)
++        orig_ewald = {p: dict(ewald.params[p]) for p in ewald.params}
++
++        ForcesHandler(scale_charge=0.5).scale_sim(sim)
++        assert ewald in sim.active_forces
++        assert "cannot scale Ewald" in caplog.text
++        for p in ewald.params:
++            assert ewald.params[p] == orig_ewald[p]
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_scale_fene_bonds(self):
++        """scale_bond keeps FENE bonds in the run and scales k and epsilon, not r0."""
++        from mbuild.utils.simulation.path_forces import PathForcefield
++
++        path = _make_two_type_path(n=6)
++        pff = PathForcefield(radius=0.15, btype="fene")
++        sim = HoomdSimulation(path, forcefield=pff, r_cut=0.5, run_on_gpu=False)
++        fene = sim._get_force(hoomd.md.bond.FENEWCA)
++        orig = {p: dict(fene.params[p]) for p in fene.params}
++
++        ForcesHandler(scale_bond=0.5).scale_sim(sim)
++        assert fene in sim.active_forces
++        for p in fene.params:
++            assert np.isclose(fene.params[p]["k"], orig[p]["k"] * 0.5)
++            assert np.isclose(fene.params[p]["epsilon"], orig[p]["epsilon"] * 0.5)
++            assert np.isclose(fene.params[p]["r0"], orig[p]["r0"])
++
+     @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
+     def test_forces_dict_populated(self, sim):
+         """Test that forcesDict is populated after scale_sim."""
+@@ -673,6 +795,112 @@ def test_box_update_no_half_box_shift(self):
+         # A stale offset would shift these by ~dL/2 (1 nm here) and go negative.
+         assert np.all(xyz >= -1e-4)
+         assert np.all(xyz <= L_final + 1e-4)
++        assert np.allclose(sim._frame_offset, L_final / 2, atol=1e-4)
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    @pytest.mark.parametrize(("start_L", "target_L"), [(3.0, 5.0), (5.0, 3.5)])
++    def test_box_update_centered_system_stays_centered(self, start_L, target_L):
++        """A centered compound keeps its frame through a resize, either way."""
++        methane = mb.load("C", smiles=True)
++        methane.name = "Methane"
++        # Keep the cluster off the faces so normalization has nothing to wrap.
++        box = mb.fill_box(compound=[methane], n_compounds=[8], box=[2, 2, 2])
++        box.xyz = box.xyz - box.xyz.mean(axis=0)  # centered convention
++        box.box = mb.Box(lengths=[start_L] * 3)
++
++        sim = HoomdSimulation(
++            system=box, box=[start_L] * 3, r_cut=1.0, run_on_gpu=False, kick=False
++        )
++        assert np.allclose(sim._frame_offset, 0.0)
++        com_before = sim.compound.xyz.mean(axis=0)
++
++        sim.box_update(
++            n_steps=3000,
++            kT=1.0,
++            dt=1e-4,
++            tau=1e-2,
++            target_box=hoomd.Box(target_L, target_L, target_L),
++            update_period=50,
++        )
++
++        L_final = np.asarray(sim.state.box.L)
++        xyz = sim.compound.xyz
++        assert np.allclose(sim._frame_offset, 0.0)
++        assert np.allclose(xyz.mean(axis=0), com_before, atol=1e-2)
++        assert np.all(xyz >= -L_final / 2 - 1e-4)
++        assert np.all(xyz <= L_final / 2 + 1e-4)
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_box_update_corner_system_shrinks_without_shift(self):
++        """The corner convention survives a shrink as well as a growth."""
++        methane = mb.load("C", smiles=True)
++        methane.name = "Methane"
++        box = mb.fill_box(compound=[methane], n_compounds=[8], box=[5, 5, 5])
++        sim = HoomdSimulation(system=box, r_cut=1.0, box_buffer=2, run_on_gpu=False)
++        assert np.allclose(sim._frame_offset, 2.5, atol=1e-4)
++
++        # 3.5 nm still clears HOOMD's minimum image distance for this r_cut.
++        sim.box_update(
++            n_steps=3000,
++            kT=1.0,
++            dt=1e-4,
++            tau=1e-2,
++            target_box=hoomd.Box(3.5, 3.5, 3.5),
++            update_period=50,
++        )
++
++        L_final = np.asarray(sim.state.box.L)
++        xyz = sim.compound.xyz
++        assert np.allclose(sim._frame_offset, L_final / 2, atol=1e-4)
++        assert np.all(xyz >= -1e-4)
++        assert np.all(xyz <= L_final + 1e-4)
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_resized_snapshot_not_reused_for_explicit_box(self):
++        """After a box_update, the same explicit box rebuilds rather than reusing."""
++        methane = mb.load("C", smiles=True)
++        methane.name = "Methane"
++        box = mb.fill_box(compound=[methane], n_compounds=[8], box=[5, 5, 5])
++        sim = HoomdSimulation(
++            system=box, box=[5, 5, 5], r_cut=1.0, run_on_gpu=False, kick=False
++        )
++        sim.box_update(
++            n_steps=3000,
++            kT=1.0,
++            dt=1e-4,
++            tau=1e-2,
++            target_box=hoomd.Box(3.5, 3.5, 3.5),
++            update_period=50,
++        )
++        xyz = box.xyz.copy()
++
++        sim = HoomdSimulation(
++            system=box, box=[5, 5, 5], r_cut=1.0, run_on_gpu=False, kick=False
++        )
++        assert np.allclose(sim.state.box.L, 5.0)
++        # Reusing the resized snapshot would shift every atom by ~(5 - 3.5) / 2.
++        sim.nvt(n_steps=0, kT=1.0, dt=1e-4, tau=1e-2)
++        assert np.allclose(box.xyz, xyz, atol=1e-4)
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_rebuild_keeps_bounding_box_unplaced(self):
++        """Regression: a bounding box stored by one sim must not split a molecule in the next."""
++        chain = mb.load("C" * 20, smiles=True)
++        sim = HoomdSimulation(chain, r_cut=1.0, kick=False, run_on_gpu=False)
++        sim.nvt(n_steps=0, kT=1.0, dt=1e-4, tau=1e-2)
++        # Straddle the x face of a [0, L) layout, mostly inside it. Without the
++        # bounding-box marker this is read as a corner layout and wrapped atom
++        # by atom, stretching bonds across the box.
++        Lx = chain.box.lengths[0]
++        chain.translate_to((Lx - 0.75, 0.0, 0.0))
++        com = chain.xyz.mean(axis=0)
++
++        # A different r_cut rebuilds the snapshot rather than reusing it.
++        sim = HoomdSimulation(chain, r_cut=0.9, kick=False, run_on_gpu=False)
++        sim.nvt(n_steps=0, kT=1.0, dt=1e-4, tau=1e-2)
++        max_bond = max(np.linalg.norm(a.pos - b.pos) for a, b in chain.bonds())
++        assert max_bond < 0.2
++        assert np.allclose(chain.xyz.mean(axis=0), com, atol=1e-3)
+ 
+     @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
+     def test_recover_undoes_only_the_last_run(self):
+diff --git a/mbuild/utils/simulation/path_forces.py b/mbuild/utils/simulation/path_forces.py
+index e9114c2f0..e0841ad1f 100644
+--- a/mbuild/utils/simulation/path_forces.py
++++ b/mbuild/utils/simulation/path_forces.py
+@@ -173,7 +173,10 @@ def build_path_ff(
+     must cover every type present. angle_sampler/dihedral_sampler are None or
+     dicts keyed by angle/dihedral-type name and may cover a subset (uncovered
+     types get a flat, zero table). LJ cross-pairs sigma is the arithmetic
+-    mean of the two bead radii.
++    mean of the two bead radii. Angle partners are excluded from the LJ only
++    when the angle table covers every type. Dihedral partners are excluded
++    only when the dihedral table covers every type and angle partners are
++    also excluded, since a dihedral alone does not keep 1-4 pairs apart.
+ 
+     Parameters
+     ----------
+@@ -208,7 +211,22 @@ def build_path_ff(
+     forces = []
+     ptypes = list(snap.particles.types)
+ 
+-    nlist = hoomd.md.nlist.Cell(buffer=0.2, exclusions=("bond",))
++    # Exclude angle/dihedral partners only if a table covers every type.
++    exclusions = ["bond"]
++    if (
++        angle_sampler
++        and snap.angles.N > 0
++        and set(snap.angles.types) <= set(angle_sampler)
++    ):
++        exclusions.append("angle")
++    if (
++        "angle" in exclusions
++        and dihedral_sampler
++        and snap.dihedrals.N > 0
++        and set(snap.dihedrals.types) <= set(dihedral_sampler)
++    ):
++        exclusions.append("dihedral")
++    nlist = hoomd.md.nlist.Cell(buffer=0.2, exclusions=tuple(exclusions))
+     lj = hoomd.md.pair.LJ(
+         nlist=nlist, default_r_cut=r_cut * max(radius.values()), mode="shift"
+     )

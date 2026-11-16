@@ -1,0 +1,1175 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 80af1026..c7684392 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -236,6 +236,24 @@ matplotlib and the sandbox executor out of each other's way
+ spec. Anchors and refits stay serial: they are the LLM-heavy, human-gated
+ part.
+ 
++**The replay gate, the verdict and the regime choice are shared policies.**
++The three analysis agents each judged a replay of a locked recipe, said what
++"verified" means and chose among a series' regime recipes in their own way,
++and the copies drifted (#712). `exp_agents/_replay.py` now holds those
++policies by composition — no base class: a `verdict_record` (one dict shape,
++`verified` / `reason` / `decided_by` ∈ qc_gate · replay_gate · recipe ·
++excluded · none) that every agent STAMPS where it decides (a series unit at
++fit time, a cube or a run when its result is final, `results["verdict"]`) and
++that `analysis_verdict` and the swarm board only read; three replay gates with
++one verdict shape (`ScoreReplayGate` for the curve's R² and the image's vision
++score, `FeatureHealthGate` for an image strict replay, `MapReplayGate` for a
++hyperspectral map); and `select_recipe`, the one rule for choosing among a
++series' regime recipes on a reuse (today: in lock order, the first the gate
++calls good). The reconstruction from result shapes (`reconstructed_verdict`)
++serves results from before the stamp and is the reference the stamps are held
++to (`tests/test_verdict_parity.py`, no allow-list). A new agent-side decision
++about a replay or a verdict goes into `_replay.py`, not into one agent.
++
+ ## Data preparation is a stage, not an agent
+ 
+ Some instruments hand over a container that sits *upstream* of what the
+diff --git a/scilink/agents/exp_agents/_replay.py b/scilink/agents/exp_agents/_replay.py
+new file mode 100644
+index 00000000..e24eb0f7
+--- /dev/null
++++ b/scilink/agents/exp_agents/_replay.py
+@@ -0,0 +1,266 @@
++"""The policies the three analysis agents share, in one place (#712).
++
++The curve, image and hyperspectral agents each judge a replay of a locked
++recipe, each say what "verified" means, and each choose among a series'
++regime recipes on a reuse — three copies that drifted. This module holds the
++POLICIES, by composition: each agent keeps its pipeline, prompts and
++controllers, and routes these decisions through here. It is not a base
++class (CLAUDE.md), and it is the shape ``CodegenQCEngine`` set.
++
++- **A verdict record** (``verdict_record``) is one dict shape every agent
++  stamps where it decides — a unit at fit time, a replay at its gate, a
++  single run or a cube when its result is final — and ``analysis_verdict``
++  and the swarm board only READ it. It says whether the result is
++  verified, why, and WHO decided (``decided_by``): the agent's own QC gate,
++  a replay gate, the recipe a follower replayed, or nothing.
++- **A replay gate** turns a replayed result plus the anchor's reference
++  into ``{"verdict": good | poor | failed, "score", "threshold", "reasons"}``.
++  Three implementations, today's behaviours as they were: a score against
++  the accept gate (the curve's R², the image's vision score), the image's
++  feature-health gate for a strict replay, and the hyperspectral map gate
++  against the anchor's statistics.
++- **``select_recipe``** chooses among a series' regime recipes on a reuse:
++  today's rule — in lock order, the first the gate calls good, else the
++  first that executed — as the default strategy.
++
++Nothing here calls a model.
++"""
++
++from __future__ import annotations
++
++import math
++from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
++
++import numpy as np
++
++# ---------------------------------------------------------------- the record
++#: Who decided a verdict record.
++DECIDERS = ("qc_gate", "replay_gate", "recipe", "excluded", "none")
++
++
++def verdict_record(*, verified: bool, reason: str, decided_by: str, regime: Optional[str] = None,
++                   recipe_of: Optional[str] = None, score: Optional[float] = None,
++                   threshold: Optional[float] = None, interpretation_checked: bool = False,
++                   **extra: Any) -> Dict[str, Any]:
++    """One verdict, one shape. ``own_gate`` is kept as a derived key for the
++    readers of the stage-2 stamp (a QC gate or a replay gate decided)."""
++    if decided_by not in DECIDERS:
++        raise ValueError(f"decided_by must be one of {DECIDERS}, not {decided_by!r}")
++    rec: Dict[str, Any] = {"verified": bool(verified), "reason": str(reason), "decided_by": decided_by,
++                           "interpretation_checked": bool(interpretation_checked), "regime": regime}
++    if recipe_of is not None:
++        rec["recipe_of"] = recipe_of
++    if score is not None:
++        rec["score"] = score
++    if threshold is not None:
++        rec["threshold"] = threshold
++    if decided_by in ("qc_gate", "replay_gate"):
++        rec["own_gate"] = True
++    rec.update(extra)
++    return rec
++
++
++def is_verdict_record(value: Any) -> bool:
++    return isinstance(value, dict) and isinstance(value.get("verified"), bool) and "reason" in value
++
++
++# ------------------------------------------------------------ replay gates
++def replay_verdict(verdict: str, *, score: Optional[float] = None, threshold: Optional[float] = None,
++                   reasons: Optional[Sequence[str]] = None, gate: str = "") -> Dict[str, Any]:
++    if verdict not in ("good", "poor", "failed"):
++        raise ValueError(f"a replay verdict is good, poor or failed, not {verdict!r}")
++    return {"verdict": verdict, "score": score, "threshold": threshold,
++            "reasons": [r for r in (reasons or []) if r], "gate": gate}
++
++
++class ScoreReplayGate:
++    """A replayed result judged by one score against the agent's accept gate:
++    the curve agent's R² (``fit_quality.r_squared``), the image agent's
++    vision-review score. ``accept`` is the agent's ``is_accept`` (the soft
++    band included, as it always was)."""
++
++    def __init__(self, accept: Callable[[float], bool], threshold: float, metric: str):
++        self.accept, self.threshold, self.metric = accept, threshold, metric
++
++    def judge(self, score: Any) -> Dict[str, Any]:
++        value = float(score or 0.0)
++        ok = bool(self.accept(value))
++        return replay_verdict("good" if ok else "poor", score=value, threshold=self.threshold,
++                              reasons=[] if ok else [f"{self.metric} {value:.4f} below the acceptance "
++                                                     f"threshold {self.threshold:.3f}"],
++                              gate=self.metric)
++
++
++def feature_health(features: Any, reference: Any) -> Tuple[bool, str]:
++    """Evidence-only acceptance of an image analysed by a LOCKED-SCRIPT replay.
++
++    A strict replay (a live frame) has no model to look at the overlay, and an
++    image analysis has no R²: what it has is the numbers the approved script
++    reports, and what that script reported on its reference. The gate judges
++    METHOD HEALTH from them and nothing else:
++
++    - every numeric quantity the reference run reported is reported again, and
++      is finite (a script that silently stops measuring something is broken);
++    - the analysis still finds SOMETHING: if every quantity that was non-zero on
++      the reference is zero now (no particles, no mask, no lattice), the method
++      collapsed on this image or there is nothing in it, and either way the
++      frame is not one to track quietly.
++
++    It does not ask whether the values are plausible: in a stream they are
++    expected to move, and that is the live loop's range gate (which flags a
++    jump and adopts a value that persists) and its audits. What no gate here
++    can see is a segmentation that runs, reports finite numbers and is wrong;
++    the independent audit is the check for that. Returns ``(ok, reason)``."""
++    ref = {k: v for k, v in (reference or {}).items()
++           if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)}
++    got = features if isinstance(features, dict) else {}
++    if not ref:
++        numeric = [v for v in got.values() if isinstance(v, (int, float)) and not isinstance(v, bool)]
++        if not numeric or not all(math.isfinite(v) for v in numeric):
++            return False, "the replay reported no finite quantity"
++        return True, ""
++    missing = [k for k in ref if not isinstance(got.get(k), (int, float)) or isinstance(got.get(k), bool)]
++    if missing:
++        return False, ("the locked script no longer reports "
++                       + ", ".join(sorted(missing)[:4]) + " (it did on the reference)")
++    broken = [k for k in ref if not math.isfinite(float(got[k]))]
++    if broken:
++        return False, "not finite: " + ", ".join(sorted(broken)[:4])
++    alive = [k for k, v in ref.items() if v != 0]
++    if alive and all(float(got[k]) == 0.0 for k in alive):
++        return False, ("every quantity that was non-zero on the reference is zero here "
++                       "(nothing was found: the method collapsed on this image, or it is empty)")
++    return True, ""
++
++
++class FeatureHealthGate:
++    """The image agent's strict-replay gate (``feature_health``) as a gate."""
++
++    def judge(self, features: Any, reference: Any) -> Dict[str, Any]:
++        ok, reason = feature_health(features, reference)
++        return replay_verdict("good" if ok else "poor", reasons=[reason], gate="feature_health")
++
++
++def map_health(result_map, fit_mask, reference: Optional[dict], required: bool) -> Tuple[bool, str]:
++    """Deterministic acceptance of a map produced by a LOCKED-SCRIPT replay.
++
++    A verbatim replay re-runs a method the reviewer already approved on the
++    anchor; re-judging every map with the LLM only adds cost and judge
++    variance (observed live: the map approved on the anchor rejected on
++    replays, punching holes in the series schema). So replays are gated on
++    evidence alone: valid coverage (within the fit mask when scoped), a
++    non-collapsed value distribution, and — for a required output with the
++    anchor's stats as ``reference`` — a median inside the locked method's
++    plausible range (the anchor's [min, max] widened by one span on each
++    side, at least 0.5 % of the magnitude so a near-constant anchor map does
++    not reject trivial drift). Coverage is judged against the anchor's own
++    coverage (``reference["coverage"]``) when known. A map outside that range is the
++    method breaking down on this dataset (e.g. the peak left the fit
++    window), which the series driver answers with a fresh-code refit.
++    """
++    m = np.asarray(result_map, dtype=float)
++    if fit_mask is not None:
++        try:
++            m = m[np.asarray(fit_mask, dtype=bool)]
++        except Exception:  # noqa: BLE001 - shape mismatch: judge the full frame
++            pass
++    m = m.ravel()
++    finite = np.isfinite(m)
++    cov = float(finite.mean()) if m.size else 0.0
++    # Coverage floor: half of what the SAME method achieved on the anchor when
++    # that is known (a dilated fit mask over-covers its emitter, so the
++    # converged fraction is legitimately well below 1 — observed live at 43 %
++    # on a mask-scoped follower, which a fixed 50 % floor wrongly rejected);
++    # otherwise a lenient absolute floor.
++    # Without a reference there is NO coverage floor: a small emitter fitted
++    # full-frame legitimately covers ~1 % of the frame (observed live on a
++    # legacy replay), and only the anchor's own coverage can say what this
++    # method should reach. All-NaN maps are excluded before the gate.
++    ref_cov = (reference or {}).get("coverage") if isinstance(reference, dict) else None
++    if isinstance(ref_cov, (int, float)) and 0 < ref_cov <= 1:
++        min_cov = 0.25 * float(ref_cov)
++        if cov < min_cov:
++            return False, (f"valid coverage {cov:.0%} < {min_cov:.0%} (a quarter of the "
++                           f"anchor's {float(ref_cov):.0%}) — the locked method did not "
++                           "converge here")
++    vals = m[finite]
++    # A constant map is a collapse only if the SAME method varied on the
++    # anchor: a synthetic emitter with one exact centre, or a channel-
++    # quantized position, is legitimately constant (observed live on a
++    # mask-scoped follower the LLM review used to accept).
++    if vals.size > 8 and float(np.ptp(vals)) == 0.0 and isinstance(reference, dict):
++        try:
++            ref_spread = float(reference.get("max")) - float(reference.get("min"))
++        except (TypeError, ValueError):
++            ref_spread = None
++        if ref_spread is not None and ref_spread > 0:
++            return False, ("map is constant across the frame while the anchor's varied "
++                           f"over [{float(reference['min']):.4g}, {float(reference['max']):.4g}] "
++                           "(fit collapsed to a bound)")
++    # The range rule is for SIBLING datasets, where a required output far from
++    # the anchor's means the method broke. In a stream the tracked quantity is
++    # expected to move (a resonance shifting through a ramp, another part of a
++    # sample), so a live loop sets ``values_may_move``: method health is judged
++    # here (coverage, collapse), plausibility by the loop's own range gate, which
++    # flags a jump and then adopts a value that keeps saying the same thing.
++    # Observed live on tiles of one real EELS field: four of eleven tiles were
++    # withheld for a plasmon 35 to 60 meV below the first tile's range.
++    if (required and isinstance(reference, dict) and not reference.get("values_may_move")
++            and all(isinstance(reference.get(k), (int, float)) for k in ("min", "max"))):
++        lo, hi = float(reference["min"]), float(reference["max"])
++        mean = float(reference.get("mean", (lo + hi) / 2.0))
++        span = max(hi - lo, 0.005 * abs(mean), 1e-9)
++        med = float(np.median(vals))
++        if not (lo - span <= med <= hi + span):
++            return False, (f"median {med:.4g} outside the locked method's plausible "
++                           f"range [{lo - span:.4g}, {hi + span:.4g}] (anchor "
++                           f"[{lo:.4g}, {hi:.4g}]) — method breakdown on this dataset")
++    return True, ""
++
++
++class MapReplayGate:
++    """The hyperspectral agent's per-map replay gate (``map_health``) as a gate."""
++
++    def judge(self, result_map, fit_mask, reference: Optional[dict], required: bool) -> Dict[str, Any]:
++        ok, reason = map_health(result_map, fit_mask, reference, required)
++        return replay_verdict("good" if ok else "poor", reasons=[reason], gate="map_health")
++
++
++# ------------------------------------------------------------ select_recipe
++def select_recipe(candidates: Sequence[Tuple[str, Optional[str]]],
++                  run: Callable[[int, str, Optional[str]], Dict[str, Any]],
++                  judge: Callable[[Dict[str, Any]], Dict[str, Any]],
++                  *, strategy: str = "first_good") -> Dict[str, Any]:
++    """Choose among a series' regime recipes on a reuse.
++
++    ``candidates`` are ``(script, source)`` in lock order; ``run(n, script,
++    source)`` replays one (the agent's own fit, in its own folder) and
++    returns the result; ``judge(result)`` is the replay gate's verdict for a
++    result that executed. The default strategy is today's rule: the FIRST
++    candidate the gate calls good is chosen; when none is good, the first
++    that executed (poor); when none executed, nothing. Returns
++    ``{"chosen": n | None, "result", "verdict", "tried": [...]}`` with one
++    entry per candidate tried (its index, source, executed, verdict)."""
++    if strategy != "first_good":
++        raise ValueError(f"unknown strategy {strategy!r}")
++    tried: List[Dict[str, Any]] = []
++    kept: Optional[Dict[str, Any]] = None
++    last_failed: Optional[Dict[str, Any]] = None
++    for n, (script, source) in enumerate(candidates, 1):
++        result = run(n, script, source)
++        if result.get("success"):
++            verdict = judge(result)
++            tried.append({"n": n, "source": source, "executed": True, "verdict": verdict["verdict"],
++                          "score": verdict.get("score")})
++            if verdict["verdict"] == "good":
++                return {"chosen": n, "result": result, "verdict": verdict, "source": source, "tried": tried}
++            if kept is None:
++                kept = {"chosen": n, "result": result, "verdict": verdict, "source": source}
++        else:
++            last_failed = {"result": result, "source": source}
++            tried.append({"n": n, "source": source, "executed": False, "verdict": "failed",
++                          "error": result.get("error")})
++    if kept is not None:
++        return {**kept, "tried": tried}
++    return {"chosen": None, "result": None, "verdict": None, "source": None, "tried": tried,
++            "last_failed": last_failed}
+diff --git a/scilink/agents/exp_agents/_verification_record.py b/scilink/agents/exp_agents/_verification_record.py
+index b84a0a71..03055d3a 100644
+--- a/scilink/agents/exp_agents/_verification_record.py
++++ b/scilink/agents/exp_agents/_verification_record.py
+@@ -301,37 +301,38 @@ def unit_verdict_for(unit: Dict[str, Any], *, recipe: Optional[Dict[str, Any]] =
+ 
+     ``recipe`` is the regime anchor's record at the time the follower ran:
+     ``{"unit": name, "verdict": {verified, reason}}`` or None when the
+-    follower was fitted with no base script.
++    follower was fitted with no base script. The record is the shared
++    ``verdict_record`` shape (``_replay.py``): who decided is ``decided_by``.
+     """
+-    name = unit.get("name") or unit.get("index")
++    from ._replay import verdict_record
+     if not unit.get("success"):
+-        return {"verified": False, "reason": f"unit failed: {str(unit.get('error') or '')[:120]}",
+-                "regime": regime}
++        return verdict_record(verified=False, reason=f"unit failed: {str(unit.get('error') or '')[:120]}",
++                              decided_by="excluded", regime=regime)
+     if _has_record(unit.get("quality_history")):
+         # verified by its own gate: an anchor, a regime anchor, a refit
+         bad = _unit_verdict(unit, where="")
+-        return {"verified": bad is None, "reason": (bad or {}).get("reason") or "approved by its own gate",
+-                "regime": regime, "own_gate": True}
++        return verdict_record(verified=bad is None, reason=(bad or {}).get("reason") or "approved by its own gate",
++                              decided_by="qc_gate", regime=regime)
+     rv = unit.get("reuse_validity") or {}
+     if rv.get("reused"):
+         # a locked-script reuse (a prior run's script, or a script-bank cold
+         # start) writes no QC record: the replay gate is its own gate
+         good = rv.get("verdict") == "good"
+-        return {"verified": good, "regime": regime, "own_gate": True,
+-                "reason": ("locked-script reuse passed the replay gate" if good
+-                           else f"reused script verdict {rv.get('verdict')!r}")}
++        return verdict_record(verified=good, decided_by="replay_gate", regime=regime,
++                              reason=("locked-script reuse passed the replay gate" if good
++                                      else f"reused script verdict {rv.get('verdict')!r}"))
+     if (unit.get("quality_history") or {}).get("unverified"):
+-        return {"verified": False, "reason": "follower unverified (budget)", "regime": regime}
++        return verdict_record(verified=False, reason="follower unverified (budget)", decided_by="none", regime=regime)
+     if unit.get("fitted_from") == "fresh_code" or recipe is None:
+-        return {"verified": False, "reason": "fitted without a locked recipe (its regime's anchor "
+-                                             "produced none)", "regime": regime}
++        return verdict_record(verified=False, decided_by="none", regime=regime,
++                              reason="fitted without a locked recipe (its regime's anchor produced none)")
+     rv = recipe.get("verdict") or {}
+     if rv.get("verified"):
+-        return {"verified": True, "reason": f"replayed the locked recipe of unit {recipe.get('unit')}, "
+-                                            "whose gate passed", "regime": regime, "recipe_of": recipe.get("unit")}
+-    return {"verified": False, "reason": f"replayed the locked recipe of unit {recipe.get('unit')}, which was "
+-                                         f"not approved: {rv.get('reason')}", "regime": regime,
+-            "recipe_of": recipe.get("unit")}
++        return verdict_record(verified=True, decided_by="recipe", regime=regime, recipe_of=recipe.get("unit"),
++                              reason=f"replayed the locked recipe of unit {recipe.get('unit')}, whose gate passed")
++    return verdict_record(verified=False, decided_by="recipe", regime=regime, recipe_of=recipe.get("unit"),
++                          reason=f"replayed the locked recipe of unit {recipe.get('unit')}, which was "
++                                 f"not approved: {rv.get('reason')}")
+ 
+ 
+ def stamp_unit_verdict(unit: Dict[str, Any], *, recipe: Optional[Dict[str, Any]] = None,
+@@ -376,6 +377,20 @@ def analysis_verdict(full_result: Optional[dict]) -> Dict[str, Any]:
+     - a hyperspectral series: every successful row's own ``verified``.
+     """
+     full = full_result or {}
++    from ._replay import is_verdict_record
++    stamped = full.get("verdict")
++    if is_verdict_record(stamped):
++        # The agent stamped its verdict when the result was final
++        # (``final_verdict_record``): read it. The reconstruction serves
++        # results from before the stamp.
++        return {"verified": stamped["verified"], "reason": stamped["reason"]}
++    return reconstructed_verdict(full)
++
++
++def reconstructed_verdict(full: Dict[str, Any]) -> Dict[str, Any]:
++    """The verdict read from the shapes an agent writes, for a result that
++    carries no stamped ``verdict`` (a run from before the record), and the
++    reference the stamps are held to (the parity test)."""
+     status = full.get("status")
+     if status != "success":
+         return {"verified": False, "reason": f"status {status!r}"}
+@@ -459,8 +474,9 @@ def legacy_series_verdict(full: Dict[str, Any]) -> Dict[str, Any]:
+                 if not (isinstance(n_t, int) and isinstance(n_a, int) and n_t > 0 and n_a == n_t):
+                     if not n_t:
+                         return {"verified": False, "reason": f"the unit has no dynamic-analysis record{where}"}
+-                    return {"verified": False, "reason": f"not every target of the unit was approved{where}: "
+-                                                          f"{n_a} of {n_t}"}
++                    # (the count before the unit, as the row's stamp says it)
++                    return {"verified": False, "reason": f"not every target of the unit was approved: "
++                                                          f"{n_a} of {n_t}{where}"}
+                 anchors += 1 if it.get("role") == "anchor" else 0
+                 continue
+             rv = it.get("reuse_validity") or {}
+@@ -501,7 +517,8 @@ def legacy_series_verdict(full: Dict[str, Any]) -> Dict[str, Any]:
+                             f"{bad['reason']} (recipe from unit {recipe.get('name')}, since refit)")}
+         if anchors == 0 and not any("verified" in it for it in ok_items):
+             return {"verified": False, "reason": "no unit carries a verification record"}
+-        return {"verified": True, "reason": "series anchors approved and every follower verified"
++        # (the same words as the stamped aggregation, so a reader of either path reads one text)
++        return {"verified": True, "reason": "every unit verified by the series driver"
+                 + (f" ({failed} failed unit(s) excluded by the agent)" if failed else "")}
+ 
+ 
+@@ -526,6 +543,44 @@ def _hyperspectral_cube_verdict(hs_records: List[Any]) -> Dict[str, Any]:
+         return {"verified": True, "reason": "every target passed verification"}
+ 
+ 
++def final_verdict_record(final: Dict[str, Any]) -> Dict[str, Any]:
++    """The verdict an agent stamps on its result when it is final
++    (``final["verdict"]``): a single curve or image run, a series (the
++    aggregate of the units' stamps), a hyperspectral cube or series. Built
++    from the same signals the reconstruction read — the status, the QC
++    record, the reuse verdict, the salvage and judge markers, the units'
++    stamps, the cube's records — so a reader of the stamp and a reader of
++    the shapes agree (the parity test holds them to it). Who decided: the
++    QC gate, the replay gate, the units' stamps (``qc_gate``), or nobody."""
++    from ._replay import verdict_record
++    v = reconstructed_verdict(final)
++    rv = final.get("reuse_validity") or {}
++    records = final.get("dynamic_analysis_records") or []
++    if final.get("status") != "success":
++        decided = "none"
++    elif isinstance(final.get("individual_results"), list) and final["individual_results"]:
++        decided = "qc_gate"
++    elif isinstance(records, list) and records:
++        # a cube's records say ``locked_replay`` (the controller's key); the
++        # response's ``script_reuse`` says it too, verbatim or repaired
++        replayed = any(isinstance(r, dict) and r.get("locked_replay") for r in records) or bool(
++            (final.get("script_reuse") or {}).get("verbatim"))
++        decided = "replay_gate" if replayed else "qc_gate"
++    elif rv.get("reused") and not _has_record(final.get("quality_history")):
++        decided = "replay_gate"
++    elif _has_record(final.get("quality_history")):
++        decided = "qc_gate"
++    else:
++        decided = "none"
++    return verdict_record(verified=v["verified"], reason=v["reason"], decided_by=decided,
++                          score=next((v for v in (rv.get("r_squared"), rv.get("quality_score"),
++                                                  (final.get("quality_history") or {}).get("final_r2"),
++                                                  (final.get("quality_history") or {}).get("final_score"))
++                                      if isinstance(v, (int, float))), None),
++                          threshold=next((v for v in (rv.get("threshold"), (final.get("quality_history") or {}).get("threshold"))
++                                          if isinstance(v, (int, float))), None))
++
++
+ def _single_run_verdict(full: Dict[str, Any], rv: Dict[str, Any]) -> Dict[str, Any]:
+     if full.get("quality_warning") and not _has_record(full.get("quality_history")):
+         return {"verified": False, "reason": "salvaged best-available result (quality_warning)"}
+diff --git a/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py b/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
+index ded9bd85..6d55c4d3 100644
+--- a/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
++++ b/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
+@@ -5099,6 +5099,12 @@ def qc_try_reuse(self, ctx: QCItemContext) -> Optional[dict]:
+         # correction ladder, as a single recipe is — the ladder's cost is
+         # paid once, not once per regime. A single recipe runs as it always
+         # did, in the spectrum's own folder.
++        from .._replay import ScoreReplayGate, select_recipe
++        gate = ScoreReplayGate(self._accept_gate().is_accept, self.r2_threshold, "R²")
++
++        def r2_of(result: dict) -> float:
++            return float(result.get("fit_quality", {}).get("r_squared") or 0 or 0.0)
++
+         candidates = [(ctx.reuse_script, ctx.reuse_source)]
+         extra = ctx.state.get("_reuse_candidates") or []
+         if extra and extra[0].get("script") == ctx.reuse_script:
+@@ -5106,46 +5112,45 @@ def qc_try_reuse(self, ctx: QCItemContext) -> Optional[dict]:
+         if len(candidates) == 1:
+             reuse_result = self._run_reuse_candidate(ctx, ctx.reuse_script, ctx.reuse_source, None, 1, 1)
+             if reuse_result.get("success"):
+-                r2 = (reuse_result.get("fit_quality", {}).get("r_squared") or 0 or 0.0)
+-                verdict = "good" if self._accept_gate().is_accept(r2) else "poor"
+-                return self._reuse_verdict(ctx, reuse_result, ctx.reuse_source, r2, verdict, tried=1, of=1)
++                rv = gate.judge(r2_of(reuse_result))
++                return self._reuse_verdict(ctx, reuse_result, ctx.reuse_source, rv["score"], rv["verdict"], tried=1, of=1)
+             return self._reuse_failed(ctx, reuse_result, ctx.reuse_source)
+-        kept = None                       # (result, source, r2, n, subdir) of the first poor-but-executed
+-        failed_last = None
+-        for n, (script, source) in enumerate(candidates, 1):
+-            subdir = f"{CANDIDATES_DIR_NAME}/recipe_{n:02d}"
+-            reuse_result = self._run_reuse_candidate(ctx, script, source, subdir, n, len(candidates),
+-                                                     verbatim=True)
+-            if reuse_result.get("success"):
+-                r2 = (reuse_result.get("fit_quality", {}).get("r_squared") or 0 or 0.0)
+-                if self._accept_gate().is_accept(r2):
+-                    self._promote_candidate_artifacts(reuse_result, ctx.item_idx, 0, subdir=subdir)
+-                    return self._reuse_verdict(ctx, reuse_result, source, r2, "good", tried=n, of=len(candidates))
+-                kept = kept or (reuse_result, source, r2, n, subdir)
+-                if n < len(candidates):
+-                    self.logger.info(f"   ↪ R² = {r2:.4f} below {self.r2_threshold:.3f}; "
+-                                     "trying the next regime's recipe")
+-                continue
+-            failed_last = (reuse_result, source)
+-            if n < len(candidates):
++        # Several regimes: each recipe VERBATIM in its own folder, the shared
++        # choice rule (select_recipe: the first the gate calls good, else the
++        # first that executed), the chosen one promoted.
++        subdirs: Dict[int, str] = {}
++
++        def run(n: int, script: str, source: Optional[str]) -> dict:
++            subdirs[n] = f"{CANDIDATES_DIR_NAME}/recipe_{n:02d}"
++            out = self._run_reuse_candidate(ctx, script, source, subdirs[n], n, len(candidates), verbatim=True)
++            if not out.get("success") and n < len(candidates):
+                 self.logger.info("   ↪ this regime's recipe could not execute verbatim; trying the next")
+-        if kept is not None:
+-            reuse_result, source, r2, n, subdir = kept
+-            self._promote_candidate_artifacts(reuse_result, ctx.item_idx, 0, subdir=subdir)
+-            return self._reuse_verdict(ctx, reuse_result, source, r2, "poor", tried=len(candidates),
+-                                       of=len(candidates), kept_from=n)
++            return out
++
++        def judge(result: dict) -> dict:
++            rv = gate.judge(r2_of(result))
++            if rv["verdict"] != "good" and len(subdirs) < len(candidates):     # a next candidate exists
++                self.logger.info(f"   ↪ R² = {rv['score']:.4f} below {self.r2_threshold:.3f}; "
++                                 "trying the next regime's recipe")
++            return rv
++        chosen = select_recipe(candidates, run, judge)
++        if chosen["chosen"] is not None:
++            n, reuse_result, rv = chosen["chosen"], chosen["result"], chosen["verdict"]
++            self._promote_candidate_artifacts(reuse_result, ctx.item_idx, 0, subdir=subdirs[n])
++            return self._reuse_verdict(ctx, reuse_result, chosen["source"], rv["score"], rv["verdict"],
++                                       tried=len(chosen["tried"]), of=len(candidates),
++                                       kept_from=n if rv["verdict"] != "good" else None)
+         if ctx.state.get("_strict_replay"):
+-            reuse_result, source = failed_last
+-            return self._reuse_failed(ctx, reuse_result, source)
++            failed = chosen["last_failed"]
++            return self._reuse_failed(ctx, failed["result"], failed["source"])
+         # None executed verbatim: the first recipe gets the correction ladder,
+         # as a single recipe would, in the spectrum's own folder.
+         script, source = candidates[0]
+         self.logger.info("   ↪ no regime's recipe ran verbatim; repairing the first as a single recipe would")
+         reuse_result = self._run_reuse_candidate(ctx, script, source, None, 1, len(candidates))
+         if reuse_result.get("success"):
+-            r2 = (reuse_result.get("fit_quality", {}).get("r_squared") or 0 or 0.0)
+-            verdict = "good" if self._accept_gate().is_accept(r2) else "poor"
+-            return self._reuse_verdict(ctx, reuse_result, source, r2, verdict, tried=len(candidates),
++            rv = gate.judge(r2_of(reuse_result))
++            return self._reuse_verdict(ctx, reuse_result, source, rv["score"], rv["verdict"], tried=len(candidates),
+                                        of=len(candidates), kept_from=1)
+         return self._reuse_failed(ctx, reuse_result, source)
+ 
+diff --git a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+index 3a6ab21f..07bef33c 100644
+--- a/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
++++ b/scilink/agents/exp_agents/controllers/hyperspectral_controllers.py
+@@ -1036,82 +1036,9 @@ def _map_valid_coverage(result_map) -> tuple[float, int]:
+     return 100.0 * n_valid / max(result_map.size, 1), n_valid
+ 
+ 
+-def _replay_map_gate(result_map, fit_mask, reference: dict | None,
+-                     required: bool) -> tuple[bool, str]:
+-    """Deterministic acceptance of a map produced by a LOCKED-SCRIPT replay.
+-
+-    A verbatim replay re-runs a method the reviewer already approved on the
+-    anchor; re-judging every map with the LLM only adds cost and judge
+-    variance (observed live: the map approved on the anchor rejected on
+-    replays, punching holes in the series schema). So replays are gated on
+-    evidence alone: valid coverage (within the fit mask when scoped), a
+-    non-collapsed value distribution, and — for a required output with the
+-    anchor's stats as ``reference`` — a median inside the locked method's
+-    plausible range (the anchor's [min, max] widened by one span on each
+-    side, at least 0.5 % of the magnitude so a near-constant anchor map does
+-    not reject trivial drift). Coverage is judged against the anchor's own
+-    coverage (``reference["coverage"]``) when known. A map outside that range is the
+-    method breaking down on this dataset (e.g. the peak left the fit
+-    window), which the series driver answers with a fresh-code refit.
+-    """
+-    m = np.asarray(result_map, dtype=float)
+-    if fit_mask is not None:
+-        try:
+-            m = m[np.asarray(fit_mask, dtype=bool)]
+-        except Exception:  # noqa: BLE001 - shape mismatch: judge the full frame
+-            pass
+-    m = m.ravel()
+-    finite = np.isfinite(m)
+-    cov = float(finite.mean()) if m.size else 0.0
+-    # Coverage floor: half of what the SAME method achieved on the anchor when
+-    # that is known (a dilated fit mask over-covers its emitter, so the
+-    # converged fraction is legitimately well below 1 — observed live at 43 %
+-    # on a mask-scoped follower, which a fixed 50 % floor wrongly rejected);
+-    # otherwise a lenient absolute floor.
+-    # Without a reference there is NO coverage floor: a small emitter fitted
+-    # full-frame legitimately covers ~1 % of the frame (observed live on a
+-    # legacy replay), and only the anchor's own coverage can say what this
+-    # method should reach. All-NaN maps are excluded before the gate.
+-    ref_cov = (reference or {}).get("coverage") if isinstance(reference, dict) else None
+-    if isinstance(ref_cov, (int, float)) and 0 < ref_cov <= 1:
+-        min_cov = 0.25 * float(ref_cov)
+-        if cov < min_cov:
+-            return False, (f"valid coverage {cov:.0%} < {min_cov:.0%} (a quarter of the "
+-                           f"anchor's {float(ref_cov):.0%}) — the locked method did not "
+-                           "converge here")
+-    vals = m[finite]
+-    # A constant map is a collapse only if the SAME method varied on the
+-    # anchor: a synthetic emitter with one exact centre, or a channel-
+-    # quantized position, is legitimately constant (observed live on a
+-    # mask-scoped follower the LLM review used to accept).
+-    if vals.size > 8 and float(np.ptp(vals)) == 0.0 and isinstance(reference, dict):
+-        try:
+-            ref_spread = float(reference.get("max")) - float(reference.get("min"))
+-        except (TypeError, ValueError):
+-            ref_spread = None
+-        if ref_spread is not None and ref_spread > 0:
+-            return False, ("map is constant across the frame while the anchor's varied "
+-                           f"over [{float(reference['min']):.4g}, {float(reference['max']):.4g}] "
+-                           "(fit collapsed to a bound)")
+-    # The range rule is for SIBLING datasets, where a required output far from
+-    # the anchor's means the method broke. In a stream the tracked quantity is
+-    # expected to move (a resonance shifting through a ramp, another part of a
+-    # sample), so a live loop sets ``values_may_move``: method health is judged
+-    # here (coverage, collapse), plausibility by the loop's own range gate, which
+-    # flags a jump and then adopts a value that keeps saying the same thing.
+-    # Observed live on tiles of one real EELS field: four of eleven tiles were
+-    # withheld for a plasmon 35 to 60 meV below the first tile's range.
+-    if (required and isinstance(reference, dict) and not reference.get("values_may_move")
+-            and all(isinstance(reference.get(k), (int, float)) for k in ("min", "max"))):
+-        lo, hi = float(reference["min"]), float(reference["max"])
+-        mean = float(reference.get("mean", (lo + hi) / 2.0))
+-        span = max(hi - lo, 0.005 * abs(mean), 1e-9)
+-        med = float(np.median(vals))
+-        if not (lo - span <= med <= hi + span):
+-            return False, (f"median {med:.4g} outside the locked method's plausible "
+-                           f"range [{lo - span:.4g}, {hi + span:.4g}] (anchor "
+-                           f"[{lo:.4g}, {hi:.4g}]) — method breakdown on this dataset")
+-    return True, ""
++# The per-map replay gate lives with the shared replay policies (#712); the
++# name stays here for its callers and tests.
++from .._replay import MapReplayGate, map_health as _replay_map_gate  # noqa: E402
+ 
+ 
+ def _wrap_console_text(text: str, width: int = 70) -> list:
+@@ -4226,9 +4153,9 @@ def _run_attempt(self, ctx: QCItemContext) -> dict:
+                         # Locked-script replay: deterministic gate, no LLM
+                         # review (see _replay_map_gate).
+                         _ref = (state.get("replay_reference") or {}).get(feature_name)
+-                        is_valid, critique = _replay_map_gate(
+-                            result_map, fit_mask, _ref,
+-                            feature_name in required_outputs)
++                        _rv = MapReplayGate().judge(result_map, fit_mask, _ref,
++                                                    feature_name in required_outputs)
++                        is_valid, critique = _rv["verdict"] == "good", (_rv["reasons"] or [""])[0]
+                         self.logger.info(
+                             f"    🔒 Deterministic replay gate on {feature_name}: "
+                             f"{'pass' if is_valid else 'REJECT — ' + critique}")
+diff --git a/scilink/agents/exp_agents/controllers/hyperspectral_series.py b/scilink/agents/exp_agents/controllers/hyperspectral_series.py
+index 40f3ce95..c5bf7d7d 100644
+--- a/scilink/agents/exp_agents/controllers/hyperspectral_series.py
++++ b/scilink/agents/exp_agents/controllers/hyperspectral_series.py
+@@ -149,6 +149,26 @@ def build_series_row(index: int, data_path: str, result: Dict[str, Any],
+         "scientific_claims": result.get("scientific_claims") or [],
+         "detailed_analysis": result.get("detailed_analysis") or "",
+     }
++    # The unit's verdict, stamped here where everything about it is known
++    # (the shared record shape, _replay.verdict_record): the single-cube rule
++    # — a clean status, something extracted, EVERY target approved. The
++    # series' own `verified` (one approved target is enough to keep the row
++    # in the table) stays as it is; this is what "verified" means to a
++    # reader of the result (the board).
++    from .._replay import verdict_record
++    n_t = len(records)
++    if row["verified"] is False or status != "success" or not features:
++        uv = verdict_record(verified=False, reason="unit not verified by the series driver",
++                            decided_by="none" if status != "success" else "qc_gate")
++    elif not n_t:
++        uv = verdict_record(verified=False, reason="the unit has no dynamic-analysis record", decided_by="none")
++    elif n_ok != n_t:
++        uv = verdict_record(verified=False, reason=f"not every target of the unit was approved: {n_ok} of {n_t}",
++                            decided_by="qc_gate")
++    else:
++        uv = verdict_record(verified=True, reason="every target approved", decided_by=(
++            "replay_gate" if (result.get("script_reuse") or {}).get("verbatim") else "qc_gate"))
++    row["unit_verdict"] = uv
+     reuse = result.get("script_reuse")
+     if reuse:
+         row["reuse_validity"] = {
+diff --git a/scilink/agents/exp_agents/controllers/image_analysis_controllers.py b/scilink/agents/exp_agents/controllers/image_analysis_controllers.py
+index a4efd40e..b67a12dd 100644
+--- a/scilink/agents/exp_agents/controllers/image_analysis_controllers.py
++++ b/scilink/agents/exp_agents/controllers/image_analysis_controllers.py
+@@ -548,47 +548,9 @@ def _load_prior_state(raw_path):
+     return anchor_dir, data
+ 
+ 
+-def _replay_feature_gate(features, reference) -> tuple:
+-    """Evidence-only acceptance of an image analysed by a LOCKED-SCRIPT replay.
+-
+-    A strict replay (a live frame) has no model to look at the overlay, and an
+-    image analysis has no R²: what it has is the numbers the approved script
+-    reports, and what that script reported on its reference. The gate judges
+-    METHOD HEALTH from them and nothing else:
+-
+-    - every numeric quantity the reference run reported is reported again, and
+-      is finite (a script that silently stops measuring something is broken);
+-    - the analysis still finds SOMETHING: if every quantity that was non-zero on
+-      the reference is zero now (no particles, no mask, no lattice), the method
+-      collapsed on this image or there is nothing in it, and either way the
+-      frame is not one to track quietly.
+-
+-    It does not ask whether the values are plausible: in a stream they are
+-    expected to move, and that is the live loop's range gate (which flags a
+-    jump and adopts a value that persists) and its audits. What no gate here
+-    can see is a segmentation that runs, reports finite numbers and is wrong;
+-    the independent audit is the check for that. Returns ``(ok, reason)``."""
+-    import math
+-    ref = {k: v for k, v in (reference or {}).items()
+-           if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)}
+-    got = features if isinstance(features, dict) else {}
+-    if not ref:
+-        numeric = [v for v in got.values() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+-        if not numeric or not all(math.isfinite(v) for v in numeric):
+-            return False, "the replay reported no finite quantity"
+-        return True, ""
+-    missing = [k for k in ref if not isinstance(got.get(k), (int, float)) or isinstance(got.get(k), bool)]
+-    if missing:
+-        return False, ("the locked script no longer reports "
+-                       + ", ".join(sorted(missing)[:4]) + " (it did on the reference)")
+-    broken = [k for k in ref if not math.isfinite(float(got[k]))]
+-    if broken:
+-        return False, "not finite: " + ", ".join(sorted(broken)[:4])
+-    alive = [k for k, v in ref.items() if v != 0]
+-    if alive and all(float(got[k]) == 0.0 for k in alive):
+-        return False, ("every quantity that was non-zero on the reference is zero here "
+-                       "(nothing was found: the method collapsed on this image, or it is empty)")
+-    return True, ""
++# The strict-replay gate lives with the shared replay policies (#712); the
++# name stays here for its callers and tests.
++from .._replay import FeatureHealthGate, ScoreReplayGate, feature_health as _replay_feature_gate  # noqa: E402
+ 
+ 
+ def _first_prior_image_script(state: dict):
+@@ -3706,9 +3668,9 @@ def qc_try_reuse(self, ctx: QCItemContext) -> Optional[dict]:
+             # A live frame: no vision review. The verdict is evidence only —
+             # what the approved script reports, against what it reported on its
+             # reference (see _replay_feature_gate for what that can and cannot see).
+-            ok, reason = _replay_feature_gate(
+-                reuse_result.get("extracted_features"),
+-                ctx.state.get("replay_reference"))
++            _rv = FeatureHealthGate().judge(reuse_result.get("extracted_features"),
++                                            ctx.state.get("replay_reference"))
++            ok, reason = _rv["verdict"] == "good", (_rv["reasons"] or [""])[0]
+             (self.logger.info if ok else self.logger.warning)(
+                 "   🔒 Deterministic replay gate: " + ("pass" if ok else f"REJECT — {reason}"))
+             reuse_result["reuse_validity"] = {
+@@ -3743,7 +3705,8 @@ def qc_try_reuse(self, ctx: QCItemContext) -> Optional[dict]:
+                 verification.get("quality_score"), (int, float)
+             ):
+                 v_score = verification["quality_score"]
+-            verdict = "good" if ctx.accept_gate.is_accept(v_score) else "poor"
++            verdict = ScoreReplayGate(ctx.accept_gate.is_accept, ctx.quality_threshold,
++                                      "vision score").judge(v_score)["verdict"]
+             reuse_result["_quality_score"] = v_score
+             if verdict == "good":
+                 self.logger.info(
+diff --git a/scilink/agents/exp_agents/curve_fitting_agent.py b/scilink/agents/exp_agents/curve_fitting_agent.py
+index 9ac46ed4..071dd3c5 100644
+--- a/scilink/agents/exp_agents/curve_fitting_agent.py
++++ b/scilink/agents/exp_agents/curve_fitting_agent.py
+@@ -2175,6 +2175,15 @@ def _compile_results(self, state: dict) -> Dict[str, Any]:
+             if state.get("anchor_candidates"):
+                 results["anchor_candidates"] = state["anchor_candidates"]
+ 
++        # The run's verdict, stamped here where the result's signals are all
++        # in hand (#712): the status, the QC record, the reuse verdict, the
++        # units' stamps. What "verified" means to a reader — the board,
++        # run_task's rows — is decided here, never reconstructed later.
++        from ._verification_record import final_verdict_record
++        try:
++            results["verdict"] = final_verdict_record(results)
++        except Exception as exc:  # noqa: BLE001 - a stamp never fails a run
++            self.logger.warning(f"verdict not stamped: {exc}")
+         return results
+ 
+     def _make_serializable(self, obj: Any) -> Any:
+diff --git a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+index 1724a1c1..7a38def1 100644
+--- a/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
++++ b/scilink/agents/exp_agents/hyperspectral_analysis_agent.py
+@@ -716,6 +716,13 @@ def analyze(
+         if staged:
+             response["staged_solutions"] = staged
+ 
++        # The cube's verdict, stamped now that the status is decided (#712).
++        from ._verification_record import final_verdict_record
++        try:
++            response["verdict"] = final_verdict_record(response)
++        except Exception as exc:  # noqa: BLE001 - a stamp never fails a run
++            self.logger.warning(f"verdict not stamped: {exc}")
++
+         # Persist the numeric results to <output_dir>/analysis_results.json
+         # so the shared feature-table writer (feature_table.py, generic
+         # extracted_features adapter) can emit features.csv — the file the
+@@ -831,6 +838,8 @@ def _write_results_file(self, response: dict) -> str | None:
+             }
+             if response.get("stage_timings"):
+                 payload["stage_timings"] = response["stage_timings"]
++            if isinstance(response.get("verdict"), dict):
++                payload["verdict"] = response["verdict"]          # the run's stamped verdict (#712)
+             path = self.output_dir / "analysis_results.json"
+             with open(path, "w", encoding="utf-8") as fh:
+                 json.dump(payload, fh, indent=2, default=str)
+@@ -1500,7 +1509,7 @@ def _compile_series_results(self, state: dict, literature_file) -> Dict[str, Any
+                     "confidence", "output_directory", "error", "flagged",
+                     "flag_reason", "flag_details", "adaptively_refitted",
+                     "reuse_validity", "quality_metrics", "warnings", "regime",
+-                    "locked_schema_gap", "schema_aliases", "verified")
++                    "locked_schema_gap", "schema_aliases", "verified", "unit_verdict")
+                 if k in r})
+             individual[-1]["n_features"] = len(r.get("extracted_features") or {})
+ 
+@@ -1549,6 +1558,12 @@ def _compile_series_results(self, state: dict, literature_file) -> Dict[str, Any
+             response["warnings"] = warnings
+         if literature_file:
+             response["literature_files"] = {"provided_file": str(literature_file)}
++        # The series' verdict, the aggregate of its rows' stamps (#712).
++        from ._verification_record import final_verdict_record
++        try:
++            response["verdict"] = final_verdict_record(response)
++        except Exception as exc:  # noqa: BLE001 - a stamp never fails a run
++            self.logger.warning(f"verdict not stamped: {exc}")
+         return response
+ 
+     def _maybe_stage_t2_solutions(self, records: list, skill_state: dict) -> list:
+diff --git a/scilink/agents/exp_agents/image_analysis_agent.py b/scilink/agents/exp_agents/image_analysis_agent.py
+index fe6726bb..5f6f4881 100644
+--- a/scilink/agents/exp_agents/image_analysis_agent.py
++++ b/scilink/agents/exp_agents/image_analysis_agent.py
+@@ -1902,6 +1902,15 @@ def _compile_results(self, state: dict) -> Dict[str, Any]:
+                     ),
+                 }
+ 
++        # The run's verdict, stamped here where the result's signals are all
++        # in hand (#712): the status, the QC record, the reuse verdict, the
++        # units' stamps. What "verified" means to a reader — the board,
++        # run_task's rows — is decided here, never reconstructed later.
++        from ._verification_record import final_verdict_record
++        try:
++            results["verdict"] = final_verdict_record(results)
++        except Exception as exc:  # noqa: BLE001 - a stamp never fails a run
++            self.logger.warning(f"verdict not stamped: {exc}")
+         return results
+ 
+     def _make_serializable(self, obj: Any) -> Any:
+diff --git a/tests/qc_golden/goldens/curve_realtime_reuse.json b/tests/qc_golden/goldens/curve_realtime_reuse.json
+index b12e87da..89fd0989 100644
+--- a/tests/qc_golden/goldens/curve_realtime_reuse.json
++++ b/tests/qc_golden/goldens/curve_realtime_reuse.json
+@@ -38,7 +38,17 @@
+     },
+     "scientific_claims": [],
+     "status": "success",
+-    "task_mode": "fitting"
++    "task_mode": "fitting",
++    "verdict": {
++      "decided_by": "replay_gate",
++      "interpretation_checked": false,
++      "own_gate": true,
++      "reason": "locked-script reuse passed the replay gate",
++      "regime": null,
++      "score": 0.995,
++      "threshold": 0.95,
++      "verified": true
++    }
+   },
+   "reuse_validity": {
+     "drift": "none",
+diff --git a/tests/test_board.py b/tests/test_board.py
+index 702af41d..86f8f481 100644
+--- a/tests/test_board.py
++++ b/tests/test_board.py
+@@ -562,7 +562,7 @@ def test_series_verdicts_follow_the_agents_shapes():
+     from scilink.agents.exp_agents._verification_record import analysis_verdict
+     # a clean curve series: anchor approved, followers replayed
+     v = analysis_verdict(_curve_series(ANCHOR_OK))
+-    assert v == {"verified": True, "reason": "series anchors approved and every follower verified"}
++    assert v == {"verified": True, "reason": "every unit verified by the series driver"}
+     # quick profile: followers carry only the profile stamp — still verified
+     v = analysis_verdict(_curve_series({**ANCHOR_OK, "produced_under_profile": "quick"},
+                                        follower_qh={"produced_under_profile": "quick"}))
+@@ -585,8 +585,8 @@ def test_series_verdicts_follow_the_agents_shapes():
+     # a failed unit is flagged and excluded by the agent: it does not block
+     failed = _curve_series(ANCHOR_OK)
+     failed["individual_results"][2].update({"success": False, "error": "fit diverged", "quality_history": None})
+-    assert analysis_verdict(failed) == {"verified": True, "reason": "series anchors approved and every follower "
+-                                                                    "verified (1 failed unit(s) excluded by the agent)"}
++    assert analysis_verdict(failed) == {"verified": True, "reason": "every unit verified by the series driver "
++                                                                    "(1 failed unit(s) excluded by the agent)"}
+     # a refit the driver accepted by its consistency rule is held like a follower: finished, not
+     # unverified — not to the anchor's salvage markers (a refit that improved a unit must not
+     # unverify a series the unrefit unit would have passed)
+@@ -699,7 +699,7 @@ def row(i, ok, verified, role="follower"):
+     assert not analysis_verdict(hs)["verified"]
+     # ... and every target approved: the driver's `verified` asks for one
+     hs["individual_results"][1].update({"n_features": 3, "quality_metrics": {"n_targets": 2, "n_approved": 1}})
+-    assert analysis_verdict(hs)["reason"] == "not every target of the unit was approved (unit cube1): 1 of 2"
++    assert analysis_verdict(hs)["reason"] == "not every target of the unit was approved: 1 of 2 (unit cube1)"
+     hs["individual_results"][1]["quality_metrics"] = {"n_targets": 0, "n_approved": 0}
+     assert analysis_verdict(hs)["reason"] == "the unit has no dynamic-analysis record (unit cube1)"
+     # on the board: the same claim text, provisional with the reason as its gate
+diff --git a/tests/test_measurement_loop.py b/tests/test_measurement_loop.py
+index 11ea9df9..cb3e27bb 100644
+--- a/tests/test_measurement_loop.py
++++ b/tests/test_measurement_loop.py
+@@ -575,9 +575,11 @@ def _try_reuse(self, strict):
+             logger=SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None),
+             _fit_single_spectrum=lambda **kw: {"success": False, "error": "needs 3 peaks",
+                                                "parameters": {}, "fit_quality": {}})
+-        # the reuse path's own helpers (a single recipe runs as it always did)
++        # the reuse path's own helpers (a single recipe runs as it always did) and its gate
+         host._run_reuse_candidate = lambda *a, **kw: C._run_reuse_candidate(host, *a, **kw)
+         host._reuse_failed = lambda *a, **kw: C._reuse_failed(host, *a, **kw)
++        host._accept_gate = lambda: SimpleNamespace(is_accept=lambda r2: r2 >= 0.95)
++        host.r2_threshold = 0.95
+         ctx = QCItemContext(state={"_strict_replay": strict}, data=None, data_path="f.csv",
+                             item_name="f", item_idx=0, reuse_script="s",
+                             reuse_source="anchor")
+diff --git a/tests/test_series_verdict_path.py b/tests/test_series_verdict_path.py
+index 10899442..a1a5458f 100644
+--- a/tests/test_series_verdict_path.py
++++ b/tests/test_series_verdict_path.py
+@@ -404,7 +404,9 @@ def test_a_good_reuse_series_verifies_and_a_failed_reuse_is_salvaged(tmp_path, m
+     units = _units(results)
+     uv = results["individual_results"][0]["unit_verdict"]
+     assert "quality_history" not in results["individual_results"][0] or not results["individual_results"][0]["quality_history"]
+-    assert uv == {"verified": True, "reason": "locked-script reuse passed the replay gate", "regime": "default", "own_gate": True}, uv
++    assert {k: uv[k] for k in ("verified", "reason", "regime", "own_gate", "decided_by")} == {
++        "verified": True, "reason": "locked-script reuse passed the replay gate", "regime": "default",
++        "own_gate": True, "decided_by": "replay_gate"}, uv
+     assert analysis_verdict(results)["verified"], (analysis_verdict(results), units)
+     # the reuse attempted, the script could not run, full QC re-derived the model (approved):
+     # the controller stamps reuse_validity script_failed + quality_warning → salvaged
+diff --git a/tests/test_verdict_parity.py b/tests/test_verdict_parity.py
+new file mode 100644
+index 00000000..c1650692
+--- /dev/null
++++ b/tests/test_verdict_parity.py
+@@ -0,0 +1,237 @@
++"""Parity for #712 PR A: the verdict an agent STAMPS when its result is
++final equals the verdict `main` reconstructed from the result's shapes —
++identical `{verified, reason}`, no allow-list — over result shapes built by
++the agents' own code: the curve and image series harnesses (real series and
++refit controllers, real compile), single runs through the real compile with
++the QC engine's record shapes and the real reuse path, a hyperspectral cube
++through the real `analyze()` (strict replay, no model) and hyperspectral
++series rows through the real row builder.
++
++The reference is `reconstructed_verdict` on the result with the new stamps
++removed: the top-level `verdict` everywhere, and the hyperspectral rows'
++`unit_verdict` (main had none; the curve and image units were already
++stamped in stage 2, so theirs stay).
++"""
++
++import copy
++import json
++import sys
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++import test_series_verdict_path as curve  # noqa: E402
++import test_image_series_verdict_path as image  # noqa: E402
++import test_hs_locked_replay as hs  # noqa: E402
++
++from scilink.agents.exp_agents._verification_record import (  # noqa: E402
++    analysis_verdict, final_verdict_record, reconstructed_verdict)
++from scilink.agents.exp_agents._replay import is_verdict_record  # noqa: E402
++
++
++def _reference(final: dict, *, hs_rows: bool = False) -> dict:
++    """`main`'s reading of the same result: the stamps this PR adds removed."""
++    plain = copy.deepcopy(final)
++    plain.pop("verdict", None)
++    if hs_rows:
++        for row in plain.get("individual_results") or []:
++            row.pop("unit_verdict", None)
++    return reconstructed_verdict(plain)
++
++
++def _check(final: dict, label: str, *, hs_rows: bool = False):
++    assert is_verdict_record(final.get("verdict")), f"{label}: no stamp"
++    stamped = analysis_verdict(final)
++    assert stamped == {"verified": final["verdict"]["verified"], "reason": final["verdict"]["reason"]}, label
++    assert stamped == _reference(final, hs_rows=hs_rows), label
++    assert final["verdict"]["decided_by"] in ("qc_gate", "replay_gate", "recipe", "excluded", "none"), label
++
++
++# ------------------------------------------------------------- curve series
++CURVE_SERIES = {
++    "clean": dict(names=curve.NAMES, anchors={"spectrum_0000": curve.OK},
++                  follower_r2={"spectrum_0001": 0.97, "spectrum_0002": 0.98}),
++    "salvaged_anchor": dict(names=curve.NAMES, anchors={"spectrum_0000": curve.SALVAGED},
++                            follower_r2={"spectrum_0001": 0.97, "spectrum_0002": 0.98}),
++    "cut_anchor": dict(names=curve.NAMES, anchors={"spectrum_0000": {**curve.OK, "unverified": True, "approved": False}},
++                       follower_r2={"spectrum_0001": 0.97, "spectrum_0002": 0.98}),
++    "failed_anchor": dict(names=curve.NAMES, anchors={"spectrum_0000": {"r2": 0.0, "approved": False, "script": None, "failed": True}},
++                          follower_r2={"spectrum_0001": 0.97, "spectrum_0002": 0.98}),
++    "two_regimes": dict(names=[f"spectrum_{i:04d}" for i in range(6)], regimes=[[0, 1, 2], [3, 4, 5]],
++                        anchors={"spectrum_0000": curve.OK, "spectrum_0003": {**curve.OK, "script": "M3"}},
++                        follower_r2={f"spectrum_{i:04d}": 0.97 for i in range(6)}),
++    "two_regimes_launder": dict(names=[f"spectrum_{i:04d}" for i in range(6)], regimes=[[0, 1, 2], [3, 4, 5]],
++                                anchors={"spectrum_0000": curve.SALVAGED, "spectrum_0003": {**curve.OK, "script": "M3"}},
++                                follower_r2={f"spectrum_{i:04d}": 0.97 for i in range(6)},
++                                refits={"spectrum_0000": {"r2": 0.99, "approved": True, "script": "M2"}}),
++    "anchor_refit_m1_m2": dict(names=curve.NAMES, anchors={"spectrum_0000": {**curve.OK, "r2": 0.92}},
++                               follower_r2={"spectrum_0001": 0.93, "spectrum_0002": 0.97},
++                               refits={"spectrum_0000": {"r2": 0.99, "approved": True, "script": "M2"},
++                                       "spectrum_0001": {"r2": 0.79, "approved": False, "script": "M2"}}),
++    "follower_refit_ok": dict(names=[f"spectrum_{i:04d}" for i in range(4)], anchors={"spectrum_0000": curve.OK},
++                              follower_r2={"spectrum_0001": 0.97, "spectrum_0002": None, "spectrum_0003": 0.96},
++                              refits={"spectrum_0002": {"r2": 0.98, "approved": True, "script": "M2"}}),
++    "follower_refit_salvaged": dict(names=[f"spectrum_{i:04d}" for i in range(4)], anchors={"spectrum_0000": curve.OK},
++                                    follower_r2={"spectrum_0001": 0.97, "spectrum_0002": None, "spectrum_0003": 0.96},
++                                    refits={"spectrum_0002": {"r2": 0.80, "approved": False, "script": "M2",
++                                                              "warning": "R² = 0.8000 below threshold 0.95"}}),
++    "good_reuse": dict(names=curve.NAMES, anchors={"spectrum_0000": {**curve.OK, "reused": "good"}},
++                       follower_r2={"spectrum_0001": 0.97, "spectrum_0002": 0.98}),
++    "failed_reuse_rederived": dict(names=curve.NAMES, anchors={"spectrum_0000": {**curve.SALVAGED, "reused": "failed"}},
++                                   follower_r2={"spectrum_0001": 0.97, "spectrum_0002": 0.98}),
++}
++
++
++@pytest.mark.parametrize("name", sorted(CURVE_SERIES))
++def test_curve_series_stamp_equals_the_reconstruction(tmp_path, monkeypatch, name):
++    spec = dict(CURVE_SERIES[name])
++    state, _ = curve.run_series(tmp_path, monkeypatch, **spec)
++    final = curve.compile_results(tmp_path, state)
++    _check(final, f"curve series {name}")
++
++
++# ------------------------------------------------------------- curve single
++def _single_curve(tmp_path, unit):
++    """A single-spectrum result through the real compile, from the QC
++    engine's record shapes (``_canned_anchor``) or a real reuse result."""
++    from scilink.agents.exp_agents.curve_fitting_agent import CurveFittingAgent
++    import logging
++    agent = object.__new__(CurveFittingAgent)
++    agent.output_dir = Path(tmp_path)
++    agent.logger = logging.getLogger("parity.single")
++    agent._validate_scientific_claims = lambda claims: claims
++    agent._maybe_stage_t2_solutions = lambda state: []
++    agent._bank_series_scripts = lambda state: None
++    state = {"is_single_spectrum": True, "num_spectra": 1, "series_results": [unit],
++             "fit_results": {"model_type": unit.get("model_type"), "parameters": unit.get("fitted_parameters") or {},
++                             "fit_quality": unit.get("fit_quality") or {}},
++             "synthesis_result": {"detailed_analysis": "d", "scientific_claims": [{"claim": "c"}]},
++             "task_mode": "fitting", "spectrum_names": ["spectrum_0000"]}
++    agent._save_fitting_scripts(state)
++    return agent._compile_results(state)
++
++
++CURVE_SINGLE = {
++    "approved": dict(r2=0.98, approved=True, script="M1"),
++    "soft_band_approved": dict(r2=0.92, approved=True, script="M1"),
++    "salvaged": dict(r2=0.80, approved=False, script="M1", warning="R² = 0.8000 below threshold 0.95"),
++    "judge_picked": dict(r2=0.90, approved=True, script="M1", judge_warning="Judge selected this as best available"),
++    "budget_cut": dict(r2=0.98, approved=False, script="M1", unverified=True),
++    "failed": dict(r2=0.0, approved=False, script=None, failed=True),
++    "reused_good": dict(r2=0.98, approved=True, script="M1", reused="good"),
++    "reused_poor": dict(r2=0.80, approved=False, script="M1", reused="poor"),
++}
++
++
++@pytest.mark.parametrize("name", sorted(CURVE_SINGLE))
++def test_curve_single_run_stamp_equals_the_reconstruction(tmp_path, name):
++    unit = curve._canned_anchor("spectrum_0000", 0, **CURVE_SINGLE[name])
++    final = _single_curve(tmp_path, unit)
++    _check(final, f"curve single {name}")
++
++
++def test_curve_single_run_through_the_real_reuse_path(tmp_path, monkeypatch):
++    """The reuse verdict the gate writes (good / poor / failed → re-derive)
++    reaches the compile and the stamp through the real qc_try_reuse."""
++    for label, scripts in (("good", {"LOW": 0.80, "HIGH": 0.985}), ("poor", {"LOW": 0.70, "HIGH": 0.75})):
++        res, ex, _, item = curve._replay(tmp_path / label, monkeypatch, scripts)
++        unit = {**res, "name": "spectrum_0000", "index": 0, "success": True}
++        final = _single_curve(tmp_path / label / "compiled", unit)
++        assert final["reuse_validity"]["verdict"] == label
++        _check(final, f"curve single reuse {label}")
++
++
++# ------------------------------------------------------------- image series
++IMAGE_SERIES = {
++    "clean": dict(names=image.NAMES, anchors={"image_0000": image.OK}, follower_score={"image_0001": 0.88, "image_0002": 0.9}),
++    "salvaged_anchor": dict(names=image.NAMES, anchors={"image_0000": image.SALVAGED}, follower_score={"image_0001": 0.88, "image_0002": 0.9}),
++    "failed_anchor": dict(names=image.NAMES, anchors={"image_0000": {"score": 0.0, "approved": False, "script": None, "failed": True}},
++                          follower_score={"image_0001": 0.9, "image_0002": 0.9}),
++    "two_regimes": dict(names=[f"image_{i:04d}" for i in range(6)], regimes=[[0, 1, 2], [3, 4, 5]],
++                        anchors={"image_0000": image.OK, "image_0003": {**image.OK, "script": "M3"}},
++                        follower_score={f"image_{i:04d}": 0.9 for i in range(6)}),
++    "follower_refit_ok": dict(names=[f"image_{i:04d}" for i in range(4)], anchors={"image_0000": image.OK},
++                              follower_score={"image_0001": 0.9, "image_0002": None, "image_0003": 0.88},
++                              refits={"image_0002": {"score": 0.85, "approved": True, "script": "M2"}}),
++    "follower_refit_salvaged": dict(names=[f"image_{i:04d}" for i in range(4)], anchors={"image_0000": image.OK},
++                                    follower_score={"image_0001": 0.9, "image_0002": None, "image_0003": 0.88},
++                                    refits={"image_0002": {"score": 0.5, "approved": False, "script": "M2", "warning": "below"}}),
++}
++
++
++@pytest.mark.parametrize("name", sorted(IMAGE_SERIES))
++def test_image_series_stamp_equals_the_reconstruction(tmp_path, monkeypatch, name):
++    state, _ = image.run_series(tmp_path, monkeypatch, **dict(IMAGE_SERIES[name]))
++    final = image.compile_results(tmp_path, state)
++    _check(final, f"image series {name}")
++
++
++# --------------------------------------------------------- hyperspectral
++def test_hyperspectral_cube_stamp_through_the_real_analyze(tmp_path, monkeypatch):
++    """The whole analyze() of a strict replay (no model call), success and
++    failure: the stamp is placed after the status is decided."""
++    monkeypatch.setenv("UNSAFE_EXECUTION_OK", "true")
++    np.save(tmp_path / "cube.npy", hs._peak_cube(center=660.0, seed=1))
++    ok = hs._strict_agent(tmp_path, "frame").analyze(
++        str(tmp_path / "cube.npy"), system_info=dict(hs.AXIS_OK),
++        prior_analysis_paths=[str(hs._anchor_dir(tmp_path))], reuse_locked_script=True, strict_replay=True,
++        replay_reference={"Peak_Position": {"min": 640.0, "max": 662.0, "mean": 650.0, "coverage": 1.0}})
++    assert ok["status"] == "success"
++    _check(ok, "hs cube strict replay (good)")
++    assert ok["verdict"]["verified"] and ok["verdict"]["decided_by"] == "replay_gate"
++    # the saved file carries the same stamp
++    saved = json.loads((tmp_path / "frame" / "analysis_results.json").read_text())
++    assert saved.get("verdict", {}).get("verified") is True
++    broken = hs.PEAK_SCRIPT.replace("w = data", "w = undefined_name + data")
++    (tmp_path / "b").mkdir()
++    bad = hs._strict_agent(tmp_path, "frame2").analyze(
++        str(tmp_path / "cube.npy"), system_info=dict(hs.AXIS_OK),
++        prior_analysis_paths=[str(hs._anchor_dir(tmp_path / "b", broken))], reuse_locked_script=True, strict_replay=True)
++    assert bad["status"] != "success"
++    if is_verdict_record(bad.get("verdict")):
++        _check(bad, "hs cube strict replay (failed)")
++        assert not bad["verdict"]["verified"]
++
++
++def test_hyperspectral_series_rows_stamp_equals_the_legacy_row_rule():
++    """Rows from the real row builder over cube results of every outcome: the
++    stamp on each row aggregates to what main's row rule read."""
++    from scilink.agents.exp_agents.controllers.hyperspectral_series import build_series_row
++    rec_ok = {"target": "t", "task_success": True, "script": "s", "quality_history": {"approved": True}}
++    rec_bad = {"target": "u", "task_success": False, "script": "s"}
++    feats = [{"name": "Peak_Position", "stats": {"mean": 1.0}}]
++    cubes = {
++        "clean": {"status": "success", "extracted_features": feats, "dynamic_analysis_records": [rec_ok]},
++        "two_of_three": {"status": "success", "extracted_features": feats, "dynamic_analysis_records": [rec_ok, rec_ok, rec_bad]},
++        "partial": {"status": "partial", "extracted_features": feats, "dynamic_analysis_records": [rec_ok]},
++        "no_records": {"status": "success", "extracted_features": feats, "dynamic_analysis_records": []},
++        "salvaged_only": {"status": "success", "extracted_features": feats, "dynamic_analysis_records": [rec_bad]},
++        "failed": {"status": "error", "extracted_features": [], "dynamic_analysis_records": [], "error": "boom"},
++        "verbatim_replay": {"status": "success", "extracted_features": feats, "dynamic_analysis_records": [rec_ok],
++                            "script_reuse": {"verbatim": True, "n_replayed": 1}},
++    }
++    rows = {k: build_series_row(i, f"/d/{k}.npy", v, "anchor" if i == 0 else "follower", f"/o/{k}")
++            for i, (k, v) in enumerate(cubes.items())}
++    for k, row in rows.items():
++        assert is_verdict_record(row["unit_verdict"]), k
++    assert rows["verbatim_replay"]["unit_verdict"]["decided_by"] == "replay_gate"
++    # every combination the series driver can hand to a reader, assembled by the
++    # agent's own _compile_series_results (the response's rows and its stamp)
++    from scilink.agents.exp_agents.hyperspectral_analysis_agent import HyperspectralAnalysisAgent
++    import itertools
++    agent = object.__new__(HyperspectralAnalysisAgent)
++    agent.output_dir = Path("/o")
++    agent._validate_scientific_claims = lambda claims: claims
++    agent._scout_summary = lambda scout: None
++    names = list(rows)
++    for k in range(1, 4):
++        for combo in itertools.combinations(names, k):
++            state = {"series_results": [copy.deepcopy(rows[n]) for n in combo],
++                     "synthesis_result": {"detailed_analysis": "d", "scientific_claims": []}}
++            final = agent._compile_series_results(state, None)
++            assert all(is_verdict_record(r.get("unit_verdict")) for r in final["individual_results"]), combo
++            _check(final, f"hs series rows {combo}", hs_rows=True)
++            # the response's own stamp says who decided; a series that is not "success" has none to decide
++            assert final["verdict"]["decided_by"] == ("qc_gate" if final["status"] == "success" else "none"), combo

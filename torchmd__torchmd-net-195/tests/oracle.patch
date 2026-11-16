@@ -1,0 +1,675 @@
+diff --git a/benchmarks/inference.py b/benchmarks/inference.py
+new file mode 100644
+index 000000000..f6508bc34
+--- /dev/null
++++ b/benchmarks/inference.py
+@@ -0,0 +1,167 @@
++"""
++Benchmark script for inference.
++This script compiles a model using torch.compile and measures the time it takes to run a forward and backward pass for a certain molecule.
++
++"""
++import torch
++from os.path import dirname, join
++import torch
++from torchmdnet.models.model import create_model
++import yaml
++from moleculekit.molecule import Molecule
++from moleculekit.periodictable import periodictable
++import numpy as np
++import time
++import os
++
++
++def load_example_args(model_name, remove_prior=False, config_file=None, **kwargs):
++    if config_file is None:
++        if model_name == "tensornet":
++            config_file = join(
++                dirname(dirname(__file__)), "examples", "TensorNet-QM9.yaml"
++            )
++        else:
++            config_file = join(dirname(dirname(__file__)), "examples", "ET-QM9.yaml")
++    with open(config_file, "r") as f:
++        args = yaml.load(f, Loader=yaml.FullLoader)
++    args["model"] = model_name
++    args["seed"] = 1234
++    if remove_prior:
++        args["prior_model"] = None
++    for key, val in kwargs.items():
++        assert key in args, f"Broken test! Unknown key '{key}'."
++        args[key] = val
++    return args
++
++
++class GpuTimer:
++    def __enter__(self):
++        self.start = time.perf_counter()
++        return self
++
++    def __exit__(self, *args):
++        # synchronize CUDA device
++        self.end = time.perf_counter()
++        self.interval = (self.end - self.start) * 1000  # Convert to milliseconds
++
++
++def benchmark_pdb(pdb_file, **kwargs):
++    device = "cuda"
++    molecule = Molecule(pdb_file)
++    atomic_numbers = torch.tensor(
++        [periodictable[symbol].number for symbol in molecule.element],
++        dtype=torch.long,
++        device=device,
++    )
++    positions = torch.tensor(
++        molecule.coords[:, :, 0], dtype=torch.float32, device=device
++    ).to(device)
++    molecule = None
++    torch.cuda.nvtx.range_push("Initialization")
++    args = load_example_args(
++        "tensornet",
++        config_file="../examples/TensorNet-rMD17.yaml",
++        remove_prior=True,
++        output_model="Scalar",
++        derivative=False,
++        max_z=int(atomic_numbers.max() + 1),
++        max_num_neighbors=32,
++        **kwargs,
++    )
++    model = create_model(args)
++    z = atomic_numbers
++    pos = positions
++    batch = torch.zeros_like(z).to("cuda")
++    model = model.to("cuda")
++    torch.cuda.nvtx.range_pop()
++    torch.cuda.nvtx.range_push("Warmup")
++    for i in range(3):
++        pred, _ = model(z, pos, batch)
++        pred.sum().backward()
++    torch.cuda.synchronize()
++    model = torch.compile(model, backend="inductor", mode="max-autotune")
++    for i in range(10):
++        pred, _ = model(z, pos, batch)
++        pred.sum().backward()
++    torch.cuda.nvtx.range_pop()
++    torch.cuda.nvtx.range_push("Benchmark")
++    nbench = 100
++    times = np.zeros(nbench)
++    stream = torch.cuda.Stream()
++    torch.cuda.synchronize()
++    with GpuTimer() as timer:
++        with torch.cuda.stream(stream):
++            for i in range(nbench):
++                # torch.cuda.synchronize()
++                # with GpuTimer() as timer2:
++                # torch.cuda.nvtx.range_push("Step")
++                pred, _ = model(z, pos, batch)
++                # torch.cuda.nvtx.range_push("derivative")
++                pred.sum().backward()
++                # torch.cuda.nvtx.range_pop()
++                # torch.cuda.nvtx.range_pop()
++                # torch.cuda.synchronize()
++                # times[i] = timer2.interval
++        torch.cuda.synchronize()
++    # torch.cuda.nvtx.range_pop()
++    return len(atomic_numbers), timer.interval / nbench
++
++
++from tabulate import tabulate
++
++# List of cases to benchmark, arbitrary parameters can be overriden here
++cases = {
++    "0L": {"num_layers": 0, "embedding_dimension": 128},
++    "1L": {"num_layers": 1, "embedding_dimension": 128},
++    "2L": {"num_layers": 2, "embedding_dimension": 128},
++    "2L emb 64": {"num_layers": 2, "embedding_dimension": 64},
++}
++
++def benchmark_all():
++    timings = {}
++    for pdb_file in os.listdir("systems"):
++        if not pdb_file.endswith(".pdb"):
++            continue
++        molecule = Molecule(os.path.join("systems", pdb_file))
++        natoms = len(molecule.element)
++        print("Found %s, with %d atoms" % (pdb_file, natoms))
++    for pdb_file in os.listdir("systems"):
++        if not pdb_file.endswith(".pdb"):
++            continue
++        if pdb_file == "stmv.pdb":  # Does not fit in a 4090
++            continue
++        times = {}
++        num_atoms = 0
++        for name, kwargs in cases.items():
++            torch.cuda.empty_cache()
++            num_atoms, time = benchmark_pdb(os.path.join("systems", pdb_file), **kwargs)
++            times[name] = time
++        timings[pdb_file] = (num_atoms, times)
++    # Print a table with the timings
++    keys = list(timings.keys())
++    values = list(timings.values())
++    labels = [f"Time %s (ms)" % key for key in values[0][1].keys()]
++    table_data = [["Molecule (atoms)", *labels]]
++    for key, val in timings.items():
++        # Remove the .pdb extension
++        key = key[:-4]
++        molecule = "{} ({})".format(key, val[0])
++        times = []
++        for time in val[1].values():
++            times.append(round(time, 2))
++        table_data.append([molecule, *times])
++    table = tabulate(
++        table_data,
++        headers="firstrow",
++        tablefmt="pretty",
++        showindex=False,
++        stralign="center",
++        numalign="center",
++        colalign=("center",),
++    )
++    print(table)
++
++
++if __name__ == "__main__":
++    benchmark_all()
+diff --git a/examples/TensorNet-rMD17.yaml b/examples/TensorNet-rMD17.yaml
+index 0efd5fc5e..44afdd9b6 100644
+--- a/examples/TensorNet-rMD17.yaml
++++ b/examples/TensorNet-rMD17.yaml
+@@ -30,7 +30,7 @@ lr_min: 1.0e-08
+ lr_patience: 25
+ lr_warmup_steps: 500
+ max_num_neighbors: 32
+-max_z: 128
++max_z: 100
+ model: tensornet
+ ngpus: 1
+ num_epochs: 10000
+diff --git a/tests/test_model.py b/tests/test_model.py
+index 8b436abb3..88ea54d49 100644
+--- a/tests/test_model.py
++++ b/tests/test_model.py
+@@ -62,6 +62,8 @@ def test_torchscript(model_name, device):
+ def test_torchscript_dynamic_shapes(model_name, device):
+     if device == "cuda" and not torch.cuda.is_available():
+         pytest.skip("CUDA not available")
++    if model_name == "tensornet":
++        pytest.skip("TorchScripted TensorNet does not support dynamic shapes.")
+     z, pos, batch = create_example_batch()
+     model = torch.jit.script(
+         create_model(load_example_args(model_name, remove_prior=True, derivative=True))
+diff --git a/torchmdnet/models/model.py b/torchmdnet/models/model.py
+index 8a5bf7038..abb9cdbaf 100644
+--- a/torchmdnet/models/model.py
++++ b/torchmdnet/models/model.py
+@@ -75,6 +75,7 @@ def create_model(args, prior_model=None, mean=None, std=None):
+         )
+     elif args["model"] == "tensornet":
+         from torchmdnet.models.tensornet import TensorNet
++
+ 	# Setting is_equivariant to False to enforce the use of Scalar output module instead of EquivariantScalar
+         is_equivariant = False
+         representation_model = TensorNet(
+@@ -252,10 +253,8 @@ def forward(
+ 
+         if self.derivative:
+             pos.requires_grad_(True)
+-
+         # run the potentially wrapped representation model
+         x, v, z, pos, batch = self.representation_model(z, pos, batch, q=q, s=s)
+-
+         # apply the output network
+         x = self.output_model.pre_reduce(x, v, z, pos, batch)
+ 
+@@ -282,8 +281,8 @@ def forward(
+         if self.prior_model is not None:
+             for prior in self.prior_model:
+                 y = prior.post_reduce(y, z, pos, batch, extra_args)
+-
+         # compute gradients with respect to coordinates
++
+         if self.derivative:
+             grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(y)]
+             dy = grad(
+diff --git a/torchmdnet/models/tensornet.py b/torchmdnet/models/tensornet.py
+index 9484de20c..b2704571d 100644
+--- a/torchmdnet/models/tensornet.py
++++ b/torchmdnet/models/tensornet.py
+@@ -3,14 +3,15 @@
+ from typing import Optional, Tuple
+ from torch import Tensor, nn
+ from torch_scatter import scatter
+-from torch_geometric.nn import MessagePassing
+ from torchmdnet.models.utils import (
+     CosineCutoff,
+-    Distance,
++    OptimizedDistance,
+     rbf_class_mapping,
+     act_class_mapping,
+ )
+ 
++torch.set_float32_matmul_precision('high')
++torch.backends.cuda.matmul.allow_tf32 = True
+ # Creates a skew-symmetric tensor from a vector
+ def vector_to_skewtensor(vector):
+     batch_size = vector.size(0)
+@@ -96,6 +97,9 @@ class TensorNet(nn.Module):
+             positions internal tensor features will be equivariant and scalar predictions
+             will be invariant. O(3) or SO(3).
+             (default :obj:`"O(3)"`)
++        static_shapes (bool, optional): Whether to enforce static shapes.
++            Makes the model CUDA-graph compatible.
++            (default: :obj:`True`)
+     """
+ 
+     def __init__(
+@@ -108,9 +112,10 @@ def __init__(
+         activation="silu",
+         cutoff_lower=0,
+         cutoff_upper=4.5,
+-        max_z=128,
+         max_num_neighbors=64,
++        max_z=128,
+         equivariance_invariance_group="O(3)",
++        static_shapes=True,
+         dtype=torch.float32,
+     ):
+         super(TensorNet, self).__init__()
+@@ -137,9 +142,6 @@ def __init__(
+         self.cutoff_lower = cutoff_lower
+         self.cutoff_upper = cutoff_upper
+         act_class = act_class_mapping[activation]
+-        self.distance = Distance(
+-            cutoff_lower, cutoff_upper, max_num_neighbors, return_vecs=True, loop=True
+-        )
+         self.distance_expansion = rbf_class_mapping[rbf_type](
+             cutoff_lower, cutoff_upper, num_rbf, trainable_rbf
+         )
+@@ -152,7 +154,7 @@ def __init__(
+             trainable_rbf,
+             max_z,
+             dtype,
+-        ).jittable()
++        )
+ 
+         self.layers = nn.ModuleList()
+         if num_layers != 0:
+@@ -166,11 +168,26 @@ def __init__(
+                         cutoff_upper,
+                         equivariance_invariance_group,
+                         dtype,
+-                    ).jittable()
++                    )
+                 )
+         self.linear = nn.Linear(3 * hidden_channels, hidden_channels, dtype=dtype)
+         self.out_norm = nn.LayerNorm(3 * hidden_channels, dtype=dtype)
+         self.act = act_class()
++        # Resize to fit set to false ensures Distance returns a statically-shaped tensor of size max_num_pairs=pos.size*max_num_neigbors
++        # negative max_num_pairs argument means "per particle"
++        # long_edge_index set to False saves memory and spares some kernel launches by keeping neighbor indices as int32.
++        self.static_shapes = static_shapes
++        self.distance = OptimizedDistance(
++            cutoff_lower,
++            cutoff_upper,
++            max_num_pairs=-max_num_neighbors,
++            return_vecs=True,
++            loop=True,
++            check_errors=False,
++            resize_to_fit=not self.static_shapes,
++            long_edge_index=True,
++        )
++
+         self.reset_parameters()
+ 
+     def reset_parameters(self):
+@@ -188,19 +205,26 @@ def forward(
+         q: Optional[Tensor] = None,
+         s: Optional[Tensor] = None,
+     ) -> Tuple[Tensor, Optional[Tensor], Tensor, Tensor, Tensor]:
+-
+         # Obtain graph, with distances and relative position vectors
+         edge_index, edge_weight, edge_vec = self.distance(pos, batch)
+         # This assert convinces TorchScript that edge_vec is a Tensor and not an Optional[Tensor]
+         assert (
+             edge_vec is not None
+         ), "Distance module did not return directional information"
+-
+-        # Expand distances with radial basis functions
++        # Distance module returns -1 for non-existing edges, to avoid having to resize the tensors when we want to ensure static shapes (for CUDA graphs) we make all non-existing edges pertain to the first atom
++        if self.static_shapes:
++            mask = (edge_index[0] >= 0).unsqueeze(0).expand_as(edge_index)
++            # I trick the model into thinking that the masked edges pertain to the first atom
++            # WARNING: This can hurt performance if max_num_pairs >> actual_num_pairs
++            edge_index = edge_index * mask
++            edge_weight = edge_weight * mask[0]
++            edge_vec = edge_vec * mask[0].unsqueeze(-1).expand_as(edge_vec)
+         edge_attr = self.distance_expansion(edge_weight)
+-        # Embedding from edge-wise tensors to node-wise tensors
++        mask = edge_index[0] == edge_index[1]
++        # Normalizing edge vectors by their length can result in NaNs, breaking Autograd.
++        # I avoid dividing by zero by setting the weight of self edges and self loops to 1
++        edge_vec = edge_vec / edge_weight.masked_fill(mask, 1).unsqueeze(1)
+         X = self.tensor_embedding(z, edge_index, edge_weight, edge_vec, edge_attr)
+-        # Interaction layers
+         for layer in self.layers:
+             X = layer(X, edge_index, edge_weight, edge_attr)
+         I, A, S = decompose_tensor(X)
+@@ -210,7 +234,7 @@ def forward(
+         return x, None, z, pos, batch
+ 
+ 
+-class TensorEmbedding(MessagePassing):
++class TensorEmbedding(nn.Module):
+     def __init__(
+         self,
+         hidden_channels,
+@@ -222,7 +246,7 @@ def __init__(
+         max_z=128,
+         dtype=torch.float32,
+     ):
+-        super(TensorEmbedding, self).__init__(aggr="add", node_dim=0)
++        super(TensorEmbedding, self).__init__()
+ 
+         self.hidden_channels = hidden_channels
+         self.distance_proj1 = nn.Linear(num_rbf, hidden_channels, dtype=dtype)
+@@ -230,7 +254,7 @@ def __init__(
+         self.distance_proj3 = nn.Linear(num_rbf, hidden_channels, dtype=dtype)
+         self.cutoff = CosineCutoff(cutoff_lower, cutoff_upper)
+         self.max_z = max_z
+-        self.emb = torch.nn.Embedding(max_z, hidden_channels, dtype=dtype)
++        self.emb = nn.Embedding(max_z, hidden_channels, dtype=dtype)
+         self.emb2 = nn.Linear(2 * hidden_channels, hidden_channels, dtype=dtype)
+         self.act = activation()
+         self.linears_tensor = nn.ModuleList()
+@@ -265,31 +289,31 @@ def forward(
+         z: Tensor,
+         edge_index: Tensor,
+         edge_weight: Tensor,
+-        edge_vec: Tensor,
++        edge_vec_norm: Tensor,
+         edge_attr: Tensor,
+-    ):
+-
+-        Z = self.emb(z)
++    ) -> Tensor:
+         C = self.cutoff(edge_weight)
+         W1 = self.distance_proj1(edge_attr) * C.view(-1, 1)
+         W2 = self.distance_proj2(edge_attr) * C.view(-1, 1)
+         W3 = self.distance_proj3(edge_attr) * C.view(-1, 1)
+-        mask = edge_index[0] != edge_index[1]
+-        edge_vec[mask] = edge_vec[mask] / torch.norm(edge_vec[mask], dim=1).unsqueeze(1)
+         Iij, Aij, Sij = new_radial_tensor(
+-            torch.eye(3, 3, device=edge_vec.device, dtype=edge_vec.dtype)[
++            torch.eye(3, 3, device=edge_vec_norm.device, dtype=edge_vec_norm.dtype)[
+                 None, None, :, :
+             ],
+-            vector_to_skewtensor(edge_vec)[..., None, :, :],
+-            vector_to_symtensor(edge_vec)[..., None, :, :],
++            vector_to_skewtensor(edge_vec_norm)[..., None, :, :],
++            vector_to_symtensor(edge_vec_norm)[..., None, :, :],
+             W1,
+             W2,
+             W3,
+         )
+-        # propagate_type: (Z: Tensor, I: Tensor, A: Tensor, S: Tensor)
+-        I, A, S = self.propagate(edge_index, Z=Z, I=Iij, A=Aij, S=Sij, size=None)
+-        norm = tensor_norm(I + A + S)
+-        norm = self.init_norm(norm)
++        Z = self.emb(z)
++        Zij = self.emb2(
++            Z.index_select(0, edge_index.t().reshape(-1)).view(-1, self.hidden_channels * 2)
++        )[..., None, None]
++        I = scatter(Zij*Iij, edge_index[0], dim=0, dim_size=z.shape[0])
++        A = scatter(Zij*Aij, edge_index[0], dim=0, dim_size=z.shape[0])
++        S = scatter(Zij*Sij, edge_index[0], dim=0, dim_size=z.shape[0])
++        norm = self.init_norm(tensor_norm(I + A + S))
+         I = self.linears_tensor[0](I.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+         A = self.linears_tensor[1](A.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+         S = self.linears_tensor[2](S.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+@@ -301,37 +325,14 @@ def forward(
+ 
+         return X
+ 
+-    def message(self, Z_i, Z_j, I, A, S):
+-        zij = torch.cat((Z_i, Z_j), dim=-1)
+-        Zij = self.emb2(zij)
+-        I = Zij[..., None, None] * I
+-        A = Zij[..., None, None] * A
+-        S = Zij[..., None, None] * S
+ 
+-        return I, A, S
++def tensor_message_passing(edge_index: Tensor, factor: Tensor, tensor: Tensor, natoms: int) -> Tensor:
++    msg = factor * tensor.index_select(0, edge_index[1])
++    tensor_m = scatter(msg, edge_index[0], dim=0, dim_size=natoms)
++    return tensor_m
+ 
+-    def aggregate(
+-        self,
+-        features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+-        index: torch.Tensor,
+-        ptr: Optional[torch.Tensor],
+-        dim_size: Optional[int],
+-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-
+-        I, A, S = features
+-        I = scatter(I, index, dim=self.node_dim, dim_size=dim_size)
+-        A = scatter(A, index, dim=self.node_dim, dim_size=dim_size)
+-        S = scatter(S, index, dim=self.node_dim, dim_size=dim_size)
+-
+-        return I, A, S
+-
+-    def update(
+-        self, inputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-        return inputs
+ 
+-
+-class Interaction(MessagePassing):
++class Interaction(nn.Module):
+     def __init__(
+         self,
+         num_rbf,
+@@ -342,13 +343,15 @@ def __init__(
+         equivariance_invariance_group,
+         dtype=torch.float32,
+     ):
+-        super(Interaction, self).__init__(aggr="add", node_dim=0)
++        super(Interaction, self).__init__()
+ 
+         self.num_rbf = num_rbf
+         self.hidden_channels = hidden_channels
+         self.cutoff = CosineCutoff(cutoff_lower, cutoff_upper)
+         self.linears_scalar = nn.ModuleList()
+-        self.linears_scalar.append(nn.Linear(num_rbf, hidden_channels, bias=True, dtype=dtype))
++        self.linears_scalar.append(
++            nn.Linear(num_rbf, hidden_channels, bias=True, dtype=dtype)
++        )
+         self.linears_scalar.append(
+             nn.Linear(hidden_channels, 2 * hidden_channels, bias=True, dtype=dtype)
+         )
+@@ -370,7 +373,9 @@ def reset_parameters(self):
+         for linear in self.linears_tensor:
+             linear.reset_parameters()
+ 
+-    def forward(self, X, edge_index, edge_weight, edge_attr):
++    def forward(
++        self, X: Tensor, edge_index: Tensor, edge_weight: Tensor, edge_attr: Tensor
++    ) -> Tensor:
+ 
+         C = self.cutoff(edge_weight)
+         for linear_scalar in self.linears_scalar:
+@@ -384,10 +389,9 @@ def forward(self, X, edge_index, edge_weight, edge_attr):
+         A = self.linears_tensor[1](A.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+         S = self.linears_tensor[2](S.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+         Y = I + A + S
+-        # propagate_type: (I: Tensor, A: Tensor, S: Tensor, edge_attr: Tensor)
+-        Im, Am, Sm = self.propagate(
+-            edge_index, I=I, A=A, S=S, edge_attr=edge_attr, size=None
+-        )
++        Im = tensor_message_passing(edge_index, edge_attr[..., 0, None, None], I, X.shape[0])
++        Am = tensor_message_passing(edge_index, edge_attr[..., 1, None, None], A, X.shape[0])
++        Sm = tensor_message_passing(edge_index, edge_attr[..., 2, None, None], S, X.shape[0])
+         msg = Im + Am + Sm
+         if self.equivariance_invariance_group == "O(3)":
+             A = torch.matmul(msg, Y)
+@@ -402,31 +406,5 @@ def forward(self, X, edge_index, edge_weight, edge_attr):
+         A = self.linears_tensor[4](A.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+         S = self.linears_tensor[5](S.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+         dX = I + A + S
+-        X = X + dX + torch.matmul(dX,dX)
++        X = X + dX + torch.matrix_power(dX, 2)
+         return X
+-
+-    def message(self, I_j, A_j, S_j, edge_attr):
+-
+-        I, A, S = new_radial_tensor(
+-            I_j, A_j, S_j, edge_attr[..., 0], edge_attr[..., 1], edge_attr[..., 2]
+-        )
+-        return I, A, S
+-
+-    def aggregate(
+-        self,
+-        features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+-        index: torch.Tensor,
+-        ptr: Optional[torch.Tensor],
+-        dim_size: Optional[int],
+-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-
+-        I, A, S = features
+-        I = scatter(I, index, dim=self.node_dim, dim_size=dim_size)
+-        A = scatter(A, index, dim=self.node_dim, dim_size=dim_size)
+-        S = scatter(S, index, dim=self.node_dim, dim_size=dim_size)
+-        return I, A, S
+-
+-    def update(
+-        self, inputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-        return inputs
+diff --git a/torchmdnet/models/torchmd_et.py b/torchmdnet/models/torchmd_et.py
+index 9f93028cb..a295d1302 100644
+--- a/torchmdnet/models/torchmd_et.py
++++ b/torchmdnet/models/torchmd_et.py
+@@ -6,7 +6,7 @@
+ from torchmdnet.models.utils import (
+     NeighborEmbedding,
+     CosineCutoff,
+-    Distance,
++    OptimizedDistance,
+     rbf_class_mapping,
+     act_class_mapping,
+ )
+@@ -103,12 +103,13 @@ def __init__(
+ 
+         self.embedding = nn.Embedding(self.max_z, hidden_channels, dtype=dtype)
+ 
+-        self.distance = Distance(
++        self.distance = OptimizedDistance(
+             cutoff_lower,
+             cutoff_upper,
+-            max_num_neighbors=max_num_neighbors,
++            max_num_pairs=-max_num_neighbors,
+             return_vecs=True,
+             loop=True,
++            long_edge_index=True
+         )
+         self.distance_expansion = rbf_class_mapping[rbf_type](
+             cutoff_lower, cutoff_upper, num_rbf, trainable_rbf
+diff --git a/torchmdnet/models/utils.py b/torchmdnet/models/utils.py
+index bdc806742..75ff4640a 100644
+--- a/torchmdnet/models/utils.py
++++ b/torchmdnet/models/utils.py
+@@ -107,6 +107,8 @@ def forward(
+     def message(self, x_j, W):
+         return x_j * W
+ 
++from torchmdnet.neighbors import get_neighbor_pairs_kernel
++
+ class OptimizedDistance(torch.nn.Module):
+     def __init__(
+         self,
+@@ -120,6 +122,7 @@ def __init__(
+         resize_to_fit=True,
+         check_errors=True,
+         box=None,
++        long_edge_index=True
+     ):
+         super(OptimizedDistance, self).__init__()
+         """ Compute the neighbor list for a given cutoff.
+@@ -176,6 +179,9 @@ def __init__(
+         return_vecs : bool, optional
+             Whether to return the distance vectors.
+             Default: False
++        long_edge_index : bool, optional
++            Whether to return edge_index as int64, otherwise int32.
++            Default: True
+         """
+         self.cutoff_upper = cutoff_upper
+         self.cutoff_lower = cutoff_lower
+@@ -196,8 +202,7 @@ def __init__(
+                 self.box = torch.tensor([[lbox, 0, 0], [0, lbox, 0], [0, 0, lbox]])
+         self.box = self.box.cpu()  # All strategies expect the box to be in CPU memory
+         self.check_errors = check_errors
+-        from torchmdnet.neighbors import get_neighbor_pairs_kernel
+-        self.kernel = get_neighbor_pairs_kernel;
++        self.long_edge_index = long_edge_index
+ 
+     def forward(
+         self, pos: Tensor, batch: Optional[Tensor] = None
+@@ -231,7 +236,7 @@ def forward(
+             max_pairs = -self.max_num_pairs * pos.shape[0]
+         if batch is None:
+             batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
+-        edge_index, edge_vec, edge_weight, num_pairs = self.kernel(
++        edge_index, edge_vec, edge_weight, num_pairs = get_neighbor_pairs_kernel(
+             strategy=self.strategy,
+             positions=pos,
+             batch=batch,
+@@ -250,14 +255,14 @@ def forward(
+                         num_pairs[0], max_pairs
+                     )
+                 )
+-        edge_index = edge_index.to(torch.long)
+         # Remove (-1,-1)  pairs
+         if self.resize_to_fit:
+             mask = edge_index[0] != -1
+             edge_index = edge_index[:, mask]
+             edge_weight = edge_weight[mask]
+             edge_vec = edge_vec[mask, :]
+-
++        if self.long_edge_index:
++            edge_index = edge_index.to(torch.long)
+         if self.return_vecs:
+             return edge_index, edge_weight, edge_vec
+         else:
+@@ -360,7 +365,7 @@ def __init__(self, cutoff_lower=0.0, cutoff_upper=5.0):
+         self.cutoff_lower = cutoff_lower
+         self.cutoff_upper = cutoff_upper
+ 
+-    def forward(self, distances):
++    def forward(self, distances: Tensor) -> Tensor:
+         if self.cutoff_lower > 0:
+             cutoffs = 0.5 * (
+                 torch.cos(
+diff --git a/torchmdnet/neighbors/__init__.py b/torchmdnet/neighbors/__init__.py
+index 3f4fdc29d..e57ad43d0 100644
+--- a/torchmdnet/neighbors/__init__.py
++++ b/torchmdnet/neighbors/__init__.py
+@@ -14,3 +14,6 @@ def compile_extension():
+ 
+ compile_extension()
+ get_neighbor_pairs_kernel = torch.ops.torchmdnet_neighbors.get_neighbor_pairs
++if int(torch.__version__.split('.')[0]) >= 2:
++    import torch._dynamo as dynamo
++    dynamo.disallow_in_graph(get_neighbor_pairs_kernel)
+diff --git a/torchmdnet/neighbors/common.cuh b/torchmdnet/neighbors/common.cuh
+index 9b1105476..3585f4719 100644
+--- a/torchmdnet/neighbors/common.cuh
++++ b/torchmdnet/neighbors/common.cuh
+@@ -71,7 +71,7 @@ struct PairList {
+              bool use_periodic)
+         : i_curr_pair(zeros({1}, options.dtype(torch::kInt))),
+           neighbors(full({2, max_num_pairs}, -1, options.dtype(torch::kInt))),
+-          deltas(empty({max_num_pairs, 3}, options)), distances(full({max_num_pairs}, 0, options)),
++          deltas(full({max_num_pairs, 3},0, options)), distances(full({max_num_pairs}, 0, options)),
+           loop(loop), include_transpose(include_transpose), use_periodic(use_periodic) {
+     }
+ };

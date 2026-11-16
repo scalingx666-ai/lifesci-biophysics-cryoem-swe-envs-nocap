@@ -1,0 +1,335 @@
+diff --git a/mbuild/simulation.py b/mbuild/simulation.py
+index dae819e60..2656454e1 100644
+--- a/mbuild/simulation.py
++++ b/mbuild/simulation.py
+@@ -57,15 +57,17 @@ def __init__(
+         compound,
+         forcefield,
+         r_cut,
+-        run_on_gpu,
+-        seed,
++        run_on_gpu=None,
++        seed=1,
+         automatic_box=False,
+         box_buffer=10,
+         integrate_compounds=None,
+         fixed_compounds=None,
+         gsd_file_name=None,
+     ):
+-        if run_on_gpu:
++        if run_on_gpu is None:
++            device = hoomd.device.auto_select()
++        elif run_on_gpu:
+             try:
+                 device = hoomd.device.GPU()
+                 print(f"GPU found, running on device {device.device}")
+@@ -85,6 +87,7 @@ def __init__(
+         self.fixed_compounds = fixed_compounds
+         self.automatic_box = automatic_box
+         self.box_buffer = box_buffer
++        self.energies = []  # each step of run energy values
+         # Check if a hoomd sim method has been used on this compound already
+         if compound._hoomd_data:
+             last_snapshot, last_forces, last_forcefield = compound._get_sim_data()
+@@ -105,20 +108,15 @@ def __init__(
+         # Place holders for forces added/changed by specific methods below
+         self.active_forces = []
+         self.inactive_forces = []
++        self._orig_force_params = {}  # populated after forces are known
+         super(HoomdSimulation, self).__init__(device=device, seed=seed)
+         self.create_state_from_snapshot(snapshot)
++        self._orig_force_params = self._snapshot_force_params()
+ 
+     def _to_hoomd_snap_forces(self):
+         # If a box isn't set, make one with the buffer
+         if not self.compound.box:
+             self.compound.box = self.compound.get_boundingbox(pad_box=self.box_buffer)
+-        shift_coords = True
+-        if all(
+-            np.max(self.compound.xyz, axis=0) < np.array(self.compound.box.lengths)
+-        ) and all(
+-            -1 * np.min(self.compound.xyz, axis=0) < np.array(self.compound.box.lengths)
+-        ):
+-            shift_coords = False
+         # Convert to GMSO, apply forcefield
+         top = self.compound.to_gmso()
+         top.identify_connections()
+@@ -126,10 +124,21 @@ def _to_hoomd_snap_forces(self):
+         apply(top, forcefields=self.forcefield, ignore_params=["dihedral", "improper"])
+         # Get hoomd snapshot and force objects
+         forces, _ = gmso.external.to_hoomd_forcefield(top, r_cut=self.r_cut)
+-        snap, _ = gmso.external.to_gsd_snapshot(top, shift_coords)
++        snap, _ = gmso.external.to_gsd_snapshot(top=top)
+         forces = list(set().union(*forces.values()))
+         return snap, forces
+ 
++    def _snapshot_force_params(self):
++        """Snapshot current force params so ForcesHandler can restore before re-scaling."""
++        orig = {}
++        for force in self.forces:
++            if not hasattr(force, "params"):
++                continue
++            orig[id(force)] = {
++                param: dict(force.params[param]) for param in force.params
++            }
++        return orig
++
+     def get_integrate_group(self):
+         # Get indices of compounds to include in integration
+         if self.integrate_compounds and not self.fixed_compounds:
+@@ -162,8 +171,12 @@ def get_integrate_group(self):
+         else:
+             return hoomd.filter.All()
+ 
+-    def get_force(self, instance):
+-        for force in set(self.forces + self.active_forces + self.inactive_forces):
++    def get_force(self, instance, active_only=False):
++        if active_only:
++            iterForcesSet = set(self.active_forces)
++        else:
++            iterForcesSet = set(self.forces)
++        for force in iterForcesSet:
+             if isinstance(force, instance):
+                 return force
+         raise ValueError(f"No force of {instance} was found.")
+@@ -232,6 +245,29 @@ def update_positions(self):
+             pos = snap.particles.position[particles]
+             self.compound.xyz = np.copy(pos)
+ 
++    def store_current_energies(self):
++        """Store energy simulations progress."""
++        new_energy = {}
++        for force in self.active_forces:
++            ffname = force.__class__.__module__ + "." + force.__class__.__name__
++            new_energy[ffname] = force.energy
++        if new_energy:
++            self.energies.append(new_energy)
++
++    def get_energy(self):
++        """Return each energy by index for previously run energy breakdown."""
++        if not self.energies:
++            print(f"No energies currently stored in {self}")
++            return None
++        returnDict = {}
++        n_frames = len(self.energies)
++        for frame, energyDict in enumerate(self.energies):
++            for ffkey in energyDict:
++                if ffkey not in returnDict:
++                    returnDict[ffkey] = np.zeros(n_frames)
++                returnDict[ffkey][frame] = energyDict[ffkey]
++        return returnDict
++
+ 
+ class ForcesHandler:
+     """Provides a quick method for tuning HOOMD forces to better handle
+@@ -290,6 +326,7 @@ def __init__(
+ 
+     def scale_sim(self, sim):
+         "Iterate through HOOMD force objects and apply scaling factors."
++        sim.active_forces = []  # reset active forces
+         forcesDict = {
+             "lj": (hoomd.md.pair.LJ, ("epsilon")),
+             "charge": (hoomd.md.special_pair.Coulomb, ("alpha")),
+@@ -318,9 +355,13 @@ def scale_sim(self, sim):
+                 continue
+ 
+             force = sim.get_force(forcesDict[key][0])
++            orig_params = sim._orig_force_params.get(id(force), {})
+             for param in force.params:
+                 for term in forcesDict[key][1:]:
+-                    force.params[param][term] *= scalar
++                    if param in orig_params and term in orig_params[param]:
++                        force.params[param][term] = orig_params[param][term] * scalar
++                    else:
++                        force.params[param][term] *= scalar
+             sim.active_forces.append(force)
+             self.forcesDict[key] = force  # store for usage elsewhere
+ 
+@@ -414,7 +455,13 @@ def hoomd_cap_displacement(
+         maximum_displacement=max_displacement,
+     )
+     sim.set_integrator(method=displacement_capped, dt=dt)
++    if sim.energies == []:
++        print("Initial Energy States:")
++        sim.run(0)
++        sim.store_current_energies()
++        print("\n")
+     sim.run(n_steps)
++    sim.store_current_energies()
+     sim.operations.integrator = None
+     sim.update_positions()
+     sim._update_snapshot()
+@@ -526,11 +573,15 @@ def hoomd_fire(
+         min_steps_conv=min_steps_conv,
+         methods=[nvt],
+     )
++    if sim.energies == []:
++        sim.run(0)
++        sim.store_current_energies()
+     for sim_num in range(n_iterations):
+         sim.run(n_steps)
+         sim.operations.integrator.reset()
+ 
+     # Update particle positions, save latest state point snapshot
++    sim.store_current_energies()
+     sim.operations.integrator = None
+     sim._update_snapshot()
+     sim.update_positions()
+diff --git a/mbuild/tests/test_simulation.py b/mbuild/tests/test_simulation.py
+index c6f216b62..ad2ed4b86 100644
+--- a/mbuild/tests/test_simulation.py
++++ b/mbuild/tests/test_simulation.py
+@@ -1,17 +1,21 @@
+ import sys
+ 
++import hoomd
+ import numpy as np
+ import pytest
++from gmso import ForceField
+ 
+ import mbuild as mb
+ from mbuild.exceptions import MBuildError
+-from mbuild.simulation import energy_minimize
+-from mbuild.tests.base_test import BaseTest
+-from mbuild.utils.io import (
+-    get_fn,
+-    has_foyer,
+-    has_openbabel,
++from mbuild.simulation import (
++    ForcesHandler,
++    HoomdSimulation,
++    energy_minimize,
++    hoomd_cap_displacement,
++    hoomd_fire,
+ )
++from mbuild.tests.base_test import BaseTest
++from mbuild.utils.io import get_fn, has_foyer, has_hoomd, has_openbabel
+ 
+ 
+ class TestSimulation(BaseTest):
+@@ -347,3 +351,125 @@ def test_energy_minimize_openmm_invalid_constraints(self, octane):
+     @pytest.mark.skipif(not has_foyer, reason="Foyer is not installed")
+     def test_energy_minimize_openmm_xml(self, octane):
+         energy_minimize(compound=octane, forcefield=get_fn("small_oplsaa.xml"))
++
++
++class TestSimulationHoomd(BaseTest):
++    """Test minimization methods using hoomd-blue."""
++
++    @pytest.fixture
++    def oplsaa(self):
++        return ForceField("oplsaa")
++
++    @pytest.fixture
++    def sim(self, octane, oplsaa):
++        return HoomdSimulation(octane, oplsaa, r_cut=0.3, run_on_gpu=False)
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_forces_handler(self, sim):
++        force = sim.get_force(hoomd.md.pair.LJ)
++        assert len(force.params.keys()) == 6
++        force = sim.get_force(hoomd.md.pair.Ewald)
++        assert force
++        force = sim.get_force(hoomd.md.long_range.pppm.Coulomb)
++        assert force
++        force = sim.get_force(hoomd.md.special_pair.LJ)
++        assert len(force.params.keys()) == 5
++        force = sim.get_force(hoomd.md.special_pair.Coulomb)
++        assert force
++        force = sim.get_force(hoomd.md.bond.Harmonic)
++        assert len(force.params.keys()) == 2
++        force = sim.get_force(hoomd.md.angle.Harmonic)
++        assert len(force.params.keys()) == 3
++        force = sim.get_force(hoomd.md.dihedral.OPLS)
++        assert len(force.params.keys()) == 3
++
++    def test_scale_forces(self, sim):
++        A = 1
++        ffhandler = ForcesHandler(dpd=A, scale_bond=0, scale_angle=0)
++        ffhandler.scale_sim(sim)
++        lj_force = sim.get_force(hoomd.md.pair.LJ)
++        force = sim.get_force(hoomd.md.pair.DPDConservative, active_only=True)
++        for param in force.params:
++            assert force.params[param]["A"] == A
++            assert force.r_cut[param] == lj_force.params[param]["sigma"]
++        forceTypes = [type(force) for force in sim.active_forces]
++        allforceTypes = [type(force) for force in sim.forces]
++        assert hoomd.md.bond.Harmonic not in forceTypes
++        assert hoomd.md.bond.Harmonic in allforceTypes
++        assert hoomd.md.angle.Harmonic not in forceTypes
++        assert hoomd.md.angle.Harmonic in allforceTypes
++        assert hoomd.md.dihedral.OPLS not in forceTypes
++        assert hoomd.md.dihedral.OPLS in allforceTypes
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_fire(self, sim):
++        ffhandler = ForcesHandler(scale_lj=1, scale_bond=1, scale_angle=1)
++        cpd = sim.compound
++        old_coords = cpd.xyz.copy()
++        hoomd_fire(cpd, sim, ffhandler, n_steps=20)
++        new_coords = cpd.xyz
++        assert not np.allclose(old_coords, new_coords, atol=1e-5)
++        # TODO: Get and validate energies here
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_capped_displacement(self, sim):
++        bond = sim.get_force(hoomd.md.bond.Harmonic)
++        orig_bond_params = {p: dict(bond.params[p]) for p in bond.params}
++
++        ffhandler = ForcesHandler(dpd=1, scale_bond=0.1, scale_angle=0)
++        cpd = sim.compound
++        old_coords = cpd.xyz.copy()
++        hoomd_cap_displacement(
++            cpd, sim, ffhandler, dt=1, max_displacement=1, n_steps=10
++        )
++        new_coords = cpd.xyz
++        assert not np.allclose(old_coords, new_coords, atol=1e-5)
++        forcesTypesSet = set([type(force) for force in sim.active_forces])
++        assert forcesTypesSet == set(
++            (
++                hoomd.md.pair.DPDConservative,
++                hoomd.md.bond.Harmonic,
++            )
++        )
++        for p in bond.params:
++            assert np.isclose(bond.params[p]["k"], orig_bond_params[p]["k"] * 0.1)
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_scale_forces_restores_on_second_call(self, sim):
++        bond = sim.get_force(hoomd.md.bond.Harmonic)
++        angle = sim.get_force(hoomd.md.angle.Harmonic)
++        orig_bond_params = {p: dict(bond.params[p]) for p in bond.params}
++        orig_angle_params = {p: dict(angle.params[p]) for p in angle.params}
++
++        ForcesHandler(scale_bond=0.5, scale_angle=0.5).scale_sim(sim)
++        for p in bond.params:
++            assert np.isclose(bond.params[p]["k"], orig_bond_params[p]["k"] * 0.5)
++        for p in angle.params:
++            assert np.isclose(angle.params[p]["k"], orig_angle_params[p]["k"] * 0.5)
++
++        ForcesHandler(scale_bond=1, scale_angle=1).scale_sim(sim)
++        for p in bond.params:
++            assert np.isclose(bond.params[p]["k"], orig_bond_params[p]["k"])
++        for p in angle.params:
++            assert np.isclose(angle.params[p]["k"], orig_angle_params[p]["k"])
++
++    @pytest.mark.skipif(not has_hoomd, reason="hoomd is not installed")
++    def test_get_energy(self, sim):
++        cpd = sim.compound
++        ffhandler = ForcesHandler(scale_lj=1, scale_bond=1, scale_angle=1)
++        assert sim.get_energy() is None
++        hoomd_cap_displacement(
++            cpd, sim, ffhandler, dt=1, max_displacement=1, n_steps=10
++        )
++        energyDict = sim.get_energy()
++        assert np.allclose(
++            energyDict["hoomd.md.pair.pair.LJ"], np.array(([-1.25498152, 0.0]))
++        )
++        assert np.allclose(
++            energyDict["hoomd.md.bond.Harmonic"],
++            np.array(([1.35651551e02, 3.05080224e06])),
++        )
++        assert np.allclose(
++            energyDict["hoomd.md.angle.Harmonic"],
++            np.array(([3942.05658645, 19129.72619001])),
++        )

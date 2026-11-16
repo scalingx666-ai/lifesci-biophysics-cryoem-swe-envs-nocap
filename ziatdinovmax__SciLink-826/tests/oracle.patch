@@ -1,0 +1,1029 @@
+diff --git a/docs/cli_reference.md b/docs/cli_reference.md
+index 95d9833d..18de4d54 100644
+--- a/docs/cli_reference.md
++++ b/docs/cli_reference.md
+@@ -148,6 +148,50 @@ scilink analyze --resume analysis_session_20260919_101500    # ... or name it
+ scilink --verbose                                            # full narration from the start
+ ```
+ 
++### Headless results (`-p`)
++
++`-p` runs one task autonomously, narrates on stderr and prints the result on
++stdout (`--output-format text | markdown | json`). The JSON is the mode's
++`run_task` result. Two things in it tell a script whether to trust the run:
++
++- **`status`** — `success`, `error`, or (Mission Control only) `partial`: some
++  delegations produced a result and some did not. A turn whose every
++  delegation failed is an `error`, whatever the reply says. Mission Control
++  also lists the turn's delegations under `delegation_results`.
++- **`verification`** — over the analyses the task ran: `analyses`, `verified`,
++  the `unverified` ones (a result was produced but not approved by its own
++  checks, with the reason), the `failed` ones, and `all_verified` (`null` when
++  no analysis ran). `status: success` says the task ran, not that its fits
++  were approved.
++
++| Exit status | Meaning |
++|---|---|
++| 0 | success (and, without `--strict`, a `partial` turn) |
++| 1 | the task failed |
++| 2 | could not start (credentials, a bad flag) |
++| 3 | `--strict` only: finished, but read the result before using it |
++| 130 | interrupted |
++
++`--strict` is for a task that is meant to analyse data. It exits 0 only when
++at least one analysis ran, every analysis was verified and, in Mission Control,
++no delegation failed. A task that could not find its data still ends in a
++reply, so its status is `success`; under `--strict` it exits 3, because
++`verification.analyses` is 0. Details:
++
++- Verification is judged only on a result that carries one: analyze always;
++  Mission Control when the turn delegated an analysis; plan and simulate never.
++- A data-preparation or derivation step that passed its own gate is counted
++  under `verification.steps`, not as an analysis. A delegation that only
++  prepared data is fine beside one that analysed it; a delegation that did
++  nothing at all (no analysis, no step) is counted under `without_analysis`
++  and fails `--strict`.
++- An analysis that crashed is listed under `failed`, like one that returned
++  an error.
++
++Without `--strict` the exit status is 0 or 1 as before; `status` and
++`verification` are in the result either way, and text / markdown output says
++when the status is not `success`.
++
+ ### Slash commands
+ 
+ Shared by every mode: `/help`, `/status` (`/state`), `/mode [level]`
+diff --git a/scilink/agents/exp_agents/_verification_record.py b/scilink/agents/exp_agents/_verification_record.py
+index ffc0719b..5860dfe4 100644
+--- a/scilink/agents/exp_agents/_verification_record.py
++++ b/scilink/agents/exp_agents/_verification_record.py
+@@ -455,6 +455,101 @@ def analysis_verdict(full_result: Optional[dict]) -> Dict[str, Any]:
+     return reconstructed_verdict(full)
+ 
+ 
++# Rows of a task that are steps around an analysis, not analyses: they pass
++# or fail a gate of their own and carry no verification record, so their
++# ``verified`` is False by construction ("no verification record") and says
++# nothing. A failed one is still a failure of the task.
++_STEP_AGENTS = ("DataPreparation", "OutputDerivation")
++
++
++def verification_summary(rows) -> Dict[str, Any]:
++    """One answer over a task's ``analyses`` rows: was everything verified?
++
++    A task's ``status`` says the task ran; each row's ``verified`` says
++    whether that analysis passed its own checks. A caller that reads only the
++    status (an exit code, a job state) took a salvaged or unverified result
++    for an approved one, so the rows are counted here, once, for every
++    surface that reports a task: ``run_task``, the meta's ledger, headless
++    ``-p``.
++
++    ``all_verified`` is True when every analysis produced a result and was
++    verified, False when any was not (or any row failed), and None when no
++    analysis ran (nothing was verified and nothing failed to be).
++    ``unverified`` lists the analyses that produced a result that was not
++    approved, with the reason; ``failed`` the rows that produced none. A
++    data-preparation or derivation step that succeeded is not an analysis
++    and is not counted; one that failed is listed under ``failed``.
++    """
++    rows = [r for r in (rows or []) if isinstance(r, dict)]
++    failed = [r for r in rows if r.get("status") not in ("success", "partial")]
++    produced = [r for r in rows if r.get("status") in ("success", "partial")
++                and r.get("agent_name") not in _STEP_AGENTS]
++    unverified = [r for r in produced if r.get("verified") is not True]
++    steps = sum(1 for r in rows if r.get("status") in ("success", "partial")
++                and r.get("agent_name") in _STEP_AGENTS)
++    return {
++        "analyses": len(produced) + len(failed),
++        # preparation / derivation steps that passed their own gate
++        "steps": steps,
++        "verified": len(produced) - len(unverified),
++        "unverified": [{"analysis_id": r.get("analysis_id"), "reason": r.get("reason")}
++                       for r in unverified],
++        "failed": [{"analysis_id": r.get("analysis_id"), "status": r.get("status")}
++                   for r in failed],
++        "all_verified": (not unverified and not failed) if (produced or failed) else None,
++    }
++
++
++def did_nothing(summary) -> bool:
++    """A task's verification that shows no analysis and no step that passed."""
++    return (isinstance(summary, dict) and not int(summary.get("analyses") or 0)
++            and not int(summary.get("steps") or 0))
++
++
++def merge_verification(summaries) -> Optional[Dict[str, Any]]:
++    """Several tasks' :func:`verification_summary` as one (a meta turn's
++    analysis delegations). None when none of them carries one.
++
++    ``all_verified`` is True only when EVERY task's is, and None only when no
++    task ran an analysis. A task that did NOTHING beside one that was
++    verified — no analysis and no step that passed, the "file not found"
++    delegation — is not "all verified" and is counted under
++    ``without_analysis``. A task that only prepared data (a successful
++    step, no analysis) did its job: preparing in one delegation and
++    analysing in the next is the prescribed shape for raw-instrument data.
++    An item of ``summaries`` may be a ``(tag, summary)`` pair; the tag (a
++    delegation index) is then put on that task's ``unverified`` and
++    ``failed`` items as ``delegation``, since analysis ids repeat across
++    sessions.
++    """
++    parts = []
++    for item in summaries or []:
++        tag, summary = item if isinstance(item, tuple) else (None, item)
++        if isinstance(summary, dict) and "analyses" in summary:
++            parts.append((tag, summary))
++    if not parts:
++        return None
++
++    def tagged(key):
++        return [dict(x, delegation=tag) if tag is not None else x
++                for tag, s in parts for x in (s.get(key) or [])]
++
++    unverified, failed = tagged("unverified"), tagged("failed")
++    n = sum(int(s.get("analyses") or 0) for _, s in parts)
++    empty = sum(1 for _, s in parts if did_nothing(s))
++    merged = {
++        "analyses": n,
++        "steps": sum(int(s.get("steps") or 0) for _, s in parts),
++        "verified": sum(int(s.get("verified") or 0) for _, s in parts),
++        "unverified": unverified,
++        "failed": failed,
++        "all_verified": (not unverified and not failed and not empty) if n else None,
++    }
++    if empty and len(parts) > 1:
++        merged["without_analysis"] = empty
++    return merged
++
++
+ def replay_certification_reason(full_result: Optional[dict]) -> Optional[str]:
+     """Why a replay's interpretation is not certified (#753), for the
+     ``analyses`` row beside :func:`replay_escalation`, so a reader quotes
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator.py b/scilink/agents/exp_agents/analysis_orchestrator.py
+index fc3b3e10..78e951f2 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator.py
+@@ -15,7 +15,8 @@
+ import logging
+ from ._verification_record import (analysis_verdict, replay_certification_reason, replay_escalation,
+                                    series_anchor_unit, series_coverage,
+-                                   ungated_outputs_of, failed_outputs_of)
++                                   ungated_outputs_of, failed_outputs_of,
++                                   verification_summary)
+ import os
+ import time
+ from pathlib import Path
+@@ -1760,6 +1761,9 @@ def run_task(self, task: str, context: Optional[Dict[str, Any]] = None,
+             ],
+             "warnings": warnings,
+         }
++        # status says the task ran; this says whether what it produced was
++        # verified — one field, so a caller need not walk the rows.
++        result["verification"] = verification_summary(result["analyses"])
+         if _depth:
+             result["depth"] = _depth
+         if error_msg:
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator_tools.py b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+index 6c69ef06..9b5a3a27 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator_tools.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator_tools.py
+@@ -2946,6 +2946,10 @@ def run_analysis(
+                         print("  📎 Filled from the file's own record: "
+                               + ", ".join(_filled))
+             
++            # Known to the handler below only once an analysis has been given
++            # an id: an error before that is a refused call, not a failed run.
++            analysis_id = None
++            analysis_output_dir = None
+             try:
+                 # === Handle directory / glob input - filter out metadata files ===
+                 path = Path(data_path)
+@@ -3717,9 +3721,27 @@ def _resolve_one(s):
+                     
+             except Exception as e:
+                 self.logger.error(f"Analysis error: {e}", exc_info=True)
++                # An analysis that RAISED is a failed analysis, like one whose
++                # agent returned an error status. It used to leave no record,
++                # so a task with one verified analysis and one that crashed
++                # reported every analysis verified.
++                if analysis_id and not any(r.get("analysis_id") == analysis_id
++                                           for r in self.orch.analysis_results):
++                    self.orch.analysis_results.append({
++                        "analysis_id": analysis_id,
++                        "timestamp": datetime.now().isoformat(),
++                        "data_path": data_path,
++                        "agent_id": agent_id,
++                        "agent_name": self.AGENT_NAMES.get(agent_id),
++                        "status": "error",
++                        "output_directory": str(analysis_output_dir),
++                        "full_result": {"status": "error", "error": str(e)},
++                        "novelty_assessment": None,
++                    })
+                 return json.dumps({
+                     "status": "error",
+-                    "message": str(e)
++                    "message": str(e),
++                    **({"analysis_id": analysis_id} if analysis_id else {}),
+                 })
+         
+         self._register_tool(
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index 1cb0d2a6..f44f1349 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -614,6 +614,7 @@ def __init__(
+             else self.MAX_TOOL_ITERATIONS
+         )
+         self._last_chat_hit_iter_cap = False
++        self._last_chat_error: Optional[str] = None
+ 
+         if restore_checkpoint and self.checkpoint_path.exists():
+             self._restore_checkpoint()
+@@ -1876,6 +1877,10 @@ def _close_delegation(self, entry: Dict[str, Any], result: dict) -> None:
+                                  if isinstance(a, dict) and a.get("analysis_id")],
+                 "recommended_parameters": recommended_parameters,
+                 "recommended_values": recommended_values,
++                # Whether what an analysis delegation produced was verified
++                # (the child's own count over its analyses): the status above
++                # only says the delegation ran.
++                "verification": result.get("verification"),
+             })
+         # A completed delegation is the ledger state worth preserving — the
+         # every-N-messages auto-save left short sessions (fewer than
+@@ -2268,6 +2273,7 @@ def chat(self, user_input: str) -> str:
+         _set_evlog(str(_P(self.base_dir) / "events.jsonl"))
+         self.message_count += 1
+         self._last_chat_hit_iter_cap = False
++        self._last_chat_error = None
+ 
+         # First-turn: fill the system prompt's specialist-capability inventory
+         # from the children's live tool registries (idempotent thereafter).
+@@ -2314,6 +2320,9 @@ def chat(self, user_input: str) -> str:
+ 
+         except Exception as e:
+             logging.error(f"Chat Error: {e}", exc_info=True)
++            # The reply below is returned as a normal string (the CLI and the
++            # UI show it); a programmatic caller reads the flag.
++            self._last_chat_error = str(e)
+             print("  💾 Error detected - saving emergency checkpoint...")
+             self._auto_checkpoint()
+             return f"❌ Error: {e}\n\n(Emergency checkpoint saved to {self.checkpoint_path})"
+diff --git a/scilink/agents/meta_agent/turn_result.py b/scilink/agents/meta_agent/turn_result.py
+new file mode 100644
+index 00000000..e45586f6
+--- /dev/null
++++ b/scilink/agents/meta_agent/turn_result.py
+@@ -0,0 +1,130 @@
++"""What one meta turn did, as the ``run_task`` contract's shape.
++
++The meta has no ``run_task`` — it is the top-level caller — so a
++programmatic caller of ``chat()`` (headless ``-p``) had only the reply text
++to go by, and called a turn a success whenever there was one: a turn whose
++every delegation failed still exited 0. The delegation ledger knows better.
++This reads the entries the turn worked on and gives the same fields the
++specialists' ``run_task`` returns, with a status derived from them.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Dict, List
++
++# A delegation that produced a result. Anything else ("error", "failed",
++# "interrupted", "cancelled", a "running" left by an aborted turn) did not.
++_PRODUCED = ("success", "partial")
++
++
++def _unique(items) -> List[Any]:
++    seen, out = set(), []
++    for item in items:
++        key = str(item)
++        if key not in seen:
++            seen.add(key)
++            out.append(item)
++    return out
++
++
++def turn_status(reply: str, entries: List[Dict[str, Any]], *, chat_error=None,
++                hit_iteration_cap: bool = False) -> str:
++    """``success`` · ``partial`` · ``error`` for one meta turn.
++
++    ``error``: the turn itself failed (the chat loop raised, hit its
++    iteration cap, or returned nothing), or it delegated and no delegation
++    produced a result. ``partial``: some delegations produced a result and
++    some did not — the reply may well account for it (a retry that worked),
++    which the ledger cannot tell, so it is not called an error. ``success``:
++    every delegation produced a result, or the turn needed none.
++    """
++    if chat_error or hit_iteration_cap or not (reply or "").strip():
++        return "error"
++    failed = [e for e in entries if str(e.get("status", "")).lower() not in _PRODUCED]
++    if not failed:
++        return "success"
++    return "partial" if len(failed) < len(entries) else "error"
++
++
++def ledger_snapshot(agent) -> Dict[Any, Any]:
++    """The ledger as it stands before a turn: ``{index: completed_at}``.
++
++    Taken AFTER the sweep ``chat()`` itself starts with: a restored session
++    can hold a delegation an earlier, stopped session left ``running``, and
++    the sweep closes it at the start of the next turn — it was then charged
++    to that turn as a failed delegation. Sweeping first makes it part of the
++    "before". Idempotent, so ``chat()`` sweeping again finds nothing.
++    """
++    sweep = getattr(agent, "_sweep_interrupted_delegations", None)
++    if callable(sweep):
++        sweep()
++    return {e.get("index"): e.get("completed_at")
++            for e in (getattr(agent, "_delegation_ledger", None) or []) if isinstance(e, dict)}
++
++
++def turn_entries(ledger: List[Dict[str, Any]], before: Dict[Any, Any]) -> List[Dict[str, Any]]:
++    """The ledger entries one turn worked on: the ones it added, and the
++    earlier ones it closed again (a resumed fan-out reopens its entries in
++    place, so position says nothing). Read by CHANGE against the snapshot —
++    never by comparing timestamps, which misattributes entries on a host
++    whose clock is behind the one that wrote the ledger."""
++    return [e for e in ledger if isinstance(e, dict)
++            and (e.get("index") not in before or e.get("completed_at") != before[e.get("index")])]
++
++
++def turn_result(agent, task: str, reply: str,
++                before: Dict[Any, Any] = None) -> Dict[str, Any]:
++    """The structured result of one turn; ``before`` is the
++    :func:`ledger_snapshot` taken before ``chat()`` was called (none: every
++    entry is the turn's)."""
++    ledger = list(getattr(agent, "_delegation_ledger", None) or [])
++    entries = turn_entries(ledger, before or {})
++    chat_error = getattr(agent, "_last_chat_error", None)
++    cap = bool(getattr(agent, "_last_chat_hit_iter_cap", False))
++    status = turn_status(reply, entries, chat_error=chat_error, hit_iteration_cap=cap)
++
++    from ..exp_agents._verification_record import did_nothing, merge_verification
++    failed = [e for e in entries if str(e.get("status", "")).lower() not in _PRODUCED]
++    warnings = [f"Delegation #{e.get('index')} ({e.get('mode')}) did not complete "
++                f"(status={e.get('status')})" + (f": {e['error']}" if e.get("error") else ".")
++                for e in failed]
++    warnings += [w for e in entries for w in (e.get("warnings") or [])]
++    # A delegation that ran no analysis is a success by its status (the
++    # specialist replied) and has nothing to show: said here, since neither
++    # the status nor the files say it.
++    warnings += [f"Delegation #{e.get('index')} (analysis) ran no analysis."
++                 for e in entries if e not in failed and e.get("mode") == "analysis"
++                 and did_nothing(e.get("verification"))]
++
++    result: Dict[str, Any] = {
++        "status": status,
++        "task": task,
++        "summary": reply or "",
++        # A delegation that produced nothing has no results to list: what it
++        # left on disk is not one.
++        "files_produced": _unique(f for e in entries if e not in failed
++                                  for f in (e.get("files_produced") or [])),
++        "feature_tables": _unique(f for e in entries if e not in failed
++                                  for f in (e.get("feature_tables") or [])),
++        "key_findings": _unique(k for e in entries if e not in failed
++                                for k in (e.get("key_findings") or [])),
++        "suggested_followups": _unique(s for e in entries
++                                       for s in (e.get("suggested_followups") or [])),
++        "warnings": _unique(warnings),
++        "delegations": len(entries),
++        "delegation_results": [
++            {"index": e.get("index"), "mode": e.get("mode"), "label": e.get("label") or "",
++             "status": e.get("status"), "error": e.get("error"),
++             "analysis_ids": e.get("analysis_ids") or [],
++             "verification": e.get("verification")}
++            for e in entries],
++    }
++    verification = merge_verification((e.get("index"), e.get("verification")) for e in entries)
++    if verification is not None:
++        result["verification"] = verification
++    if status == "error":
++        result["error"] = (chat_error or (reply if cap else None)
++                           or "; ".join(str(e.get("error")) for e in failed if e.get("error"))
++                           or ("The turn produced no reply." if not (reply or "").strip()
++                               else f"No delegation produced a result ({len(failed)} failed)."))
++    return result
+diff --git a/scilink/cli/shell/app.py b/scilink/cli/shell/app.py
+index 946b036c..9b2a693e 100644
+--- a/scilink/cli/shell/app.py
++++ b/scilink/cli/shell/app.py
+@@ -34,6 +34,13 @@ def build_parser(adapter) -> argparse.ArgumentParser:
+                         "(autonomous; every question is auto-accepted)")
+     g.add_argument("--output-format", dest="output_format", choices=OUTPUT_FORMATS,
+                    default="text", help="Headless output format (default: text)")
++    g.add_argument("--strict", action="store_true",
++                   help="Headless, for a task that is meant to analyse data: exit 3, not "
++                        "0, unless at least one analysis ran, every analysis was verified "
++                        "and (Mission Control) no delegation failed; see 'status' and "
++                        "'verification' in the result. Exit statuses: 0 success, 1 error, "
++                        "2 could not start, 3 (--strict only) read the result before "
++                        "using it")
+     g.add_argument("--yes", "-y", action="store_true",
+                    help="Pre-approve generated-code execution without asking")
+     g.add_argument("--resume", dest="resume", nargs="?", const=True, default=None,
+diff --git a/scilink/cli/shell/headless.py b/scilink/cli/shell/headless.py
+index 5127b5ee..376a57a3 100644
+--- a/scilink/cli/shell/headless.py
++++ b/scilink/cli/shell/headless.py
+@@ -2,7 +2,9 @@
+ 
+ Runs the mode's ``run_task`` under full autonomy with every human-feedback
+ question auto-accepted, narrates on stderr, and prints the result on
+-stdout as text, markdown or JSON. Exit status follows the task's status.
++stdout as text, markdown or JSON. Exit status follows the task's status
++(``exit_code``): 0 success, 1 error, and with ``--strict`` 3 for a result
++to read before using.
+ """
+ 
+ from __future__ import annotations
+@@ -31,6 +33,10 @@ def render_result(result: Dict[str, Any], fmt: str) -> str:
+     if fmt == "json":
+         return json.dumps(result, indent=2, default=str)
+     lines = [result.get("summary") or ""]
++    status = str(result.get("status", "")).lower()
++    if status and status not in ("success", "ok", "completed", "done"):
++        # the JSON says it; text and markdown read as a normal answer without it
++        lines += ["", f"Status: {status}" if fmt == "text" else f"**Status:** {status}"]
+     findings = result.get("key_findings") or []
+     if findings:
+         lines += ["", "Key findings:" if fmt == "text" else "## Key findings"]
+@@ -39,6 +45,18 @@ def render_result(result: Dict[str, Any], fmt: str) -> str:
+     if files:
+         lines += ["", "Files:" if fmt == "text" else "## Files"]
+         lines += [f"- {f}" for f in files]
++    verification = result.get("verification") or {}
++    if verification.get("analyses"):
++        lines += ["", "Verification:" if fmt == "text" else "## Verification",
++                  f"- {verification.get('verified', 0)} of {verification['analyses']} "
++                  "analyses verified"]
++        lines += [f"- not verified: {u.get('analysis_id')} ({u.get('reason')})"
++                  for u in verification.get("unverified") or []]
++        lines += [f"- failed: {f.get('analysis_id')} (status={f.get('status')})"
++                  for f in verification.get("failed") or []]
++        if verification.get("without_analysis"):
++            lines.append(f"- {verification['without_analysis']} analysis delegation(s) "
++                         "ran nothing")
+     warnings = result.get("warnings") or []
+     if warnings:
+         lines += ["", "Warnings:" if fmt == "text" else "## Warnings"]
+@@ -48,8 +66,36 @@ def render_result(result: Dict[str, Any], fmt: str) -> str:
+     return "\n".join(lines).rstrip() + "\n"
+ 
+ 
+-def exit_code(result: Dict[str, Any]) -> int:
+-    return 0 if str(result.get("status", "")).lower() in ("success", "ok", "completed", "done") else 1
++# Exit statuses of a ``-p`` run. 2 is a start-up failure (credentials, a
++# bad flag), 130 an interrupt.
++EXIT_OK, EXIT_ERROR, EXIT_RESERVATIONS = 0, 1, 3
++
++
++def exit_code(result: Dict[str, Any], *, strict: bool = False) -> int:
++    """0 when the task succeeded, 1 when it failed. ``--strict`` adds 3,
++    "finished, read the result before using it":
++
++    * a ``partial`` status — a meta turn in which some delegations failed
++      and some did not (the reply may account for it, e.g. a retry that
++      worked, which the ledger cannot tell);
++    * a success that is not backed by verified analyses — one was not
++      verified, one failed, or none ran at all (a task that could not find
++      its data still ends in a reply, and a reply is a success). This is
++      judged only on a result that carries a ``verification``: analyze mode
++      always does, the meta when the turn delegated an analysis, plan and
++      simulate never.
++
++    Without ``--strict`` both exit 0, as they always have; the status and
++    the count are in the result either way."""
++    status = str(result.get("status", "")).lower()
++    if status == "partial":
++        return EXIT_RESERVATIONS if strict else EXIT_OK
++    if status not in ("success", "ok", "completed", "done"):
++        return EXIT_ERROR
++    verification = result.get("verification")
++    if strict and isinstance(verification, dict) and verification.get("all_verified") is not True:
++        return EXIT_RESERVATIONS
++    return EXIT_OK
+ 
+ 
+ def run(adapter, args, task: str, *, console: Console = None) -> int:
+@@ -89,4 +135,4 @@ def run(adapter, args, task: str, *, console: Console = None) -> int:
+         return 130
+     sys.stdout.write(render_result(result, fmt))
+     sys.stdout.flush()
+-    return exit_code(result)
++    return exit_code(result, strict=bool(getattr(args, "strict", False)))
+diff --git a/scilink/cli/shell/modes.py b/scilink/cli/shell/modes.py
+index 03a1d905..4638baac 100644
+--- a/scilink/cli/shell/modes.py
++++ b/scilink/cli/shell/modes.py
+@@ -272,15 +272,13 @@ def initial_turns(self, args, agent):
+         return [args.initial_message] if getattr(args, "initial_message", None) else []
+ 
+     def headless_run(self, agent, task, context=None):
++        """The meta has no ``run_task``: one ``chat()`` turn, reported from
++        the delegations that turn worked on (a restored session's earlier
++        ones are not this task's; a fan-out it resumed is)."""
++        from scilink.agents.meta_agent.turn_result import ledger_snapshot, turn_result
++        before = ledger_snapshot(agent)
+         reply = agent.chat(task)
+-        ledger = getattr(agent, "_delegation_ledger", None) or []
+-        files = [f for e in ledger for f in (e.get("files_produced") or [])]
+-        findings = [k for e in ledger for k in (e.get("key_findings") or [])]
+-        failed = [e for e in ledger if str(e.get("status", "")).lower() in ("error", "failed")]
+-        return {"status": "error" if failed and not reply else "success", "task": task,
+-                "summary": reply or "", "files_produced": files, "key_findings": findings,
+-                "delegations": len(ledger),
+-                "warnings": [e.get("error") for e in failed if e.get("error")]}
++        return turn_result(agent, task, reply, before)
+ 
+ 
+ def _delegations(shell, arg: str) -> None:
+diff --git a/tests/test_headless_result_status.py b/tests/test_headless_result_status.py
+new file mode 100644
+index 00000000..7b979686
+--- /dev/null
++++ b/tests/test_headless_result_status.py
+@@ -0,0 +1,483 @@
++"""What a headless caller can trust: the status, the exit code and whether
++the analyses behind a success were verified.
++
++Before: a meta ``-p`` turn was a success whenever it had a reply (a turn
++whose every delegation failed exited 0), and an analyze ``-p`` run exited 0
++for a salvaged or unverified result with nothing at the top level to say so.
++No LLM calls.
++"""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from scilink.agents.exp_agents._replay import verdict_record
++from scilink.agents.exp_agents._verification_record import (merge_verification,
++                                                            verification_summary)
++from scilink.agents.exp_agents.analysis_orchestrator import (AnalysisMode,
++                                                            AnalysisOrchestratorAgent)
++from scilink.agents.meta_agent.turn_result import turn_result, turn_status
++from scilink.cli.shell import headless
++from scilink.cli.shell.modes import MetaAdapter
++
++
++# ── verification over a task's analyses ──────────────────────────
++
++def _row(aid, status="success", verified=True, reason="approved"):
++    return {"analysis_id": aid, "status": status, "verified": verified, "reason": reason}
++
++
++def test_all_verified():
++    v = verification_summary([_row("a"), _row("b")])
++    assert v == {"analyses": 2, "steps": 0, "verified": 2, "unverified": [], "failed": [],
++                 "all_verified": True}
++
++
++def test_an_unverified_success_is_counted_and_named():
++    v = verification_summary([_row("a"), _row("b", verified=False, reason="salvaged fit")])
++    assert v["all_verified"] is False and v["verified"] == 1
++    assert v["unverified"] == [{"analysis_id": "b", "reason": "salvaged fit"}]
++    assert v["failed"] == []
++
++
++def test_a_failed_analysis_is_not_called_unverified():
++    v = verification_summary([_row("a"), _row("b", status="error", verified=False)])
++    assert v["all_verified"] is False
++    assert v["failed"] == [{"analysis_id": "b", "status": "error"}] and v["unverified"] == []
++
++
++def test_a_partial_result_is_a_result_and_is_judged_on_its_verdict():
++    v = verification_summary([_row("cube", status="partial", verified=False, reason="status 'partial'")])
++    assert v["unverified"][0]["analysis_id"] == "cube" and v["failed"] == []
++
++
++def test_no_analysis_is_neither_verified_nor_not():
++    assert verification_summary([])["all_verified"] is None
++    assert verification_summary(None)["analyses"] == 0
++
++
++def test_a_step_that_passed_its_own_gate_is_not_an_unverified_analysis():
++    """A preparation or a derivation carries no verification record, so its
++    row says verified=False by construction; it is not an analysis."""
++    prep = dict(_row("prep", verified=False, reason="no verification record"),
++                agent_name="DataPreparation")
++    derive = dict(_row("der", verified=False, reason="no verification record"),
++                  agent_name="OutputDerivation")
++    v = verification_summary([prep, _row("a"), derive])
++    assert v == {"analyses": 1, "steps": 2, "verified": 1, "unverified": [], "failed": [],
++                 "all_verified": True}
++    only = verification_summary([prep])
++    assert only["all_verified"] is None and only["steps"] == 1        # no analysis ran
++    failed_prep = dict(prep, status="error")
++    v = verification_summary([failed_prep, _row("a")])
++    assert v["all_verified"] is False and v["failed"][0]["analysis_id"] == "prep"
++
++
++def test_a_missing_verdict_is_not_verified():
++    v = verification_summary([{"analysis_id": "a", "status": "success"}])
++    assert v["all_verified"] is False and v["unverified"][0]["analysis_id"] == "a"
++
++
++def test_merge_over_delegations():
++    a = verification_summary([_row("a")])
++    b = verification_summary([_row("b", verified=False, reason="r")])
++    merged = merge_verification([a, None, b, {"unrelated": 1}])
++    assert merged["analyses"] == 2 and merged["verified"] == 1
++    assert merged["all_verified"] is False and merged["unverified"][0]["analysis_id"] == "b"
++    assert merge_verification([None, None]) is None
++    assert merge_verification([verification_summary([])])["all_verified"] is None
++
++
++def test_merge_names_the_delegation_and_counts_the_empty_ones():
++    ok = verification_summary([_row("a")])
++    bad = verification_summary([_row("a", verified=False, reason="r")])   # ids repeat
++    merged = merge_verification([(1, ok), (2, bad)])
++    assert merged["unverified"] == [{"analysis_id": "a", "reason": "r", "delegation": 2}]
++    # one delegation verified, two analysed nothing: not "all verified"
++    merged = merge_verification([(1, ok), (2, verification_summary([])),
++                                 (3, verification_summary([]))])
++    assert merged["analyses"] == 1 and merged["verified"] == 1
++    assert merged["all_verified"] is False and merged["without_analysis"] == 2
++
++
++def test_preparing_in_one_delegation_and_analysing_in_the_next_is_verified():
++    """The shape CLAUDE.md prescribes for raw-instrument data. The preparing
++    delegation ran no analysis and did its job; it used to count against
++    all_verified, so this could never pass --strict through Mission Control."""
++    prep = verification_summary([dict(_row("prep", verified=False), agent_name="DataPreparation")])
++    assert prep["analyses"] == 0 and prep["steps"] == 1
++    merged = merge_verification([(1, prep), (2, verification_summary([_row("a")]))])
++    assert merged["all_verified"] is True and "without_analysis" not in merged
++    assert merged["analyses"] == 1 and merged["steps"] == 1
++    # a preparation alone is still no analysis
++    assert merge_verification([(1, prep)])["all_verified"] is None
++
++
++# ── analyze: run_task carries it ─────────────────────────────────
++
++def _analysis_orch(records):
++    o = AnalysisOrchestratorAgent.__new__(AnalysisOrchestratorAgent)
++    o.analysis_mode = AnalysisMode.AUTONOMOUS
++    o.max_iterations = 5
++    o.analysis_results = []
++    o.default_profile = o.default_targets = o.default_time_budget_s = None
++    o._last_chat_hit_iter_cap = False
++    o._last_chat_error = None
++    o.logger = SimpleNamespace(exception=lambda *a, **k: None, info=lambda *a, **k: None,
++                               warning=lambda *a, **k: None)
++    o.set_analysis_mode = lambda m: setattr(o, "analysis_mode", m)
++    o._auto_checkpoint = lambda *a, **k: None
++
++    def chat(prompt):
++        o.analysis_results.extend(records)
++        return "done"
++    o.chat = chat
++    return o
++
++
++def _record(aid, *, verified, reason="approved", status="success"):
++    return {"analysis_id": aid, "agent_name": "CurveFittingAgent", "status": status,
++            "data_path": f"/data/{aid}.csv", "output_directory": None,
++            "full_result": {"status": status, "verdict": verdict_record(
++                verified=verified, reason=reason, decided_by="qc_gate")}}
++
++
++def test_run_task_reports_verification_at_the_top_level():
++    res = _analysis_orch([_record("a", verified=True),
++                          _record("b", verified=False, reason="best available, not approved")]
++                         ).run_task("fit both")
++    assert res["status"] == "success"            # the task ran: unchanged
++    v = res["verification"]
++    assert v["analyses"] == 2 and v["verified"] == 1 and v["all_verified"] is False
++    assert v["unverified"] == [{"analysis_id": "b", "reason": "best available, not approved"}]
++    # the same answer the rows give
++    assert [r["verified"] for r in res["analyses"]] == [True, False]
++
++
++def test_run_task_with_no_analysis_has_nothing_to_verify():
++    res = _analysis_orch([]).run_task("just answer")
++    assert res["verification"]["all_verified"] is None
++
++
++# ── the meta turn ────────────────────────────────────────────────
++
++def _entry(index, status="success", mode="analysis", **kw):
++    e = {"index": index, "mode": mode, "label": f"d{index}", "status": status, "summary": "",
++         "key_findings": [f"finding {index}"], "files_produced": [f"/out/{index}.png"],
++         "feature_tables": [], "suggested_followups": [], "warnings": [], "error": None}
++    e.update(kw)
++    return e
++
++
++@pytest.mark.parametrize("statuses, expected", [
++    ([], "success"),                               # a turn that needed no delegation
++    (["success", "success"], "success"),
++    (["success", "error"], "partial"),
++    (["error", "interrupted"], "error"),
++    (["error"], "error"),
++    (["partial"], "success"),                      # a result was produced
++])
++def test_turn_status_follows_the_delegations(statuses, expected):
++    entries = [_entry(i + 1, s) for i, s in enumerate(statuses)]
++    assert turn_status("a reply", entries) == expected
++
++
++def test_a_turn_that_failed_is_an_error_whatever_it_delegated():
++    ok = [_entry(1)]
++    assert turn_status("", ok) == "error"
++    assert turn_status("❌ Error: boom", ok, chat_error="boom") == "error"
++    assert turn_status("⚠️ iteration cap", ok, hit_iteration_cap=True) == "error"
++
++
++class _Meta:
++    """A meta whose chat() closes the delegations it is scripted with."""
++
++    def __init__(self, ledger=None, script=(), reply="All done.", chat_error=None):
++        self._delegation_ledger = list(ledger or [])
++        self._script, self._reply, self._chat_error = list(script), reply, chat_error
++        self._last_chat_error = None
++        self._last_chat_hit_iter_cap = False
++
++    def chat(self, task):
++        self._delegation_ledger.extend(self._script)
++        self._last_chat_error = self._chat_error
++        return self._reply
++
++
++def test_every_delegation_failed_is_an_error_even_with_a_reply():
++    """The bug: this exited 0."""
++    meta = _Meta(script=[_entry(1, "error", error="branch wall-clock budget exceeded")],
++                 reply="I could not complete the analysis.")
++    res = MetaAdapter().headless_run(meta, "analyze it")
++    assert res["status"] == "error" and "budget exceeded" in res["error"]
++    assert headless.exit_code(res) == headless.EXIT_ERROR
++    assert res["files_produced"] == [] and res["key_findings"] == []
++    assert res["delegation_results"][0]["status"] == "error"
++
++
++def test_some_delegations_failed_is_partial():
++    """Said in the status always; in the exit code only under --strict (a
++    retry that worked looks the same to the ledger, and exited 0 before)."""
++    meta = _Meta(script=[_entry(1), _entry(2, "error", error="boom")])
++    res = MetaAdapter().headless_run(meta, "analyze both")
++    assert res["status"] == "partial" and headless.exit_code(res) == headless.EXIT_OK
++    assert headless.exit_code(res, strict=True) == headless.EXIT_RESERVATIONS
++    assert res["files_produced"] == ["/out/1.png"]            # not the failed one's
++    assert any("#2" in w and "boom" in w for w in res["warnings"])
++    assert "error" not in res
++
++
++def test_a_restored_sessions_earlier_delegations_are_not_this_tasks():
++    meta = _Meta(ledger=[_entry(1, "error", error="old failure")], script=[_entry(2)])
++    res = MetaAdapter().headless_run(meta, "next step")
++    assert res["status"] == "success" and res["delegations"] == 1
++    assert [d["index"] for d in res["delegation_results"]] == [2]
++    assert res["files_produced"] == ["/out/2.png"]
++
++
++def _real_meta(tmp_path, monkeypatch, name="meta", **kw):
++    from scilink.agents.meta_agent.meta_orchestrator import MetaMode, MetaOrchestratorAgent
++    monkeypatch.setenv("SCILINK_HOME", str(tmp_path / "home"))
++    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
++    return MetaOrchestratorAgent(base_dir=str(tmp_path / name),
++                                 model_name="anthropic/claude-sonnet-4-5",
++                                 meta_mode=MetaMode.AUTONOMOUS, launch_dir=str(tmp_path), **kw)
++
++
++def _chat_through_the_real_sweep(m, during=lambda: None, reply="Done."):
++    """chat() with the model loop replaced; it starts with the real sweep."""
++    def chat(task):
++        m._sweep_interrupted_delegations()
++        during()
++        return reply
++    m.chat = chat
++
++
++def test_a_delegation_left_running_by_an_earlier_session_is_not_this_turns(tmp_path, monkeypatch):
++    """Reproduced in review on the --restore -p path: chat() starts by
++    closing the entries a stopped session left running, with a fresh
++    completed_at, and the new turn was reported as an error for them."""
++    m = _real_meta(tmp_path, monkeypatch)
++    done = m._open_delegation("analysis", "finished earlier", None, None)
++    m._close_delegation(done, {"status": "success", "summary": "s"})
++    m._open_delegation("analysis", "stopped mid-run", None, None)        # left 'running'
++    m._auto_checkpoint()
++    restored = _real_meta(tmp_path, monkeypatch, restore_checkpoint=True)
++    assert [e["status"] for e in restored._delegation_ledger] == ["success", "running"]
++
++    _chat_through_the_real_sweep(restored, reply="Nothing to delegate.")
++    res = MetaAdapter().headless_run(restored, "what did we find?")
++    assert res["status"] == "success" and res["delegations"] == 0 and res["warnings"] == []
++    assert restored._delegation_ledger[1]["status"] == "interrupted"     # swept, on record
++
++    # and a real delegation in such a turn is reported alone
++    restored2 = _real_meta(tmp_path, monkeypatch, name="meta2")
++    restored2._open_delegation("analysis", "stopped mid-run", None, None)
++
++    def delegate():
++        e = restored2._open_delegation("analysis", "new work", None, None)
++        restored2._close_delegation(e, {"status": "success", "summary": "s"})
++    _chat_through_the_real_sweep(restored2, delegate)
++    res = MetaAdapter().headless_run(restored2, "analyze it")
++    assert res["status"] == "success" and [d["index"] for d in res["delegation_results"]] == [2]
++
++
++def test_a_fanout_resumed_in_place_is_this_turns_work(tmp_path, monkeypatch):
++    """resume_fanout reopens its entries where they are, below the ledger's
++    length at the start of the turn: they were invisible, so a resume whose
++    every branch failed was a success with no delegations."""
++    m = _real_meta(tmp_path, monkeypatch)
++    old = m._open_delegation("analysis", "an earlier, finished task", None, None)
++    m._close_delegation(old, {"status": "success", "summary": "s"})
++    branch = m._open_delegation("analysis", "a fan-out branch", None, None)
++    branch["fanout"] = True
++    m._close_delegation(branch, {"status": "interrupted", "error": "server restarted"})
++
++    def resume():                          # what resume_fanout does to a stale entry
++        branch["resumed_from_interruption"] = True
++        branch["status"] = "running"
++        branch.pop("completed_at", None)
++        m._close_delegation(branch, {"status": "error", "error": "budget exceeded"})
++    _chat_through_the_real_sweep(m, resume, reply="The resumed branch failed.")
++    res = MetaAdapter().headless_run(m, "resume the fan-out")
++    assert [d["index"] for d in res["delegation_results"]] == [branch["index"]]
++    assert res["status"] == "error" and "budget exceeded" in res["error"]
++    assert headless.exit_code(res) == headless.EXIT_ERROR
++
++    # a resumed branch still running when the turn ends (aborted) is the turn's too
++    branch["status"] = "interrupted"
++    before_abort = {"reply": "Stopped."}
++
++    def reopen_only():
++        branch["status"] = "running"
++        branch.pop("completed_at", None)
++    _chat_through_the_real_sweep(m, reopen_only, reply=before_abort["reply"])
++    res = MetaAdapter().headless_run(m, "resume again")
++    assert res["status"] == "error" and res["delegation_results"][0]["status"] == "running"
++
++
++def test_every_delegation_failed_with_no_error_text_does_not_claim_no_reply():
++    meta = _Meta(script=[_entry(1, "error")], reply="It did not work.")
++    res = MetaAdapter().headless_run(meta, "t")
++    assert res["status"] == "error" and "no reply" not in res["error"]
++    assert "No delegation produced a result" in res["error"]
++
++
++def test_a_chat_error_is_an_error():
++    meta = _Meta(reply="❌ Error: provider down", chat_error="provider down")
++    res = MetaAdapter().headless_run(meta, "t")
++    assert res["status"] == "error" and res["error"] == "provider down"
++
++
++def test_the_meta_result_carries_the_delegations_verification():
++    unverified = verification_summary([_row("a2", verified=False, reason="salvaged")])
++    meta = _Meta(script=[_entry(1, verification=verification_summary([_row("a1")])),
++                         _entry(2, verification=unverified),
++                         _entry(3, mode="planning")])
++    res = MetaAdapter().headless_run(meta, "analyze then plan")
++    assert res["status"] == "success"
++    assert res["verification"]["analyses"] == 2 and res["verification"]["all_verified"] is False
++    assert res["delegation_results"][1]["verification"]["unverified"][0]["analysis_id"] == "a2"
++    assert headless.exit_code(res) == headless.EXIT_OK
++    assert headless.exit_code(res, strict=True) == headless.EXIT_RESERVATIONS
++    json.dumps(res)                                           # what -p prints
++
++
++def test_an_analysis_delegation_that_analysed_nothing_is_named():
++    """Seen live: the specialist could not find the file, replied, and the
++    delegation closed as a success with no analysis in it."""
++    meta = _Meta(script=[_entry(1, verification=verification_summary([]), files_produced=[],
++                                key_findings=[])],
++                 reply="The file was not found.")
++    res = MetaAdapter().headless_run(meta, "analyze missing.csv")
++    assert res["status"] == "success" and res["verification"]["analyses"] == 0
++    assert res["warnings"] == ["Delegation #1 (analysis) ran no analysis."]
++    assert headless.exit_code(res) == headless.EXIT_OK
++    assert headless.exit_code(res, strict=True) == headless.EXIT_RESERVATIONS
++
++
++def test_a_turn_with_no_analysis_has_no_verification():
++    res = MetaAdapter().headless_run(_Meta(script=[_entry(1, mode="planning")], reply="Planned."),
++                                     "plan")
++    assert res["delegations"] == 1
++    assert "verification" not in res and headless.exit_code(res, strict=True) == headless.EXIT_OK
++
++
++def test_the_ledger_keeps_the_childs_verification(tmp_path, monkeypatch):
++    m = _real_meta(tmp_path, monkeypatch)
++    entry = m._open_delegation("analysis", "fit it", None, None)
++    v = verification_summary([_row("a", verified=False, reason="salvaged")])
++    m._close_delegation(entry, {"status": "success", "summary": "s", "verification": v})
++    assert m._delegation_ledger[-1]["verification"] == v
++    res = turn_result(m, "fit it", "Fitted.")
++    assert res["verification"]["all_verified"] is False
++    saved = json.loads((tmp_path / "meta" / "checkpoint.json").read_text())
++    assert saved["delegation_ledger"][-1]["verification"]["unverified"][0]["analysis_id"] == "a"
++
++
++# ── exit codes ───────────────────────────────────────────────────
++
++def test_exit_codes():
++    ok = {"status": "success"}
++    assert headless.exit_code(ok) == 0 and headless.exit_code(ok, strict=True) == 0
++    assert headless.exit_code({"status": "error"}) == 1
++    assert headless.exit_code({"status": "partial"}) == 0          # as before
++    assert headless.exit_code({"status": "partial"}, strict=True) == 3
++    unverified = {"status": "success", "verification": {"all_verified": False}}
++    assert headless.exit_code(unverified) == 0                 # unchanged without --strict
++    assert headless.exit_code(unverified, strict=True) == 3
++    # no analysis ran: a reply, a success, and nothing behind it
++    nothing = {"status": "success", "verification": {"analyses": 0, "all_verified": None}}
++    assert headless.exit_code(nothing) == 0 and headless.exit_code(nothing, strict=True) == 3
++    # a mode with no analyses to verify (plan, simulate) is not judged
++    assert headless.exit_code({"status": "success", "campaign_state": {}}, strict=True) == 0
++    verified = {"status": "success", "verification": {"analyses": 2, "all_verified": True}}
++    assert headless.exit_code(verified, strict=True) == 0
++    # an error stays an error under --strict
++    assert headless.exit_code({"status": "error", "verification": {"all_verified": False}},
++                              strict=True) == 1
++
++
++def test_strict_flag_reaches_the_exit_code(tmp_path, capsys, monkeypatch):
++    from shell_fakes import FakeAdapter, make_args
++    monkeypatch.chdir(tmp_path)
++
++    class Unverified(FakeAdapter):
++        def headless_run(self, agent, task, context=None):
++            return {"status": "success", "summary": "fitted",
++                    "verification": verification_summary(
++                        [_row("a"), _row("b", verified=False, reason="salvaged fit")])}
++
++    adapter = Unverified()
++    args = make_args(adapter, ["-p", "t", "--yes"])
++    assert headless.run(adapter, args, "t") == 0
++    out = capsys.readouterr().out
++    assert "1 of 2 analyses verified" in out and "not verified: b (salvaged fit)" in out
++    args = make_args(adapter, ["-p", "t", "--yes", "--strict", "--output-format", "json"])
++    assert headless.run(adapter, args, "t") == 3
++    assert json.loads(capsys.readouterr().out)["verification"]["all_verified"] is False
++
++
++def test_text_output_says_a_turn_was_not_a_success():
++    """Text and markdown printed a partial or failed turn like any answer."""
++    meta = _Meta(script=[_entry(1, verification=verification_summary([_row("a")])),
++                         _entry(2, "error", error="boom")], reply="One of two worked.")
++    res = MetaAdapter().headless_run(meta, "analyze both")
++    text = headless.render_result(res, "text")
++    assert "Status: partial" in text and "1 of 1 analyses verified" in text and "boom" in text
++    assert "**Status:** partial" in headless.render_result(res, "markdown")
++    ok = headless.render_result({"status": "success", "summary": "fine"}, "text")
++    assert "Status" not in ok
++
++
++# ── an analysis that raised is a failed analysis ─────────────────
++
++class _CrashingAgent:
++    def __init__(self, *a, **k):
++        pass
++
++    def analyze(self, data, system_info=None, **kwargs):
++        raise RuntimeError("detector overflow")
++
++
++class _VerifiedAgent(_CrashingAgent):
++    def analyze(self, data, system_info=None, **kwargs):
++        return {"status": "success", "detailed_analysis": "ok", "scientific_claims": [],
++                "verdict": verdict_record(verified=True, reason="approved", decided_by="qc_gate")}
++
++
++def test_a_crashed_analysis_is_counted_as_failed(tmp_path, monkeypatch):
++    """It left no record, so one verified analysis beside one that crashed
++    reported all_verified True and --strict exited 0."""
++    monkeypatch.setenv("SCILINK_HOME", str(tmp_path / "home"))
++    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
++    monkeypatch.setenv("UNSAFE_EXECUTION_OK", "true")
++    o = AnalysisOrchestratorAgent(base_dir=str(tmp_path / "session"),
++                                  model_name="anthropic/claude-sonnet-4-5")
++    good, bad = max(o._agent_registry) + 1, max(o._agent_registry) + 2
++    o.register_agent(good, _VerifiedAgent)
++    o.register_agent(bad, _CrashingAgent)
++
++    def run(name, agent_id):
++        data = tmp_path / name
++        data.write_text("x,y\n" + "\n".join(f"{i},{i * i}" for i in range(50)))
++        o.current_metadata = o.current_metadata_owner = None
++        return json.loads(o.tools.execute_tool("run_analysis", data_path=str(data),
++                                               agent_id=agent_id, analysis_goal="a curve"))
++
++    def chat(prompt):
++        assert run("a.csv", good)["status"] == "success"
++        crashed = run("b.csv", bad)
++        assert crashed["status"] == "error" and crashed["analysis_id"]
++        return "One fitted, one crashed."
++    o.chat = chat
++    res = o.run_task("fit both")
++    v = res["verification"]
++    assert v["analyses"] == 2 and v["verified"] == 1 and v["all_verified"] is False
++    assert [f["status"] for f in v["failed"]] == ["error"]
++    assert headless.exit_code(res, strict=True) == headless.EXIT_RESERVATIONS
++    # a call refused before an analysis started leaves no row
++    n = len(o.analysis_results)
++    refused = json.loads(o.tools.execute_tool("run_analysis", data_path=str(tmp_path / "missing.csv"),
++                                              agent_id=good, analysis_goal="a curve"))
++    assert refused["status"] == "error" and len(o.analysis_results) == n

@@ -1,0 +1,186 @@
+diff --git a/cryosparc/dataset/__init__.py b/cryosparc/dataset/__init__.py
+index 1e0010ee..4f289bc3 100644
+--- a/cryosparc/dataset/__init__.py
++++ b/cryosparc/dataset/__init__.py
+@@ -25,7 +25,7 @@
+ """
+ 
+ from functools import reduce
+-from pathlib import PurePath
++from pathlib import Path, PurePath
+ from typing import (
+     IO,
+     TYPE_CHECKING,
+@@ -55,7 +55,7 @@
+ from ..constants import ONE_MIB
+ from ..errors import DatasetLoadError
+ from ..stream import AsyncReadable, Streamable
+-from ..util import BinaryFile, bopen, default_rng, random_integers, u32bytesle, u32intle
++from ..util import BinaryFile, bopen, default_rng, random_integers, safe_write_bopen, u32bytesle, u32intle
+ from .column import Column
+ from .core import Data, DsetType, Stream
+ from .dtype import (
+@@ -650,7 +650,7 @@ def _load_numpy(
+         if (
+             os.getenv("CRYOSPARC_DATASET_MMAP", "true").lower() == "true"
+             and isinstance(file, (str, PurePath))
+-            and os.stat(file).st_size > ONE_MIB
++            and Path(file).stat().st_size > ONE_MIB
+         ):
+             # Use mmap to avoid loading full record array into memory
+             # cast path to a string for older numpy/python
+@@ -792,16 +792,16 @@ def save(self, file: BinaryFile, *, format: int = DEFAULT_FORMAT) -> None:
+         Raises:
+             TypeError: If invalid format specified
+         """
+-        if format == NUMPY_FORMAT:
+-            outdata = self.to_records(fixed=True)
+-            with bopen(file, "wb") as f:
++        if format not in (NUMPY_FORMAT, CSDAT_FORMAT):
++            raise TypeError(f"Invalid dataset save format for {file}: {format}")
++
++        with safe_write_bopen(file, tmpprefix=".dataset-") as f:
++            if format == NUMPY_FORMAT:
++                outdata = self.to_records(fixed=True)
+                 n.save(f, outdata, allow_pickle=False)
+-        elif format == CSDAT_FORMAT:
+-            with bopen(file, "wb") as f:
++            else:
+                 for chunk in self.stream(compression="lz4"):
+                     f.write(chunk)
+-        else:
+-            raise TypeError(f"Invalid dataset save format for {file}: {format}")
+ 
+     def stream(self, compression: Literal["lz4", None] = None) -> Iterator[bytes]:
+         """
+diff --git a/cryosparc/util.py b/cryosparc/util.py
+index 0626de03..6e3747f0 100644
+--- a/cryosparc/util.py
++++ b/cryosparc/util.py
+@@ -1,12 +1,15 @@
++import stat
+ import warnings
+ from contextlib import contextmanager
+-from pathlib import PurePath, PurePosixPath
++from pathlib import Path, PurePath, PurePosixPath
++from tempfile import NamedTemporaryFile
+ from typing import (
+     IO,
+     TYPE_CHECKING,
+     Any,
+     Callable,
+     Dict,
++    Generator,
+     Generic,
+     Iterator,
+     List,
+@@ -355,3 +358,42 @@ def clear_cached_property(obj: object, name: str):
+     """
+     if name in obj.__dict__:
+         delattr(obj, name)
++
++
++@contextmanager
++def safe_write_bopen(file: BinaryFile, *, tmpprefix=".cstools-", tmpsuffix=".tmp") -> Generator[IO[bytes], None, None]:
++    """
++    "with open(...)" alias. If a path is given, creates a named temporary file
++    and yields it for writing. If the context exits without exception, the
++    temporary file is renamed to the given path. If an exception occurs, the
++    temporary file is deleted.
++
++    Args:
++        file (str | Path | IO): binary file path or handle
++        mode (OpenBinaryMode, optional): File open mode. Defaults to "wb".
++
++    Yields:
++        IO: Binary file handle
++    """
++    if not isinstance(file, (str, PurePath)):
++        yield file
++        return
++
++    target = Path(file)
++    if target.is_dir():
++        raise IsADirectoryError(f"Cannot write to directory {target}")
++
++    tmp_path = None
++    try:
++        with NamedTemporaryFile(
++            mode="wb", prefix=tmpprefix, suffix=tmpsuffix, dir=str(target.parent), delete=False
++        ) as tmp:
++            tmp_path = Path(tmp.name)
++            yield tmp
++        if target.exists():
++            target_mode = stat.S_IMODE(target.stat().st_mode)
++            tmp_path.chmod(target_mode)
++        tmp_path.replace(target)
++    finally:
++        if tmp_path is not None and tmp_path.exists():
++            tmp_path.unlink()
+diff --git a/tests/test_dataset.py b/tests/test_dataset.py
+index cc25fa52..da43fb13 100644
+--- a/tests/test_dataset.py
++++ b/tests/test_dataset.py
+@@ -1,10 +1,11 @@
++import stat
+ from base64 import b64decode
+ from io import BytesIO
+ 
+ import numpy as n
+ import pytest
+ 
+-from cryosparc.dataset import CSDAT_FORMAT, Column
++from cryosparc.dataset import CSDAT_FORMAT, NUMPY_FORMAT, Column
+ from cryosparc.dataset.row import Row
+ 
+ from .conftest import Dataset
+@@ -245,6 +246,49 @@ def test_save():
+     assert all(e.decode() == a.decode() for e, a in zip(expected["field3"], actual["field3"]))
+ 
+ 
++@pytest.mark.parametrize("format", [NUMPY_FORMAT, CSDAT_FORMAT])
++def test_save_replaces_existing_file(tmp_path, format):
++    dataset_path = tmp_path / "dataset.cs"
++    original = Dataset({"test/value": ["old"]})
++    original.save(dataset_path, format=format)
++    dataset_path.chmod(0o664)
++    original_mode = stat.S_IMODE(dataset_path.stat().st_mode)
++
++    replacement = Dataset({"test/value": ["new"]})
++    replacement.save(dataset_path, format=format)
++
++    assert Dataset.load(dataset_path) == replacement
++    assert stat.S_IMODE(dataset_path.stat().st_mode) == original_mode
++
++
++@pytest.mark.parametrize("format", [NUMPY_FORMAT, CSDAT_FORMAT])
++def test_save_failure_preserves_existing_file(tmp_path, monkeypatch, format):
++    dataset_path = tmp_path / "dataset.cs"
++    original = Dataset({"test/value": ["old"]})
++    original.save(dataset_path, format=format)
++    replacement = Dataset({"test/value": ["new"]})
++
++    if format == NUMPY_FORMAT:
++
++        def fail_to_records(self, fixed=False):
++            raise RuntimeError("serialization failed")
++
++        monkeypatch.setattr(Dataset, "to_records", fail_to_records)
++    else:
++
++        def fail_stream(self, compression=None):
++            yield b"partial"
++            raise RuntimeError("serialization failed")
++
++        monkeypatch.setattr(Dataset, "stream", fail_stream)
++
++    with pytest.raises(RuntimeError, match="serialization failed"):
++        replacement.save(dataset_path, format=format)
++
++    assert Dataset.load(dataset_path) == original
++    assert list(tmp_path.iterdir()) == [dataset_path]
++
++
+ def test_load(io_data):
+     dtype = [("field1", "u4"), ("field2", "f4"), ("field3", "O"), ("field4", "f8"), ("field5", "i8")]
+     expected = Dataset.allocate(size=2, fields=dtype)

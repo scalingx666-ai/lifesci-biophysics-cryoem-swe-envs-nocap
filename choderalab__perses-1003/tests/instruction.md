@@ -1,0 +1,32 @@
+# Issue
+
+**Title:** Fix example testing. Clean sdf.
+
+## Description
+
+## Description
+
+Fix testing and cleaning SDF file.
+
+## Motivation and context
+
+<!--- Why is this change required? What problem does it solve? -->
+
+<!-- Replace ??? with the issue number that this pull request resolves. -->
+Resolves #???
+
+## How has this been tested?
+
+Tested locally.
+
+## Change log
+
+<!-- Propose a change log entry. -->
+<!-- Examples here https://github.com/choderalab/perses/blob/master/docs/changelog.rst -->
+```
+
+```
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `48b66e11e481`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

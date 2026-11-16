@@ -1,0 +1,237 @@
+diff --git a/scilink/agents/sim_agents/simulation_pipeline.py b/scilink/agents/sim_agents/simulation_pipeline.py
+index 0e83b940..9912531a 100644
+--- a/scilink/agents/sim_agents/simulation_pipeline.py
++++ b/scilink/agents/sim_agents/simulation_pipeline.py
+@@ -162,6 +162,7 @@ def _generate_inputs(
+     force_field_files: Optional[Dict[str, str]] = None,
+     staged: bool = False,
+     required_observables: Optional[list] = None,
++    potential_selection: Optional[Dict[str, Any]] = None,
+ ) -> Dict[str, Any]:
+     """Generate inputs for ``scale``, returning a normalized result.
+ 
+@@ -231,17 +232,21 @@ def _generate_inputs(
+         # the species are known, decide whether the interatomic potential
+         # comes from a classical force field or an MLIP, then dispatch. The
+         # router no longer makes this choice — it only picks the MD scale.
+-        from .potential_selection import select_potential_family
+-        selection = select_potential_family(
+-            structure_file=structure_file, research_goal=request,
+-            model_name=model_name, api_key=api_key, base_url=base_url,
+-            force_field_files=force_field_files,
+-        )
+-        logger.info(
+-            "potential selection: family=%s source=%s (%s)",
+-            selection.get("family"), selection.get("source"),
+-            selection.get("reasoning", ""),
+-        )
++        # A caller that already selected (the workflow does, before any
++        # classical parameterization) passes its decision through.
++        selection = potential_selection
++        if selection is None:
++            from .potential_selection import select_potential_family
++            selection = select_potential_family(
++                structure_file=structure_file, research_goal=request,
++                model_name=model_name, api_key=api_key, base_url=base_url,
++                force_field_files=force_field_files,
++            )
++            logger.info(
++                "potential selection: family=%s source=%s (%s)",
++                selection.get("family"), selection.get("source"),
++                selection.get("reasoning", ""),
++            )
+         if selection.get("family") == "mlip":
+             result = _generate_mlip_inputs(
+                 backend=None, structure_file=structure_file, request=request,
+@@ -571,12 +576,31 @@ def _run_workflow_once(
+     # Turn a packed box of coordinates into an engine-native, parameterized
+     # input (e.g. a typed LAMMPS data file) via the engine-neutral FF stack:
+     # ForceFieldAgent.parameterize -> ParameterizedSystem -> write_md_inputs.
+-    # Gated on a components.json manifest, so MLIP-driven MD (potential-based,
+-    # no manifest), pre-built data files, and non-MD scales are untouched. When
+-    # the caller already supplied force_field_files, respect them.
++    # The potential family is chosen first (issue #666): a packed-box manifest
++    # exists whether the run ends up on a force field or an MLIP, and a
++    # classical FF cannot parameterize e.g. a metal slab, so parameterizing
++    # before selecting would fail (or force the classical choice) before the
++    # selector ever ran. Pre-built data files and non-MD scales are untouched.
++    # When the caller already supplied force_field_files, respect them.
++    potential_selection = None
+     if (scale == "molecular_dynamics" and force_field_files is None):
++        from .potential_selection import select_potential_family
++        potential_selection = select_potential_family(
++            structure_file=structure_path, research_goal=user_request,
++            model_name=model_name, api_key=api_key, base_url=base_url,
++        )
++        result["potential_selection"] = potential_selection
++        logger.info(
++            "potential selection: family=%s source=%s (%s)",
++            potential_selection.get("family"),
++            potential_selection.get("source"),
++            potential_selection.get("reasoning", ""),
++        )
+         manifest = _load_components_manifest(structure_path)
+-        if manifest:
++        if potential_selection.get("family") == "mlip":
++            logger.info("MLIP selected; skipping classical force-field "
++                        "parameterization.")
++        elif manifest:
+             try:
+                 from .force_field_agent import ForceFieldAgent
+                 from ._engine_inputs import write_md_inputs
+@@ -746,6 +770,7 @@ def _run_workflow_once(
+             output_dir=output_dir, api_key=api_key, base_url=base_url,
+             model_name=model_name, force_field_files=force_field_files,
+             staged=staged, required_observables=required_observables,
++            potential_selection=potential_selection,
+         )
+     except Exception as e:
+         result["final_status"] = "failed_input_generation"
+diff --git a/tests/test_pipeline_refinement_integration.py b/tests/test_pipeline_refinement_integration.py
+index 5f043c6f..78f258aa 100644
+--- a/tests/test_pipeline_refinement_integration.py
++++ b/tests/test_pipeline_refinement_integration.py
+@@ -65,6 +65,9 @@ def parameterize(self, **kw):
+ 
+         import scilink.agents.sim_agents._engine_inputs as ei
+         import scilink.agents.sim_agents.force_field_agent as ffa
++        import scilink.agents.sim_agents.potential_selection as ps
++        monkeypatch.setattr(ps, "select_potential_family", lambda **kw: {
++            "family": "force_field", "reasoning": "test", "source": "forced"})
+         monkeypatch.setattr(ffa, "ForceFieldAgent", FakeFFAgent)
+         monkeypatch.setattr(ei, "write_md_inputs",
+                             lambda ps, sw, wd: {"structure_file": str(structure),
+diff --git a/tests/test_potential_selection_order.py b/tests/test_potential_selection_order.py
+new file mode 100644
+index 00000000..8c52860e
+--- /dev/null
++++ b/tests/test_potential_selection_order.py
+@@ -0,0 +1,128 @@
++"""Potential selection runs before classical FF parameterization (issue #666).
++
++A packed-box ``components.json`` manifest exists whether the run ends up on a
++force field or an MLIP. The workflow must choose the family first and only
++parameterize classically when that choice is ``force_field``; otherwise a
++metal slab dies in OpenFF before the selector ever runs. No LLM, no OpenFF.
++"""
++
++import json
++import sys
++from pathlib import Path
++
++import pytest
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO_ROOT))
++
++import scilink.agents.sim_agents.simulation_pipeline as sp  # noqa: E402
++import scilink.agents.sim_agents.potential_selection as ps  # noqa: E402
++import scilink.agents.sim_agents.force_field_agent as ffa  # noqa: E402
++import scilink.agents.sim_agents._engine_inputs as ei  # noqa: E402
++
++
++@pytest.fixture
++def md_case(tmp_path, monkeypatch):
++    """A manifest-bearing MD structure with every LLM/OpenFF seam faked.
++
++    Returns a dict the test mutates: ``family`` (what the fake selector
++    answers) and ``calls`` (ordered log of selector / FF / generation calls).
++    """
++    case = {"family": "force_field", "calls": []}
++
++    structure = tmp_path / "structure.extxyz"
++    structure.write_text("dummy")
++    (tmp_path / "components.json").write_text(json.dumps(
++        {"components": [{"name": "water", "smiles": "O", "count": 100}]}))
++
++    def fake_select(**kw):
++        case["calls"].append("select")
++        return {"family": case["family"], "reasoning": "test", "source": "llm"}
++
++    class FakePSystem:
++        backend, n_atoms, total_charge = "openff", 300, 0.0
++
++    class FakeFFAgent:
++        def __init__(self, **kw):
++            pass
++
++        def parameterize(self, **kw):
++            case["calls"].append("parameterize")
++            return FakePSystem()
++
++    def fake_generate_inputs(**kw):
++        case["calls"].append("generate")
++        case["gen_kwargs"] = kw
++        return {"status": "success", "input_files": {"run.lammps": "run"},
++                "entry_file": "run.lammps"}
++
++    monkeypatch.setattr(ps, "select_potential_family", fake_select)
++    monkeypatch.setattr(ffa, "ForceFieldAgent", FakeFFAgent)
++    monkeypatch.setattr(ei, "write_md_inputs",
++                        lambda p, s, w: {"structure_file": str(structure),
++                                         "force_field_files": {}})
++    monkeypatch.setattr(sp, "_generate_inputs", fake_generate_inputs)
++    case["structure"] = structure
++    case["out"] = tmp_path / "out"
++    return case
++
++
++def _run(case):
++    return sp.run_complete_workflow(
++        "MD of a test system", scale="molecular_dynamics", software="lammps",
++        structure_file=str(case["structure"]), output_dir=str(case["out"]),
++        validate=False, api_key="k",
++    )
++
++
++def test_selector_runs_before_parameterization(md_case):
++    _run(md_case)
++    assert md_case["calls"].index("select") < md_case["calls"].index("parameterize")
++
++
++def test_force_field_choice_parameterizes_classically(md_case):
++    result = _run(md_case)
++    assert "force_field" in result["steps_completed"]
++    assert result["potential_selection"]["family"] == "force_field"
++    assert md_case["gen_kwargs"]["potential_selection"]["family"] == "force_field"
++
++
++def test_mlip_choice_skips_classical_parameterization(md_case):
++    md_case["family"] = "mlip"
++    result = _run(md_case)
++    assert "parameterize" not in md_case["calls"]
++    assert "force_field" not in result["steps_completed"]
++    assert result["potential_selection"]["family"] == "mlip"
++    assert md_case["gen_kwargs"]["potential_selection"]["family"] == "mlip"
++    assert result["final_status"] != "failed_force_field"
++    # The MLIP path must not be mistaken for "no manifest, nothing to do".
++    assert not any("no components.json" in w
++                   for w in result.get("warnings", []))
++
++
++def test_selector_called_once_per_workflow(md_case):
++    _run(md_case)
++    assert md_case["calls"].count("select") == 1
++
++
++def test_generate_inputs_honours_passed_selection(tmp_path, monkeypatch):
++    """A precomputed decision is used as-is; no second selection is made."""
++    def boom(**kw):
++        raise AssertionError("selector must not run again")
++    monkeypatch.setattr(ps, "select_potential_family", boom)
++    seen = {}
++    monkeypatch.setattr(sp, "_generate_mlip_inputs",
++                        lambda **kw: seen.setdefault("mlip", kw) or
++                        {"status": "success", "input_files": {}})
++    monkeypatch.setattr(sp, "_generate_classical_md_inputs",
++                        lambda **kw: seen.setdefault("classical", kw) or
++                        {"status": "success", "input_files": {}})
++
++    out = sp._generate_inputs(
++        scale="molecular_dynamics", software="lammps", method="llm",
++        structure_file=str(tmp_path / "s.xyz"), request="r",
++        output_dir=str(tmp_path), api_key="k", base_url=None, model_name="m",
++        potential_selection={"family": "mlip", "source": "llm"},
++    )
++    assert "mlip" in seen and "classical" not in seen
++    assert out["potential_selection"]["family"] == "mlip"

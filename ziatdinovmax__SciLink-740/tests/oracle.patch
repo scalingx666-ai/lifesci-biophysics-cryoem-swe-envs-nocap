@@ -1,0 +1,219 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 3b3d95c0..edad444c 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -128,7 +128,9 @@ Curve, image and hyperspectral all run a series as **anchor + locked recipe**:
+ the first unit is analysed in full, the verified recipe is locked, every later
+ unit reuses it verbatim, failures are re-analysed within `max_series_refits`,
+ feature outliers are flagged (never re-analysed — the anomaly may be the
+-physics), then trend codegen and a series synthesis run over the per-unit
++physics; a curve follower whose replay pins a parameter at its bound likewise
++keeps the recipe verbatim, is flagged `pinned_at_bound` and is withheld as a
++degenerate fit, never relaxed into bounds of its own, #726), then trend codegen and a series synthesis run over the per-unit
+ feature table. The per-unit rows are written to `series_analysis_results.json`
+ in one shape, so `feature_table.write_feature_table` and every downstream
+ consumer read all three the same way. Every unit is a row of `features.csv`,
+diff --git a/scilink/agents/exp_agents/_verification_record.py b/scilink/agents/exp_agents/_verification_record.py
+index c589af02..036e95f5 100644
+--- a/scilink/agents/exp_agents/_verification_record.py
++++ b/scilink/agents/exp_agents/_verification_record.py
+@@ -341,6 +341,19 @@ def unit_verdict_for(unit: Dict[str, Any], *, recipe: Optional[Dict[str, Any]] =
+         return verdict_record(verified=False, decided_by="none", regime=regime,
+                               reason="fitted without a locked recipe (its regime's anchor produced none)")
+     rv = recipe.get("verdict") or {}
++    own_pins = unit.get("pinned_at_bound") or (unit.get("fit_quality") or {}).get("pinned_at_bound")
++    if rv.get("verified") and own_pins:
++        # the recipe passed, but on THIS unit a parameter sits at its bound: the
++        # follower keeps the locked recipe (comparability) and is withheld as
++        # a degenerate fit, named (#726)
++        from ..skills._shared.curve_fitting_tools import describe_pinned
++        try:
++            what = describe_pinned(own_pins)
++        except Exception:  # noqa: BLE001
++            what = "a parameter"
++        return verdict_record(verified=False, decided_by="recipe", regime=regime, recipe_of=recipe.get("unit"),
++                              reason=f"replayed the locked recipe of unit {recipe.get('unit')}, but this unit's "
++                                     f"fit is degenerate: {what} (pinned at bound)")
+     if rv.get("verified"):
+         # a follower is certified by the cheap checks against its regime's
+         # anchor (``regime_checks``, the series driver's), when they agree
+diff --git a/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py b/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
+index 22d43f07..e7f7a2aa 100644
+--- a/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
++++ b/scilink/agents/exp_agents/controllers/curve_fitting_controllers.py
+@@ -1196,6 +1196,14 @@ def _regime_model(state: dict, regime_name: Any) -> Optional[str]:
+     return None
+ 
+ 
++#: What a series follower whose replay pinned a parameter is told, everywhere
++#: the pin is reported (log, quality_warning, script_errors, the flag): the
++#: recipe was HELD, nothing was relaxed or refit (#726, #740).
++PINNED_HELD_NOTE = ("the locked recipe was kept for comparability, so the value at its bound is not "
++                    "a measurement of this unit; a separate analysis (or a new series anchored on "
++                    "this regime) is needed for it.")
++
++
+ def _regime_references(state: dict, candidates: list) -> list:
+     """For each regime candidate of a reuse: a drift monitor seeded with the
+     regime's units' data from the prior run (``spectrum_NNNN/data.npy``),
+@@ -4098,7 +4106,14 @@ def _fit_single_spectrum(
+         refine_from_script: Optional[str] = None,
+         refine_from_r2: float = 0.0,
+         refine_from_issues: Optional[list] = None,
++        hold_recipe: bool = False,
+     ) -> dict:
++        # ``hold_recipe``: a series FOLLOWER replaying its regime's locked
++        # recipe. A parameter pinned at a bound is then flagged on the unit,
++        # never "relaxed" by rewriting the recipe's bounds: the locked recipe
++        # exists for comparability, and a relaxed refit gave that one unit's
++        # secondary features different bounds from every other unit in the
++        # same table (#726). An execution error is still repaired.
+         # Realtime pre-flight gate (#346): fail a glitch frame instantly —
+         # this single choke point covers reuse, non-anchor locked-script
+         # execution, AND the fallback codegen, so a degenerate frame costs
+@@ -4253,7 +4268,11 @@ def _fit_single_spectrum(
+                             validate_bound_pinning, describe_pinned, PINNED_BOUND_FIX)
+                         _fr = _parse_script_markers(run["stdout"])
+                         _pins = validate_bound_pinning(_fr.get("parameters"), _fr.get("bounds"))
+-                        if (_pins and attempt < self.MAX_ATTEMPTS
++                        if _pins and hold_recipe:
++                            self.logger.warning(
++                                f"    ⚠️ Pinned at bound — {describe_pinned(_pins)}; the locked "
++                                f"recipe is kept verbatim and the unit flagged (not relaxed)")
++                        elif (_pins and attempt < self.MAX_ATTEMPTS
+                                 and pinned_retries < self.MAX_PINNED_RETRIES):
+                             pinned_retries += 1
+                             last_error = (
+@@ -4354,13 +4373,16 @@ def _fit_single_spectrum(
+         pinned = validate_bound_pinning(
+             fit_results.get("parameters"), fit_results.get("bounds"))
+         if pinned:
++            held = bool(hold_recipe)
+             script_errors.append({
+                 "error": "degenerate fit — parameter(s) pinned at a bound: "
+                          + describe_pinned(pinned),
+-                "diagnosis": PINNED_BOUND_FIX,
++                "diagnosis": (PINNED_HELD_NOTE if held else PINNED_BOUND_FIX),
+                 "kind": "pinned_bound",
+             })
+             self.logger.warning(
++                ("    ⚠️ Pinned at bound — the locked recipe was kept for comparability, the unit "
++                 "flagged: %s") if held else
+                 "    ⚠️ Pinned at bound after relaxation — kept and flagged: %s",
+                 describe_pinned(pinned))
+ 
+@@ -4464,10 +4486,15 @@ def _fit_single_spectrum(
+             result["bounds"] = fit_results["bounds"]
+         if pinned:
+             result["pinned_at_bound"] = pinned
+-            result["quality_warning"] = (
+-                "Degenerate fit: " + describe_pinned(pinned)
+-                + " — the extracted value is not trustworthy; the bound must "
+-                  "be made data-relative and the spectrum refitted.")
++            if hold_recipe:
++                # nothing was relaxed or refit: say what happened (#740 review)
++                result["pin_held"] = True
++                result["quality_warning"] = "Degenerate fit: " + describe_pinned(pinned) + " — " + PINNED_HELD_NOTE
++            else:
++                result["quality_warning"] = (
++                    "Degenerate fit: " + describe_pinned(pinned)
++                    + " — the extracted value is not trustworthy; the bound must "
++                      "be made data-relative and the spectrum refitted.")
+         if used_timeout_escalation:
+             # Provenance: this fit came from the last-resort model
+             # restructure after persistent timeouts — the executed script,
+@@ -7517,8 +7544,10 @@ def _unverified(r):
+                     "deviation_sigma": None,
+                     "recommendation": ("Degenerate fit: " + describe_pinned(pins)
+                                        + ". R² is not evidence here — another parameter absorbed "
+-                                         "the misfit. Refit with that bound made data-relative "
+-                                         "(e.g. 2 × max(y)) before trusting the extracted values."),
++                                         "the misfit. "
++                                       + (PINNED_HELD_NOTE[0].upper() + PINNED_HELD_NOTE[1:] if r.get("pin_held") else
++                                          "Refit with that bound made data-relative (relative to the "
++                                          "feature the data shows) before trusting the extracted values.")),
+                 })
+                 continue
+             if r2 is None:
+@@ -7957,7 +7986,7 @@ def execute(self, state: dict) -> dict:
+                 result = self._fit_single_spectrum(
+                     state=state, curve_data=curve_data, data_path=data_path,
+                     spectrum_name=spectrum_name, spectrum_idx=idx,
+-                    base_script=base_script,
++                    base_script=base_script, hold_recipe=base_script is not None,
+                 )
+                 self._check_follower(result, recipe_by_regime.get(regime_name),
+                                      anchor_params_by_regime.get(regime_name), curve_data)
+@@ -8002,6 +8031,7 @@ def _run_deferred(job: dict) -> dict:
+                     spectrum_name=job["spectrum_name"],
+                     spectrum_idx=job["idx"],
+                     base_script=job["base_script"],
++                    hold_recipe=job["base_script"] is not None,
+                 )
+ 
+             with ThreadPoolExecutor(max_workers=workers) as pool:
+diff --git a/tests/test_series_verdict_path.py b/tests/test_series_verdict_path.py
+index 69f89950..ac18fa63 100644
+--- a/tests/test_series_verdict_path.py
++++ b/tests/test_series_verdict_path.py
+@@ -781,3 +781,60 @@ def test_an_approved_anchor_with_a_pinned_parameter_is_degenerate_not_salvaged(t
+                           follower_r2={"spectrum_0001": 0.97, "spectrum_0002": 0.96}, max_series_refits=0)
+     v = analysis_verdict(compile_results(tmp_path / "salv", state))
+     assert not v["verified"] and v["reason"].startswith("salvaged best-available result"), v
++
++
++class PinningExecutor(FakeExecutor):
++    """As FakeExecutor, but the named units' fits report a width AT its upper
++    bound (with the bounds, as a real script prints them)."""
++
++    def __init__(self, r2_by_name, pinned_names):
++        super().__init__(r2_by_name)
++        self.pinned_names = set(pinned_names)
++
++    def execute_script(self, script, working_dir=None, timeout=None, **kw):
++        res = super().execute_script(script, working_dir=working_dir, timeout=timeout, **kw)
++        name = self.calls[-1][0] if self.calls else None
++        if name in self.pinned_names and res.get("status") == "success":
++            out = json.loads(res["stdout"].split("FIT_RESULTS_JSON:", 1)[1])
++            out["parameters"]["peak_1"]["fwhm"] = 12.0
++            out["bounds"] = {"peak_1": {"fwhm": [1.0, 12.0]}}
++            res["stdout"] = "FIT_RESULTS_JSON:" + json.dumps(out)
++        return res
++
++
++def test_a_follower_whose_replay_pins_keeps_the_recipe_and_is_named_degenerate(tmp_path, monkeypatch):
++    """#726, the reviewer's call on its side effect: a follower whose replay
++    pins a parameter is NOT sent through the bound-relaxing ladder (that gave
++    its secondary features different bounds from every other unit's). It
++    keeps the locked recipe verbatim, is flagged pinned_at_bound (not
++    refit), and is withheld as a degenerate fit by its own pin; the other
++    followers verify as before."""
++    follower_r2 = {"spectrum_0001": 0.97, "spectrum_0002": 0.96}
++    ex = PinningExecutor(follower_r2, {"spectrum_0001"})
++    state, _ = run_series(tmp_path, monkeypatch, names=NAMES, anchors={"spectrum_0000": OK},
++                          follower_r2=follower_r2, executor=ex)
++    results = compile_results(tmp_path, state)
++    assert [n for n, _ in ex.calls].count("spectrum_0001") == 1           # replayed once, never relaxed
++    raw = {u["name"]: u for u in state["series_results"]}                 # the driver's own rows
++    assert raw["spectrum_0001"]["fitted_from"] == "locked_script" and raw["spectrum_0001"]["replay_verbatim"] is True
++    assert raw["spectrum_0001"]["pinned_at_bound"][0]["parameter"] == "fwhm"
++    flag_list = state.get("flagged_spectra") or state.get("flagged_images") or []
++    flags = {f["name"]: f["reason"] for f in flag_list}
++    assert flags.get("spectrum_0001") == "pinned_at_bound"
++    # every text on the held path says what happened: kept, not relaxed or refit (#740 review)
++    row = raw["spectrum_0001"]
++    rec = next(f["recommendation"] for f in flag_list if f["name"] == "spectrum_0001")
++    texts = [row["quality_warning"], rec] + [e.get("diagnosis") or "" for e in row.get("script_errors") or []
++                                            if e.get("kind") == "pinned_bound"]
++    assert row.get("pin_held") is True and len(texts) == 3
++    for t in texts:
++        assert "kept for comparability" in t and "refit" not in t.lower() and "relax" not in t.lower(), t
++    by_name = {u["name"]: u for u in results["individual_results"]}
++    pinned = by_name["spectrum_0001"]
++    assert not pinned.get("adaptively_refitted")                          # flagged, never re-derived
++    uv = pinned["unit_verdict"]
++    assert not uv["verified"] and uv["decided_by"] == "recipe"
++    assert "this unit's fit is degenerate: peak_1.fwhm = 12 at its upper bound 12" in uv["reason"]
++    assert by_name["spectrum_0002"]["unit_verdict"]["verified"] is True
++    v = analysis_verdict(results)
++    assert not v["verified"] and "degenerate" in v["reason"] and "spectrum_0001" in v["reason"]

@@ -1,0 +1,251 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6d21aed3..7b3b63b8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,7 @@ Version 0.10.7-DEV
+ - ![ENHANCEMENT][badge-enhancement] New implementation of the cell lists: the cells are defined on a grid in fractional coordinates of the unit cell, each particle is stored once (no replication of periodic images), and periodic images are reached in the pairwise computation by wrapping the indices of neighboring cells. Orthorhombic, triclinic and non-periodic systems share the same implementation. Candidate pairs between cells with many particles are filtered by projection on the axis connecting the cell centers. Cell list construction is much faster (2-8x), while the speedup of complete applications depends on the cost of the mapped function and on the density of the system: relative to the previous version, the cell list part of Packmol.jl (100k water molecules) is ~45% faster, the computation of distribution functions in ComplexMixtures.jl (dense system, 20 Å cutoff) is ~5% faster, and a pairwise velocity-correlation computation (1M particles) is ~30% faster for a sparse system and has about the same speed for a dense system.
+ - ![ENHANCEMENT][badge-enhancement] `neighborlist` no longer copies the whole list of pairs when the number of pairs slightly exceeds the preallocated estimate (which happened in about half of the uniform systems), making it up to 3x faster in those cases.
+ - ![ENHANCEMENT][badge-enhancement] The threaded copies of the output are reset in parallel, each by the task that uses it in the `pairwise!` computation, instead of serially before the computation. This removes a cost that grew with the number of threads for large array outputs (e.g. 70 ms per call with 16 threads, and 133 ms with 32 threads, for the per-atom gradients of a 2.77M-atom system in Packmol.jl). Simple outputs are unaffected.
++- ![INFO][badge-info] In two-set systems, only the cell lists of the sets whose positions changed are rebuilt (as in previous versions: this fixes a regression of the new cell list implementation, in which both lists were rebuilt when either set was updated). The list of the first set, which is only iterated over, is built at a cost independent of the number of cells when it has few particles relative to the number of cells (by sorting its particles by cell), making updates of a small first set (e.g. one molecule queried against a large fixed set) nearly free.
+ - ![INFO][badge-info] Degenerate (zero-volume) unit cells throw an `ArgumentError`.
+ - ![INFO][badge-info] The order of the pairs in the neighbor lists, and of the calls to the mapped function in `pairwise!`, changed. The `pair.x` coordinate of each pair is now always the coordinate of particle `i` wrapped into the unit cell (identical to the input coordinate if the particle is inside the cell), and `pair.y` the image of particle `j` within the cutoff of `pair.x`.
+ - ![INFO][badge-info] Internal changes: the `CellList` structure was rewritten, the `OrthorhombicCell` and `TriclinicCell` unit cell types were replaced by a single `PeriodicCell` type (non-periodic systems use `NonPeriodicCell`), the `Box` structure no longer contains the `aligned_unit_cell`, `rotation`, `cell_size` fields, and the `AuxThreaded` auxiliary structures were removed.
+diff --git a/src/internals/CellLists.jl b/src/internals/CellLists.jl
+index 099b615e..97435557 100644
+--- a/src/internals/CellLists.jl
++++ b/src/internals/CellLists.jl
+@@ -61,6 +61,7 @@ Base.@kwdef mutable struct CellList{N, T}
+     wrapped::Vector{SVector{N, T}} = SVector{N, T}[]
+     wrap_shift::Vector{SVector{N, Int32}} = SVector{N, Int32}[]
+     write_pos::Vector{Int32} = Int32[]
++    sort_keys::Vector{Int} = Int[]
+     " Offsets of neighboring cells: one of each {v,-v} (self-computations) and all of them (cross-computations). "
+     offsets_half::Vector{SVector{N, Int}} = SVector{N, Int}[]
+     offsets_full::Vector{SVector{N, Int}} = SVector{N, Int}[]
+@@ -310,6 +311,7 @@ function _update_cell_list!(
+         cl::CellList{N, T};
+         parallel::Bool = true,
+         validate_coordinates::F = _validate_coordinates,
++        outer::Bool = false,
+     ) where {UnitCellType, N, T, F <: Function}
+     isnothing(validate_coordinates) || validate_coordinates(x)
+     # Provide a better error message if the unit cell dimension does not match the dimension of the positions.
+@@ -328,7 +330,7 @@ function _update_cell_list!(
+     cl.n_real_particles = length(x)
+     cl.number_of_cells = prod(box.nc)
+     _update_offsets!(cl, box)
+-    _build!(cl, x, box; parallel)
++    _build!(cl, x, box; parallel, outer)
+     # set updated to false, to indicate that the cell list was constructed
+     # for these coordinates.
+     x.updated[] = false
+@@ -449,8 +451,11 @@ In parallel, each batch handles a consecutive range of particles, and keeps its
+ cell. The prefix sum over (cell, batch) then gives each batch its own write positions in each
+ cell, such that all steps run in parallel, and the result is identical to the serial build.
+ 
++If `outer` is `true`, the list is only iterated over (the reference list of a `CellListPair`),
++and lists with few particles relative to the number of cells are built by `_build_small!`.
++
+ =#
+-function _build!(cl::CellList{N, T}, x::ParticleSystemPositions, box::Box; parallel::Bool) where {N, T}
++function _build!(cl::CellList{N, T}, x::ParticleSystemPositions, box::Box; parallel::Bool, outer::Bool = false) where {N, T}
+     n = length(x)
+     ncell = cl.number_of_cells
+     # Cell indices and positions in the sorted arrays are stored as Int32
+@@ -463,6 +468,9 @@ function _build!(cl::CellList{N, T}, x::ParticleSystemPositions, box::Box; paral
+     resize!(cl.particles, n)
+     resize!(cl.shifts, n)
+     resize!(cl.cell_start, ncell + 1)
++    if outer && SMALL_LIST_CELLS_PER_PARTICLE * n < ncell
++        return _build_small!(cl, x, box)
++    end
+     _nbatches = parallel ? nbatches(cl, :build) : 1
+     nb_sort = _nbatches_counting_sort(_nbatches, n, ncell)
+     if nb_sort == 1
+@@ -481,6 +489,43 @@ function _build!(cl::CellList{N, T}, x::ParticleSystemPositions, box::Box; paral
+     return cl
+ end
+ 
++#
++# Construction of a list that is only iterated over (the reference list of a `CellListPair`),
++# with few particles relative to the number of cells. The pairwise computation reads the
++# particles of each nonempty cell `c` of such a list as `particles[cell_start[c]:cell_start[c+1]-1]`,
++# and never reads `cell_start` at other cells. Thus, the particles are sorted by cell (keeping
++# the order of their indices within each cell), and `cell_start` is set only at the nonempty
++# cells and at the cells following them, at a cost that does not depend on the number of cells.
++# The other entries of `cell_start` are left as they were. The resulting `particles`, `shifts`
++# and `nonempty_cells` are identical to those of the counting sort.
++#
++const SMALL_LIST_CELLS_PER_PARTICLE = 64
++function _build_small!(cl::CellList, x::ParticleSystemPositions, box::Box)
++    n = length(x)
++    _locate_range!(cl, x, box, 1:n)
++    # Sorting keys: the cell index in the high bits, the particle index in the low bits
++    keys = resize!(cl.sort_keys, n)
++    @inbounds for i in 1:n
++        keys[i] = (Int(cl.cell_of[i]) << 32) | i
++    end
++    sort!(keys; alg = QuickSort)
++    nonempty_cells = resize!(cl.nonempty_cells, 0)
++    c_prev = 0
++    @inbounds for p in 1:n
++        c = keys[p] >> 32
++        i = keys[p] & 0xffffffff
++        cl.particles[p] = ParticleWithIndex(i, cl.wrapped[i])
++        cl.shifts[p] = cl.wrap_shift[i]
++        if c != c_prev
++            push!(nonempty_cells, c)
++            cl.cell_start[c] = p
++            c_prev = c
++        end
++        cl.cell_start[c + 1] = p + 1
++    end
++    return cl
++end
++
+ #
+ # Number of batches of the parallel counting sort (1 means the serial counting sort).
+ # Each batch keeps one count per cell, thus the number of batches is reduced for
+@@ -655,7 +700,7 @@ function UpdateCellList!(
+         validate_coordinates::F = _validate_coordinates,
+     ) where {F <: Function}
+     x_updated, y_updated = x.updated[], y.updated[]
+-    ref_list = x_updated ? _update_cell_list!(x, box, cl_pair.ref_list; parallel, validate_coordinates) : cl_pair.ref_list
++    ref_list = x_updated ? _update_cell_list!(x, box, cl_pair.ref_list; parallel, validate_coordinates, outer = true) : cl_pair.ref_list
+     target_list = y_updated ? _update_cell_list!(y, box, cl_pair.target_list; parallel, validate_coordinates) : cl_pair.target_list
+     cl_pair = CellListPair(ref_list, target_list)
+     if x_updated || y_updated
+@@ -663,17 +708,3 @@ function UpdateCellList!(
+     end
+     return cl_pair
+ end
+-
+-# Unconditional update of both cell lists (does not update the number of batches).
+-function _update_cell_list!(
+-        x::ParticleSystemPositions,
+-        y::ParticleSystemPositions,
+-        box::Box,
+-        cl_pair::CellListPair{N, T};
+-        parallel::Bool = true,
+-        validate_coordinates::F = _validate_coordinates,
+-    ) where {N, T, F <: Function}
+-    ref_list = _update_cell_list!(x, box, cl_pair.ref_list; parallel, validate_coordinates)
+-    target_list = _update_cell_list!(y, box, cl_pair.target_list; parallel, validate_coordinates)
+-    return CellListPair{N, T}(ref_list, target_list)
+-end
+diff --git a/src/internals/ParticleSystem.jl b/src/internals/ParticleSystem.jl
+index 03e13af6..3e6648cd 100644
+--- a/src/internals/ParticleSystem.jl
++++ b/src/internals/ParticleSystem.jl
+@@ -173,14 +173,18 @@ function _update!(sys::ParticleSystem2, ::Type{CellList})
+     n_particles_changed = 
+         (length(sys.xpositions) != n_real_particles(sys, :ref)) ||
+         (length(sys.ypositions) != n_real_particles(sys, :target))
+-    sys.private.cell_list = _update_cell_list!(
+-        sys.xpositions,
+-        sys.ypositions,
+-        box(sys),
+-        celllist(sys);
+-        parallel = sys.parallel,
+-        validate_coordinates = sys.validate_coordinates,
++    # Only the lists of the sets whose positions changed are rebuilt: in typical
++    # uses one of the sets is fixed (and may be much larger than the other).
++    cl = celllist(sys)
++    ref_list = !updated(sys, :x) ? cl.ref_list : _update_cell_list!(
++        sys.xpositions, box(sys), cl.ref_list;
++        parallel = sys.parallel, validate_coordinates = sys.validate_coordinates, outer = true,
++    )
++    target_list = !updated(sys, :y) ? cl.target_list : _update_cell_list!(
++        sys.ypositions, box(sys), cl.target_list;
++        parallel = sys.parallel, validate_coordinates = sys.validate_coordinates,
+     )
++    sys.private.cell_list = CellListPair(ref_list, target_list)
+     if n_particles_changed
+         _old_nbatches = get_nbatches(sys)
+         sys.private.cell_list = update_number_of_batches!(celllist(sys); parallel = sys.parallel)
+diff --git a/test/API/ParticleSystem.jl b/test/API/ParticleSystem.jl
+index d71534ec..38d51df1 100644
+--- a/test/API/ParticleSystem.jl
++++ b/test/API/ParticleSystem.jl
+@@ -360,6 +360,35 @@ end
+ 
+ end
+ 
++@testitem "ParticleSystem2: only the updated set is rebuilt" begin
++    using StaticArrays
++    using CellListMap
++    x = rand(SVector{3, Float64}, 100)
++    y = rand(SVector{3, Float64}, 1000)
++    sys = ParticleSystem(xpositions = x, ypositions = y, unitcell = [1.0, 1.0, 1.0], cutoff = 0.1, output = 0.0)
++    target_coordinates() = [p.coordinates for p in CellListMap.celllist(sys).target_list.particles]
++    y_list = target_coordinates()
++    # Modify the second set without flagging it as updated (bypassing `setindex!`):
++    # the list of the second set must not be rebuilt when only the first set is updated
++    sys.ypositions.x .= rand(SVector{3, Float64}, 1000)
++    update!(sys; xpositions = rand(SVector{3, Float64}, 100))
++    CellListMap.UpdateParticleSystem!(sys)
++    @test target_coordinates() == y_list
++    # Results after updating only the first set are those of a new system
++    sys.ypositions.x .= y
++    xnew = rand(SVector{3, Float64}, 100)
++    update!(sys; xpositions = xnew)
++    f(pair, out) = out + pair.d
++    sys_new = ParticleSystem(xpositions = xnew, ypositions = y, unitcell = [1.0, 1.0, 1.0], cutoff = 0.1, output = 0.0)
++    @test pairwise!(f, sys) ≈ pairwise!(f, sys_new)
++    # Updating the second set rebuilds its list
++    ynew = rand(SVector{3, Float64}, 1000)
++    update!(sys; ypositions = ynew)
++    CellListMap.UpdateParticleSystem!(sys)
++    @test target_coordinates() != y_list
++    @test pairwise!(f, sys) ≈ pairwise!(f, ParticleSystem(xpositions = xnew, ypositions = ynew, unitcell = [1.0, 1.0, 1.0], cutoff = 0.1, output = 0.0))
++end
++
+ @testitem "automatic nbatches update on ParticleSystem resize" begin
+     using CellListMap, StaticArrays
+ 
+diff --git a/test/internals/tests.jl b/test/internals/tests.jl
+index 369536fe..a0de5ea3 100644
+--- a/test/internals/tests.jl
++++ b/test/internals/tests.jl
+@@ -697,3 +697,41 @@ end
+ @testitem "test_pathological2D" setup = [Testing] begin
+     @test test_pathological() == (nothing, nothing)
+ end
++
++@testitem "small reference lists" begin
++    using CellListMap, StaticArrays
++    using CellListMap: ParticleSystemPositions, Box, CellList, _update_cell_list!
++    # The construction of small lists that are only iterated over (reference lists of
++    # CellListPairs) gives the same lists as the counting sort, at the entries that are read
++    for unitcell in ([10.0, 10.0, 10.0], [10.0 3.0 0.0; 0.0 10.0 2.0; 0.0 0.0 10.0])
++        box = Box(unitcell, 0.5)
++        for n in (0, 1, 5, 20)
++            # coordinates outside the unit cell, such that some particles are wrapped
++            x = ParticleSystemPositions(SVector{3, Float64}[30 .* v .- 10 for v in rand(SVector{3, Float64}, n)])
++            cl_full = _update_cell_list!(x, box, CellList(x, box; parallel = false); parallel = false)
++            x.updated[] = true
++            cl_small = _update_cell_list!(x, box, CellList(x, box; parallel = false); parallel = false, outer = true)
++            @test 64 * n < cl_small.number_of_cells # the small construction was used
++            @test cl_small.nonempty_cells == cl_full.nonempty_cells
++            @test all(c -> cl_small.cell_start[c] == cl_full.cell_start[c] && cl_small.cell_start[c + 1] == cl_full.cell_start[c + 1], cl_full.nonempty_cells)
++            @test [(p.index, p.coordinates) for p in cl_small.particles] == [(p.index, p.coordinates) for p in cl_full.particles]
++            @test cl_small.shifts == cl_full.shifts
++        end
++    end
++    # Pairwise computations with a small first set (small reference list) are equal
++    # to those with the sets swapped (both lists constructed by the counting sort)
++    f(pair, out) = out + pair.d + sum(pair.shift)
++    y = 10 .* rand(SVector{3, Float64}, 2000)
++    # in periodic systems, coordinates outside the unit cell, such that some particles are wrapped
++    newx(unitcell) = SVector{3, Float64}[isnothing(unitcell) ? 10 .* v : 30 .* v .- 10 for v in rand(SVector{3, Float64}, 5)]
++    for unitcell in ([10.0, 10.0, 10.0], [10.0 3.0 0.0; 0.0 10.0 2.0; 0.0 0.0 10.0], nothing)
++        sys_small = ParticleSystem(xpositions = newx(unitcell), ypositions = y, unitcell = unitcell, cutoff = 1.0, output = 0.0)
++        for _ in 1:5
++            x = newx(unitcell)
++            update!(sys_small; xpositions = x)
++            sys_swapped = ParticleSystem(xpositions = y, ypositions = x, unitcell = unitcell, cutoff = 1.0, output = 0.0)
++            g(pair, out) = out + pair.d - sum(pair.shift) # shifts are reversed when the sets are swapped
++            @test pairwise!(f, sys_small) ≈ pairwise!(g, sys_swapped)
++        end
++    end
++end

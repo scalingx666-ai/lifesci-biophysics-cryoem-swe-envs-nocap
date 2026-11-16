@@ -1,0 +1,128 @@
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index bfa20f52d..f0002d47e 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -1569,7 +1569,7 @@ def _restore_checkpoint(self):
+         except Exception as e:
+             logging.warning(f"Failed to restore checkpoint: {e}")
+ 
+-    def _auto_checkpoint(self):
++    def _auto_checkpoint(self, verbose: bool = True):
+         """Internal auto-checkpoint without LLM interaction.
+ 
+         Atomic (temp file + replace) and serialized: concurrent fan-out
+@@ -1590,7 +1590,8 @@ def _auto_checkpoint(self):
+                 with open(tmp_path, 'w', encoding="utf-8") as f:
+                     json.dump(checkpoint_data, f, indent=2, default=str)
+                 os.replace(tmp_path, self.checkpoint_path)
+-            print(f"    ✅ Auto-checkpoint saved")
++            if verbose:
++                print(f"    ✅ Auto-checkpoint saved")
+             return True
+         except Exception as e:
+             logging.warning(f"Auto-checkpoint failed: {e}")
+@@ -1724,6 +1725,14 @@ def chat(self, user_input: str) -> str:
+             # responsible for displaying it — chat() does not print it.
+             self._save_history()
+ 
++            # Checkpoint on turn completion, not only on interval/error: a
++            # programmatic session (one chat() per process) never crosses the
++            # interval check, so without this its non-delegation state (mode,
++            # message count) — and, before _close_delegation checkpointed,
++            # the whole delegation ledger — was lost on restore.
++            self._auto_checkpoint(verbose=False)
++            self.last_checkpoint_message_count = self.message_count
++
+             if self.message_count > 80:
+                 response_text += (
+                     "\n\n⚠️ Note: Conversation is getting long. "
+diff --git a/tests/test_meta_turn_checkpoint.py b/tests/test_meta_turn_checkpoint.py
+new file mode 100644
+index 000000000..9a00a87e9
+--- /dev/null
++++ b/tests/test_meta_turn_checkpoint.py
+@@ -0,0 +1,84 @@
++"""Regression test for #364: a programmatic single-turn meta session must
++persist its checkpoint on turn completion — interval-based checkpointing never
++fires for a one-chat()-per-process session, and before this fix such sessions
++restored with an empty delegation ledger.
++
++Offline — the LLM turn is stubbed.
++
++  conda run -n scilink python -m pytest tests/test_meta_turn_checkpoint.py -v
++"""
++import json
++import os
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++from scilink.agents.meta_agent.meta_orchestrator import MetaOrchestratorAgent, MetaMode
++
++
++def _entry(index):
++    return {
++        "index": index,
++        "mode": "analysis",
++        "task": f"task {index}",
++        "status": "success",
++        "summary": "ok",
++        "key_findings": ["finding"],
++        "files_produced": [],
++    }
++
++
++def test_single_turn_session_persists_ledger(tmp_path):
++    base = str(tmp_path)
++    ag = MetaOrchestratorAgent(
++        base_dir=base,
++        api_key="sk-dummy",
++        model_name="claude-opus-4-6",
++        meta_mode=MetaMode.AUTONOMOUS,
++    )
++
++    def fake_turn(user_input):
++        # Simulate a turn whose tool calls completed two delegations.
++        ag._delegation_ledger.append(_entry(1))
++        ag._delegation_ledger.append(_entry(2))
++        return "done"
++
++    ag._handle_litellm_chat = fake_turn
++    assert ag.chat("fan out over my datasets") == "done"
++
++    # One successful turn, no interval crossed, no error — the checkpoint
++    # must exist anyway, with the ledger and the turn's message count.
++    assert ag.checkpoint_path.exists()
++    data = json.loads(ag.checkpoint_path.read_text())
++    assert [e["index"] for e in data["delegation_ledger"]] == [1, 2]
++    assert data["message_count"] == ag.message_count
++    assert ag.last_checkpoint_message_count == ag.message_count
++
++    # "Second process": restore the session and see the first process's
++    # delegations without re-running them.
++    ag2 = MetaOrchestratorAgent(
++        base_dir=base,
++        api_key="sk-dummy",
++        model_name="claude-opus-4-6",
++        restore_checkpoint=True,
++    )
++    assert [e["index"] for e in ag2._delegation_ledger] == [1, 2]
++
++
++def test_turn_error_still_checkpoints(tmp_path):
++    ag = MetaOrchestratorAgent(
++        base_dir=str(tmp_path),
++        api_key="sk-dummy",
++        model_name="claude-opus-4-6",
++        meta_mode=MetaMode.AUTONOMOUS,
++    )
++
++    def broken_turn(user_input):
++        ag._delegation_ledger.append(_entry(1))
++        raise RuntimeError("synthetic turn failure")
++
++    ag._handle_litellm_chat = broken_turn
++    out = ag.chat("boom")
++    assert "Error" in out
++
++    data = json.loads(ag.checkpoint_path.read_text())
++    assert [e["index"] for e in data["delegation_ledger"]] == [1]

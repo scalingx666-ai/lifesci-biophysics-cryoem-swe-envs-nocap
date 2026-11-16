@@ -1,0 +1,316 @@
+diff --git a/maintainer/parsing/importlib_wrapper.py b/maintainer/parsing/importlib_wrapper.py
+index 30b8c20123a..ec59ee371f3 100644
+--- a/maintainer/parsing/importlib_wrapper.py
++++ b/maintainer/parsing/importlib_wrapper.py
+@@ -20,6 +20,8 @@
+ import io
+ import sys
+ import ast
++import time
++import warnings
+ import tokenize
+ import unittest
+ import unittest.mock
+@@ -117,6 +119,7 @@ def configure_and_import(filepath,
+         os.chdir(dirname)
+     sys.path.insert(0, str(dirname))
+     module_name = output_filepath.stem
++    wait_on_file(output_filepath)
+     try:
+         module = importlib.import_module(module_name)
+     except espressomd.code_features.FeaturesError as err:
+@@ -490,3 +493,23 @@ def skip_future_imports_dependency(filepath):
+         skip_future_imports = module_name
+     return unittest.skip(
+         f"failed to import {skip_future_imports}, skipping test!")
++
++
++def wait_on_file(path, timeout=2.):
++    """
++    Wait for a file to become available on the file system. File systems
++    may experience latency during when the load is high, in which case
++    Python may be able to write to a file handle, close the handle,
++    and then be unable to open that file for a few milliseconds.
++    """
++    wait_time = 0.01
++    start_time = time.time()
++    runtime = 0.
++    while runtime < timeout:
++        time.sleep(wait_time)
++        wait_time *= 2
++        runtime = time.time() - start_time
++        if path.exists():
++            return
++    warnings.warn(f"file {path} still doesn't exist after {runtime:.1f}s",
++                  ResourceWarning)
+diff --git a/src/core/cell_system/CellStructure.cpp b/src/core/cell_system/CellStructure.cpp
+index 0ce965428be..a1c58fa49db 100644
+--- a/src/core/cell_system/CellStructure.cpp
++++ b/src/core/cell_system/CellStructure.cpp
+@@ -33,6 +33,7 @@
+ #include "cell_system/CellStructureType.hpp"
+ #include "communication.hpp"
+ #include "custom_verlet_list.hpp"
++#include "integrators/Propagation.hpp"
+ #include "lees_edwards/lees_edwards.hpp"
+ #include "particle_enumeration.hpp"
+ #include "particle_reduction.hpp"
+@@ -94,7 +95,7 @@ void CellStructure::set_kokkos_handle(
+   m_kokkos_handle = std::move(handle);
+ }
+ 
+-static auto estimate_max_counts(int max_prefactor, double pair_cutoff,
++static auto estimate_max_counts(double pair_cutoff,
+                                 std::size_t number_of_unique_particles) {
+   if (std::isinf(pair_cutoff)) {
+     return number_of_unique_particles;
+@@ -103,13 +104,8 @@ static auto estimate_max_counts(int max_prefactor, double pair_cutoff,
+     pair_cutoff = 0.;
+   }
+   auto const volume = Utils::int_pow<3>(pair_cutoff);
+-  auto max_counts = static_cast<std::size_t>(
+-      std::ceil(static_cast<double>(max_prefactor) * volume));
+-#ifdef COLLISION_DETECTION
+-  std::size_t constexpr threshold_num = 64;
+-#else
++  auto max_counts = static_cast<std::size_t>(std::ceil(8. * volume));
+   std::size_t constexpr threshold_num = 16;
+-#endif
+   if (max_counts < threshold_num) {
+     max_counts = std::min(threshold_num, number_of_unique_particles);
+   }
+@@ -135,7 +131,17 @@ void CellStructure::rebuild_local_properties(double const pair_cutoff) {
+   // particle properties are defined in aosoa_pack.hpp
+   m_aosoa = std::make_unique<AoSoA_pack>(*m_particle_storage);
+ 
+-  auto max_counts = estimate_max_counts(m_max_prefactor, pair_cutoff, num_part);
++  auto const &system = get_system();
++  auto max_counts = estimate_max_counts(pair_cutoff, num_part);
++  // TODO: use other types of Verlet list data structures
++  if (system.propagation->integ_switch == INTEG_METHOD_STEEPEST_DESCENT) {
++    max_counts = num_part;
++  }
++#ifdef COLLISION_DETECTION
++  if (system.has_collision_detection_enabled()) {
++    max_counts = num_part * 2ul;
++  }
++#endif
+   m_verlet_list_cabana = std::make_unique<ListType>(0ul, num_part, max_counts);
+ }
+ 
+diff --git a/src/core/cell_system/CellStructure.hpp b/src/core/cell_system/CellStructure.hpp
+index 9358d72ff7d..8221605c20f 100644
+--- a/src/core/cell_system/CellStructure.hpp
++++ b/src/core/cell_system/CellStructure.hpp
+@@ -205,7 +205,6 @@ class CellStructure : public System::Leaf<CellStructure> {
+   double m_verlet_reuse = 0.;
+ #ifdef SHARED_MEMORY_PARALLELISM
+   int m_cached_max_local_particle_id = 0;
+-  int m_max_prefactor = 8;
+   int m_max_id = 0;
+   std::unique_ptr<ForceType> m_local_force;
+ #ifdef ROTATION
+@@ -725,7 +724,6 @@ class CellStructure : public System::Leaf<CellStructure> {
+ 
+ #ifdef SHARED_MEMORY_PARALLELISM
+ public:
+-  void set_max_prefactor(int value) { m_max_prefactor = value; }
+   auto get_max_id() const { return m_max_id; }
+ 
+   void set_kokkos_handle(std::shared_ptr<Communication::KokkosHandle> handle);
+diff --git a/src/core/collision_detection/CollisionDetection.cpp b/src/core/collision_detection/CollisionDetection.cpp
+index 9a1dc15f454..f2bac8064a2 100644
+--- a/src/core/collision_detection/CollisionDetection.cpp
++++ b/src/core/collision_detection/CollisionDetection.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include "CollisionDetection.hpp"
+ 
++#include "cell_system/CellStructure.hpp"
+ #include "system/System.hpp"
+ 
+ #include <memory>
+@@ -50,6 +51,9 @@ void CollisionDetection::initialize() {
+                *m_protocol);
+   }
+   system.on_short_range_ia_change();
++#ifdef SHARED_MEMORY_PARALLELISM
++  system.cell_structure->clear_local_properties();
++#endif
+ }
+ 
+ void CollisionDetection::set_protocol(
+@@ -62,6 +66,9 @@ void CollisionDetection::unset_protocol() {
+   m_protocol = nullptr;
+   auto &system = get_system();
+   system.on_short_range_ia_change();
++#ifdef SHARED_MEMORY_PARALLELISM
++  system.cell_structure->clear_local_properties();
++#endif
+ }
+ 
+ } // namespace CollisionDetection
+diff --git a/src/core/electrostatics/icc.cpp b/src/core/electrostatics/icc.cpp
+index 7e3a3e6b69e..1e734a671ba 100644
+--- a/src/core/electrostatics/icc.cpp
++++ b/src/core/electrostatics/icc.cpp
+@@ -148,13 +148,12 @@ void ICCStar::iteration() {
+     kokkos_parallel_range_for<Kokkos::RangePolicy<execution_space>>(
+         "reduction", std::size_t{0}, unique_particles.size(),
+         [&local_force, &unique_particles, num_threads](std::size_t const i) {
+-          Utils::Vector3d force{};
++          auto &force = unique_particles.at(i)->force();
+           for (int tid = 0; tid < num_threads; ++tid) {
+             force[0] += local_force(i, tid, 0);
+             force[1] += local_force(i, tid, 1);
+             force[2] += local_force(i, tid, 2);
+           }
+-          unique_particles.at(i)->force() += force;
+         });
+     Kokkos::fence();
+ #endif // SHARED_MEMORY_PARALLELISM
+diff --git a/src/core/integrate.cpp b/src/core/integrate.cpp
+index abcab32d980..99805d335a6 100644
+--- a/src/core/integrate.cpp
++++ b/src/core/integrate.cpp
+@@ -505,15 +505,7 @@ int System::System::integrate(int n_steps, int reuse_forces) {
+   if (propagation.integ_switch != INTEG_METHOD_STEEPEST_DESCENT) {
+     lb_active = lb.is_solver_set();
+     ek_active = ek.is_ready_for_propagation();
+-#ifdef SHARED_MEMORY_PARALLELISM
+-    cell_structure->set_max_prefactor(5);
+-#endif
+-  }
+-#ifdef SHARED_MEMORY_PARALLELISM
+-  else {
+-    cell_structure->set_max_prefactor(8);
+   }
+-#endif
+   auto const calc_md_steps_per_tau = [this](double tau) {
+     return static_cast<int>(std::round(tau / time_step));
+   };
+diff --git a/src/core/system/System.cpp b/src/core/system/System.cpp
+index 9f05f5e2b4d..cbe188461a7 100644
+--- a/src/core/system/System.cpp
++++ b/src/core/system/System.cpp
+@@ -568,4 +568,10 @@ Utils::Vector3d *System::System::get_npt_virial() const {
+   return nullptr;
+ }
+ 
++#ifdef COLLISION_DETECTION
++bool System::System::has_collision_detection_enabled() const {
++  return not collision_detection->is_off();
++}
++#endif
++
+ } // namespace System
+diff --git a/src/core/system/System.hpp b/src/core/system/System.hpp
+index 4797fde87eb..993bb06fb9f 100644
+--- a/src/core/system/System.hpp
++++ b/src/core/system/System.hpp
+@@ -178,6 +178,10 @@ class System : public std::enable_shared_from_this<System> {
+   void calculate_long_range_fields();
+ #endif
+ 
++#ifdef COLLISION_DETECTION
++  bool has_collision_detection_enabled() const;
++#endif
++
+   /**
+    * @brief Compute the short-range energy of a particle.
+    *
+diff --git a/src/utils/include/utils/math/bspline.hpp b/src/utils/include/utils/math/bspline.hpp
+index 0dd677c606c..ab20dfe4c8c 100644
+--- a/src/utils/include/utils/math/bspline.hpp
++++ b/src/utils/include/utils/math/bspline.hpp
+@@ -189,34 +189,6 @@ DEVICE_QUALIFIER auto bspline(int i, T x) -> T
+   return T{};
+ }
+ 
+-/**
+- * @brief Calculate B-splines.
+- * @param i knot number, using 0-based indexing
+- * @param x position in the range (-0.5, 0.5)
+- * @param k order of the B-spline, using 1-based indexing, i.e. a
+- * B-spline of order @p k is a polynomial of degree <tt>k-1</tt>
+- */
+-template <class T> auto bspline(int i, T x, int k) {
+-  switch (k) {
+-  case 1:
+-    return bspline<1>(i, x);
+-  case 2:
+-    return bspline<2>(i, x);
+-  case 3:
+-    return bspline<3>(i, x);
+-  case 4:
+-    return bspline<4>(i, x);
+-  case 5:
+-    return bspline<5>(i, x);
+-  case 6:
+-    return bspline<6>(i, x);
+-  case 7:
+-    return bspline<7>(i, x);
+-  }
+-
+-  return T(0.);
+-}
+-
+ /** @brief Derivative of the B-spline. */
+ template <int order, typename T = double>
+ DEVICE_QUALIFIER auto bspline_d(int i, T x) -> T
+diff --git a/src/utils/tests/bspline_test.cpp b/src/utils/tests/bspline_test.cpp
+index c7fe8a2f45f..eb7df106b69 100644
+--- a/src/utils/tests/bspline_test.cpp
++++ b/src/utils/tests/bspline_test.cpp
+@@ -73,7 +73,7 @@ BOOST_AUTO_TEST_CASE_TEMPLATE(bspline_derivatives, T, test_bspline_orders) {
+   auto const bspline_d_approx = [](int i, double x) {
+     using Utils::bspline;
+     constexpr auto h = 1e-6;
+-    return (bspline(i, x + h / 2, order) - bspline(i, x - h / 2, order)) / h;
++    return (bspline<order>(i, x + h / 2) - bspline<order>(i, x - h / 2)) / h;
+   };
+ 
+   for (int i = 0; i < order; ++i) {
+diff --git a/testsuite/python/nsquare.py b/testsuite/python/nsquare.py
+index 7351132dc14..cd718ee22e6 100644
+--- a/testsuite/python/nsquare.py
++++ b/testsuite/python/nsquare.py
+@@ -50,7 +50,7 @@ def test_load_balancing(self):
+         self.system.part.add(pos=[(0.01, 0.01, 0.01)], type=[0])
+         if espressomd.has_features(['LENNARD_JONES']):
+             self.system.non_bonded_inter[0, 1].lennard_jones.set_params(
+-                epsilon=1.0, sigma=0.14, cutoff=0.15, shift=0.1)
++                epsilon=50., sigma=0.11, cutoff=0.12, shift=0.1)
+             ref_energy = self.system.analysis.energy()['total']
+             assert ref_energy > 10.
+ 
+diff --git a/testsuite/test_importlib_wrapper.py b/testsuite/test_importlib_wrapper.py
+index 43b68efaf43..76510ec8d28 100644
+--- a/testsuite/test_importlib_wrapper.py
++++ b/testsuite/test_importlib_wrapper.py
+@@ -290,6 +290,9 @@ def test_configure_and_import(self):
+             path_in = pathlib.Path(temp_dir) / "sample.py"
+             path_out = pathlib.Path(temp_dir) / "sample_test_processed.py"
+             path_features = pathlib.Path(temp_dir) / "sample_impossible.py"
++            path_missing = pathlib.Path(temp_dir) / "missing.txt"
++            with self.assertWarns(ResourceWarning):
++                iw.wait_on_file(path_missing, timeout=0.02)
+ 
+             # test importing a simple sample
+             sys.argv.append("42")
+@@ -301,6 +304,7 @@ def test_configure_and_import(self):
+ argv = list(sys.argv)
+ import espressomd.visualization
+ """)
++            iw.wait_on_file(path_in)
+             sample, _ = iw.configure_and_import(
+                 path_in, move_to_script_dir=False, cmd_arguments=["TestCase"],
+                 gpu=False, script_suffix="test", value=43)
+@@ -320,6 +324,7 @@ def test_configure_and_import(self):
+ import espressomd
+ espressomd.assert_features({list(inactive_features)})
+ """)
++                iw.wait_on_file(path_features)
+                 module, _ = iw.configure_and_import(path_features)
+                 self.assertIsInstance(module, ut.mock.MagicMock)
+ 

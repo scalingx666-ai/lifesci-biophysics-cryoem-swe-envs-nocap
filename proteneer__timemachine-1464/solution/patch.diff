@@ -1,0 +1,226 @@
+diff --git a/Makefile b/Makefile
+index 4fafa63ca6..fec64d4e99 100644
+--- a/Makefile
++++ b/Makefile
+@@ -54,7 +54,7 @@ nightly_tests:
+ 
+ .PHONY: nightly_memcheck_tests
+ nightly_memcheck_tests:
+-	compute-sanitizer --launch-timeout 120 --leak-check full --error-exitcode 1 pytest -m '$(NIGHTLY_MARKER) and $(MEMCHECK_MARKER)' $(PYTEST_CI_ARGS)
++	compute-sanitizer --launch-timeout 120 --padding 2048 --leak-check full --error-exitcode 1 pytest -m '$(NIGHTLY_MARKER) and $(MEMCHECK_MARKER)' $(PYTEST_CI_ARGS)
+ 
+ .PHONY: nocuda_nightly_tests
+ nocuda_nightly_tests:
+diff --git a/tests/test_cuda_targeted_insertion_mover.py b/tests/test_cuda_targeted_insertion_mover.py
+index c2f880a610..8824956c7f 100644
+--- a/tests/test_cuda_targeted_insertion_mover.py
++++ b/tests/test_cuda_targeted_insertion_mover.py
+@@ -413,16 +413,21 @@ def brd4_rbfe_state() -> InitialState:
+     return replace(initial_state, v0=traj.final_velocities, x0=x, box0=b)
+ 
+ 
++@pytest.mark.parametrize("water_count", [1, 2])
++@pytest.mark.parametrize("proposals_per_move, batch_size", [(1000, 1), (1000, 250)])
+ @pytest.mark.parametrize("radius", [0.4])
+ @pytest.mark.parametrize("moves", [10000])
+-@pytest.mark.parametrize("precision,rtol,atol", [(np.float64, 3e-5, 2e-5), (np.float32, 1e-4, 2e-3)])
++@pytest.mark.parametrize(
++    "precision,rtol,atol", [(np.float64, 3e-5, 2e-5), pytest.param(np.float32, 1e-4, 2e-3, marks=pytest.mark.memcheck)]
++)
+ @pytest.mark.parametrize("seed", [2024])
+-def test_targeted_insertion_buckyball_edge_cases(radius, moves, precision, rtol, atol, seed):
++def test_targeted_insertion_buckyball_edge_cases(
++    water_count, proposals_per_move, batch_size, radius, moves, precision, rtol, atol, seed
++):
+     """Test the edges cases of targeted insertion where the proposal probability isn't symmetric.
+ 
+-    Tests a single water and two waters being moved into an empty buckyball.
++    Tests the edge cases where there is either only one or two waters moving in and out of a buckyball.
+     """
+-    proposals_per_move = 1
+     ff = Forcefield.load_precomputed_default()
+     with resources.as_file(resources.files("timemachine.datasets.water_exchange")) as water_exchange:
+         host_pdb = water_exchange / "bb_0_waters.pdb"
+@@ -453,9 +458,8 @@ def test_targeted_insertion_buckyball_edge_cases(radius, moves, precision, rtol,
+     bond_list = get_bond_list(bond_pot)
+     all_group_idxs = get_group_indices(bond_list, conf.shape[0])
+ 
+-    # Select an arbitrary water, will be the only water considered for insertion/deletion
+-    water_idxs_single = [get_water_idxs(all_group_idxs)[-1]]
+-    water_idxs_double = get_water_idxs(all_group_idxs)[-2:]
++    # Select an arbitrary set of waters, will be the only waters considered for insertion/deletion
++    water_idxs = get_water_idxs(all_group_idxs)[-water_count:]
+ 
+     conf = image_frame(all_group_idxs, conf, box)
+ 
+@@ -467,26 +471,26 @@ def test_targeted_insertion_buckyball_edge_cases(radius, moves, precision, rtol,
+     klass = custom_ops.TIBDExchangeMove_f32
+     if precision == np.float64:
+         klass = custom_ops.TIBDExchangeMove_f64
+-    for water_idxs in [water_idxs_single, water_idxs_double]:
+-        bdem = klass(
+-            N,
+-            ligand_idxs,
+-            water_idxs,
+-            params,
+-            DEFAULT_TEMP,
+-            nb.potential.beta,
+-            cutoff,
+-            radius,
+-            seed,
+-            proposals_per_move,
+-            1,
+-        )
+-        assert bdem.last_log_probability() == 0.0, "First log probability expected to be zero"
++    bdem = klass(
++        N,
++        ligand_idxs,
++        water_idxs,
++        params,
++        DEFAULT_TEMP,
++        nb.potential.beta,
++        cutoff,
++        radius,
++        seed,
++        proposals_per_move,
++        1,
++        batch_size=batch_size,
++    )
++    assert bdem.last_log_probability() == 0.0, "First log probability expected to be zero"
+ 
+-        ref_bdem = RefTIBDExchangeMove(nb.potential.beta, cutoff, params, water_idxs, DEFAULT_TEMP, ligand_idxs, radius)
++    ref_bdem = RefTIBDExchangeMove(nb.potential.beta, cutoff, params, water_idxs, DEFAULT_TEMP, ligand_idxs, radius)
+ 
+-        verify_targeted_moves(all_group_idxs, bdem, ref_bdem, conf, box, moves, proposals_per_move, rtol, atol)
+-        assert bdem.n_proposed() == moves
++    verify_targeted_moves(all_group_idxs, bdem, ref_bdem, conf, box, moves, proposals_per_move, rtol, atol)
++    assert bdem.n_proposed() == moves
+ 
+ 
+ @pytest.mark.parametrize("proposals_per_move, batch_size", [(20000, 1), (20000, 200)])
+diff --git a/timemachine/cpp/src/kernels/k_exchange.cu b/timemachine/cpp/src/kernels/k_exchange.cu
+index 787f8e3d2f..e8473717fb 100644
+--- a/timemachine/cpp/src/kernels/k_exchange.cu
++++ b/timemachine/cpp/src/kernels/k_exchange.cu
+@@ -686,8 +686,10 @@ template void __global__ k_separate_weights_for_targeted<double>(
+ 
+ template <typename RealType>
+ void __global__ k_setup_destination_weights_for_targeted(
++    const int total_proposals,
+     const int batch_size,
+     const int num_target_mols,
++    const int *__restrict__ noise_offset,           // [1]
+     const int *__restrict__ samples,                // [batch_size]
+     const int *__restrict__ weight_offsets,         // [batch_size + 1]
+     const int *__restrict__ targeting_inner_volume, // [batch_size]
+@@ -697,7 +699,9 @@ void __global__ k_setup_destination_weights_for_targeted(
+     RealType *__restrict__ output_weights           // [batch_size, num_target_mols]
+ ) {
+     const int idx_in_batch = blockIdx.y;
+-    if (idx_in_batch >= batch_size) {
++    const int num_prev_proposals = *noise_offset;
++    // Don't set weights beyond the total number of proposals, state of buffers can be invalid
++    if (idx_in_batch >= batch_size || idx_in_batch + num_prev_proposals >= total_proposals) {
+         return;
+     }
+     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+@@ -723,9 +727,11 @@ void __global__ k_setup_destination_weights_for_targeted(
+ }
+ 
+ template void __global__ k_setup_destination_weights_for_targeted<float>(
++    const int total_proposals,
+     const int batch_size,
+     const int num_target_mols,
+-    const int *__restrict__ samples,                // [1]
++    const int *__restrict__ noise_offset,           // [1]
++    const int *__restrict__ samples,                // [batch_size]
+     const int *__restrict__ weight_offsets,         // [batch_size + 1]
+     const int *__restrict__ targeting_inner_volume, // [batch_size]
+     const int *__restrict__ inner_count,            // [1]
+@@ -735,9 +741,11 @@ template void __global__ k_setup_destination_weights_for_targeted<float>(
+ );
+ 
+ template void __global__ k_setup_destination_weights_for_targeted<double>(
++    const int total_proposals,
+     const int batch_size,
+     const int num_target_mols,
+-    const int *__restrict__ samples,                // [1]
++    const int *__restrict__ noise_offset,           // [1]
++    const int *__restrict__ samples,                // [batch_size]
+     const int *__restrict__ weight_offsets,         // [batch_size + 1]
+     const int *__restrict__ targeting_inner_volume, // [batch_size]
+     const int *__restrict__ inner_count,            // [1]
+diff --git a/timemachine/cpp/src/kernels/k_exchange.cuh b/timemachine/cpp/src/kernels/k_exchange.cuh
+index 1f16556eb6..eb3e9eeb00 100644
+--- a/timemachine/cpp/src/kernels/k_exchange.cuh
++++ b/timemachine/cpp/src/kernels/k_exchange.cuh
+@@ -190,9 +190,11 @@ void __global__ k_separate_weights_for_targeted(
+ 
+ template <typename RealType>
+ void __global__ k_setup_destination_weights_for_targeted(
++    const int total_proposals,
+     const int batch_size,
+     const int num_target_mols,
+-    const int *__restrict__ samples,                // [1]
++    const int *__restrict__ noise_offset,           // [1]
++    const int *__restrict__ samples,                // [batch_size]
+     const int *__restrict__ weight_offsets,         // [batch_size + 1]
+     const int *__restrict__ targeting_inner_volume, // [batch_size]
+     const int *__restrict__ inner_count,            // [1]
+diff --git a/timemachine/cpp/src/tibd_exchange_move.cu b/timemachine/cpp/src/tibd_exchange_move.cu
+index 3f77c8d3db..d83d178798 100644
+--- a/timemachine/cpp/src/tibd_exchange_move.cu
++++ b/timemachine/cpp/src/tibd_exchange_move.cu
+@@ -93,6 +93,11 @@ TIBDExchangeMove<RealType>::TIBDExchangeMove(
+     // Take the larger of the two to use as the temp storage data for CUB
+     temp_storage_bytes_ = max(flagged_bytes, sum_bytes);
+ 
++    // Memset these buffers to ensure `compute-sanitizer --tool initcheck` has no errors
++    gpuErrchk(cudaMemset(this->d_box_volume_.data, 0, this->d_box_volume_.size()));
++    gpuErrchk(cudaMemset(this->d_lse_max_src_.data, 0, this->d_lse_max_src_.size()));
++    gpuErrchk(cudaMemset(this->d_lse_exp_sum_src_.data, 0, this->d_lse_max_src_.size()));
++
+     // Zero out the sample segments offsets, the first index will always be zero and the inclusive sum will be offset by 1
+     gpuErrchk(cudaMemset(this->d_sample_segments_offsets_.data, 0, this->d_sample_segments_offsets_.size()));
+     gpuErrchk(cudaMemset(d_sample_after_segment_offsets_.data, 0, d_sample_after_segment_offsets_.size()));
+@@ -309,8 +314,10 @@ void TIBDExchangeMove<RealType>::move(
+             N, false, d_box, d_coords, this->d_quaternions_.data, this->d_selected_translations_.data, stream);
+ 
+         k_setup_destination_weights_for_targeted<RealType><<<dim3(mol_blocks, this->batch_size_, 1), tpb, 0, stream>>>(
++            this->num_proposals_per_move_,
+             this->batch_size_,
+             this->num_target_mols_,
++            this->d_noise_offset_.data,
+             this->d_samples_.data,
+             d_sample_after_segment_offsets_.data,
+             d_targeting_inner_vol_.data,
+@@ -413,16 +420,18 @@ TIBDExchangeMove<RealType>::move_host(const int N, const double *h_coords, const
+ template <typename RealType> double TIBDExchangeMove<RealType>::raw_log_probability_host() {
+     std::vector<RealType> h_log_exp_src(2 * this->batch_size_);
+     std::vector<RealType> h_log_exp_after(2 * this->batch_size_);
++
+     d_lse_max_src_.copy_to(&h_log_exp_src[0]);
+     d_lse_exp_sum_src_.copy_to(&h_log_exp_src[this->batch_size_]);
++
+     this->d_lse_max_after_.copy_to(&h_log_exp_after[0]);
+     this->d_lse_exp_sum_after_.copy_to(&h_log_exp_after[this->batch_size_]);
+ 
+     int h_targeting_inner_vol[this->batch_size_];
+     d_targeting_inner_vol_.copy_to(h_targeting_inner_vol);
+ 
+-    int h_local_inner_count[1];
+-    d_inner_mols_count_.copy_to(h_local_inner_count);
++    int h_local_inner_count;
++    d_inner_mols_count_.copy_to(&h_local_inner_count);
+ 
+     RealType h_box_vol;
+     d_box_volume_.copy_to(&h_box_vol);
+@@ -433,7 +442,7 @@ template <typename RealType> double TIBDExchangeMove<RealType>::raw_log_probabil
+         h_targeting_inner_vol[0],
+         inner_volume_,
+         outer_vol,
+-        h_local_inner_count[0],
++        h_local_inner_count,
+         this->num_target_mols_,
+         &h_log_exp_src[0],
+         &h_log_exp_src[this->batch_size_],

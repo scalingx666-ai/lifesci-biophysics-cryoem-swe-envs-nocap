@@ -1,0 +1,255 @@
+diff --git a/src/core/lb/particle_coupling.cpp b/src/core/lb/particle_coupling.cpp
+index 260fde92fa..6e787c2cdc 100644
+--- a/src/core/lb/particle_coupling.cpp
++++ b/src/core/lb/particle_coupling.cpp
+@@ -305,10 +305,13 @@ void ParticleCoupling::kernel(std::vector<Particle *> const &particles) {
+       ++it_positions_velocity_coupling;
+     }
+ 
+-    auto force_on_fluid = -force_on_particle;
++    // the coupling runs at every MD step, but the accumulated force on the
++    // fluid is only applied once per LB step: weight it by dt / tau
++    auto force_on_fluid = -force_on_particle * m_md_to_lb_time_step_ratio;
+ #ifdef ESPRESSO_ENGINE
+     if (coupling_mode == swimmer_force_on_fluid) {
+-      force_on_fluid = p.calc_director() * p.swimming().f_swim;
++      force_on_fluid =
++          p.calc_director() * p.swimming().f_swim * m_md_to_lb_time_step_ratio;
+     }
+ #endif
+ 
+@@ -357,7 +360,8 @@ void System::System::lb_couple_particles() {
+     }
+     auto const real_particles = cell_structure->local_particles();
+     auto const ghost_particles = cell_structure->ghost_particles();
+-    LB::ParticleCoupling coupling{*thermostat->lb, lb, *box_geo, *local_geo};
++    LB::ParticleCoupling coupling{*thermostat->lb, lb, *box_geo, *local_geo,
++                                  get_time_step()};
+     LB::CouplingBookkeeping bookkeeping{*cell_structure};
+     lb.ghost_communication_vel();
+     std::vector<Particle *> particles{};
+diff --git a/src/core/lb/particle_coupling.hpp b/src/core/lb/particle_coupling.hpp
+index 38d650b4ed..1447f72f6a 100644
+--- a/src/core/lb/particle_coupling.hpp
++++ b/src/core/lb/particle_coupling.hpp
+@@ -73,22 +73,29 @@ class ParticleCoupling {
+   BoxGeometry const &m_box_geo;
+   LocalBox const &m_local_box;
+   double m_noise_pref_wo_gamma;
++  /** Fraction of a LB time step covered by one MD time step. Forces on the
++   *  fluid are accumulated over all MD steps of one LB step. */
++  double m_md_to_lb_time_step_ratio;
+   bool m_thermalized;
+ 
+ public:
+   ParticleCoupling(LBThermostat const &thermostat, LB::Solver &lb,
+-                   BoxGeometry const &box_geo, LocalBox const &local_box)
++                   BoxGeometry const &box_geo, LocalBox const &local_box,
++                   double time_step)
+       : m_thermostat{thermostat}, m_lb{lb}, m_box_geo{box_geo},
+-        m_local_box{local_box} {
++        m_local_box{local_box},
++        m_md_to_lb_time_step_ratio{time_step / lb.get_tau()} {
+     /* Eq. (16) @cite ahlrichs99a, without the gamma term.
+      * The factor 12 comes from the fact that we use random numbers
+      * from -0.5 to 0.5 (equally distributed) which have variance 1/12.
+-     * The time step comes from the discretization.
++     * The time step comes from the discretization: the coupling force is
++     * applied to the particles at every MD step, hence the noise variance
++     * must scale with the MD time step, not with the LB time step.
+      */
+     auto constexpr variance_inv = 12.;
+     auto const kT = lb.get_kT() * Utils::sqr(lb.get_lattice_speed());
+     m_thermalized = (kT != 0.);
+-    m_noise_pref_wo_gamma = std::sqrt(variance_inv * 2. * kT / lb.get_tau());
++    m_noise_pref_wo_gamma = std::sqrt(variance_inv * 2. * kT / time_step);
+   }
+ 
+   Utils::Vector3d get_noise_term(Particle const &p) const;
+diff --git a/src/core/unit_tests/lb_particle_coupling_test.cpp b/src/core/unit_tests/lb_particle_coupling_test.cpp
+index d35a6ce10c..50d310d206 100644
+--- a/src/core/unit_tests/lb_particle_coupling_test.cpp
++++ b/src/core/unit_tests/lb_particle_coupling_test.cpp
+@@ -199,7 +199,8 @@ BOOST_FIXTURE_TEST_CASE(rng, CleanupActorLB) {
+   thermostat.gamma = 0.2;
+   espresso::set_lb_kT(1.);
+ 
+-  LB::ParticleCoupling coupling{thermostat, lb, box_geo, local_box};
++  LB::ParticleCoupling coupling{thermostat, lb, box_geo, local_box,
++                                params.time_step};
+   BOOST_CHECK_EQUAL(thermostat.rng_seed(), 17u);
+   BOOST_CHECK_EQUAL(thermostat.rng_counter(), 11ul);
+   BOOST_CHECK(not thermostat.is_seed_required());
+@@ -227,7 +228,7 @@ BOOST_FIXTURE_TEST_CASE(rng, CleanupActorLB) {
+ 
+   espresso::set_lb_kT(0.);
+   LB::ParticleCoupling coupling_unthermalized{thermostat, lb, box_geo,
+-                                              local_box};
++                                              local_box, params.time_step};
+   auto const step3_norandom =
+       coupling_unthermalized.get_noise_term(test_partcl_2);
+   BOOST_CHECK((step3_norandom == Utils::Vector3d{0., 0., 0.}));
+@@ -274,7 +275,8 @@ BOOST_DATA_TEST_CASE_F(CleanupActorLB, swimmer_force, bdata::make(kTs), kT) {
+   // swimmer coupling
+   {
+     if (in_local_halo(local_box, p.pos(), params.agrid)) {
+-      LB::ParticleCoupling coupling{thermostat, lb, box_geo, local_box};
++      LB::ParticleCoupling coupling{thermostat, lb, box_geo, local_box,
++                                    params.time_step};
+       coupling.kernel({&p});
+       auto const interpolated = LB::get_force_to_be_applied(p.pos());
+       auto const expected =
+@@ -328,7 +330,8 @@ BOOST_DATA_TEST_CASE_F(CleanupActorLB, particle_coupling, bdata::make(kTs),
+       espresso::lb_fluid->get_lattice().get_local_domain().first;
+   thermostat.gamma = 0.2;
+   Particle p{};
+-  LB::ParticleCoupling coupling{thermostat, lb, box_geo, local_box};
++  LB::ParticleCoupling coupling{thermostat, lb, box_geo, local_box,
++                                params.time_step};
+   auto expected = coupling.get_noise_term(p);
+ #ifdef ESPRESSO_LB_ELECTROHYDRODYNAMICS
+   p.mu_E() = Utils::Vector3d{-2., 1.5, 1.};
+@@ -390,7 +393,8 @@ BOOST_DATA_TEST_CASE_F(CleanupActorLB, coupling_particle_lattice_ia,
+   set_particle_property(pid, &Particle::mu_E, Utils::Vector3d{-2., 1.5, 1.});
+ #endif
+ 
+-  LB::ParticleCoupling coupling{thermostat, lb, box_geo, local_box};
++  LB::ParticleCoupling coupling{thermostat, lb, box_geo, local_box,
++                                params.time_step};
+   auto expected = Utils::Vector3d{};
+   {
+     auto const p_opt = copy_particle_to_head_node(comm, system, pid);
+diff --git a/testsuite/python/lb_thermostat.py b/testsuite/python/lb_thermostat.py
+index 2508dbc2b3..baf36d4fd7 100644
+--- a/testsuite/python/lb_thermostat.py
++++ b/testsuite/python/lb_thermostat.py
+@@ -26,7 +26,7 @@
+ 
+ """
+ Check the lattice-Boltzmann thermostat with respect to the particle velocity
+-distribution.
++distribution. The LB time step can be an integer multiple of the MD time step.
+ """
+ 
+ KT = 0.2
+@@ -34,12 +34,12 @@
+ node_volume = AGRID**3
+ KIN_VISC = 0.3
+ DENS = 0.8
+-TIME_STEP = 0.005
++TAU = 0.005
+ 
+ LB_PARAMS = {'agrid': AGRID,
+              'density': DENS,
+              'kinematic_viscosity': KIN_VISC,
+-             'tau': TIME_STEP,
++             'tau': TAU,
+              'kT': KT,
+              'seed': 123}
+ 
+@@ -52,10 +52,13 @@ class LBThermostatCommon(thermostats_common.ThermostatsCommon):
+     with the root-mean-squared-velocity.
+     The temperature check together with the friction test
+     ensure that the noise amplitude is correct.
++    The LB time step is always ``TAU``, the MD time step is
++    ``TAU / md_steps_per_lb_step``.
+     """
+ 
+     system = espressomd.System(box_l=[AGRID * 12] * 3)
+-    system.time_step = TIME_STEP
++    system.time_step = TAU
++    md_steps_per_lb_step = 1
+     system.cell_system.skin = 0.4 * AGRID
+     # use "small" particles such that radius=hydrodynamic radius
+     global_gamma = 0.1 * AGRID * 6 * np.pi * KIN_VISC * DENS
+@@ -64,6 +67,7 @@ class LBThermostatCommon(thermostats_common.ThermostatsCommon):
+     partcl_mass = 0.2 * partcl_gamma
+ 
+     def setUp(self):
++        self.system.time_step = TAU / self.md_steps_per_lb_step
+         self.lbf = self.lb_class(**LB_PARAMS, **self.lb_params)
+         self.system.lb = self.lbf
+         # make test results independent of execution order
+@@ -78,6 +82,9 @@ def tearDown(self):
+         self.system.thermostat.turn_off()
+         self.system.part.clear()
+ 
++    def run_lb_steps(self, n_lb_steps):
++        self.system.integrator.run(n_lb_steps * self.md_steps_per_lb_step)
++
+     def get_lb_kT(self, lbf):
+         nodes_mass = lbf[:, :, :].density * node_volume
+         nodes_vel_sq = np.sum(np.square(lbf[:, :, :].velocity), axis=3)
+@@ -87,11 +94,11 @@ def get_lb_velocity(self, lbf):
+         return np.mean(lbf[:, :, :].velocity, axis=(0, 1, 2))
+ 
+     def test_fluid(self):
+-        self.system.integrator.run(100)
++        self.run_lb_steps(100)
+         fluid_kTs = []
+         for _ in range(100):
+             fluid_kTs.append(self.get_lb_kT(self.lbf))
+-            self.system.integrator.run(3)
++            self.run_lb_steps(3)
+ 
+         fluid_kT = np.mean(fluid_kTs)
+         np.testing.assert_allclose(fluid_kT, KT, rtol=0.05)
+@@ -121,14 +128,14 @@ def test_temperature_with_particles(self):
+             pos=np.random.random((n_partcls_per_type, 3)) * self.system.box_l,
+             mass=n_partcls_per_type * [self.partcl_mass],
+             gamma=n_partcls_per_type * [self.partcl_gamma])
+-        self.system.integrator.run(50)
++        self.run_lb_steps(50)
+         n_samples = 400
+         vel_global_gamma = np.zeros((n_samples, n_partcls_per_type, 3))
+         vel_per_part_gamma = np.zeros_like(vel_global_gamma)
+         fluid_kTs = []
+ 
+         for i in range(n_samples):
+-            self.system.integrator.run(3)
++            self.run_lb_steps(3)
+             if i % 10 == 0:
+                 fluid_kTs.append(self.get_lb_kT(self.lbf))
+             vel_global_gamma[i] = partcls_global_gamma.v
+@@ -172,7 +179,7 @@ def test_friction(self):
+ 
+         run_time = 0.3
+         n_steps = int(run_time / self.system.time_step)
+-        steps_per_sample = 10
++        steps_per_sample = 10 * self.md_steps_per_lb_step
+         lb_vels = []
+         for _ in range(int(n_steps / steps_per_sample)):
+             self.system.integrator.run(steps_per_sample)
+@@ -241,5 +248,32 @@ class LBThermostatWalberlaDoublePrecisionBlocksCPU(
+                  "blocks_per_mpi_rank": [2, 2, 2]}
+ 
+ 
++@utx.skipIfMissingFeatures(["WALBERLA"])
++class LBThermostatWalberlaDoublePrecisionCPUTauNeqTimeStep(
++        LBThermostatCommon, ut.TestCase):
++    lb_class = espressomd.lb.LBFluid
++    lb_params = {"single_precision": False, "gpu": False}
++    md_steps_per_lb_step = 5
++
++
++@utx.skipIfMissingFeatures(["WALBERLA"])
++class LBThermostatWalberlaSinglePrecisionCPUTauNeqTimeStep(
++        LBThermostatCommon, ut.TestCase):
++    lb_class = espressomd.lb.LBFluid
++    lb_params = {"single_precision": True, "gpu": False}
++    md_steps_per_lb_step = 5
++
++
++@utx.skipIfMissingGPU()
++@ut.skipIf(LBThermostatCommon.system.cell_system.get_state()["n_nodes"] != 1,
++           "only runs for 1 MPI rank")
++@utx.skipIfMissingFeatures(["WALBERLA", "CUDA"])
++class LBThermostatWalberlaDoublePrecisionGPUTauNeqTimeStep(
++        LBThermostatCommon, ut.TestCase):
++    lb_class = espressomd.lb.LBFluid
++    lb_params = {"single_precision": False, "gpu": True}
++    md_steps_per_lb_step = 5
++
++
+ if __name__ == '__main__':
+     ut.main()

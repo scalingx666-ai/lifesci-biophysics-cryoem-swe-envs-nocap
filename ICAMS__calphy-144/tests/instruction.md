@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Addition of singularity build file and documentation to run calculations using the container.
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `a624be6f7f3e`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

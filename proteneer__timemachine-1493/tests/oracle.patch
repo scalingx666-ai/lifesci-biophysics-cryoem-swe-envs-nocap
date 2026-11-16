@@ -1,0 +1,1568 @@
+diff --git a/examples/rbfe_edge_list.py b/examples/rbfe_edge_list.py
+deleted file mode 100644
+index 876290b3c6..0000000000
+--- a/examples/rbfe_edge_list.py
++++ /dev/null
+@@ -1,285 +0,0 @@
+-import argparse
+-import csv
+-import pickle
+-import traceback
+-from collections.abc import Sequence
+-from dataclasses import replace
+-from typing import Any, NamedTuple, Optional
+-
+-import numpy as np
+-from openmm import app
+-from rdkit import Chem
+-
+-from timemachine.constants import DEFAULT_ATOM_MAPPING_KWARGS, KCAL_TO_KJ
+-from timemachine.fe import atom_mapping, rbfe
+-from timemachine.fe.free_energy import MDParams, WaterSamplingParams
+-from timemachine.fe.utils import get_mol_name, read_sdf
+-from timemachine.ff import Forcefield
+-from timemachine.parallel.client import AbstractClient, AbstractFileClient, CUDAPoolClient, FileClient
+-
+-
+-class Edge(NamedTuple):
+-    mol_a_name: str
+-    mol_b_name: str
+-    metadata: dict[str, Any]
+-
+-
+-def get_failure_result_path(mol_a_name: str, mol_b_name: str):
+-    return f"failure_rbfe_result_{mol_a_name}_{mol_b_name}.pkl"
+-
+-
+-def get_success_result_path(mol_a_name: str, mol_b_name: str):
+-    return f"success_rbfe_result_{mol_a_name}_{mol_b_name}.pkl"
+-
+-
+-def run_edge_and_save_results(
+-    edge: Edge,
+-    mols: dict[str, Chem.rdchem.Mol],
+-    forcefield: Forcefield,
+-    protein: app.PDBFile,
+-    file_client: AbstractFileClient,
+-    n_windows: Optional[int],
+-    md_params: MDParams = rbfe.DEFAULT_MD_PARAMS,
+-):
+-    # Ensure that all mol props (e.g. _Name) are included in pickles
+-    # Without this get_mol_name(mol) will fail on roundtripped mol
+-    Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
+-
+-    edge_prefix = f"{edge.mol_a_name}_{edge.mol_b_name}"
+-
+-    try:
+-        mol_a = mols[edge.mol_a_name]
+-        mol_b = mols[edge.mol_b_name]
+-
+-        all_cores = atom_mapping.get_cores(
+-            mol_a,
+-            mol_b,
+-            **DEFAULT_ATOM_MAPPING_KWARGS,
+-        )
+-        core = all_cores[0]
+-
+-        complex_res, complex_host_config = rbfe.run_complex(
+-            mol_a,
+-            mol_b,
+-            core,
+-            forcefield,
+-            protein,
+-            md_params,
+-            n_windows=n_windows,
+-        )
+-
+-        complex_top = complex_host_config.omm_topology
+-
+-        if isinstance(complex_res, rbfe.HREXSimulationResult):
+-            file_client.store(
+-                f"{edge_prefix}_complex_hrex_transition_matrix.png", complex_res.hrex_plots.transition_matrix_png
+-            )
+-            file_client.store(
+-                f"{edge_prefix}_complex_hrex_swap_acceptance_rates_convergence.png",
+-                complex_res.hrex_plots.swap_acceptance_rates_convergence_png,
+-            )
+-            file_client.store(
+-                f"{edge_prefix}_complex_hrex_replica_state_distribution_heatmap.png",
+-                complex_res.hrex_plots.replica_state_distribution_heatmap_png,
+-            )
+-
+-        solvent_res, solvent_host_config = rbfe.run_solvent(
+-            mol_a,
+-            mol_b,
+-            core,
+-            forcefield,
+-            protein,
+-            md_params,
+-            n_windows=n_windows,
+-        )
+-        solvent_top = solvent_host_config.omm_topology
+-        if isinstance(solvent_res, rbfe.HREXSimulationResult):
+-            file_client.store(
+-                f"{edge_prefix}_solvent_hrex_transition_matrix.png", solvent_res.hrex_plots.transition_matrix_png
+-            )
+-            file_client.store(
+-                f"{edge_prefix}_solvent_hrex_swap_acceptance_rates_convergence.png",
+-                solvent_res.hrex_plots.swap_acceptance_rates_convergence_png,
+-            )
+-            file_client.store(
+-                f"{edge_prefix}_solvent_hrex_replica_state_distribution_heatmap.png",
+-                solvent_res.hrex_plots.replica_state_distribution_heatmap_png,
+-            )
+-
+-    except Exception as err:
+-        print(
+-            "failed:",
+-            " | ".join(
+-                [
+-                    f"{edge.mol_a_name} -> {edge.mol_b_name} (kJ/mol)",
+-                    f"exp_ddg {edge.metadata['exp_ddg']:.2f}" if "exp_ddg" in edge.metadata else "",
+-                    (
+-                        f"fep_ddg {edge.metadata['fep_ddg']:.2f} +- {edge.metadata['fep_ddg_err']:.2f}"
+-                        if "fep_ddg" in edge.metadata and "fep_ddg_err" in edge.metadata
+-                        else ""
+-                    ),
+-                ]
+-            ),
+-        )
+-
+-        path = get_failure_result_path(edge.mol_a_name, edge.mol_b_name)
+-        tb = traceback.format_exception(None, err, err.__traceback__)
+-        file_client.store(path, pickle.dumps((edge, err, tb)))
+-
+-        print(err)
+-        traceback.print_exc()
+-
+-        return file_client.full_path(path)
+-
+-    path = get_success_result_path(edge.mol_a_name, edge.mol_b_name)
+-    pkl_obj = (mol_a, mol_b, edge.metadata, core, solvent_res, solvent_top, complex_res, complex_top)
+-    file_client.store(path, pickle.dumps(pkl_obj))
+-
+-    solvent_ddg = sum(solvent_res.final_result.dGs)
+-    solvent_ddg_err = np.linalg.norm(solvent_res.final_result.dG_errs)
+-    complex_ddg = sum(complex_res.final_result.dGs)
+-    complex_ddg_err = np.linalg.norm(complex_res.final_result.dG_errs)
+-
+-    tm_ddg = complex_ddg - solvent_ddg
+-    tm_err = np.linalg.norm([complex_ddg_err, solvent_ddg_err])
+-
+-    print(
+-        "finished:",
+-        " | ".join(
+-            [
+-                f"{edge.mol_a_name} -> {edge.mol_b_name} (kJ/mol)",
+-                f"complex {complex_ddg:.2f} +- {complex_ddg_err:.2f}",
+-                f"solvent {solvent_ddg:.2f} +- {solvent_ddg_err:.2f}",
+-                f"tm_pred {tm_ddg:.2f} +- {tm_err:.2f}",
+-                f"exp_ddg {edge.metadata['exp_ddg']:.2f}" if "exp_ddg" in edge.metadata else "",
+-                (
+-                    f"fep_ddg {edge.metadata['fep_ddg']:.2f} +- {edge.metadata['fep_ddg_err']:.2f}"
+-                    if "fep_ddg" in edge.metadata and "fep_ddg_err" in edge.metadata
+-                    else ""
+-                ),
+-            ]
+-        ),
+-    )
+-
+-    return file_client.full_path(path)
+-
+-
+-def run_edges_parallel(
+-    ligands: Sequence[Chem.rdchem.Mol],
+-    edges: Sequence[Edge],
+-    ff: Forcefield,
+-    protein: app.PDBFile,
+-    n_gpus: int,
+-    pool_client: Optional[AbstractClient] = None,
+-    file_client: Optional[AbstractFileClient] = None,
+-    md_params: MDParams = rbfe.DEFAULT_MD_PARAMS,
+-    n_windows: Optional[int] = None,
+-):
+-    mols = {get_mol_name(mol): mol for mol in ligands}
+-
+-    pool_client = pool_client or CUDAPoolClient(n_gpus)
+-    pool_client.verify()
+-
+-    file_client = file_client or FileClient()
+-
+-    # Ensure that all mol props (e.g. _Name) are included in pickles
+-    # Without this get_mol_name(mol) will fail on roundtripped mol
+-    Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
+-
+-    jobs = [
+-        pool_client.submit(
+-            run_edge_and_save_results,
+-            edge,
+-            mols,
+-            ff,
+-            protein,
+-            file_client,
+-            n_windows,
+-            md_params,
+-        )
+-        for edge in edges
+-    ]
+-
+-    # Remove references to completed jobs to allow garbage collection.
+-    # TODO: The current approach uses O(edges) memory in the worst case (e.g. if the first job gets stuck). Ideally we
+-    #   should process and remove references to jobs in the order they complete, but this would require an interface
+-    #   presently not implemented in our custom future classes.
+-    paths = []
+-    while jobs:
+-        job = jobs.pop(0)
+-        paths.append(job.result())
+-
+-    return paths
+-
+-
+-def parse_args():
+-    parser = argparse.ArgumentParser(
+-        description="Estimate relative free energy difference between complex and solvent given a results csv file."
+-    )
+-    parser.add_argument(
+-        "--n_frames", type=int, help="number of frames to use for the free energy estimate", required=True
+-    )
+-    parser.add_argument("--ligands", type=str, help="SDF file containing the ligands of interest", required=True)
+-    parser.add_argument("--results_csv", type=str, help="CSV containing the results and edges", required=True)
+-    parser.add_argument("--forcefield", type=str, help="location of the ligand forcefield", required=True)
+-    parser.add_argument("--protein", type=str, help="PDB of the protein complex", required=True)
+-    parser.add_argument("--n_gpus", type=int, help="number of gpus", required=True)
+-    parser.add_argument("--seed", type=int, help="random seed for the runs", required=True)
+-    parser.add_argument("--n_eq_steps", type=int, help="number of steps used for equilibration", required=False)
+-    parser.add_argument("--n_windows", type=int, help="number of lambda windows", required=False)
+-    parser.add_argument(
+-        "--water_sampling_interval", type=int, help="how often to run water sampling", required=False, default=None
+-    )
+-
+-    return parser.parse_args()
+-
+-
+-def read_edges_csv(path: str) -> list[Edge]:
+-    with open(path) as fp:
+-        reader = csv.reader(fp, delimiter=",")
+-        next(reader, None)  # skip header
+-        return [
+-            Edge(
+-                mol_a_name,
+-                mol_b_name,
+-                {
+-                    "exp_ddg": float(exp_ddg_kcal) * KCAL_TO_KJ,
+-                    "fep_ddg": float(fep_ddg_kcal) * KCAL_TO_KJ,
+-                    "fep_ddg_err": float(fep_ddg_err_kcal) * KCAL_TO_KJ,
+-                    "ccc_ddg": float(ccc_ddg_kcal) * KCAL_TO_KJ,
+-                    "ccc_ddg_err": float(ccc_ddg_err_kcal) * KCAL_TO_KJ,
+-                },
+-            )
+-            for (
+-                mol_a_name,
+-                mol_b_name,
+-                exp_ddg_kcal,
+-                fep_ddg_kcal,
+-                fep_ddg_err_kcal,
+-                ccc_ddg_kcal,
+-                ccc_ddg_err_kcal,
+-            ) in reader
+-        ]
+-
+-
+-if __name__ == "__main__":
+-    args = parse_args()
+-
+-    ligands = read_sdf(args.ligands)
+-    edges = read_edges_csv(args.results_csv)
+-    forcefield = Forcefield.load_from_file(args.forcefield)
+-    protein = app.PDBFile(str(args.protein))
+-
+-    md_params = replace(rbfe.DEFAULT_HREX_PARAMS, n_frames=args.n_frames, n_eq_steps=args.n_eq_steps, seed=args.seed)
+-    if args.water_sampling_interval is not None and args.water_sampling_interval > 0:
+-        md_params = replace(md_params, water_sampling_params=WaterSamplingParams(interval=args.water_sampling_interval))
+-
+-    _ = run_edges_parallel(
+-        ligands,
+-        edges,
+-        forcefield,
+-        protein,
+-        args.n_gpus,
+-        md_params=md_params,
+-        n_windows=args.n_windows,
+-    )
+diff --git a/examples/run_rbfe_legs.py b/examples/run_rbfe_legs.py
+new file mode 100644
+index 0000000000..b25840c71a
+--- /dev/null
++++ b/examples/run_rbfe_legs.py
+@@ -0,0 +1,292 @@
++import pickle
++from argparse import ArgumentParser
++from datetime import datetime
++from pathlib import Path
++from typing import Literal
++
++import jax
++
++# Enable 64 bit jax
++jax.config.update("jax_enable_x64", True)
++
++
++import numpy as np
++from numpy.typing import NDArray
++from rdkit import Chem
++
++# This is needed for pickled mols to preserve their properties
++Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
++
++from timemachine.constants import DEFAULT_ATOM_MAPPING_KWARGS, DEFAULT_FF
++from timemachine.fe import atom_mapping
++from timemachine.fe.free_energy import HREXParams, RESTParams, WaterSamplingParams
++from timemachine.fe.rbfe import (
++    DEFAULT_NUM_WINDOWS,
++    HREXSimulationResult,
++    MDParams,
++    run_complex,
++    run_solvent,
++    run_vacuum,
++)
++from timemachine.fe.utils import get_mol_name, plot_atom_mapping_grid, read_sdf_mols_by_name
++from timemachine.ff import Forcefield
++from timemachine.md.exchange.utils import get_radius_of_mol_pair
++from timemachine.parallel.client import AbstractFileClient, CUDAPoolClient, FileClient
++from timemachine.parallel.utils import get_gpu_count
++
++
++def run_leg(
++    file_client: AbstractFileClient,
++    mol_a: Chem.Mol,
++    mol_b: Chem.Mol,
++    core: NDArray,
++    leg_name: Literal["complex", "solvent", "vacuum"],
++    ff: Forcefield,
++    pdb_path: str | None,
++    md_params: MDParams,
++    n_windows: int,
++    min_overlap: float,
++):
++    """Run an RBFE leg (vacuum, solvent, or complex).
++
++    Will store results using the file_client to a new directory that has the name of the leg being run.
++
++    Stores the following files:
++
++    * results.npz - Predictions, overlaps and the number of windows
++    * lambda*_traj.npz - Store the endstate trajectories
++    * simulation_result.pkl - Pickled copy of the SimulationResult object
++    * host_config.pkl - Pickled HostConfig, if the leg is not vacuum
++    * hrex_transition_matrix.png - PNG of the transition matrix plot
++    * hrex_swap_acceptance_rates_convergence.png - PNG of the HREX swap rate convergence
++    * hrex_replica_state_distribution_heatmap.png - PNG of the HREX replica state distribution heatmap
++
++    Parameters
++    ----------
++    file_client : FileClient
++        File client for storing results of the simulation
++    mol_a : Chem.Mol
++        First molecule in the system.
++    mol_b : Chem.Mol
++        Second molecule in the system.
++    core : NDArray
++        The atom mapping between the two molecules
++    leg_name : str
++        Name of the leg to run. Can be "vacuum", "solvent", or "complex".
++    ff : Forcefield
++        Forcefield
++    pdb_path : str, optional
++        Path to a PDB file if running a "complex" leg. Optional.
++    md_params : MDParams
++        Parameters for the RBFE simulation.
++    n_windows : int
++        Maximum number of windows to generate during bisection.
++    min_overlap : float
++        Minimum overlap used during bisection.
++    """
++    np.random.seed(md_params.seed)
++    host_config = None
++    if leg_name == "vacuum":
++        res = run_vacuum(
++            mol_a,
++            mol_b,
++            core,
++            ff,
++            None,
++            md_params,
++            n_windows=n_windows,
++            min_overlap=min_overlap,
++        )
++    elif leg_name == "solvent":
++        res, host_config = run_solvent(
++            mol_a,
++            mol_b,
++            core,
++            ff,
++            None,
++            md_params,
++            n_windows=n_windows,
++            min_overlap=min_overlap,
++        )
++    elif leg_name == "complex":
++        assert pdb_path is not None
++        res, host_config = run_complex(
++            mol_a,
++            mol_b,
++            core,
++            ff,
++            str(Path(pdb_path).expanduser()),
++            md_params,
++            n_windows=n_windows,
++            min_overlap=min_overlap,
++        )
++    else:
++        assert 0, f"Invalid leg: {leg_name}"
++
++    pred_dg = float(np.sum(res.final_result.dGs))
++    pred_dg_err = float(np.linalg.norm(res.final_result.dG_errs))
++    print(
++        " | ".join(
++            [
++                f"{get_mol_name(mol_a)} -> {get_mol_name(mol_b)} (kJ/mol)",
++                f"{leg_name} {pred_dg:.2f} +- {pred_dg_err:.2f}",
++            ]
++        ),
++    )
++    # Ensure the output directory exists
++    Path(file_client.full_path(leg_name)).mkdir(parents=True, exist_ok=True)
++
++    np.savez_compressed(
++        file_client.full_path(Path(leg_name) / "results.npz"),
++        pred_dg=pred_dg,
++        pred_dg_err=pred_dg_err,
++        overlaps=res.final_result.overlaps,
++        n_windows=len(res.final_result.initial_states),
++    )
++
++    np.savez_compressed(
++        file_client.full_path(Path(leg_name) / "lambda0_traj.npz"),
++        coords=np.array(res.trajectories[0].frames),
++        boxes=np.asarray(res.trajectories[0].boxes),
++    )
++    np.savez_compressed(
++        file_client.full_path(Path(leg_name) / "lambda1_traj.npz"),
++        coords=np.array(res.trajectories[-1].frames),
++        boxes=np.asarray(res.trajectories[-1].boxes),
++    )
++    file_client.store(Path(leg_name) / "simulation_result.pkl", pickle.dumps(res))
++    if host_config is not None:
++        file_client.store(Path(leg_name) / "host_config.pkl", pickle.dumps(host_config))
++
++    if isinstance(res, HREXSimulationResult):
++        file_client.store(Path(leg_name) / "hrex_transition_matrix.png", res.hrex_plots.transition_matrix_png)
++        file_client.store(
++            Path(leg_name) / "hrex_swap_acceptance_rates_convergence.png",
++            res.hrex_plots.swap_acceptance_rates_convergence_png,
++        )
++        file_client.store(
++            Path(leg_name) / "hrex_replica_state_distribution_heatmap.png",
++            res.hrex_plots.replica_state_distribution_heatmap_png,
++        )
++
++
++def main():
++    parser = ArgumentParser(description="Run the RBFE legs for a pair of molecules")
++    parser.add_argument("--sdf_path", help="Path to sdf file containing mols", required=True)
++    parser.add_argument("--mol_a", help="Name of mol a in sdf_path", required=True)
++    parser.add_argument("--mol_b", help="Name of mol b in sdf_path", required=True)
++    parser.add_argument("--pdb_path", help="Path to pdb file containing structure")
++    parser.add_argument("--n_eq_steps", default=200_000, type=int, help="Number of steps to perform equilibration")
++    parser.add_argument("--n_frames", default=2000, type=int, help="Number of frames to generation")
++    parser.add_argument("--steps_per_frame", default=400, type=int, help="Steps per frame")
++    parser.add_argument(
++        "--n_windows", default=DEFAULT_NUM_WINDOWS, type=int, help="Max number of windows from bisection"
++    )
++    parser.add_argument("--min_overlap", default=0.667, type=float, help="Overlap to target in bisection")
++    parser.add_argument(
++        "--target_overlap", default=0.667, type=float, help="Overlap to optimize final HREX schedule to"
++    )
++    parser.add_argument("--seed", default=2025, type=int, help="Seed")
++    parser.add_argument("--legs", default=["vacuum", "solvent", "complex"], nargs="+")
++    parser.add_argument("--forcefield", default=DEFAULT_FF)
++    parser.add_argument(
++        "--n_gpus", default=None, type=int, help="Number of GPUs to use, defaults to all GPUs if not provided"
++    )
++    parser.add_argument(
++        "--water_sampling_padding",
++        type=float,
++        default=0.4,
++        help="How much to expand the radius of the sphere used for water sampling (nm). Half of the largest intramolecular distance is used as the starting radius to which the padding is added: dist/2 + padding",
++    )
++    parser.add_argument(
++        "--rest_max_temperature_scale",
++        default=3.0,
++        type=float,
++        help="Maximum scale factor for the effective temperature of REST-softened interactions. Setting to 1.0 effectively disables REST.",
++    )
++    parser.add_argument(
++        "--rest_temperature_scale_interpolation",
++        default="exponential",
++        type=str,
++        help="Functional form to use for temperature scale interpolation in REST",
++    )
++    parser.add_argument(
++        "--output_dir", default=None, help="Directory to output results, else generates a directory based on the time"
++    )
++    args = parser.parse_args()
++
++    if "complex" in args.legs:
++        assert args.pdb_path is not None, "Must provide PDB to run complex leg"
++
++    mols_by_name = read_sdf_mols_by_name(args.sdf_path)
++    np.random.seed(args.seed)
++
++    mol_a = mols_by_name[args.mol_a]
++    mol_b = mols_by_name[args.mol_b]
++
++    output_dir = args.output_dir
++    if output_dir is None:
++        date = datetime.now()
++        date_str = date.strftime("%Y_%b_%d_%H_%M")
++        output_dir = f"rbfe_{date_str}_{args.mol_a}_{args.mol_b}"
++    dest_dir = Path(output_dir)
++    dest_dir.mkdir(parents=True, exist_ok=True)
++
++    file_client = FileClient(dest_dir)
++
++    ff = Forcefield.load_from_file(args.forcefield)
++
++    mol_radius = get_radius_of_mol_pair(mol_a, mol_b)
++
++    md_params = MDParams(
++        n_eq_steps=args.n_eq_steps,
++        n_frames=args.n_frames,
++        steps_per_frame=args.steps_per_frame,
++        seed=args.seed,
++        hrex_params=HREXParams(
++            optimize_target_overlap=args.target_overlap,
++            rest_params=RESTParams(args.rest_max_temperature_scale, args.rest_temperature_scale_interpolation),
++        ),
++        water_sampling_params=WaterSamplingParams(radius=mol_radius + args.water_sampling_padding),
++    )
++
++    core = atom_mapping.get_cores(mol_a, mol_b, **DEFAULT_ATOM_MAPPING_KWARGS)[0]
++
++    # Store top level data
++    file_client.store("atom_mapping.svg", plot_atom_mapping_grid(mol_a, mol_b, core).encode("utf-8"))
++    with open(file_client.full_path("md_params.pkl"), "wb") as ofs:
++        pickle.dump(md_params, ofs)
++    with open(file_client.full_path("core.pkl"), "wb") as ofs:
++        pickle.dump(core, ofs)
++    with open(file_client.full_path("ff.py"), "w") as ofs:
++        ofs.write(ff.serialize())
++
++    num_gpus = args.n_gpus
++    if num_gpus is None:
++        num_gpus = get_gpu_count()
++
++    pool = CUDAPoolClient(num_gpus)
++    pool.verify()
++
++    futures = []
++    for leg_name in args.legs:
++        fut = pool.submit(
++            run_leg,
++            file_client,
++            mol_a,
++            mol_b,
++            core,
++            leg_name,
++            ff,
++            args.pdb_path,
++            md_params,
++            args.n_windows,
++            args.min_overlap,
++        )
++        futures.append(fut)
++    for fut in futures:
++        fut.result()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/setup.py b/setup.py
+index fd9a615c91..c72cd3d8d5 100644
+--- a/setup.py
++++ b/setup.py
+@@ -125,7 +125,6 @@ def build_extension(self, ext):
+             "py.typed",
+         ],
+         "timemachine.datasets": [
+-            "**/*.csv",
+             "**/*.pdb",
+             "**/*.sdf",
+         ],
+diff --git a/tests/test_examples.py b/tests/test_examples.py
+index fbd91100f0..3d476521ba 100644
+--- a/tests/test_examples.py
++++ b/tests/test_examples.py
+@@ -2,7 +2,6 @@
+ import pickle
+ import subprocess
+ import sys
+-from contextlib import contextmanager
+ from glob import glob
+ from importlib import resources
+ from pathlib import Path
+@@ -14,14 +13,11 @@
+ from numpy.typing import NDArray as Array
+ from scipy.special import logsumexp
+ 
+-from timemachine.constants import DEFAULT_FF, DEFAULT_KT, KCAL_TO_KJ
++from timemachine.constants import DEFAULT_KT, KCAL_TO_KJ
+ from timemachine.datasets import fetch_freesolv
+-from timemachine.fe.free_energy import PairBarResult, SimulationResult
++from timemachine.fe.free_energy import assert_deep_eq
+ from timemachine.fe.utils import get_mol_name
+-
+-# All examples are to be tested nightly
+-pytestmark = [pytest.mark.nightly]
+-
++from timemachine.ff import Forcefield
+ 
+ EXAMPLES_DIR = Path(__file__).parent.parent / "examples"
+ 
+@@ -145,150 +141,7 @@ def test_smc_freesolv(smc_free_solv_path):
+     assert mean_abs_err_kcalmol <= 2
+ 
+ 
+-def get_success_result_path(mol_a_name: str, mol_b_name: str):
+-    return f"success_rbfe_result_{mol_a_name}_{mol_b_name}.pkl"
+-
+-
+-@contextmanager
+-def get_rbfe_edge_list_hif2a_path(seed):
+-    with resources.as_file(resources.files("timemachine.datasets.fep_benchmark.hif2a")) as hif2a_data:
+-        base_config = dict(
+-            n_frames=2,
+-            ligands=hif2a_data / "ligands.sdf",
+-            forcefield=DEFAULT_FF,
+-            protein=hif2a_data / "5tbm_prepared.pdb",
+-            n_gpus=1,
+-            seed=seed,
+-            n_eq_steps=2,
+-            n_windows=3,
+-        )
+-
+-        def run(results_csv, temp_dir):
+-            output_path = str(Path(temp_dir) / get_success_result_path("*", "*"))
+-            assert len(glob(output_path)) == 0
+-            config = dict(results_csv=results_csv, **base_config)
+-            _ = run_example("rbfe_edge_list.py", get_cli_args(config), cwd=temp_dir)
+-            return Path(temp_dir)
+-
+-        with open(hif2a_data / "results_edges_5ns.csv") as fp:
+-            edges_rows = fp.readlines()
+-
+-        edges_rows_sample = edges_rows[:3]  # keep header and first 2 edges (338 -> 165, 338 -> 215)
+-        edges = [("338", "165"), ("338", "215")]
+-
+-        with temporary_working_dir() as temp_dir:
+-            with (Path(temp_dir) / "edges.csv").open("w") as fp:
+-                fp.writelines(edges_rows_sample)
+-                fp.flush()
+-                path = run(fp.name, temp_dir)
+-            yield path, base_config, edges
+-
+-
+-DEFAULT_SEED = 2023
+-
+-
+-@pytest.fixture(scope="module")
+-def rbfe_edge_list_hif2a_path():
+-    with get_rbfe_edge_list_hif2a_path(DEFAULT_SEED) as r:
+-        yield r
+-
+-
+-def load_simulation_results(path: Path) -> tuple[SimulationResult, SimulationResult]:
+-    with path.open("rb") as fp:
+-        results = pickle.load(fp)
+-
+-    (
+-        _,  # mol_a
+-        _,  # mol_b
+-        _,  # edge_metadata
+-        _,  # core,
+-        solvent_res,
+-        _,  # solvent_top,
+-        complex_res,
+-        _,  # complex_top,
+-    ) = results
+-
+-    return solvent_res, complex_res
+-
+-
+-def test_rbfe_edge_list_hif2a(rbfe_edge_list_hif2a_path):
+-    path, config, edges = rbfe_edge_list_hif2a_path
+-    n_windows = config["n_windows"]
+-
+-    def check_results(results_path):
+-        # Just check that results are present and have the expected shape
+-        # (we don't do enough sampling here for statistical checks)
+-
+-        # NOTE: We're mainly interested in checking that simulation frames have been serialized properly; we already
+-        # have more exhaustive checks in test_relative_free_energy.py
+-
+-        assert results_path.exists()
+-        solvent_res, complex_res = load_simulation_results(results_path)
+-
+-        for result in solvent_res, complex_res:
+-            L = len(result.final_result.initial_states)
+-            assert L == n_windows
+-
+-            assert isinstance(result, SimulationResult)
+-            assert isinstance(result.frames, list)
+-            assert len(result.frames) == n_windows  # frames from first and last windows
+-            for frames in result.frames:
+-                assert len(frames) == config["n_frames"]
+-
+-            N, _ = result.frames[0][0].shape
+-            assert N > 0
+-
+-            for frames in result.frames:
+-                for frame in frames:
+-                    assert frame.ndim == 2
+-                    assert frame.shape == (N, 3)
+-
+-    for mol_a_name, mol_b_name in edges:
+-        check_results(path / get_success_result_path(mol_a_name, mol_b_name))
+-
+-
+-def assert_simulation_results_equal(r1: SimulationResult, r2: SimulationResult):
+-    def assert_pair_bar_results_equal(p1: PairBarResult, p2: PairBarResult):
+-        np.testing.assert_array_equal(p1.dGs, p2.dGs)
+-        np.testing.assert_array_equal(p1.dG_errs, p2.dG_errs)
+-        np.testing.assert_array_equal(p1.dG_err_by_component_by_lambda, p2.dG_err_by_component_by_lambda)
+-        np.testing.assert_array_equal(p1.overlaps, p2.overlaps)
+-        np.testing.assert_array_equal(p1.overlap_by_component_by_lambda, p2.overlap_by_component_by_lambda)
+-        np.testing.assert_array_equal(p1.u_kln_by_component_by_lambda, p2.u_kln_by_component_by_lambda)
+-
+-    assert_pair_bar_results_equal(r1.final_result, r2.final_result)
+-
+-    for p1, p2 in zip(r1.intermediate_results, r2.intermediate_results):
+-        assert_pair_bar_results_equal(p1, p2)
+-
+-
+-def test_rbfe_edge_list_reproducible(rbfe_edge_list_hif2a_path):
+-    path1, _, edges = rbfe_edge_list_hif2a_path
+-
+-    with get_rbfe_edge_list_hif2a_path(DEFAULT_SEED) as (path2, _, _):
+-        with get_rbfe_edge_list_hif2a_path(DEFAULT_SEED + 1) as (path3, _, _):
+-            for mol_a_name, mol_b_name in edges:
+-
+-                def load_results(dir):
+-                    path = dir / get_success_result_path(mol_a_name, mol_b_name)
+-                    assert path.exists()
+-                    return load_simulation_results(path)
+-
+-                solvent_res_1, complex_res_1 = load_results(path1)
+-                solvent_res_2, complex_res_2 = load_results(path2)
+-                solvent_res_3, complex_res_3 = load_results(path3)
+-
+-                # results at path2 should be bitwise equivalent to those at path1
+-                assert_simulation_results_equal(solvent_res_1, solvent_res_2)
+-                assert_simulation_results_equal(complex_res_1, complex_res_2)
+-
+-                # results at path3 should differ from those at path1 and path2
+-                with pytest.raises(AssertionError):
+-                    assert_simulation_results_equal(solvent_res_1, solvent_res_3)
+-                with pytest.raises(AssertionError):
+-                    assert_simulation_results_equal(complex_res_1, complex_res_3)
+-
+-
++@pytest.mark.nightly
+ @pytest.mark.parametrize("insertion_type", ["untargeted"])
+ def test_water_sampling_mc_bulk_water(insertion_type):
+     reference_data_path = EXAMPLES_DIR.parent / "tests" / "data" / f"reference_bulk_water_{insertion_type}.npz"
+@@ -322,6 +175,7 @@ def test_water_sampling_mc_bulk_water(insertion_type):
+             np.testing.assert_array_equal(test_data[key], reference_data[key])
+ 
+ 
++@pytest.mark.nightly
+ @pytest.mark.parametrize("batch_size", [1, 250, 512, 1000])
+ @pytest.mark.parametrize("insertion_type", ["targeted", "untargeted"])
+ def test_water_sampling_mc_buckyball(batch_size, insertion_type):
+@@ -361,3 +215,139 @@ def test_water_sampling_mc_buckyball(batch_size, insertion_type):
+ 
+         for key in reference_data.files:
+             np.testing.assert_array_equal(test_data[key], reference_data[key])
++
++
++@pytest.mark.parametrize(
++    "leg, n_windows, n_frames, n_eq_steps",
++    [
++        ("vacuum", 6, 50, 1000),
++        pytest.param("solvent", 5, 50, 1000, marks=pytest.mark.nightly),
++        pytest.param("complex", 5, 50, 1000, marks=pytest.mark.nightly),
++    ],
++)
++@pytest.mark.parametrize("mol_a, mol_b", [("15", "30")])
++@pytest.mark.parametrize("seed", [2025])
++def test_run_rbfe_legs(
++    leg,
++    n_windows,
++    n_frames,
++    n_eq_steps,
++    mol_a,
++    mol_b,
++    seed,
++):
++    with temporary_working_dir() as temp_dir:
++        with resources.as_file(resources.files("timemachine.datasets.fep_benchmark.hif2a")) as hif2a_dir:
++            config = dict(
++                mol_a=mol_a,
++                mol_b=mol_b,
++                sdf_path=hif2a_dir / "ligands.sdf",
++                pdb_path=hif2a_dir / "5tbm_prepared.pdb",
++                seed=seed,
++                legs=leg,
++                n_eq_steps=n_eq_steps,
++                n_frames=n_frames,
++                n_windows=n_windows,
++                # Use simple charges to avoid os-dependent charge differences
++                forcefield="smirnoff_1_1_0_sc.py",
++            )
++
++            def verify_run(output_dir: Path):
++                assert output_dir.is_dir()
++                assert (output_dir / "md_params.pkl").is_file()
++                assert (output_dir / "atom_mapping.svg").is_file()
++                assert (output_dir / "core.pkl").is_file()
++                assert (output_dir / "ff.py").is_file()
++
++                assert Forcefield.load_from_file(output_dir / "ff.py") is not None
++
++                leg_dir = output_dir / leg
++                assert leg_dir.is_dir()
++                assert (leg_dir / "results.npz").is_file()
++                assert (leg_dir / "lambda0_traj.npz").is_file()
++                assert (leg_dir / "lambda1_traj.npz").is_file()
++
++                assert (leg_dir / "simulation_result.pkl").is_file()
++                if leg in ["solvent", "complex"]:
++                    assert (leg_dir / "host_config.pkl").is_file()
++                else:
++                    assert not (leg_dir / "host_config.pkl").is_file()
++                assert (leg_dir / "hrex_transition_matrix.png").is_file()
++                assert (leg_dir / "hrex_swap_acceptance_rates_convergence.png").is_file()
++                assert (leg_dir / "hrex_replica_state_distribution_heatmap.png").is_file()
++
++                results = np.load(str(leg_dir / "results.npz"))
++                assert results["pred_dg"].size == 1
++                assert results["pred_dg"].dtype == np.float64
++                assert results["pred_dg"] != 0.0
++
++                assert results["pred_dg_err"].size == 1
++                assert results["pred_dg_err"].dtype == np.float64
++                assert results["pred_dg_err"] != 0.0
++
++                assert results["n_windows"].size == 1
++                assert results["n_windows"].dtype == np.intp
++                assert 2 <= results["n_windows"] <= config["n_windows"]
++                assert isinstance(results["overlaps"], np.ndarray)
++                assert all(isinstance(overlap, float) for overlap in results["overlaps"])
++
++                for lamb in [0, 1]:
++                    traj_data = np.load(str(leg_dir / f"lambda{lamb:d}_traj.npz"))
++                    assert len(traj_data["coords"]) == n_frames
++                    assert len(traj_data["boxes"]) == n_frames
++
++            config_a = dict(output_dir="a", **config)
++            proc = run_example("run_rbfe_legs.py", get_cli_args(config_a), cwd=temp_dir)
++            assert proc.returncode == 0
++            verify_run(Path(temp_dir) / config_a["output_dir"])
++
++            config_b = dict(output_dir="b", **config)
++            assert config_b["output_dir"] != config_a["output_dir"], "Runs are writing to the same output directory"
++            proc = run_example("run_rbfe_legs.py", get_cli_args(config_b), cwd=temp_dir)
++            assert proc.returncode == 0
++            verify_run(Path(temp_dir) / config_b["output_dir"])
++
++            def verify_simulations_match(ref_dir: Path, comp_dir: Path):
++                with open(ref_dir / "md_params.pkl", "rb") as ifs:
++                    ref_md_params = pickle.load(ifs)
++                with open(comp_dir / "md_params.pkl", "rb") as ifs:
++                    comp_md_params = pickle.load(ifs)
++                assert ref_md_params == comp_md_params, "MD Parameters don't match"
++
++                with open(ref_dir / "core.pkl", "rb") as ifs:
++                    ref_core = pickle.load(ifs)
++                with open(comp_dir / "core.pkl", "rb") as ifs:
++                    comp_core = pickle.load(ifs)
++                assert np.all(ref_core == comp_core), "Atom mappings don't match"
++
++                ref_results = np.load(str(ref_dir / leg / "results.npz"))
++                comp_results = np.load(str(comp_dir / leg / "results.npz"))
++                np.testing.assert_equal(ref_results["pred_dg"], comp_results["pred_dg"])
++                np.testing.assert_equal(ref_results["pred_dg_err"], comp_results["pred_dg_err"])
++                np.testing.assert_array_equal(ref_results["overlaps"], comp_results["overlaps"])
++                np.testing.assert_equal(ref_results["n_windows"], comp_results["n_windows"])
++
++                with open(ref_dir / leg / "simulation_result.pkl", "rb") as ifs:
++                    ref_res = pickle.load(ifs)
++                with open(comp_dir / leg / "simulation_result.pkl", "rb") as ifs:
++                    comp_res = pickle.load(ifs)
++                assert len(ref_res.final_result.initial_states) == ref_results["n_windows"]
++                assert len(ref_res.final_result.initial_states) == len(comp_res.final_result.initial_states)
++
++                for ref_state, comp_state in zip(
++                    ref_res.final_result.initial_states, comp_res.final_result.initial_states
++                ):
++                    np.testing.assert_array_equal(ref_state.x0, comp_state.x0)
++                    np.testing.assert_array_equal(ref_state.v0, comp_state.v0)
++                    np.testing.assert_array_equal(ref_state.box0, comp_state.box0)
++                    np.testing.assert_array_equal(ref_state.ligand_idxs, comp_state.ligand_idxs)
++                    np.testing.assert_array_equal(ref_state.protein_idxs, comp_state.protein_idxs)
++                    assert_deep_eq(ref_state.potentials, comp_state.potentials)
++
++                for lamb in [0, 1]:
++                    ref_traj = np.load(str(ref_dir / leg / f"lambda{lamb}_traj.npz"))
++                    comp_traj = np.load(str(comp_dir / leg / f"lambda{lamb}_traj.npz"))
++                    np.testing.assert_array_equal(ref_traj["coords"], comp_traj["coords"])
++                    np.testing.assert_array_equal(ref_traj["boxes"], comp_traj["boxes"])
++
++            verify_simulations_match(Path(temp_dir) / config_a["output_dir"], Path(temp_dir) / config_b["output_dir"])
+diff --git a/timemachine/datasets/fep_benchmark/hif2a/results_20ns.csv b/timemachine/datasets/fep_benchmark/hif2a/results_20ns.csv
+deleted file mode 100644
+index b2f3a0a5b3..0000000000
+--- a/timemachine/datasets/fep_benchmark/hif2a/results_20ns.csv
++++ /dev/null
+@@ -1,43 +0,0 @@
+-Affinity unit, # ,Ligand,Quality,Pred. ΔG,Pred. Error,Exp. ΔG,Structure
+-kcal/mol,1,338.0,0,-9.28,0.27,-10.76,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([F-0X1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,2,43.0,0,-8.95,0.23,-8.7,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([Cl-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[#1]
+-kcal/mol,3,235.0,0,-9.42,0.22,-10.12,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1]
+-kcal/mol,4,234.0,0,-10.56,0.21,-10.35,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[Cl-0X1]
+-kcal/mol,5,30.0,0,-10.91,0.21,-10.57,[#1][c-0X3]1[c-0X3]([c-0X3]([c-0X3]([C-0X2]#[N-0X1])[c-0X3]([c-0X3]1[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[Cl-0X1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,6,1.0,0,-10.08,0.22,-11.32,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,7,237.0,0,-9.67,0.25,-9.55,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,8,227.0,0,-11.78,0.27,-10.76,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([F-0X1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1]
+-kcal/mol,9,266.0,0,-9.94,0.24,-10.53,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([F-0X1])[c-0X3]2[c-0X3]1[c-0X3]([n-0X2][n-0X3]2[#1])[#1])[#1]
+-kcal/mol,10,206.0,0,-8.72,0.2,-10.12,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,11,67.0,0,-11.2,0.23,-10.17,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[C-0X2]#[N-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[F-0X1])[F-0X1]
+-kcal/mol,12,156.0,0,-9.35,0.22,-9.74,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,13,31.0,0,-9.42,0.22,-8.84,[#1][C-0X4]([#1])([#1])[c-0X3]1[c-0X3]([C-0X2]#[N-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[#1]
+-kcal/mol,14,289.0,0,-11.65,0.21,-10.91,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([F-0X1])[C-0X4]([#1])([F-0X1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1]
+-kcal/mol,15,61.0,0,-9.47,0.26,-10.11,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[F-0X1]
+-kcal/mol,16,167.0,0,-10.9,0.24,-10.67,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[Cl-0X1]
+-kcal/mol,17,165.0,0,-9.04,0.23,-9.24,[#1][N-0X3]([#1])[C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,18,41.0,0,-10.76,0.45,-9.79,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([Cl-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,19,7b,0,-6.51,0.42,-7.39,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,20,54.0,0,-8.31,0.22,-9.31,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([C-0X4]([#1])([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,21,215.0,0,-10.04,0.25,-10.6,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[Cl-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,22,57.0,0,-10.88,0.2,-10.67,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1]
+-kcal/mol,23,42.0,0,-9.77,0.21,-8.94,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([Cl-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,24,35.0,0,-11.51,0.21,-7.15,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([C-0X2]#[N-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,25,252.0,0,-9.57,0.28,-9.71,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,26,336.0,0,-9.88,0.28,-9.82,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([F-0X1])[C-0X4]([#1])([F-0X1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[#1]
+-kcal/mol,27,290.0,0,-11.2,0.21,-10.57,[#1][N-0X3]([#1])[C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,28,155.0,0,-10.0,0.24,-10.5,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,29,164.0,0,-6.88,0.22,-6.76,[#1][N-0X3]([#1])[C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,30,7a,0,-8.58,0.21,-10.0,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,31,224.0,0,-10.72,0.21,-9.66,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[n-0X2][c-0X3]1[#1]
+-kcal/mol,32,84.0,0,-8.81,0.22,-7.58,[#1][C-0X4]1([#1])[O-0X2][C-0X3](=[O-0X1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,33,254.0,0,-10.23,0.24,-9.55,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,34,23.0,0,-8.0,0.2,-7.07,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([O-0X2][#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[F-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,35,251.0,0,-9.61,0.22,-10.24,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[F-0X1])[F-0X1]
+-kcal/mol,36,256.0,0,-9.16,0.21,-10.67,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[F-0X1])[F-0X1]
+-kcal/mol,37,50.0,0,-8.86,0.24,-9.7,[#1][C-0X4]([#1])([#1])[c-0X3]1[c-0X3]([C-0X2]#[N-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,38,231.0,0,-10.63,0.21,-10.02,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([F-0X1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1]
+-kcal/mol,39,15.0,0,-11.29,0.23,-11.05,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,40,124.0,0,-9.93,0.25,-10.12,[#1][c-0X3]1[c-0X3]([C-0X4]([#1])([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,41,25.0,0,-9.18,0.22,-10.28,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]1[#1])[Cl-0X1]
+-kcal/mol,42,163.0,0,-10.0,0.25,-11.01,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+diff --git a/timemachine/datasets/fep_benchmark/hif2a/results_5ns.csv b/timemachine/datasets/fep_benchmark/hif2a/results_5ns.csv
+deleted file mode 100644
+index f3c73d4a3e..0000000000
+--- a/timemachine/datasets/fep_benchmark/hif2a/results_5ns.csv
++++ /dev/null
+@@ -1,43 +0,0 @@
+-Affinity unit, # ,Ligand,Quality,Pred. ΔG,Pred. Error,Exp. ΔG,Structure
+-kcal/mol,1,338.0,0,-9.31,0.28,-10.76,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([F-0X1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,2,43.0,0,-9.17,0.25,-8.7,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([Cl-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[#1]
+-kcal/mol,3,235.0,0,-9.67,0.24,-10.12,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1]
+-kcal/mol,4,234.0,0,-11.01,0.23,-10.35,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[Cl-0X1]
+-kcal/mol,5,30.0,0,-11.04,0.24,-10.57,[#1][c-0X3]1[c-0X3]([c-0X3]([c-0X3]([C-0X2]#[N-0X1])[c-0X3]([c-0X3]1[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[Cl-0X1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,6,1.0,0,-10.22,0.24,-11.32,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,7,237.0,0,-8.47,0.35,-9.55,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,8,227.0,0,-11.97,0.37,-10.76,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([F-0X1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1]
+-kcal/mol,9,266.0,0,-10.24,0.27,-10.53,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([F-0X1])[c-0X3]2[c-0X3]1[c-0X3]([n-0X2][n-0X3]2[#1])[#1])[#1]
+-kcal/mol,10,206.0,0,-8.82,0.22,-10.12,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,11,67.0,0,-11.26,0.25,-10.17,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[C-0X2]#[N-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[F-0X1])[F-0X1]
+-kcal/mol,12,156.0,0,-9.67,0.26,-9.74,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,13,31.0,0,-9.6,0.24,-8.84,[#1][C-0X4]([#1])([#1])[c-0X3]1[c-0X3]([C-0X2]#[N-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[#1]
+-kcal/mol,14,289.0,0,-12.07,0.23,-10.91,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([F-0X1])[C-0X4]([#1])([F-0X1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1]
+-kcal/mol,15,61.0,0,-9.65,0.39,-10.11,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[F-0X1]
+-kcal/mol,16,167.0,0,-11.29,0.32,-10.67,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[Cl-0X1]
+-kcal/mol,17,165.0,0,-9.24,0.26,-9.24,[#1][N-0X3]([#1])[C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,18,41.0,0,-9.39,0.38,-9.79,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([Cl-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,19,7b,0,-4.7,0.32,-7.39,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,20,54.0,0,-8.35,0.25,-9.31,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([C-0X4]([#1])([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,21,215.0,0,-10.42,0.28,-10.6,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[Cl-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,22,57.0,0,-10.66,0.22,-10.67,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1]
+-kcal/mol,23,42.0,0,-9.93,0.23,-8.94,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([Cl-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,24,35.0,0,-11.39,0.23,-7.15,[#1][C-0X4]([#1])([O-0X2][#1])[c-0X3]1[c-0X3]([C-0X2]#[N-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,25,252.0,0,-9.65,0.34,-9.71,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,26,336.0,0,-9.88,0.4,-9.82,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([F-0X1])[C-0X4]([#1])([F-0X1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[#1]
+-kcal/mol,27,290.0,0,-11.72,0.24,-10.57,[#1][N-0X3]([#1])[C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,28,155.0,0,-10.25,0.25,-10.5,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,29,164.0,0,-6.58,0.26,-6.76,[#1][N-0X3]([#1])[C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,30,7a,0,-8.63,0.23,-10.0,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,31,224.0,0,-10.25,0.23,-9.66,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[n-0X2][c-0X3]1[#1]
+-kcal/mol,32,84.0,0,-8.74,0.25,-7.58,[#1][C-0X4]1([#1])[O-0X2][C-0X3](=[O-0X1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,33,254.0,0,-10.64,0.35,-9.55,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,34,23.0,0,-8.2,0.23,-7.07,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([O-0X2][#1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[F-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1]
+-kcal/mol,35,251.0,0,-9.67,0.25,-10.24,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[F-0X1])[F-0X1]
+-kcal/mol,36,256.0,0,-9.15,0.23,-10.67,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[N-0X3]([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[F-0X1])[F-0X1]
+-kcal/mol,37,50.0,0,-9.01,0.36,-9.7,[#1][C-0X4]([#1])([#1])[c-0X3]1[c-0X3]([C-0X2]#[N-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,38,231.0,0,-10.28,0.22,-10.02,[#1][O-0X2][C-0X4]1([#1])[C-0X4]([#1])([F-0X1])[C-0X4]([#1])([#1])[c-0X3]2[c-0X3]1[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1]
+-kcal/mol,39,15.0,0,-11.5,0.27,-11.05,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+-kcal/mol,40,124.0,0,-9.18,0.28,-10.12,[#1][c-0X3]1[c-0X3]([C-0X4]([#1])([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Cl-0X1])[F-0X1]
+-kcal/mol,41,25.0,0,-9.29,0.25,-10.28,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([F-0X1])[F-0X1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]1[#1])[Cl-0X1]
+-kcal/mol,42,163.0,0,-10.49,0.27,-11.01,[#1][O-0X2][C-0X4]1([#1])[c-0X3]2[c-0X3]([C-0X4]([#1])([#1])[C-0X4]1([F-0X1])[F-0X1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[O-0X2][c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[C-0X2]#[N-0X1])[F-0X1]
+diff --git a/timemachine/datasets/fep_benchmark/hif2a/results_edges_20ns.csv b/timemachine/datasets/fep_benchmark/hif2a/results_edges_20ns.csv
+deleted file mode 100644
+index f0368de390..0000000000
+--- a/timemachine/datasets/fep_benchmark/hif2a/results_edges_20ns.csv
++++ /dev/null
+@@ -1,81 +0,0 @@
+-Ligand1,Ligand2,Exp.,FEP,FEP Error,CCC,CCC Error
+-338,165,1.52,-0.46,0.18,0.24,1.08
+-338,215,0.16,-0.39,0.21,-0.76,1.08
+-338,163,-0.25,-0.38,0.2,-0.72,0.77
+-43,235,-1.42,-0.19,0.06,-0.47,0.62
+-43,54,-0.61,0.67,0.05,0.64,0.55
+-43,215,-1.9,-1.36,0.09,-1.09,0.97
+-43,155,-1.8,-1.1,0.06,-1.05,0.96
+-43,25,-1.58,-0.22,0.07,-0.23,0.97
+-235,1,-1.2,-0.41,0.05,-0.65,0.48
+-235,54,0.81,1.15,0.12,1.11,0.62
+-234,289,-0.57,-1.09,0.02,-1.09,0.02
+-30,42,1.63,1.16,0.07,1.14,0.57
+-30,84,2.99,2.11,0.06,2.1,0.44
+-30,251,0.32,1.39,0.07,1.29,0.57
+-30,25,0.28,1.6,0.07,1.73,0.48
+-1,254,1.77,0.0,0.04,-0.15,0.98
+-1,256,0.65,0.89,0.08,0.92,0.69
+-1,15,0.28,-1.09,0.04,-1.22,0.98
+-237,227,-1.21,-2.26,0.24,-2.11,1.51
+-237,31,0.71,-0.07,0.21,0.25,1.19
+-237,41,-0.24,-2.2,0.25,-1.09,2.51
+-237,336,-0.27,1.38,0.13,-0.21,2.51
+-237,290,-1.02,-1.5,0.15,-1.53,0.98
+-237,254,0.0,-0.61,0.19,-0.56,1.21
+-227,167,0.08,0.77,0.04,0.88,1.18
+-227,231,0.74,1.35,0.04,1.15,1.51
+-227,15,-0.29,0.26,0.04,0.49,1.31
+-266,165,1.3,1.39,0.12,0.9,1.08
+-266,84,2.96,0.66,0.11,1.13,1.08
+-266,254,0.98,-0.32,0.11,-0.29,0.71
+-206,57,-0.55,-1.97,0.04,-2.15,0.18
+-206,42,1.18,-0.86,0.08,-1.05,0.79
+-206,23,3.06,0.81,0.07,0.72,0.17
+-206,256,-0.55,-0.9,0.18,-0.43,0.79
+-67,165,0.94,1.66,0.16,2.16,0.79
+-67,256,-0.5,2.54,0.08,2.04,0.79
+-156,167,-0.94,-1.47,0.04,-1.55,0.98
+-156,165,0.5,0.3,0.11,0.31,0.98
+-156,42,0.8,-0.71,0.05,-0.42,0.79
+-156,164,2.97,2.69,0.12,2.47,0.84
+-31,61,-1.27,-0.1,0.07,-0.06,1.19
+-31,7a,-1.15,0.56,0.09,0.84,0.39
+-289,35,3.76,0.14,0.06,0.14,0.06
+-61,251,-0.14,-0.18,0.04,-0.14,1.19
+-167,165,1.44,2.17,0.07,1.86,0.9
+-167,155,0.17,0.75,0.05,0.9,1.18
+-167,50,0.98,1.84,0.07,2.03,0.58
+-165,252,-0.48,-0.18,0.12,-0.53,1.27
+-165,336,-0.59,-1.31,0.17,-0.84,1.27
+-165,163,-1.77,-1.25,0.13,-0.96,0.77
+-41,7b,2.39,3.14,0.25,4.25,2.51
+-7b,231,-2.63,-5.23,0.11,-4.12,2.51
+-54,251,-0.93,-1.23,0.15,-1.3,0.83
+-54,124,-0.81,-1.61,0.09,-1.61,0.83
+-215,252,0.89,0.21,0.12,0.47,1.26
+-215,15,-0.45,-0.85,0.04,-1.26,1.26
+-215,163,-0.41,-0.01,0.05,0.04,0.66
+-57,231,0.65,0.43,0.04,0.25,0.18
+-42,164,2.17,2.82,0.14,2.9,0.57
+-35,7a,-2.84,2.93,0.06,2.93,0.06
+-252,336,-0.11,-0.77,0.03,-0.31,2.51
+-252,155,-0.79,0.01,0.09,-0.43,1.18
+-252,231,-0.31,-0.3,0.07,-1.06,2.51
+-252,124,-0.41,-1.02,0.13,-0.36,1.09
+-336,251,-0.42,0.94,0.27,0.27,1.31
+-290,7a,0.57,2.65,0.12,2.63,0.33
+-290,23,3.5,3.21,0.13,3.2,0.98
+-155,84,2.93,1.43,0.09,1.19,0.89
+-164,124,-3.36,-2.39,0.16,-3.05,1.09
+-164,25,-3.52,-2.82,0.13,-2.3,1.09
+-7a,224,0.34,-2.18,0.09,-2.15,0.29
+-7a,23,2.93,0.35,0.06,0.57,0.39
+-224,231,-0.36,0.06,0.1,0.09,0.29
+-84,15,-3.47,-2.7,0.11,-2.49,1.08
+-254,251,-0.69,0.5,0.02,0.62,1.21
+-254,50,-0.15,1.56,0.08,1.37,0.58
+-23,15,-3.98,-3.41,0.06,-3.29,0.98
+-251,15,-0.8,-1.61,0.05,-1.68,1.21
+-251,25,-0.04,1.04,0.08,0.44,1.31
+-15,25,0.76,2.16,0.04,2.12,1.31
+diff --git a/timemachine/datasets/fep_benchmark/hif2a/results_edges_5ns.csv b/timemachine/datasets/fep_benchmark/hif2a/results_edges_5ns.csv
+deleted file mode 100644
+index 58beec877e..0000000000
+--- a/timemachine/datasets/fep_benchmark/hif2a/results_edges_5ns.csv
++++ /dev/null
+@@ -1,81 +0,0 @@
+-Ligand1,Ligand2,Exp.,FEP,FEP Error,CCC,CCC Error
+-338,165,1.52,-0.44,0.25,0.07,0.76
+-338,215,0.16,-0.76,0.13,-1.11,0.76
+-338,163,-0.25,-1.02,0.1,-1.18,0.57
+-43,235,-1.42,-0.2,0.1,-0.49,0.81
+-43,54,-0.61,0.9,0.08,0.83,0.77
+-43,215,-1.9,-1.64,0.1,-1.24,1.1
+-43,155,-1.8,-1.0,0.06,-1.08,0.8
+-43,25,-1.58,-0.17,0.08,-0.11,1.1
+-235,1,-1.2,-0.3,0.07,-0.55,0.54
+-235,54,0.81,1.36,0.23,1.32,0.81
+-234,289,-0.57,-1.06,0.04,-1.06,0.04
+-30,42,1.63,1.24,0.09,1.12,0.71
+-30,84,2.99,2.28,0.09,2.3,0.6
+-30,251,0.32,1.31,0.11,1.37,0.71
+-30,25,0.28,1.71,0.1,1.76,0.48
+-1,254,1.77,-0.1,0.07,-0.43,1.98
+-1,256,0.65,0.8,0.07,1.06,0.59
+-1,15,0.28,-1.09,0.08,-1.28,1.98
+-237,227,-1.21,-4.35,0.16,-3.5,2.27
+-237,31,0.71,-1.72,0.28,-1.13,2.12
+-237,41,-0.24,-0.99,0.3,-0.92,1.53
+-237,336,-0.27,1.01,0.2,-1.41,2.56
+-237,290,-1.02,-3.36,0.22,-3.25,1.78
+-237,254,0.0,-2.98,0.18,-2.17,2.56
+-227,167,0.08,0.52,0.05,0.68,1.79
+-227,231,0.74,1.34,0.04,1.7,2.12
+-227,15,-0.29,0.15,0.06,0.48,2.27
+-266,165,1.3,1.14,0.1,1.0,1.71
+-266,84,2.96,1.11,0.13,1.5,0.78
+-266,254,0.98,-0.15,0.11,-0.4,1.71
+-206,57,-0.55,-1.88,0.06,-1.84,0.16
+-206,42,1.18,-1.08,0.07,-1.1,0.76
+-206,23,3.06,0.86,0.09,0.62,0.49
+-206,256,-0.55,-0.55,0.12,-0.33,0.76
+-67,165,0.94,1.54,0.19,2.02,0.76
+-67,256,-0.5,2.59,0.11,2.11,0.76
+-156,167,-0.94,-1.45,0.06,-1.62,1.65
+-156,165,0.5,0.47,0.1,0.43,1.65
+-156,42,0.8,-0.87,0.06,-0.26,0.85
+-156,164,2.97,3.49,0.14,3.09,0.85
+-31,61,-1.27,-0.21,0.09,-0.05,2.12
+-31,7a,-1.15,0.55,0.11,0.97,0.47
+-289,35,3.76,0.68,0.08,0.68,0.08
+-61,251,-0.14,-0.19,0.07,-0.03,2.12
+-167,165,1.44,2.42,0.09,2.05,1.58
+-167,155,0.17,0.95,0.06,1.04,1.79
+-167,50,0.98,2.01,0.13,2.28,1.14
+-165,252,-0.48,-0.07,0.19,-0.41,2.05
+-165,336,-0.59,-1.12,0.25,-0.64,2.05
+-165,163,-1.77,-1.57,0.07,-1.26,0.7
+-41,7b,2.39,4.62,0.17,4.69,1.53
+-7b,231,-2.63,-5.64,0.14,-5.57,1.53
+-54,251,-0.93,-1.27,0.25,-1.32,0.8
+-54,124,-0.81,-0.77,0.14,-0.83,0.81
+-215,252,0.89,0.18,0.16,0.77,2.09
+-215,15,-0.45,-0.69,0.05,-1.08,2.09
+-215,163,-0.41,0.07,0.06,-0.08,0.7
+-57,231,0.65,0.34,0.05,0.38,0.16
+-42,164,2.17,2.88,0.24,3.35,0.85
+-35,7a,-2.84,2.76,0.07,2.76,0.07
+-252,336,-0.11,-0.77,0.04,-0.23,2.12
+-252,155,-0.79,-0.27,0.09,-0.6,1.79
+-252,231,-0.31,-0.05,0.1,-0.63,2.12
+-252,124,-0.41,-0.14,0.16,0.47,1.33
+-336,251,-0.42,1.6,0.21,0.21,2.56
+-290,7a,0.57,3.13,0.16,3.09,0.47
+-290,23,3.5,3.36,0.17,3.51,1.78
+-155,84,2.93,1.84,0.14,1.51,0.68
+-164,124,-3.36,-2.05,0.17,-2.6,1.33
+-164,25,-3.52,-3.32,0.14,-2.71,1.33
+-7a,224,0.34,-1.73,0.18,-1.62,0.38
+-7a,23,2.93,0.15,0.07,0.42,0.46
+-224,231,-0.36,-0.13,0.19,-0.02,0.38
+-84,15,-3.47,-2.83,0.2,-2.75,0.78
+-254,251,-0.69,0.47,0.04,0.97,2.56
+-254,50,-0.15,1.91,0.12,1.64,1.14
+-23,15,-3.98,-3.48,0.09,-3.29,1.78
+-251,15,-0.8,-1.73,0.06,-1.83,2.27
+-251,25,-0.04,1.01,0.1,0.38,2.25
+-15,25,0.76,2.3,0.06,2.21,2.25
+diff --git a/timemachine/datasets/fep_benchmark/pfkfb3/results_20ns.csv b/timemachine/datasets/fep_benchmark/pfkfb3/results_20ns.csv
+deleted file mode 100644
+index 7fa27d035e..0000000000
+--- a/timemachine/datasets/fep_benchmark/pfkfb3/results_20ns.csv
++++ /dev/null
+@@ -1,41 +0,0 @@
+-Affinity unit, # ,Ligand,Quality,Pred. ΔG,Pred. Error,Exp. ΔG,Structure
+-kcal/mol,1,68.0,0,-11.32,0.1,-9.78,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[s-0X2][c-0X3]([c-0X3]([#1])[c-0X3]3[c-0X3]2[#1])[N-0X3]([#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,2,67.0,0,-10.57,0.09,-10.24,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[s-0X2][c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[N-0X3]([#1])[#1])[#1])[#1]
+-kcal/mol,3,26.0,0,-9.37,0.11,-9.17,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[#1])[#1])[#1])[C-0X3](=[O-0X1])[N-0X3]([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,4,24.0,0,-9.79,0.11,-8.87,[#1][c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]([N-0X3]([#1])[c-0X3]3[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]3[C-0X2]#[N-0X1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]3[c-0X3]([#1])[c-0X3]([c-0X3]4[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]4[c-0X3]3[#1])[#1])[#1])[c-0X3]2[n-0X2]1)[#1])[#1]
+-kcal/mol,5,53.0,0,-8.04,0.1,-7.0,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,6,37.0,-1,-12.26,0.1,-10.0,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[C-0X3](=[O-0X1])[N-0X3]([#1])[C-0X4]2([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[O-0X2][C-0X4]([#1])([#1])[C-0X4]2([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,7,29.0,0,-10.12,0.11,-9.65,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]1[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1]
+-kcal/mol,8,55.0,0,-11.98,0.12,-10.64,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[F-0X1])[#1])[#1]
+-kcal/mol,9,23.0,0,-8.77,0.12,-7.91,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]1[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,10,34.0,0,-10.37,0.11,-9.97,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]1[#1])[#1])[C-0X3](=[O-0X1])[N-0X3]([#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,11,30.0,0,-9.41,0.1,-9.2,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]1[O-0X2][C-0X4]([#1])([#1])[#1])[#1]
+-kcal/mol,12,56.0,0,-11.72,0.1,-10.57,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[C-0X4]([#1])([#1])[#1])[#1]
+-kcal/mol,13,36.0,0,-7.98,0.11,-7.44,[#1][c-0X3]1[c-0X3]([c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1])[N-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1]
+-kcal/mol,14,19.0,0,-8.58,0.1,-7.55,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X3]2[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,15,35.0,0,-10.54,0.1,-10.14,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X3]2[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,16,57.0,0,-11.1,0.1,-10.47,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([F-0X1])[F-0X1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,17,33.0,0,-10.09,0.11,-8.61,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[C-0X2]#[N-0X1])[#1]
+-kcal/mol,18,52.0,0,-9.24,0.1,-10.4,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,19,70.0,0,-10.73,0.1,-10.3,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[o-0X2][c-0X3]([c-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,20,38.0,0,-7.23,0.1,-8.76,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[#1])[N-0X3]([C-0X4]([#1])([#1])[#1])[C-0X4]([#1])([#1])[#1])[#1]
+-kcal/mol,21,60.0,0,-7.37,0.11,-8.14,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[O-0X2][C-0X4]([#1])([#1])[C-0X4]([C-0X4]([#1])([#1])[#1])([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,22,54.0,0,-8.1,0.11,-8.18,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([C-0X4]([#1])([#1])[#1])[C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1])[#1]
+-kcal/mol,23,31.0,0,-10.4,0.11,-9.28,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[O-0X2][C-0X4]([#1])([#1])[#1])[#1]
+-kcal/mol,24,64.0,0,-9.29,0.09,-9.42,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[n-0X2][c-0X3]([#1])[s-0X2][c-0X3]3[c-0X3]2[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,25,69.0,0,-11.46,0.1,-10.71,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[s-0X2][c-0X3]([c-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,26,58.0,0,-8.36,0.1,-9.13,[#1][c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]([N-0X3]([#1])[c-0X3]3[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]3[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]3[c-0X3]([#1])[c-0X3]([c-0X3]4[O-0X2][C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]4[c-0X3]3[#1])[#1])[c-0X3]2[n-0X2]1)[#1])[#1]
+-kcal/mol,27,59.0,0,-6.95,0.1,-8.12,[#1][c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]([N-0X3]([#1])[c-0X3]3[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]3[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]3[c-0X3]([#1])[c-0X3]([c-0X3]4[O-0X2][C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[O-0X2][c-0X3]4[c-0X3]3[#1])[#1])[c-0X3]2[n-0X2]1)[#1])[#1]
+-kcal/mol,28,63.0,0,-8.1,0.1,-8.56,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]3[n-0X2][s-0X2][n-0X2][c-0X3]3[c-0X3]([c-0X3]2[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,29,39.0,0,-5.77,0.1,-7.2,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[N-0X3]([#1])[#1])[#1])[#1]
+-kcal/mol,30,48.0,0,-6.78,0.1,-8.01,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([O-0X2][C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,31,46.0,0,-6.35,0.1,-7.86,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([c-0X3]([c-0X3]1[#1])[#1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[#1]
+-kcal/mol,32,62.0,0,-6.28,0.11,-7.69,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]3[n-0X2][o-0X2][n-0X2][c-0X3]3[c-0X3]([c-0X3]2[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,33,49.0,0,-6.68,0.1,-7.93,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([N-0X3]([#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,34,65.0,0,-9.34,0.09,-9.49,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[s-0X2][c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,35,47.0,0,-6.3,0.1,-8.33,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1])[#1]
+-kcal/mol,36,41.0,0,-7.65,0.1,-7.39,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[O-0X2][C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[#1]
+-kcal/mol,37,44.0,0,-8.52,0.1,-9.95,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([Br-0X1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,38,42.0,0,-8.05,0.1,-8.47,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[S-0X2][C-0X4]([#1])([#1])[#1])[#1])[#1]
+-kcal/mol,39,43.0,0,-8.82,0.11,-8.0,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Br-0X1])[#1])[#1]
+-kcal/mol,40,20.0,0,-7.26,0.09,-8.52,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[#1])[O-0X2][C-0X4]([#1])([#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+diff --git a/timemachine/datasets/fep_benchmark/pfkfb3/results_5ns.csv b/timemachine/datasets/fep_benchmark/pfkfb3/results_5ns.csv
+deleted file mode 100644
+index 0a5fa04e6c..0000000000
+--- a/timemachine/datasets/fep_benchmark/pfkfb3/results_5ns.csv
++++ /dev/null
+@@ -1,41 +0,0 @@
+-Affinity unit, # ,Ligand,Quality,Pred. ΔG,Pred. Error,Exp. ΔG,Structure
+-kcal/mol,1,68.0,0,-11.37,0.1,-9.78,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[s-0X2][c-0X3]([c-0X3]([#1])[c-0X3]3[c-0X3]2[#1])[N-0X3]([#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,2,67.0,0,-10.51,0.14,-10.24,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[s-0X2][c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[N-0X3]([#1])[#1])[#1])[#1]
+-kcal/mol,3,26.0,0,-9.44,0.1,-9.17,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[#1])[#1])[#1])[C-0X3](=[O-0X1])[N-0X3]([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,4,24.0,0,-10.16,0.11,-8.87,[#1][c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]([N-0X3]([#1])[c-0X3]3[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]3[C-0X2]#[N-0X1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]3[c-0X3]([#1])[c-0X3]([c-0X3]4[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]4[c-0X3]3[#1])[#1])[#1])[c-0X3]2[n-0X2]1)[#1])[#1]
+-kcal/mol,5,53.0,0,-7.85,0.1,-7.0,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,6,37.0,-1,-12.51,0.1,-10.0,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[C-0X3](=[O-0X1])[N-0X3]([#1])[C-0X4]2([#1])[C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[O-0X2][C-0X4]([#1])([#1])[C-0X4]2([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,7,29.0,0,-9.86,0.13,-9.65,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]1[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1]
+-kcal/mol,8,55.0,0,-12.34,0.13,-10.64,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[F-0X1])[#1])[#1]
+-kcal/mol,9,23.0,0,-8.94,0.11,-7.91,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]1[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,10,34.0,0,-10.88,0.11,-9.97,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]1[#1])[#1])[C-0X3](=[O-0X1])[N-0X3]([#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,11,30.0,0,-9.59,0.14,-9.2,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]1[O-0X2][C-0X4]([#1])([#1])[#1])[#1]
+-kcal/mol,12,56.0,0,-11.97,0.11,-10.57,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[C-0X4]([#1])([#1])[#1])[#1]
+-kcal/mol,13,36.0,0,-8.19,0.16,-7.44,[#1][c-0X3]1[c-0X3]([c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1])[N-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1]
+-kcal/mol,14,19.0,0,-8.47,0.1,-7.55,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X3]2[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,15,35.0,0,-10.9,0.1,-10.14,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X3]2[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,16,57.0,0,-11.17,0.13,-10.47,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([F-0X1])[F-0X1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,17,33.0,0,-10.45,0.13,-8.61,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[C-0X2]#[N-0X1])[#1]
+-kcal/mol,18,52.0,0,-9.06,0.1,-10.4,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,19,70.0,0,-10.69,0.12,-10.3,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[o-0X2][c-0X3]([c-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,20,38.0,0,-7.54,0.1,-8.76,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[#1])[N-0X3]([C-0X4]([#1])([#1])[#1])[C-0X4]([#1])([#1])[#1])[#1]
+-kcal/mol,21,60.0,0,-7.7,0.12,-8.14,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[O-0X2][C-0X4]([#1])([#1])[C-0X4]([C-0X4]([#1])([#1])[#1])([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,22,54.0,0,-7.48,0.15,-8.18,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([C-0X4]([#1])([#1])[#1])[C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1])[#1]
+-kcal/mol,23,31.0,0,-11.02,0.13,-9.28,[#1][N-0X3]([c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[c-0X3]([c-0X3]([#1])[n-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]2[c-0X3]1[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[O-0X2][C-0X4]([#1])([#1])[#1])[#1]
+-kcal/mol,24,64.0,0,-8.97,0.14,-9.42,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[n-0X2][c-0X3]([#1])[s-0X2][c-0X3]3[c-0X3]2[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,25,69.0,0,-11.74,0.1,-10.71,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]3[s-0X2][c-0X3]([c-0X3]([C-0X4]([#1])([#1])[#1])[c-0X3]3[c-0X3]2[#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,26,58.0,0,-8.32,0.1,-9.13,[#1][c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]([N-0X3]([#1])[c-0X3]3[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]3[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]3[c-0X3]([#1])[c-0X3]([c-0X3]4[O-0X2][C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[c-0X3]4[c-0X3]3[#1])[#1])[c-0X3]2[n-0X2]1)[#1])[#1]
+-kcal/mol,27,59.0,0,-6.68,0.1,-8.12,[#1][c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]2[c-0X3]([c-0X3]([N-0X3]([#1])[c-0X3]3[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]3[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]3[c-0X3]([#1])[c-0X3]([c-0X3]4[O-0X2][C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[O-0X2][c-0X3]4[c-0X3]3[#1])[#1])[c-0X3]2[n-0X2]1)[#1])[#1]
+-kcal/mol,28,63.0,0,-7.91,0.12,-8.56,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]3[n-0X2][s-0X2][n-0X2][c-0X3]3[c-0X3]([c-0X3]2[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,29,39.0,0,-5.44,0.1,-7.2,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[N-0X3]([#1])[#1])[#1])[#1]
+-kcal/mol,30,48.0,0,-6.47,0.1,-8.01,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([O-0X2][C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,31,46.0,0,-5.97,0.1,-7.86,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([c-0X3]([c-0X3]1[#1])[#1])[C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[#1]
+-kcal/mol,32,62.0,0,-6.49,0.14,-7.69,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]2[#1])[#1])[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]3[n-0X2][o-0X2][n-0X2][c-0X3]3[c-0X3]([c-0X3]2[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+-kcal/mol,33,49.0,0,-6.34,0.1,-7.93,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([N-0X3]([#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,34,65.0,0,-9.08,0.1,-9.49,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]2[s-0X2][c-0X3]([n-0X2][c-0X3]2[c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,35,47.0,0,-5.76,0.1,-8.33,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]1[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([C-0X4]([#1])([#1])[C-0X4]([#1])([#1])[#1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1])[#1]
+-kcal/mol,36,41.0,0,-8.11,0.1,-7.39,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[O-0X2][C-0X4]([F-0X1])([F-0X1])[F-0X1])[#1])[#1]
+-kcal/mol,37,44.0,0,-8.31,0.1,-9.95,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([Br-0X1])[c-0X3]([c-0X3]1[#1])[#1])[#1])[#1]
+-kcal/mol,38,42.0,0,-7.78,0.1,-8.47,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[S-0X2][C-0X4]([#1])([#1])[#1])[#1])[#1]
+-kcal/mol,39,43.0,0,-8.59,0.1,-8.0,[#1][c-0X3]1[c-0X3]2[n-0X2][c-0X3]([#1])[c-0X3]([n-0X2][c-0X3]2[c-0X3]([c-0X3]([c-0X3]1[N-0X3]([#1])[c-0X3]1[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]1[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[#1])[c-0X3]1[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]1[#1])[Br-0X1])[#1])[#1]
+-kcal/mol,40,20.0,0,-7.02,0.1,-8.52,[#1][c-0X3]1[c-0X3]([N-0X3]([#1])[c-0X3]2[c-0X3]([#1])[n-0X2][c-0X3]([#1])[c-0X3]([c-0X3]2[S-0X4](=[O-0X1])(=[O-0X1])[C-0X4]([#1])([#1])[#1])[#1])[c-0X3]([c-0X3]([c-0X3]2[c-0X3]([#1])[c-0X3]([c-0X3]([#1])[c-0X3]([c-0X3]2[#1])[O-0X2][C-0X4]([#1])([#1])[#1])[#1])[c-0X3]2[n-0X2][c-0X3]([c-0X3]([#1])[n-0X2][c-0X3]12)[#1])[#1]
+diff --git a/timemachine/datasets/fep_benchmark/pfkfb3/results_edges_20ns.csv b/timemachine/datasets/fep_benchmark/pfkfb3/results_edges_20ns.csv
+deleted file mode 100644
+index 17dbcaae38..0000000000
+--- a/timemachine/datasets/fep_benchmark/pfkfb3/results_edges_20ns.csv
++++ /dev/null
+@@ -1,68 +0,0 @@
+-Ligand1,Ligand2,Exp.,FEP,FEP Error,CCC,CCC Error,Solvation,Solvation Error
+-43.0,48.0,-0.01,2.37,0.06,2.04,0.33,N/A,N/A
+-43.0,44.0,-1.95,-0.04,0.06,0.29,0.33,N/A,N/A
+-30.0,56.0,-1.37,-2.35,0.14,-2.31,0.34,N/A,N/A
+-30.0,70.0,-1.11,-1.28,0.12,-1.32,0.34,N/A,N/A
+-65.0,34.0,-0.48,-0.89,0.12,-1.03,0.42,N/A,N/A
+-65.0,70.0,-0.82,-1.42,0.09,-1.39,0.42,N/A,N/A
+-65.0,64.0,0.07,0.07,0.07,0.05,0.07,N/A,N/A
+-65.0,63.0,0.93,1.33,0.06,1.24,0.33,N/A,N/A
+-65.0,20.0,0.97,1.85,0.1,2.08,0.24,N/A,N/A
+-49.0,58.0,-1.2,-1.83,0.04,-1.67,0.24,N/A,N/A
+-49.0,42.0,-0.53,-1.33,0.11,-1.37,0.29,N/A,N/A
+-49.0,44.0,-2.01,-1.72,0.06,-1.84,0.29,N/A,N/A
+-24.0,69.0,-1.84,-1.4,0.11,-1.66,0.42,N/A,N/A
+-24.0,70.0,-1.43,-1.06,0.12,-0.94,0.42,N/A,N/A
+-24.0,34.0,-1.1,-0.72,0.11,-0.58,0.42,N/A,N/A
+-67.0,56.0,-0.32,-1.12,0.09,-1.15,0.2,N/A,N/A
+-67.0,57.0,-0.23,-0.53,0.08,-0.53,0.2,N/A,N/A
+-67.0,64.0,0.82,1.26,0.11,1.28,0.11,N/A,N/A
+-62.0,53.0,0.69,-1.95,0.07,-1.76,0.38,N/A,N/A
+-62.0,70.0,-2.61,-4.52,0.03,-4.45,0.35,N/A,N/A
+-62.0,31.0,-1.59,-3.86,0.16,-4.12,0.38,N/A,N/A
+-56.0,69.0,-0.15,0.24,0.07,0.26,0.34,N/A,N/A
+-59.0,35.0,-2.02,-3.56,0.09,-3.59,0.09,N/A,N/A
+-59.0,52.0,-2.28,-2.19,0.11,-2.3,0.11,N/A,N/A
+-59.0,47.0,-0.22,0.51,0.06,0.65,0.14,N/A,N/A
+-38.0,26.0,-0.41,-2.21,0.09,-2.14,0.24,N/A,N/A
+-38.0,41.0,1.37,-0.16,0.06,-0.42,0.26,N/A,N/A
+-38.0,39.0,1.56,1.28,0.11,1.46,0.24,N/A,N/A
+-31.0,19.0,1.73,2.07,0.1,1.81,0.38,N/A,N/A
+-48.0,47.0,-0.33,0.83,0.05,0.48,0.35,N/A,N/A
+-48.0,20.0,-0.51,-0.49,0.06,-0.48,0.32,N/A,N/A
+-58.0,68.0,-0.65,-2.9,0.09,-2.96,0.33,N/A,N/A
+-58.0,60.0,0.99,0.8,0.12,0.99,0.37,N/A,N/A
+-58.0,63.0,0.57,0.23,0.04,0.26,0.37,N/A,N/A
+-41.0,44.0,-2.56,-0.62,0.08,-0.88,0.26,N/A,N/A
+-29.0,54.0,1.47,1.96,0.11,2.02,0.44,N/A,N/A
+-29.0,63.0,1.08,1.97,0.13,2.02,0.38,N/A,N/A
+-29.0,70.0,-0.66,-0.83,0.08,-0.61,0.53,N/A,N/A
+-29.0,23.0,1.73,1.68,0.17,1.36,0.53,N/A,N/A
+-54.0,36.0,0.74,0.11,0.15,0.13,0.41,N/A,N/A
+-54.0,70.0,-2.12,-2.67,0.07,-2.63,0.44,N/A,N/A
+-47.0,46.0,0.47,-0.04,0.04,-0.05,0.11,N/A,N/A
+-47.0,20.0,-0.18,-0.77,0.08,-0.96,0.32,N/A,N/A
+-26.0,69.0,-1.55,-2.36,0.12,-2.09,0.53,N/A,N/A
+-26.0,70.0,-1.13,-1.17,0.1,-1.37,0.53,N/A,N/A
+-55.0,63.0,2.07,4.07,0.08,3.88,0.41,N/A,N/A
+-55.0,23.0,2.72,3.02,0.13,3.21,0.41,N/A,N/A
+-20.0,39.0,1.32,1.48,0.07,1.49,0.2,N/A,N/A
+-20.0,42.0,0.05,-0.83,0.04,-0.79,0.29,N/A,N/A
+-57.0,70.0,0.17,0.36,0.03,0.36,0.2,N/A,N/A
+-35.0,69.0,-0.58,-0.88,0.04,-0.91,0.05,N/A,N/A
+-44.0,68.0,0.17,-2.76,0.04,-2.8,0.17,N/A,N/A
+-63.0,36.0,1.12,0.34,0.19,0.13,0.41,N/A,N/A
+-69.0,53.0,3.72,3.42,0.06,3.42,0.35,N/A,N/A
+-69.0,23.0,2.8,2.51,0.11,2.69,0.53,N/A,N/A
+-69.0,60.0,2.57,4.28,0.17,4.09,0.37,N/A,N/A
+-52.0,53.0,3.4,1.28,0.03,1.2,0.33,N/A,N/A
+-52.0,19.0,2.84,0.7,0.08,0.66,0.33,N/A,N/A
+-52.0,46.0,2.54,2.88,0.04,2.89,0.11,N/A,N/A
+-19.0,37.0,-2.45,-3.48,0.18,-3.67,0.24,N/A,N/A
+-19.0,70.0,-2.75,-2.04,0.15,-2.15,0.38,N/A,N/A
+-68.0,70.0,-0.53,0.58,0.08,0.59,0.38,N/A,N/A
+-68.0,53.0,2.78,3.39,0.12,3.28,0.38,N/A,N/A
+-33.0,23.0,0.69,1.38,0.06,1.33,0.38,N/A,N/A
+-33.0,36.0,1.17,1.92,0.13,2.12,0.38,N/A,N/A
+-33.0,70.0,-1.7,-0.49,0.07,-0.64,0.33,N/A,N/A
+-39.0,37.0,-2.8,-6.68,0.14,-6.49,0.24,N/A,N/A
+diff --git a/timemachine/datasets/fep_benchmark/pfkfb3/results_edges_5ns.csv b/timemachine/datasets/fep_benchmark/pfkfb3/results_edges_5ns.csv
+deleted file mode 100644
+index e2d64f5000..0000000000
+--- a/timemachine/datasets/fep_benchmark/pfkfb3/results_edges_5ns.csv
++++ /dev/null
+@@ -1,67 +0,0 @@
+-Ligand1,Ligand2,Exp.,FEP,FEP Error,CCC,CCC Error,Solvation,Solvation Error
+-43.0,48.0,-0.01,2.12,0.07,2.12,0.12,N/A,N/A
+-43.0,44.0,-1.95,0.28,0.06,0.28,0.12,N/A,N/A
+-30.0,56.0,-1.37,-2.6,0.22,-2.37,0.63,N/A,N/A
+-30.0,70.0,-1.11,-0.87,0.2,-1.1,0.63,N/A,N/A
+-65.0,34.0,-0.48,-1.73,0.21,-1.8,0.31,N/A,N/A
+-65.0,70.0,-0.82,-1.95,0.09,-1.61,0.64,N/A,N/A
+-65.0,64.0,0.07,0.35,0.13,0.11,0.63,N/A,N/A
+-65.0,63.0,0.93,1.19,0.07,1.17,0.64,N/A,N/A
+-65.0,20.0,0.97,2.09,0.1,2.07,0.18,N/A,N/A
+-49.0,58.0,-1.2,-2.06,0.07,-1.98,0.08,N/A,N/A
+-49.0,42.0,-0.53,-1.36,0.11,-1.44,0.12,N/A,N/A
+-49.0,44.0,-2.01,-1.98,0.06,-1.98,0.12,N/A,N/A
+-24.0,69.0,-1.84,-1.53,0.18,-1.58,0.4,N/A,N/A
+-24.0,70.0,-1.43,-0.51,0.15,-0.53,0.4,N/A,N/A
+-24.0,34.0,-1.1,-0.79,0.13,-0.72,0.31,N/A,N/A
+-67.0,56.0,-0.32,-1.17,0.12,-1.45,0.63,N/A,N/A
+-67.0,57.0,-0.23,-0.7,0.12,-0.65,0.37,N/A,N/A
+-67.0,64.0,0.82,1.31,0.16,1.55,0.63,N/A,N/A
+-62.0,70.0,-2.61,-4.53,0.04,-4.2,0.55,N/A,N/A
+-62.0,31.0,-1.59,-4.21,0.2,-4.54,0.55,N/A,N/A
+-56.0,69.0,-0.15,0.28,0.09,0.22,0.3,N/A,N/A
+-59.0,35.0,-2.02,-4.13,0.11,-4.23,0.11,N/A,N/A
+-59.0,52.0,-2.28,-2.41,0.14,-2.38,0.14,N/A,N/A
+-59.0,47.0,-0.22,0.85,0.1,0.92,0.1,N/A,N/A
+-38.0,26.0,-0.41,-1.85,0.13,-1.9,0.21,N/A,N/A
+-38.0,41.0,1.37,-0.49,0.08,-0.57,0.21,N/A,N/A
+-38.0,39.0,1.56,1.97,0.15,2.1,0.18,N/A,N/A
+-31.0,19.0,1.73,2.88,0.13,2.55,0.55,N/A,N/A
+-48.0,47.0,-0.33,0.83,0.06,0.71,0.14,N/A,N/A
+-48.0,20.0,-0.51,-0.67,0.09,-0.55,0.14,N/A,N/A
+-58.0,68.0,-0.65,-2.9,0.1,-3.05,0.49,N/A,N/A
+-58.0,60.0,0.99,0.34,0.15,0.62,0.49,N/A,N/A
+-58.0,63.0,0.57,0.45,0.04,0.41,0.43,N/A,N/A
+-41.0,44.0,-2.56,-0.13,0.07,-0.21,0.21,N/A,N/A
+-29.0,54.0,1.47,2.43,0.13,2.38,0.49,N/A,N/A
+-29.0,63.0,1.08,2.17,0.14,1.95,0.76,N/A,N/A
+-29.0,70.0,-0.66,-1.23,0.11,-0.83,0.76,N/A,N/A
+-29.0,23.0,1.73,1.04,0.12,0.91,0.49,N/A,N/A
+-54.0,36.0,0.74,-0.99,0.2,-0.71,0.76,N/A,N/A
+-54.0,70.0,-2.12,-2.88,0.09,-3.21,0.76,N/A,N/A
+-47.0,46.0,0.47,-0.17,0.07,-0.21,0.07,N/A,N/A
+-47.0,20.0,-0.18,-1.25,0.12,-1.26,0.14,N/A,N/A
+-26.0,69.0,-1.55,-2.15,0.16,-2.3,0.49,N/A,N/A
+-26.0,70.0,-1.13,-1.36,0.18,-1.25,0.49,N/A,N/A
+-55.0,63.0,2.07,4.62,0.1,4.43,0.49,N/A,N/A
+-55.0,23.0,2.72,3.2,0.13,3.39,0.49,N/A,N/A
+-20.0,39.0,1.32,1.57,0.09,1.58,0.18,N/A,N/A
+-20.0,42.0,0.05,-0.85,0.08,-0.77,0.12,N/A,N/A
+-57.0,70.0,0.17,0.43,0.05,0.48,0.37,N/A,N/A
+-35.0,69.0,-0.58,-0.74,0.06,-0.84,0.1,N/A,N/A
+-44.0,68.0,0.17,-2.98,0.06,-3.06,0.21,N/A,N/A
+-63.0,36.0,1.12,0.19,0.24,-0.28,0.76,N/A,N/A
+-69.0,53.0,3.72,3.79,0.11,3.89,0.37,N/A,N/A
+-69.0,23.0,2.8,2.98,0.13,2.8,0.39,N/A,N/A
+-69.0,60.0,2.57,4.32,0.2,4.04,0.49,N/A,N/A
+-52.0,53.0,3.4,1.31,0.05,1.21,0.13,N/A,N/A
+-52.0,19.0,2.84,0.5,0.13,0.59,0.13,N/A,N/A
+-52.0,46.0,2.54,3.05,0.07,3.09,0.07,N/A,N/A
+-19.0,37.0,-2.45,-3.9,0.19,-4.03,0.19,N/A,N/A
+-19.0,70.0,-2.75,-2.11,0.17,-2.22,0.55,N/A,N/A
+-68.0,70.0,-0.53,0.91,0.11,0.68,0.49,N/A,N/A
+-68.0,53.0,2.78,3.53,0.16,3.52,0.37,N/A,N/A
+-33.0,23.0,0.69,1.39,0.1,1.51,0.47,N/A,N/A
+-33.0,36.0,1.17,2.06,0.22,2.26,0.72,N/A,N/A
+-33.0,70.0,-1.7,0.07,0.11,-0.24,0.72,N/A,N/A
+-39.0,37.0,-2.8,-7.2,0.2,-7.07,0.2,N/A,N/A
+diff --git a/timemachine/md/exchange/utils.py b/timemachine/md/exchange/utils.py
+new file mode 100644
+index 0000000000..bac91b4409
+--- /dev/null
++++ b/timemachine/md/exchange/utils.py
+@@ -0,0 +1,14 @@
++import numpy as np
++from rdkit import Chem
++
++from timemachine.fe.utils import get_romol_conf
++from timemachine.potentials.jax_utils import pairwise_distances
++
++
++def get_radius_of_mol_pair(mol_a: Chem.Mol, mol_b: Chem.Mol) -> float:
++    """Takes two molecules, computes the max pairwise distance within the molecule coordinates,
++    treating that as a diameter and returns the radius
++    """
++    conf = np.concatenate([get_romol_conf(mol_a), get_romol_conf(mol_b)])
++    diameter = np.max(pairwise_distances(conf))
++    return diameter / 2
+diff --git a/timemachine/parallel/client.py b/timemachine/parallel/client.py
+index 8a222dba34..7eccf923f9 100644
+--- a/timemachine/parallel/client.py
++++ b/timemachine/parallel/client.py
+@@ -192,7 +192,7 @@ class CUDAPoolClient(ProcessPoolClient):
+     the number of GPUs.
+     """
+ 
+-    def __init__(self, max_workers):
++    def __init__(self, max_workers: int):
+         super().__init__(max_workers)
+         visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+         if visible_devices:
+@@ -253,7 +253,7 @@ def name(self) -> str:
+ 
+ 
+ class AbstractFileClient:
+-    def store_stream(self, path: str, stream: io.IOBase):
++    def store_stream(self, path: str | Path, stream: io.IOBase):
+         """
+         Store a stream of binary data to a given path.
+ 
+@@ -268,7 +268,7 @@ def store_stream(self, path: str, stream: io.IOBase):
+         """
+         raise NotImplementedError()
+ 
+-    def store(self, path: str, data: bytes):
++    def store(self, path: str | Path, data: bytes):
+         """
+         Store the results to the given path.
+ 
+@@ -283,7 +283,7 @@ def store(self, path: str, data: bytes):
+         """
+         raise NotImplementedError()
+ 
+-    def load(self, path: str) -> bytes:
++    def load(self, path: str | Path) -> bytes:
+         """
+         Load the results from the given path.
+ 
+@@ -299,7 +299,7 @@ def load(self, path: str) -> bytes:
+         """
+         raise NotImplementedError()
+ 
+-    def exists(self, path: str) -> bool:
++    def exists(self, path: str | Path) -> bool:
+         """
+         Parameters
+         ----------
+@@ -313,7 +313,7 @@ def exists(self, path: str) -> bool:
+         """
+         raise NotImplementedError()
+ 
+-    def full_path(self, path: str) -> str:
++    def full_path(self, path: str | Path) -> str:
+         """
+         Parameters
+         ----------
+@@ -328,7 +328,7 @@ def full_path(self, path: str) -> str:
+         """
+         raise NotImplementedError()
+ 
+-    def delete(self, path: str):
++    def delete(self, path: str | Path):
+         """
+         Parameters
+         ----------
+@@ -342,7 +342,7 @@ class FileClient(AbstractFileClient):
+     def __init__(self, base: Optional[Path] = None):
+         self.base = base or Path().cwd()
+ 
+-    def store_stream(self, path: str, stream: io.IOBase):
++    def store_stream(self, path: str | Path, stream: io.IOBase):
+         full_path = Path(self.full_path(path))
+         full_path.parent.mkdir(parents=True, exist_ok=True)
+         with open(full_path, "wb") as ofs:
+@@ -351,22 +351,22 @@ def store_stream(self, path: str, stream: io.IOBase):
+                 ofs.write(chunk)
+                 chunk = stream.read(io.DEFAULT_BUFFER_SIZE)
+ 
+-    def store(self, path: str, data: bytes):
++    def store(self, path: str | Path, data: bytes):
+         full_path = Path(self.full_path(path))
+         full_path.parent.mkdir(parents=True, exist_ok=True)
+         full_path.write_bytes(data)
+ 
+-    def load(self, path: str) -> bytes:
++    def load(self, path: str | Path) -> bytes:
+         full_path = Path(self.full_path(path))
+         return full_path.read_bytes()
+ 
+-    def exists(self, path: str) -> bool:
++    def exists(self, path: str | Path) -> bool:
+         return Path(self.full_path(path)).exists()
+ 
+-    def full_path(self, path: str) -> str:
++    def full_path(self, path: str | Path) -> str:
+         return str(Path(self.base, path).absolute())
+ 
+-    def delete(self, path: str):
++    def delete(self, path: str | Path):
+         Path(self.full_path(path)).unlink()
+ 
+ 

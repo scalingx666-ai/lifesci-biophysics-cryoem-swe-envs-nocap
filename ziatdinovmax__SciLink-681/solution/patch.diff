@@ -1,0 +1,775 @@
+diff --git a/scilink/agents/exp_agents/analysis_orchestrator.py b/scilink/agents/exp_agents/analysis_orchestrator.py
+index a821e1bb..a5920b1f 100644
+--- a/scilink/agents/exp_agents/analysis_orchestrator.py
++++ b/scilink/agents/exp_agents/analysis_orchestrator.py
+@@ -2013,6 +2013,7 @@ def _handle_litellm_chat(self, user_input: str) -> str:
+                         messages=self.messages,
+                         tools=self.tools_for_model,
+                         tool_choice="none",
++                        timeout=120,   # a brief summary, not a long generation
+                     )
+                     content = getattr(followup.choices[0].message, "content", None) or ""
+                 self.messages.append({
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index 1746010c..d939229d 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -2301,6 +2301,7 @@ def _handle_openai_chat(self, user_input: str) -> str:
+                         messages=self.messages,
+                         tools=self.tools_for_model,
+                         tool_choice="none",
++                        timeout=120,   # a brief summary, not a long generation
+                     )
+                     text = followup.choices[0].message.content or ""
+                 self.messages.append({"role": "assistant", "content": text})
+@@ -2469,6 +2470,7 @@ def _handle_litellm_chat(self, user_input: str) -> str:
+                         messages=self.messages,
+                         tools=self.tools_for_model,
+                         tool_choice="none",
++                        timeout=120,   # a brief summary, not a long generation
+                     )
+                     content = getattr(followup.choices[0].message, "content", None) or ""
+                 self.messages.append({"role": "assistant", "content": content or ""})
+diff --git a/scilink/agents/planning_agents/planning_orchestrator.py b/scilink/agents/planning_agents/planning_orchestrator.py
+index 48737501..0a328bde 100644
+--- a/scilink/agents/planning_agents/planning_orchestrator.py
++++ b/scilink/agents/planning_agents/planning_orchestrator.py
+@@ -2008,7 +2008,12 @@ def _handle_litellm_chat(self, user_input: str) -> str:
+                 tools=self.tools_for_model,
+                 tool_choice="auto",
+                 api_key=self.model.api_key,
+-                api_base=self.model.base_url
++                api_base=self.model.base_url,
++                # A chat turn (a tool call or a reply), not a long generation:
++                # a hung connection must not hold the turn for the 1200 s
++                # default. Longer than the other loops' 120 s because a final
++                # reply here can be long and there is no outer retry loop.
++                timeout=300,
+             )
+             
+             message = response.choices[0].message
+diff --git a/scilink/agents/sim_agents/simulation_orchestrator.py b/scilink/agents/sim_agents/simulation_orchestrator.py
+index 7f7d533a..fe7a7e87 100644
+--- a/scilink/agents/sim_agents/simulation_orchestrator.py
++++ b/scilink/agents/sim_agents/simulation_orchestrator.py
+@@ -952,6 +952,7 @@ def _handle_openai_chat(self, user_input: str) -> str:
+                         messages=self.messages,
+                         tools=self.tools_for_model,
+                         tool_choice="none",
++                        timeout=120,   # a brief summary, not a long generation
+                     )
+                     text = followup.choices[0].message.content or ""
+                 self.messages.append({"role": "assistant", "content": text})
+@@ -1054,6 +1055,7 @@ def _handle_litellm_chat(self, user_input: str) -> str:
+                         messages=self.messages,
+                         tools=self.tools_for_model,
+                         tool_choice="none",
++                        timeout=120,   # a brief summary, not a long generation
+                     )
+                     content = getattr(followup.choices[0].message, "content", None) or ""
+                 self.messages.append({"role": "assistant", "content": content or ""})
+diff --git a/scilink/wrappers/litellm_wrapper.py b/scilink/wrappers/litellm_wrapper.py
+index e427f7b3..1841fdd0 100644
+--- a/scilink/wrappers/litellm_wrapper.py
++++ b/scilink/wrappers/litellm_wrapper.py
+@@ -259,6 +259,216 @@ def _scope_drop_params(model) -> None:
+         litellm.drop_params = str(model or "").startswith("bedrock/")
+ 
+ 
++# ── Transient-error retries and per-attempt timeouts ────────────────────────
++# LiteLLM's own ``num_retries`` defaults to its "constant_retry" strategy: the
++# attempts follow each other with NO wait, and every openai.APIError is
++# retried, a 400 or 401 included. A throttled or briefly unavailable
++# provider is therefore hit again at once, by every concurrent caller in
++# step. SciLink retries itself instead, only what a retry can fix, with
++# exponential backoff and jitter (honouring Retry-After), and hands LiteLLM
++# ``num_retries=0``.
++
++LLM_RETRIES = 4           # retries after the first attempt, transient errors only
++LLM_TIMEOUT_S = 1200      # per attempt; the generative wrapper's long-standing default
++_BACKOFF_BASE_S = 2.0
++_BACKOFF_CAP_S = 60.0
++_TRANSIENT_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
++
++_logger = logging.getLogger(__name__)
++
++
++def llm_retries() -> int:
++    """Retries after the first attempt (``SCILINK_LLM_RETRIES`` overrides)."""
++    try:
++        return max(0, int(os.environ.get("SCILINK_LLM_RETRIES", LLM_RETRIES)))
++    except ValueError:
++        return LLM_RETRIES
++
++
++def llm_timeout_s() -> float:
++    """Per-attempt timeout (``SCILINK_LLM_TIMEOUT_S`` overrides: a local
++    model or a slow proxy may need more)."""
++    try:
++        return float(os.environ.get("SCILINK_LLM_TIMEOUT_S", LLM_TIMEOUT_S))
++    except ValueError:
++        return float(LLM_TIMEOUT_S)
++
++
++def _chain(exc: BaseException):
++    """The exception and what it was raised from, outermost first: the
++    explicit ``__cause__``, else the implicit ``__context__`` unless Python
++    was told to suppress it."""
++    seen, cur = set(), exc
++    while cur is not None and id(cur) not in seen:
++        seen.add(id(cur))
++        yield cur
++        if cur.__cause__ is not None:
++            cur = cur.__cause__
++        elif not cur.__suppress_context__:
++            cur = cur.__context__
++        else:
++            cur = None
++
++
++def _http_status(e: BaseException) -> Optional[int]:
++    for attr in ("status_code", "status"):
++        v = getattr(e, attr, None)
++        if isinstance(v, int) and 100 <= v < 600:
++            return v
++    resp = getattr(e, "response", None)
++    v = getattr(resp, "status_code", None)
++    return v if isinstance(v, int) and 100 <= v < 600 else None
++
++
++def _is_transport_error(e: BaseException) -> bool:
++    """A network-level failure (refused, reset, dropped, timed out) that
++    carries no HTTP status of its own."""
++    try:
++        import httpx
++        if isinstance(e, httpx.TransportError):
++            return True
++    except ImportError:  # pragma: no cover
++        pass
++    return isinstance(e, (ConnectionError, TimeoutError))
++
++
++def _retry_class(exc: BaseException) -> Optional[str]:
++    """How a provider error may be retried: ``"full"`` (throttling, overload,
++    a server fault, a dropped connection), ``"once"`` (a timeout, or an error
++    LiteLLM could not classify), or ``None`` (a bad request, bad credentials,
++    an unknown model: no retry can fix those).
++
++    LiteLLM wraps whatever it cannot map in ``APIConnectionError`` with status
++    500, so the status the provider actually sent is looked for down the
++    ``__cause__`` chain first: on Bedrock a malformed or wrong API key arrives
++    as ``APIConnectionError`` 500 whose cause is a 403.
++    """
++    if litellm is not None:
++        timeout_cls = getattr(litellm, "Timeout", None)
++        if isinstance(timeout_cls, type) and isinstance(exc, timeout_cls):
++            return "once"
++        catch_all = tuple(c for c in (getattr(litellm, "APIConnectionError", None),
++                                      getattr(litellm, "APIError", None))
++                          if isinstance(c, type))
++        if catch_all and isinstance(exc, catch_all):
++            # LiteLLM's catch-all, the only case where the inner status
++            # decides: a mapped class (RateLimitError built from a
++            # "ThrottlingException" 400, say) already says what it is.
++            inner = [_http_status(e) for e in list(_chain(exc))[1:]]
++            for status in inner:
++                if status is not None:
++                    if 400 <= status < 500 and status not in (408, 429):
++                        return None
++                    break
++            # A real transport failure keeps the full budget, anything else
++            # gets one retry.
++            if any(_is_transport_error(e) for e in _chain(exc)):
++                return "full"
++            if any(st in _TRANSIENT_STATUS for st in inner if st is not None):
++                return "full"
++            return "once"
++        full = tuple(c for c in (
++            getattr(litellm, "RateLimitError", None),
++            getattr(litellm, "ServiceUnavailableError", None),
++            getattr(litellm, "InternalServerError", None),
++            getattr(litellm, "BadGatewayError", None),
++        ) if isinstance(c, type))
++        if full and isinstance(exc, full):
++            return "full"
++    if _http_status(exc) in _TRANSIENT_STATUS:
++        return "full"
++    return None
++
++
++def _is_transient(exc: BaseException) -> bool:
++    return _retry_class(exc) is not None
++
++
++def _response_headers(exc: BaseException):
++    """The provider's real response headers. LiteLLM puts them on
++    ``litellm_response_headers``; ``exc.response`` is a placeholder it builds
++    with empty headers."""
++    for e in _chain(exc):
++        h = getattr(e, "litellm_response_headers", None)
++        if h:
++            return h
++        resp = getattr(e, "response", None)
++        h = getattr(resp, "headers", None)
++        if h:
++            return h
++    return None
++
++
++def _retry_after_s(exc: BaseException) -> Optional[float]:
++    """The server's requested wait (``retry-after-ms`` or ``retry-after`` in
++    seconds), capped at the backoff ceiling; None when absent or an HTTP
++    date."""
++    headers = _response_headers(exc)
++    if not headers:
++        return None
++    try:
++        get = headers.get
++        ms = get("retry-after-ms") or get("Retry-After-Ms")
++        if ms is not None:
++            return max(0.0, min(float(ms) / 1000.0, _BACKOFF_CAP_S))
++        sec = get("retry-after") or get("Retry-After")
++        if sec is not None:
++            return max(0.0, min(float(sec), _BACKOFF_CAP_S))
++    except (TypeError, ValueError, AttributeError):
++        return None
++    return None
++
++
++def _backoff_s(attempt: int) -> float:
++    """Exponential with equal jitter: half the step fixed, half random, so N
++    workers throttled together do not come back together."""
++    import random
++    step = min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
++    return step / 2 + random.uniform(0, step / 2)
++
++
++def _jitter_retry_after(retry_after: float, attempt: int) -> float:
++    """Every worker throttled together gets the same Retry-After; a little
++    jitter on top keeps them from coming back in step."""
++    import random
++    step = min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
++    return retry_after + random.uniform(0, min(retry_after, step / 2))
++
++
++def _completion_with_retries(retries: Optional[int], **kwargs):
++    """``litellm.completion`` with SciLink's retry policy (see above).
++
++    Only creating a stream is retried; an error while iterating one is the
++    caller's (no SciLink caller streams today).
++    """
++    retries = llm_retries() if retries is None else max(0, int(retries))
++    kwargs["num_retries"] = 0
++    once_used = False
++    for attempt in range(retries + 1):
++        try:
++            return litellm.completion(**kwargs)
++        except Exception as exc:
++            kind = _retry_class(exc)
++            if attempt >= retries or kind is None:
++                raise
++            if kind == "once":
++                if once_used:
++                    raise
++                once_used = True
++            retry_after = _retry_after_s(exc)
++            delay = (_backoff_s(attempt) if retry_after is None
++                     else _jitter_retry_after(retry_after, attempt))
++            # Logged before sleeping and again after: under a turn's log
++            # handler a requested Stop raises on the next record, so it lands
++            # before the next attempt instead of after another provider call.
++            _logger.warning(
++                f"LLM call failed ({type(exc).__name__}, status "
++                f"{getattr(exc, 'status_code', '?')}); retry {attempt + 1}/{retries} "
++                f"in {delay:.1f}s")
++            time.sleep(delay)
++            _logger.info(f"Retrying the LLM call (attempt {attempt + 2} of {retries + 1}).")
++
++
+ def litellm_completion(*args, **kwargs):
+     """``litellm.completion`` with Bedrock-scoped param dropping and the
+     output ceiling #238 asks for.
+@@ -295,18 +505,25 @@ def litellm_completion(*args, **kwargs):
+         if _openai_tools_need_no_reasoning(model) and "reasoning_effort" not in kwargs:
+             kwargs["reasoning_effort"] = "none"
+     _scope_drop_params(model)
+-    kwargs.setdefault("num_retries", 4)   # retry transient provider errors w/ backoff
++    retries = kwargs.pop("num_retries", None)
++    if kwargs.get("timeout") is None:
++        kwargs["timeout"] = llm_timeout_s()
+     if ("max_tokens" not in kwargs
+             and str(model or "").startswith(("bedrock/", "anthropic/"))):
+         ceiling = _registered_max_output_tokens(model)
+         if ceiling:
+             kwargs["max_tokens"] = ceiling
++    if args:                                  # the model may be positional
++        kwargs.setdefault("model", args[0])
++        if len(args) > 1:
++            kwargs.setdefault("messages", args[1])
++        if len(args) > 2:
++            raise TypeError("litellm_completion takes at most model and messages positionally")
+     _t0 = time.perf_counter()
+-    response = litellm.completion(*args, **kwargs)
++    response = _completion_with_retries(retries, **kwargs)
+     # Every orchestrator chat loop comes through here: count it (and
+     # trace it when tracing is on) like the wrapper classes do.
+-    _record_trace(model, kwargs.get("messages") or (args[1] if len(args) > 1 else None),
+-                  response, time.perf_counter() - _t0)
++    _record_trace(model, kwargs.get("messages"), response, time.perf_counter() - _t0)
+     return response
+ 
+ 
+@@ -365,7 +582,7 @@ def __init__(
+         base_url: Optional[str] = None,
+         system_instruction: Optional[str] = None,
+         tools: Optional[List] = None,
+-        timeout: Optional[int] = 1200,
++        timeout: Optional[int] = None,
+     ):
+         """
+         Initialize the LiteLLM model.
+@@ -376,7 +593,8 @@ def __init__(
+             base_url: Optional custom API base URL
+             system_instruction: Default system message
+             tools: Default tools for function calling
+-            timeout: Request timeout in seconds (default: 1200)
++            timeout: Request timeout in seconds (default: ``llm_timeout_s()``,
++                1200 unless ``SCILINK_LLM_TIMEOUT_S`` says otherwise)
+         """
+         _check_litellm()
+ 
+@@ -385,7 +603,7 @@ def __init__(
+         self.base_url = base_url
+         self.system_instruction = system_instruction
+         self.tools = tools
+-        self.timeout = timeout
++        self.timeout = timeout if timeout is not None else llm_timeout_s()
+     
+     def generate_content(
+         self,
+@@ -425,18 +643,18 @@ def generate_content(
+         try:
+             _t0 = time.perf_counter()
+             _scope_drop_params(self.model)
+-            response = litellm.completion(
++            # Transient provider errors (throttling, overload, a server
++            # fault, a timeout) are retried with backoff, so a momentary
++            # hiccup during e.g. a verification call is not mistaken for a
++            # failed step (which would tag the iteration 0.0).
++            response = _completion_with_retries(
++                params.pop("num_retries", None),
+                 model=self.model,
+                 messages=messages,
+                 api_key=self.api_key,
+                 api_base=self.base_url,
+                 stream=stream,
+                 timeout=self.timeout,
+-                # Retry transient provider errors (Bedrock ServiceUnavailable /
+-                # InternalServer / RateLimit / Timeout) with LiteLLM's exponential
+-                # backoff, so a momentary hiccup during e.g. a verification call is
+-                # not mistaken for a failed step (which would tag the iteration 0.0).
+-                num_retries=params.pop("num_retries", 4),
+                 **params
+             )
+             
+@@ -796,12 +1014,14 @@ def send_message(
+         
+         _t0 = time.perf_counter()
+         _scope_drop_params(self._model.model)
+-        response = litellm.completion(
++        response = _completion_with_retries(
++            params.pop("num_retries", None),
+             model=self._model.model,
+             messages=messages,
+             api_key=self._model.api_key,
+             api_base=self._model.base_url,
+             stream=stream,
++            timeout=self._model.timeout,
+             **params
+         )
+         
+diff --git a/tests/test_litellm_completion_max_tokens.py b/tests/test_litellm_completion_max_tokens.py
+index 16b2c3c1..db450e2a 100644
+--- a/tests/test_litellm_completion_max_tokens.py
++++ b/tests/test_litellm_completion_max_tokens.py
+@@ -77,10 +77,13 @@ def fake_completion(*a, **kw):
+     assert seen.get("max_tokens", 0) > 4096
+ 
+ 
+-def test_retries_still_defaulted():
+-    """Pre-existing behaviour must survive the change."""
++def test_retries_are_scilinks_not_litellms():
++    """SciLink retries transient errors itself (tests/test_llm_retries.py), so
++    LiteLLM's no-wait constant retry is switched off, and every call carries a
++    per-attempt timeout."""
+     seen = _captured(model="gpt-4o", messages=[])
+-    assert seen["num_retries"] == 4
++    assert seen["num_retries"] == 0
++    assert seen["timeout"] == litellm_wrapper.LLM_TIMEOUT_S
+ 
+ 
+ def test_it_sends_exactly_what_the_registry_reports():
+diff --git a/tests/test_llm_retries.py b/tests/test_llm_retries.py
+new file mode 100644
+index 00000000..1d26eb58
+--- /dev/null
++++ b/tests/test_llm_retries.py
+@@ -0,0 +1,358 @@
++"""SciLink retries what a retry can fix, backs off with jitter, and bounds
++every attempt with a timeout.
++
++LiteLLM's ``num_retries`` uses its "constant_retry" strategy by default: no
++wait between attempts, and any openai.APIError is retried, a 400 or a 401
++included. A throttled provider was hit again at once, and N concurrent callers
++came back in step. The chat-session path had no retries or timeout at all, and
++``litellm_completion`` (every orchestrator chat loop) no timeout: LiteLLM's
++default is 6000 s.
++"""
++
++from unittest import mock
++
++import httpx
++import litellm
++import pytest
++
++from scilink.wrappers import litellm_wrapper as lw
++
++
++def _rate_limited(retry_after=None):
++    headers = {"retry-after": str(retry_after)} if retry_after is not None else {}
++    return litellm.RateLimitError(
++        message="throttled", llm_provider="bedrock", model="m",
++        response=httpx.Response(429, headers=headers, request=httpx.Request("POST", "http://x")))
++
++
++def _unavailable():
++    return litellm.ServiceUnavailableError(message="busy", llm_provider="bedrock", model="m")
++
++
++def _bad_request():
++    return litellm.BadRequestError(message="bad", model="m", llm_provider="bedrock")
++
++
++def _auth():
++    return litellm.AuthenticationError(message="no", llm_provider="bedrock", model="m")
++
++
++def _timeout():
++    return litellm.Timeout(message="slow", model="m", llm_provider="bedrock")
++
++
++class _Provider:
++    """Stands in for litellm.completion: raises the scripted errors, then answers."""
++
++    def __init__(self, *errors):
++        self.errors = list(errors)
++        self.calls = []
++
++    def __call__(self, **kwargs):
++        self.calls.append(kwargs)
++        if self.errors:
++            raise self.errors.pop(0)
++        return mock.MagicMock(usage=None, choices=[])
++
++
++@pytest.fixture
++def sleeps(monkeypatch):
++    waited = []
++    monkeypatch.setattr(lw.time, "sleep", waited.append)
++    return waited
++
++
++def _run(provider, **kw):
++    with mock.patch.object(lw.litellm, "completion", side_effect=provider):
++        return lw.litellm_completion(model="gpt-4o", messages=[], **kw)
++
++
++def test_transient_errors_are_retried_with_waits_between(sleeps):
++    p = _Provider(_rate_limited(), _unavailable())
++    _run(p)
++    assert len(p.calls) == 3
++    assert len(sleeps) == 2 and all(w > 0 for w in sleeps)
++
++
++def test_litellm_does_not_retry_on_top_and_every_attempt_has_a_timeout(sleeps):
++    p = _Provider(_unavailable())
++    _run(p)
++    assert all(c["num_retries"] == 0 for c in p.calls)
++    assert all(c["timeout"] == lw.LLM_TIMEOUT_S for c in p.calls)
++
++
++@pytest.mark.parametrize("err", [_bad_request, _auth], ids=["400", "401"])
++def test_errors_a_retry_cannot_fix_are_raised_at_once(err, sleeps):
++    p = _Provider(err())
++    with pytest.raises(type(err())):
++        _run(p)
++    assert len(p.calls) == 1 and sleeps == []
++
++
++def test_retry_after_is_honoured(sleeps):
++    _run(_Provider(_rate_limited(retry_after=7)))
++    assert len(sleeps) == 1 and 7.0 <= sleeps[0] <= 8.0     # the server's wait plus jitter
++
++
++def test_backoff_grows_and_is_jittered():
++    for attempt in range(6):
++        step = min(lw._BACKOFF_CAP_S, lw._BACKOFF_BASE_S * 2 ** attempt)
++        waits = {lw._backoff_s(attempt) for _ in range(50)}
++        assert all(step / 2 <= w <= step for w in waits)
++        assert len(waits) > 1                      # not in lockstep
++
++
++def test_the_budget_is_bounded_and_the_last_error_surfaces(sleeps):
++    p = _Provider(*[_unavailable() for _ in range(10)])
++    with pytest.raises(litellm.ServiceUnavailableError):
++        _run(p)
++    assert len(p.calls) == lw.LLM_RETRIES + 1
++
++
++def test_a_timeout_is_retried_once_not_the_whole_budget(sleeps):
++    p = _Provider(_timeout(), _timeout(), _timeout())
++    with pytest.raises(litellm.Timeout):
++        _run(p)
++    assert len(p.calls) == 2
++
++
++def test_a_caller_can_turn_retries_off_or_set_its_own_timeout(sleeps):
++    p = _Provider(_unavailable())
++    with pytest.raises(litellm.ServiceUnavailableError):
++        _run(p, num_retries=0)
++    assert len(p.calls) == 1
++    p = _Provider()
++    _run(p, timeout=30)
++    assert p.calls[0]["timeout"] == 30
++
++
++def test_generate_content_uses_the_same_policy(sleeps, monkeypatch):
++    model = lw.LiteLLMGenerativeModel("gpt-4o", timeout=99)
++    monkeypatch.setattr(model, "_to_legacy_response", lambda r: r)
++    p = _Provider(_rate_limited(), _bad_request())
++    with mock.patch.object(lw.litellm, "completion", side_effect=p):
++        with pytest.raises(litellm.BadRequestError):
++            model.generate_content("hi")
++    assert len(p.calls) == 2 and p.calls[0]["timeout"] == 99 and p.calls[0]["num_retries"] == 0
++
++
++def test_the_chat_session_path_now_retries_and_times_out(sleeps, monkeypatch):
++    model = lw.LiteLLMGenerativeModel("gpt-4o", timeout=42)
++    monkeypatch.setattr(model, "_to_legacy_response", lambda r: mock.MagicMock(text="ok"))
++    chat = model.start_chat()
++    p = _Provider(_unavailable())
++    with mock.patch.object(lw.litellm, "completion", side_effect=p):
++        chat.send_message("hi")
++    assert len(p.calls) == 2 and p.calls[0]["timeout"] == 42
++
++
++# ── review follow-ups ─────────────────────────────────────────────────────
++
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++
++class _FakeOpenAI:
++    """An OpenAI-compatible endpoint that answers 429 (with the given
++    headers) a set number of times, then succeeds: the exception reaches
++    SciLink exactly as LiteLLM raises it, not hand-built."""
++
++    def __init__(self, n_429=1, headers=None):
++        self.left, self.headers, self.hits = n_429, headers or {}, 0
++        server = self
++
++        class H(BaseHTTPRequestHandler):
++            def do_POST(self):
++                server.hits += 1
++                self.rfile.read(int(self.headers.get("Content-Length", 0)))
++                if server.left > 0:
++                    server.left -= 1
++                    body = json.dumps({"error": {"message": "slow down", "type": "rate_limit"}}).encode()
++                    self.send_response(429)
++                    for k, v in server.headers.items():
++                        self.send_header(k, v)
++                else:
++                    body = json.dumps({
++                        "id": "x", "object": "chat.completion", "created": 0, "model": "m",
++                        "choices": [{"index": 0, "finish_reason": "stop",
++                                     "message": {"role": "assistant", "content": "ok"}}],
++                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
++                    self.send_response(200)
++                self.send_header("Content-Type", "application/json")
++                self.send_header("Content-Length", str(len(body)))
++                self.end_headers()
++                self.wfile.write(body)
++
++            def log_message(self, *a):
++                pass
++
++        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
++        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}/v1"
++        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
++
++    def close(self):
++        self.httpd.shutdown()
++        self.httpd.server_close()
++
++
++@pytest.mark.parametrize("headers, lo, hi", [
++    ({"retry-after": "3"}, 3.0, 6.0),
++    ({"retry-after-ms": "1500"}, 1.5, 3.0),
++])
++def test_retry_after_from_a_real_litellm_429_is_honoured(sleeps, headers, lo, hi):
++    srv = _FakeOpenAI(n_429=1, headers=headers)
++    try:
++        lw.litellm_completion(model="openai/gpt-4o", api_base=srv.base, api_key="k",
++                              messages=[{"role": "user", "content": "hi"}])
++    finally:
++        srv.close()
++    assert srv.hits == 2
++    assert len(sleeps) == 1 and lo <= sleeps[0] <= hi       # the server's wait, plus jitter
++
++
++class _Status(Exception):
++    def __init__(self, status):
++        super().__init__(f"HTTP {status}")
++        self.status_code = status
++
++
++def _raised_from(outer, inner):
++    try:
++        try:
++            raise inner
++        except Exception as e:
++            raise outer from e
++    except Exception as exc:
++        return exc
++
++
++def test_bad_bedrock_credentials_under_a_connection_error_are_not_retried(sleeps):
++    """On Bedrock a malformed or wrong API key arrives as APIConnectionError
++    500 whose cause is a 403."""
++    err = _raised_from(litellm.APIConnectionError(message="Invalid API Key format", llm_provider="bedrock",
++                                                  model="m"), _Status(403))
++    p = _Provider(err)
++    with pytest.raises(litellm.APIConnectionError):
++        _run(p)
++    assert len(p.calls) == 1 and sleeps == []
++
++
++def test_a_dropped_connection_keeps_the_full_budget(sleeps):
++    import httpx
++    errs = [_raised_from(litellm.APIConnectionError(message="Server disconnected", llm_provider="bedrock",
++                                                    model="m"), httpx.RemoteProtocolError("disconnected"))
++            for _ in range(3)]
++    p = _Provider(*errs)
++    _run(p)
++    assert len(p.calls) == 4
++
++
++def test_an_unclassified_connection_error_gets_one_retry(sleeps):
++    errs = [litellm.APIConnectionError(message="something odd", llm_provider="bedrock", model="m")
++            for _ in range(3)]
++    p = _Provider(*errs)
++    with pytest.raises(litellm.APIConnectionError):
++        _run(p)
++    assert len(p.calls) == 2
++
++
++@pytest.mark.parametrize("make", [
++    lambda: litellm.ContextWindowExceededError(message="too long", model="m", llm_provider="bedrock"),
++    lambda: litellm.ContentPolicyViolationError(message="policy", model="m", llm_provider="bedrock"),
++    lambda: litellm.NotFoundError(message="no model", model="m", llm_provider="bedrock"),
++    lambda: litellm.UnsupportedParamsError(message="bad param", model="m", llm_provider="bedrock"),
++], ids=["context_window", "content_policy", "not_found", "unsupported_params"])
++def test_litellms_final_errors_are_not_retried(make, sleeps):
++    p = _Provider(make())
++    with pytest.raises(Exception):
++        _run(p)
++    assert len(p.calls) == 1
++
++
++def test_an_overloaded_529_is_retried(sleeps):
++    p = _Provider(_Status(529))
++    _run(p)
++    assert len(p.calls) == 2
++
++
++def test_a_stop_during_the_wait_lands_before_the_next_attempt(monkeypatch):
++    """The warning before the wait is not enough: the Stop can arrive during
++    it. The record logged after the wait raises it before another call."""
++    import io
++    import logging
++    from types import SimpleNamespace
++    from scilink.server.runner import turn_log_handler
++    from scilink.ui.output_capture import AgentStoppedError
++    cap = SimpleNamespace(log_stream=io.StringIO(), stop_requested=False)
++    handler = turn_log_handler(cap, threading.get_ident())
++    root = logging.getLogger()
++    old_level = root.level
++    old_disable = logging.root.manager.disable     # other test files disable logging at import
++    logging.disable(logging.NOTSET)
++    root.addHandler(handler)
++    root.setLevel(logging.INFO)
++    monkeypatch.setattr(lw.time, "sleep", lambda s: setattr(cap, "stop_requested", True))
++    p = _Provider(_unavailable(), _unavailable())
++    try:
++        with pytest.raises(AgentStoppedError):
++            _run(p)
++    finally:
++        root.removeHandler(handler)
++        root.setLevel(old_level)
++        logging.disable(old_disable)
++    assert len(p.calls) == 1
++
++
++def test_timeout_and_retries_can_be_set_from_the_environment(sleeps, monkeypatch):
++    monkeypatch.setenv("SCILINK_LLM_TIMEOUT_S", "45")
++    monkeypatch.setenv("SCILINK_LLM_RETRIES", "1")
++    p = _Provider(_unavailable(), _unavailable())
++    with pytest.raises(litellm.ServiceUnavailableError):
++        _run(p)
++    assert len(p.calls) == 2 and p.calls[0]["timeout"] == 45.0
++    assert lw.LiteLLMGenerativeModel("gpt-4o").timeout == 45.0
++
++
++def test_num_retries_none_means_the_default(sleeps):
++    p = _Provider(_unavailable())
++    _run(p, num_retries=None)
++    assert len(p.calls) == 2
++
++
++def test_a_throttle_litellm_mapped_from_a_400_is_still_retried(sleeps):
++    """LiteLLM maps some throttles by their text: a Bedrock 400 carrying
++    'ThrottlingException' becomes RateLimitError 429 whose cause is the 400.
++    The mapped class decides, not the inner status."""
++    err = _raised_from(_rate_limited(), _Status(400))
++    p = _Provider(err, _raised_from(_rate_limited(), _Status(400)))
++    _run(p)
++    assert len(p.calls) == 3
++
++
++def test_an_unrelated_exception_being_handled_does_not_decide(sleeps):
++    """A call made while handling some other exception carries it as
++    __context__; a Timeout there is still retried once, not made final."""
++    def timeout_while_handling():
++        try:
++            raise _Status(404)                      # unrelated, e.g. a lookup that failed
++        except _Status:
++            return _raised_in_handler(_timeout())
++
++    p = _Provider(timeout_while_handling(), _timeout())
++    with pytest.raises(litellm.Timeout):
++        _run(p)
++    assert len(p.calls) == 2
++
++
++def _raised_in_handler(exc):
++    try:
++        raise exc
++    except Exception as e:
++        return e
++
++
++def test_the_bedrock_bad_key_chain_is_still_final(sleeps):
++    err = _raised_from(litellm.APIConnectionError(message="Invalid API Key format", llm_provider="bedrock",
++                                                  model="m"), _Status(403))
++    assert lw._retry_class(err) is None

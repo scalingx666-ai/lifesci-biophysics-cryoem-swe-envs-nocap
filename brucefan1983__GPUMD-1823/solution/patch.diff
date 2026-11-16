@@ -1,0 +1,353 @@
+diff --git a/doc/bibliography.rst b/doc/bibliography.rst
+index c4b5af2dc..612bafd1c 100644
+--- a/doc/bibliography.rst
++++ b/doc/bibliography.rst
+@@ -70,6 +70,12 @@ Bibliography
+    | J. Phys.: Condens. Matter **18**, 4527 (2006)
+    | DOI: `10.1088/0953-8984/18/19/008 <https://doi.org/10.1088/0953-8984/18/19/008>`_
+ 
++.. [Deserno1998]
++   | Markus Deserno and Christian Holm
++   | *How to mesh up Ewald sums. II. An accurate error estimate for the particle–particle–particle-mesh algorithm*
++   | J. Chem. Phys. **109**, 7694 (1998)
++   | DOI: `10.1063/1.477415 <https://doi.org/10.1063/1.477415>`_
++
+ .. [Drautz2019]
+    | Ralf Drautz
+    | *Atomic cluster expansion for accurate and transferable interatomic potentials*
+diff --git a/doc/gpumd/input_parameters/kspace.rst b/doc/gpumd/input_parameters/kspace.rst
+index a466d2f9a..ffcd79068 100644
+--- a/doc/gpumd/input_parameters/kspace.rst
++++ b/doc/gpumd/input_parameters/kspace.rst
+@@ -17,13 +17,25 @@ Syntax
+ 
+ The default method is ``pppm`` (particle-particle particle-mesh).
+ Its optional ``spacing`` parameter sets the maximum mesh spacing in Angstrom
+-(default: 1.0; allowed range: 0.2 to 2.0, inclusive).
++(allowed range: 0.2 to 2.0, inclusive).
+ Smaller values give finer meshes at a higher computational cost.
+ 
++The default spacing is :math:`\min(1, r_c^R/6)` Angstrom,
++where :math:`r_c^R` is the radial cutoff of the model in Angstrom.
++The Ewald splitting parameter is :math:`\alpha = \pi/r_c^R`.
++The PPPM error grows with the product of :math:`\alpha` and the spacing.
++The default spacing keeps this product at or below :math:`\pi/6`.
++
+ The mesh is chosen automatically and grows as needed when the box changes.
+ It does not shrink. The actual spacing may be smaller than the requested value.
+ 
+-Specify ``kspace`` at most once in ``run.in``, before the first ``run``.
++At the first force evaluation, GPUMD prints the mesh
++and an estimate of the root-mean-square error of the PPPM forces relative to the Ewald sum [Deserno1998]_.
++The estimate uses the charges of that step and assumes that they are randomly distributed.
++For a crystal, the actual error can be smaller by an order of magnitude or more.
++
++Specify ``kspace`` at most once in ``run.in``.
++The setting applies to every ``run``, wherever the line appears in ``run.in``.
+ 
+ Example
+ -------
+diff --git a/src/force/nep_charge.cu b/src/force/nep_charge.cu
+index cb150d3d9..6fbfa419f 100644
+--- a/src/force/nep_charge.cu
++++ b/src/force/nep_charge.cu
+@@ -49,6 +49,8 @@ const std::string ELEMENTS[NUM_ELEMENTS] = {
+ 
+ void NEP_Charge::check_ewald_pppm(const RunInput& run_input)
+ {
++  // With alpha = pi / rc_radial, the default spacing keeps alpha * spacing at or below pi / 6.
++  pppm_spacing = std::fmin(1.0, paramb.rc_radial / 6.0);
+   for (const auto& line : run_input.lines()) {
+     const std::vector<std::string>& tokens = line.tokens;
+     if (!tokens.empty() && tokens[0] == "kspace") {
+diff --git a/src/force/nep_charge.cuh b/src/force/nep_charge.cuh
+index 72534ce32..dd71fc054 100644
+--- a/src/force/nep_charge.cuh
++++ b/src/force/nep_charge.cuh
+@@ -183,7 +183,7 @@ private:
+   bool need_bec = false;
+   void check_need_bec(const RunInput& run_input);
+   bool use_pppm = true; // use PPPM by default
+-  double pppm_spacing = 1.0;
++  double pppm_spacing;
+   void check_ewald_pppm(const RunInput& run_input);
+   bool has_dftd3 = false;
+   void initialize_dftd3(const RunInput& run_input);
+diff --git a/src/force/pppm.cu b/src/force/pppm.cu
+index 4ba05a52c..8152d28e1 100644
+--- a/src/force/pppm.cu
++++ b/src/force/pppm.cu
+@@ -24,6 +24,7 @@ The k-space part of the PPPM method.
+ #include <cmath>
+ #include <cstdio>
+ #include <iostream>
++#include <vector>
+ 
+ namespace{
+ 
+@@ -623,7 +624,6 @@ void PPPM::find_para(const int N, const Box& box)
+   const float two_pi = 6.2831853f;
+   const double volume = box.get_volume();
+   para.two_pi_over_V = two_pi / volume;
+-  const bool first_mesh = !plan_initialized;
+   for (int d = 0; d < 3; ++d) {
+     const double required = volume / box.get_area(d) / mesh_spacing;
+     if (required > para.K[d]) {
+@@ -641,14 +641,6 @@ void PPPM::find_para(const int N, const Box& box)
+     para.K0K1K2 = static_cast<int>(number_of_points);
+     allocate_memory();
+   }
+-  if (first_mesh) {
+-    printf(
+-      "PPPM mesh: %d x %d x %d (target spacing %.17g A; actual spacing %.17g %.17g %.17g A).\n",
+-      para.K[0], para.K[1], para.K[2], mesh_spacing,
+-      volume / box.get_area(0) / para.K[0],
+-      volume / box.get_area(1) / para.K[1],
+-      volume / box.get_area(2) / para.K[2]);
+-  }
+   para.potential_factor = K_C_SP / N;
+   for (int d = 0; d < 3; ++d) {
+     para.b[0][d] = two_pi * (float)box.cpu_h[9 + d];
+@@ -657,6 +649,56 @@ void PPPM::find_para(const int N, const Box& box)
+   }
+ }
+ 
++void PPPM::print_mesh(const int N1, const int N2, const Box& box, const GPU_Vector<float>& charge)
++{
++  const double volume = box.get_volume();
++  printf(
++    "PPPM mesh: %d x %d x %d (target spacing %.17g A; actual spacing %.17g %.17g %.17g A).\n",
++    para.K[0],
++    para.K[1],
++    para.K[2],
++    mesh_spacing,
++    volume / box.get_area(0) / para.K[0],
++    volume / box.get_area(1) / para.K[1],
++    volume / box.get_area(2) / para.K[2]);
++
++  // Root-mean-square force error for ik differentiation and five-point charge assignment
++  // with the optimal influence function, Eq. (38) of M. Deserno and C. Holm, JCP 109, 7694 (1998).
++  // The coefficients are a_m^(5) of Table II therein.
++  // Eq. (38) holds for a cubic box. Here it is evaluated per direction with the thickness of the
++  // cell as L, and the root mean square of the three values is reported.
++  const double coefficients[5] = {
++    1.0 / 23232.0,
++    7601.0 / 13628160.0,
++    143.0 / 69120.0,
++    517231.0 / 106536960.0,
++    106640677.0 / 11737571328.0};
++  const int number_of_charges = N2 - N1;
++  std::vector<float> q(number_of_charges);
++  CHECK(gpuMemcpy(
++    q.data(), charge.data() + N1, sizeof(float) * number_of_charges, gpuMemcpyDeviceToHost));
++  double sum_of_squared_charges = 0.0;
++  for (const float q_i : q) {
++    sum_of_squared_charges += double(q_i) * q_i;
++  }
++  const double alpha = para.alpha;
++  double squared_error = 0.0;
++  for (int d = 0; d < 3; ++d) {
++    const double thickness = volume / box.get_area(d);
++    const double h_alpha = thickness / para.K[d] * alpha;
++    double sum = 0.0;
++    for (int m = 0; m < 5; ++m) {
++      sum += coefficients[m] * std::pow(h_alpha, 2 * m);
++    }
++    const double error =
++      K_C_SP * sum_of_squared_charges * std::pow(h_alpha, 5) *
++      std::sqrt(alpha * thickness * std::sqrt(2.0 * PI) * sum / number_of_charges) /
++      (thickness * thickness);
++    squared_error += error * error;
++  }
++  printf("PPPM force error estimate: %.3e eV/A.\n", std::sqrt(squared_error / 3.0));
++}
++
+ void PPPM::find_force(
+   const int N,
+   const int N1,
+@@ -669,7 +711,11 @@ void PPPM::find_force(
+   GPU_Vector<double>& virial_per_atom,
+   GPU_Vector<double>& potential_per_atom)
+ {
++  const bool first_mesh = !plan_initialized;
+   find_para(N, box);
++  if (first_mesh) {
++    print_mesh(N1, N2, box, charge);
++  }
+ 
+   find_k_and_G_opt<<<(para.K0K1K2 - 1) / 64 + 1, 64>>>(
+     para, 
+diff --git a/src/force/pppm.cuh b/src/force/pppm.cuh
+index afe1c3755..6824abe57 100644
+--- a/src/force/pppm.cuh
++++ b/src/force/pppm.cuh
+@@ -70,6 +70,7 @@ private:
+   void destroy_plans();
+   void allocate_memory();
+   void find_para(const int N, const Box& box);
++  void print_mesh(const int N1, const int N2, const Box& box, const GPU_Vector<float>& charge);
+ 
+   bool need_peratom_virial = false;
+   GPU_Vector<gpufftComplex> mesh_virial;
+diff --git a/tests_pytest/test_kspace_consistency.py b/tests_pytest/test_kspace_consistency.py
+index 1706c0ad4..7b78e453e 100644
+--- a/tests_pytest/test_kspace_consistency.py
++++ b/tests_pytest/test_kspace_consistency.py
+@@ -14,9 +14,13 @@
+ existing bulk_water and bulk_perovskite fixtures, plus a larger supercell built by tiling
+ bulk_perovskite further (no new fixture file needed).
+ """
++import re
++import subprocess
++
+ import numpy as np
+ import pytest
+ from calorine.calculators import GPUNEP
++from calorine.gpumd import write_xyz
+ 
+ from conftest import MODELS_DIR, approx_tol, make_bulk_perovskite, make_bulk_water
+ 
+@@ -72,3 +76,74 @@ def test_pppm_agrees_with_ewald(structure_name, model_type, gpumd_command):
+ 
+     assert energy_pppm == approx_tol(energy_ewald, PPPM_VS_EWALD_ENERGY_TOLERANCE)
+     assert np.allclose(forces_pppm, forces_ewald, **PPPM_VS_EWALD_FORCE_TOLERANCE)
++
++
++def _run_gpumd(directory, model_path, atoms, kspace_before_run, kspace_after_run, gpumd_command):
++    write_xyz(str(directory / 'model.xyz'), atoms)
++    lines = [f'potential {model_path}']
++    lines += [f'kspace {kspace_before_run}'] if kspace_before_run else []
++    lines += ['ensemble nve', 'time_step 1', 'run 1']
++    lines += [f'kspace {kspace_after_run}'] if kspace_after_run else []
++    (directory / 'run.in').write_text('\n'.join(lines) + '\n')
++    result = subprocess.run(
++        [gpumd_command], cwd=directory, capture_output=True, text=True, check=False
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++    return result.stdout
++
++
++def _pppm_target_spacing(directory, rc_radial, kspace_before_run, kspace_after_run, gpumd_command):
++    model_text = (MODELS_DIR / 'qnep_mode1_water.txt').read_text()
++    model_path = directory / 'nep.txt'
++    model_path.write_text(model_text.replace('cutoff 4 4 ', f'cutoff {rc_radial} 4 ', 1))
++    stdout = _run_gpumd(
++        directory, model_path, make_bulk_water(), kspace_before_run, kspace_after_run,
++        gpumd_command
++    )
++    return float(re.search(r'PPPM mesh: .*\(target spacing (\S+) A', stdout).group(1))
++
++
++# The default spacing is min(1, rc_radial / 6) A.
++# With alpha = pi / rc_radial, it keeps the product of alpha and the spacing at or below pi / 6.
++@pytest.mark.parametrize(
++    'rc_radial, kspace_before_run, kspace_after_run, expected_spacing',
++    [
++        (4, None, None, 4 / 6),
++        (4, 'pppm', None, 4 / 6),
++        (6, 'pppm', None, 1.0),
++        (8, 'pppm', None, 1.0),
++        (4, 'pppm 0.9', None, 0.9),
++        (4, None, 'pppm 0.9', 0.9),
++    ],
++    ids=['absent_rc4', 'default_rc4', 'default_rc6', 'default_rc8', 'explicit', 'explicit_late'],
++)
++def test_pppm_spacing(
++    tmp_path, gpumd_command, rc_radial, kspace_before_run, kspace_after_run, expected_spacing
++):
++    spacing = _pppm_target_spacing(
++        tmp_path, rc_radial, kspace_before_run, kspace_after_run, gpumd_command
++    )
++    assert spacing == pytest.approx(expected_spacing, rel=1e-12)
++
++
++# The ratio of the estimate to the root-mean-square force difference is 0.97, 1.13 and 1.20
++# at spacings of 0.5, 0.7 and 1.0 A for this water box of 1701 atoms.
++PPPM_FORCE_ERROR_ESTIMATE_TOLERANCE = 0.25
++
++
++@pytest.mark.parametrize('spacing', [0.5, 0.7, 1.0])
++def test_pppm_force_error_estimate(tmp_path, gpumd_command, spacing):
++    atoms = make_bulk_water().repeat(3)
++    model_path = MODELS_DIR / 'qnep_mode1_water.txt'
++    stdout = _run_gpumd(tmp_path, model_path, atoms, f'pppm {spacing}', None, gpumd_command)
++    estimate = float(re.search(r'PPPM force error estimate: (\S+) eV/A', stdout).group(1))
++
++    forces = {}
++    for kspace in [f'pppm {spacing}', 'ewald']:
++        calc = GPUNEP(str(model_path), command=gpumd_command)
++        calc.single_point_parameters = calc.single_point_parameters + [('kspace', kspace)]
++        atoms.calc = calc
++        forces[kspace] = atoms.get_forces()
++    difference = forces[f'pppm {spacing}'] - forces['ewald']
++    rms_difference = np.sqrt(np.mean(np.sum(difference**2, axis=1)))
++    assert estimate == pytest.approx(rms_difference, rel=PPPM_FORCE_ERROR_ESTIMATE_TOLERANCE)
+diff --git a/tests_regression/pppm_checks.py b/tests_regression/pppm_checks.py
+index e9890f9e7..c799c341b 100644
+--- a/tests_regression/pppm_checks.py
++++ b/tests_regression/pppm_checks.py
+@@ -12,6 +12,7 @@
+     rf"PPPM mesh: (\d+) x (\d+) x (\d+) \(target spacing ({NUMBER}) A; "
+     rf"actual spacing ({NUMBER}) ({NUMBER}) ({NUMBER}) A\)\."
+ )
++ESTIMATE = re.compile(rf"PPPM force error estimate: ({NUMBER}) eV/A\.")
+ 
+ 
+ def validate_spec(spec):
+@@ -44,12 +45,17 @@ def good_size(n):
+ def check(spec, result):
+     text = Path(result["stdout_path"]).read_text(encoding="utf-8")
+     initial = []
++    estimates = []
+     for line in text.splitlines():
+         if line.startswith("PPPM "):
+             match = INITIAL.fullmatch(line)
+-            if not match:
++            estimate = ESTIMATE.fullmatch(line)
++            if match:
++                initial.append(match.groups())
++            elif estimate and len(initial) == 1 and not estimates:
++                estimates.append(float(estimate.group(1)))
++            else:
+                 raise ValueError("unexpected or malformed PPPM mesh output")
+-            initial.append(match.groups())
+     expected = spec["initial_mesh"]
+     if expected is None:
+         if initial:
+@@ -57,6 +63,8 @@ def check(spec, result):
+         return {"initial_mesh": None}
+     if len(initial) != 1:
+         raise ValueError(f"expected one initial mesh line, got {len(initial)}")
++    if not all(math.isfinite(e) and e >= 0 for e in estimates):
++        raise ValueError("invalid PPPM force error estimate")
+     mesh = [int(x) for x in initial[0][:3]]
+     spacing = float(initial[0][3])
+     actual = [float(x) for x in initial[0][4:]]
+diff --git a/tests_regression/test_pppm_checks.py b/tests_regression/test_pppm_checks.py
+index bf0f9367b..cdfabccbe 100644
+--- a/tests_regression/test_pppm_checks.py
++++ b/tests_regression/test_pppm_checks.py
+@@ -6,6 +6,7 @@
+ 
+ 
+ INITIAL = "PPPM mesh: 16 x 16 x 16 (target spacing 1 A; actual spacing 0.99375 0.5 0.5 A).\n"
++ESTIMATE = "PPPM force error estimate: 1.234e-04 eV/A.\n"
+ 
+ 
+ class PPPMCheckTests(unittest.TestCase):
+@@ -23,6 +24,15 @@ def check(self, text):
+     def test_initial_mesh(self):
+         self.assertEqual(self.check(INITIAL), {"initial_mesh": [16, 16, 16]})
+ 
++    def test_force_error_estimate(self):
++        self.assertEqual(self.check(INITIAL + ESTIMATE), {"initial_mesh": [16, 16, 16]})
++        with self.assertRaisesRegex(ValueError, "unexpected"):
++            self.check(ESTIMATE + INITIAL)
++        with self.assertRaisesRegex(ValueError, "unexpected"):
++            self.check(INITIAL + ESTIMATE + ESTIMATE)
++        with self.assertRaisesRegex(ValueError, "invalid PPPM force error"):
++            self.check(INITIAL + ESTIMATE.replace("1.234e-04", "-1.234e-04"))
++
+     def test_unexpected_intermediate_mesh_output_fails(self):
+         with self.assertRaisesRegex(ValueError, "unexpected"):
+             self.check(INITIAL + "PPPM mesh update: 18 x 16 x 16\n")

@@ -1,0 +1,761 @@
+diff --git a/kinisi/diffusion.py b/kinisi/diffusion.py
+index b7ba792..b06a1f8 100644
+--- a/kinisi/diffusion.py
++++ b/kinisi/diffusion.py
+@@ -98,7 +98,7 @@ def bayesian_regression(
+         cond_max: float = 1e16,
+         recondition: bool = False,
+         check_consistency: bool = True,
+-        warn_threshold: float = 0.7,
++        z_threshold: float = 3.0,
+         fit_intercept: bool = True,
+         n_samples: int = 1000,
+         n_walkers: int = 32,
+@@ -113,8 +113,8 @@ def bayesian_regression(
+         :param start_dt: The time at which the diffusion regime begins.
+         :param cond_max: The maximum condition number of the covariance matrix. Optional, default is :py:attr:`1e16`.
+         :param recondition: Whether to recondition the covariance matrix. Optional, default is :py:attr:`False`.
+-        :param check_consistency: Whether to compare the fitted gradient against an ordinary least squares estimate and warn if they disagree. Optional, default is :py:attr:`True`.
+-        :param warn_threshold: The ratio below which a warning is raised. Optional, default is :py:attr:`0.7`.
++        :param check_consistency: Whether to compare the generalised least squares gradient against an ordinary least squares estimate and warn if they disagree by more than the noise in the data allows, if the covariance matrix is too close to singular for the comparison, or if the data show no increase. Optional, default is :py:attr:`True`.
++        :param z_threshold: The magnitude of the consistency statistic, :py:attr:`consistency_z`, above which a warning is raised. Optional, default is :py:attr:`3.0`.
+         :param fit_intercept: Whether to fit an intercept. Optional, default is :py:attr:`True`.
+         :param n_samples: The number of MCMC samples to take. Optional, default is :py:attr:`1000`.
+         :param n_walkers: The number of walkers to use in the MCMC. Optional, default is :py:attr:`32`.
+@@ -122,6 +122,9 @@ def bayesian_regression(
+         :param n_thin: The thinning factor for the MCMC samples. Optional, default is :py:attr:`10`.
+         :param progress: Whether to show the progress bar. Optional, default is :py:attr:`True`.
+         :param random_state: The random state to use for the MCMC. Optional, default is :py:attr:`None`.
++
++        :raises ValueError: If :py:attr:`start_dt` leaves fewer than two time intervals, or the mean-squared
++            displacements from :py:attr:`start_dt` onwards are not all finite.
+         """
+         if random_state is not None:
+             np.random.seed(random_state.get_state()[1][1])
+@@ -129,12 +132,21 @@ def bayesian_regression(
+         self._start_dt = sc.to_unit(start_dt, self.dg['da'].coords['time interval'].unit)
+         self._cond_max = cond_max
+         self._recondition = recondition
++        self._consistency_ratio = None
++        self._consistency_z = None
+ 
+         self.diff_regime = self._diff_regime_index()
+         self._covariance_matrix = self.compute_covariance_matrix()
+ 
+         x_values = self.dg['da'].coords['time interval'][self.diff_regime :].values
+         y_values = self.dg['da']['time interval', self.diff_regime :].values
++        if x_values.size < 2:
++            raise ValueError(
++                f'start_dt ({self._start_dt.value} {self._start_dt.unit}) leaves only one time interval, but at '
++                'least two are needed for the fit.'
++            )
++        if not np.all(np.isfinite(y_values)):
++            raise ValueError('The mean-squared displacements from start_dt onwards are not all finite.')
+ 
+         _, logdet = np.linalg.slogdet(self._covariance_matrix.values)
+         logdet += np.log(2 * np.pi) * y_values.size
+@@ -155,6 +167,23 @@ def log_likelihood(theta: np.ndarray) -> float:
+ 
+         ols = linregress(x_values, y_values)
+         self._ols_gradient = ols.slope
++
++        if check_consistency:
++            if not ols.slope > 0:
++                warnings.warn(
++                    f'The ordinary least squares gradient is {ols.slope:.3e}, which is not positive. The data '
++                    'show no increase over the fitted time intervals, and the diffusion coefficient may be '
++                    'unreliable. Consider whether start_dt lies within the diffusive regime.',
++                    UserWarning,
++                    stacklevel=2,
++                )
++            gls_gradient, ols_gradient, gls_variance, ols_variance = _gradient_estimates(
++                x_values, y_values, self._covariance_matrix.values, fit_intercept
++            )
++            self._consistency_z = _check_consistency(
++                gls_gradient, ols_gradient, gls_variance, ols_variance, z_threshold
++            )
++
+         slope = ols.slope
+         intercept = 1e-20
+         if slope < 0:
+@@ -182,8 +211,8 @@ def log_likelihood(theta: np.ndarray) -> float:
+         else:
+             self.intercept = None
+ 
+-        if check_consistency:
+-            self._check_consistency(warn_threshold)
++        if check_consistency and ols_gradient > 0:
++            self._consistency_ratio = np.median(self.gradient.values) / ols_gradient
+ 
+     def _diff_regime_index(self) -> int:
+         """
+@@ -202,52 +231,37 @@ def _diff_regime_index(self) -> int:
+             )
+         return indices[0][0]
+ 
+-    def _check_consistency(self, warn_threshold: float = 0.7):
++    @property
++    def consistency_ratio(self) -> float:
+         """
+-        Compare the fitted gradient against an ordinary least squares estimate of the same data.
++        The ratio of the median fitted gradient to an ordinary least squares estimate of the same straight
++        line, with or without an intercept as fitted.
+ 
+-        The generalised least squares fit performed by :py:func:`bayesian_regression` weights the
+-        observations by the inverse of an estimated covariance matrix. Where sampling noise has
+-        made that matrix numerically singular, the inversion can return a gradient in error by
+-        several orders of magnitude without any other indication of failure.
++        This is for information only: how far the ratio can stray from unity by chance depends on the
++        noise in the data, so the warning raised by the consistency check uses :py:attr:`consistency_z`
++        instead. :py:attr:`None` if the check has not been run or the ordinary least squares gradient is
++        not positive.
+ 
+-        An ordinary least squares fit to the same observations does not use the covariance and so
+-        cannot be affected in the same way. It is a less precise estimator, but a robust one, and
+-        a large disagreement between the two is evidence that the covariance is unreliable rather
+-        than that the data are unusual.
+-
+-        :param warn_threshold: The ratio of the fitted gradient to the ordinary least squares
+-            gradient below which a warning is raised. Optional, default is :py:attr:`0.7`.
++        :return: The ratio of the two gradient estimates.
+         """
+-        if getattr(self, '_ols_gradient', None) is None or self._ols_gradient <= 0:
+-            return
+-
+-        ratio = np.median(self.gradient.values) / self._ols_gradient
+-        self._consistency_ratio = ratio
+-
+-        if ratio < warn_threshold:
+-            warnings.warn(
+-                f'The fitted gradient is {ratio:.3f} times the ordinary least squares estimate. '
+-                'A ratio this low indicates that the covariance matrix may be numerically '
+-                'singular and that the diffusion coefficient may be unreliable. Consider '
+-                'refitting with recondition=True, or inspecting the eigenvalues of '
+-                'Diffusion.covariance_matrix.',
+-                UserWarning,
+-                stacklevel=3,
+-            )
++        return getattr(self, '_consistency_ratio', None)
+ 
+     @property
+-    def consistency_ratio(self) -> float:
++    def consistency_z(self) -> float:
+         """
+-        The ratio of the fitted gradient to an ordinary least squares estimate of the same data.
++        The difference between the generalised and ordinary least squares gradients of the fitted data,
++        divided by the standard deviation of that difference expected from the covariance matrix.
+ 
+-        A value near unity indicates the two estimators agree. A value well below unity indicates
+-        that the covariance-weighted fit has been affected by a numerically singular covariance
+-        matrix. :py:attr:`None` if the check has not been run.
++        If the covariance matrix is correct and a straight line describes the data, this follows approximately
++        a standard normal distribution, so a magnitude well above three indicates that the covariance matrix
++        is unreliable, that the fitted time intervals extend outside the diffusive regime, or that an
++        intercept is needed but not fitted. Zero if the two estimators coincide (for example, for a straight
++        line through two points), :py:attr:`nan` if the covariance matrix is too close to singular for the
++        statistic to be computed, and :py:attr:`None` if the check has not been run.
+ 
+-        :return: The ratio of the two gradient estimates.
++        :return: The consistency statistic.
+         """
+-        return getattr(self, '_consistency_ratio', None)
++        return getattr(self, '_consistency_z', None)
+ 
+     def _diffusion(self, start_dt: sc.Variable, **kwargs):
+         """
+@@ -487,3 +501,136 @@ def _straight_line(abscissa: np.ndarray, gradient: float, intercept: float = 0.0
+     :return: The resulting ordinate.
+     """
+     return gradient * abscissa + intercept
++
++
++def _gradient_estimates(
++    abscissa: np.ndarray, ordinate: np.ndarray, covariance: np.ndarray, fit_intercept: bool = True
++) -> tuple[float, float, float, float]:
++    """
++    Estimate the gradient of a straight line by generalised and by ordinary least squares, together
++    with the variance of each estimate under the given covariance matrix.
++
++    The generalised least squares estimate uses the same pseudo-inverse of the covariance matrix as
++    the likelihood in :py:func:`Diffusion.bayesian_regression`. If the normal matrix formed with that
++    pseudo-inverse is exactly singular (in practice, only when every eigenvalue of the covariance matrix
++    is discarded), the generalised least squares gradient is :py:attr:`nan` and its variance is infinite.
++    A normal matrix that is nearly singular instead gives a very large or negative variance, which
++    :py:func:`_check_consistency` detects.
++
++    :param abscissa: The abscissa data.
++    :param ordinate: The ordinate data.
++    :param covariance: The covariance matrix of the ordinate data.
++    :param fit_intercept: Whether the straight line has an intercept. Optional, default is :py:attr:`True`.
++
++    :return: The generalised least squares gradient, the ordinary least squares gradient, and the
++        variances of the generalised and ordinary least squares gradients.
++    """
++    if fit_intercept:
++        design = np.column_stack([abscissa, np.ones_like(abscissa)])
++    else:
++        design = abscissa[:, np.newaxis]
++
++    ols_inverse = np.linalg.inv(design.T @ design)
++    ols_gradient = (ols_inverse @ design.T @ ordinate)[0]
++    ols_variance = (ols_inverse @ design.T @ covariance @ design @ ols_inverse)[0, 0]
++
++    weights = pinvh(covariance)
++    try:
++        gls_inverse = np.linalg.inv(design.T @ weights @ design)
++    except np.linalg.LinAlgError:
++        return np.nan, ols_gradient, np.inf, ols_variance
++    gls_gradient = (gls_inverse @ design.T @ weights @ ordinate)[0]
++    gls_variance = gls_inverse[0, 0]
++
++    return gls_gradient, ols_gradient, gls_variance, ols_variance
++
++
++def _check_consistency(
++    gls_gradient: float, ols_gradient: float, gls_variance: float, ols_variance: float, z_threshold: float = 3.0
++) -> float:
++    """
++    Check that the generalised least squares gradient agrees with the ordinary least squares gradient of
++    the same data, to within the noise expected from the covariance matrix, and warn if it does not.
++
++    The check computes the statistic z = (g_GLS - g_OLS) / sqrt(Var_OLS - Var_GLS), where g_GLS and g_OLS
++    are the two gradients and Var_GLS and Var_OLS are their sampling variances, both evaluated with the
++    estimated covariance matrix C used in the fit (see :py:func:`_gradient_estimates`).
++
++    For a design matrix X, Var_GLS = [(X^T C^+ X)^-1]_00, where C^+ is the pseudo-inverse of C, and
++    Var_OLS = [(X^T X)^-1 X^T C X (X^T X)^-1]_00. Var_OLS is the variance of the OLS gradient for data
++    correlated as described by C. It is not the textbook OLS standard error sigma^2 (X^T X)^-1, which
++    assumes uncorrelated data and is far too small for mean-squared displacements.
++
++    The check is needed because the generalised least squares fit performed by
++    :py:func:`Diffusion.bayesian_regression` weights the observations by the inverse of C. Where sampling
++    noise has made C numerically singular, the inversion can return a gradient in error by several orders of
++    magnitude, in either direction, without any other indication of failure. An ordinary least squares fit
++    does not invert C and so cannot fail in the same way.
++
++    If C is correct, both gradients are unbiased and the generalised least squares gradient has a sampling
++    variance no larger than that of the ordinary least squares gradient. The variance of their difference is
++    then Var_OLS - Var_GLS, so z follows approximately a standard normal distribution (a Hausman test). This
++    is exact only for normally distributed data with a known covariance matrix that the pseudo-inverse
++    inverts exactly; estimating C from the same data widens the distribution somewhat. A large value of
++    abs(z) is therefore evidence that C is unreliable, or that a straight line does not describe the data
++    over the fitted time intervals (for example, if these begin before the diffusive regime or an intercept
++    is needed but not fitted), rather than that the data are unusual.
++
++    :param gls_gradient: The generalised least squares gradient.
++    :param ols_gradient: The ordinary least squares gradient.
++    :param gls_variance: The variance of the generalised least squares gradient.
++    :param ols_variance: The variance of the ordinary least squares gradient.
++    :param z_threshold: The magnitude of z above which a warning is raised. Optional, default
++        is :py:attr:`3.0`.
++
++    :return: The statistic z. This is zero if the two variances are equal to within rounding, when the two
++        estimators coincide (for example, for a straight line through two points) and so cannot disagree,
++        :py:attr:`nan` if C is too close to singular for its pseudo-inverse, and not finite if either
++        gradient is not finite.
++
++    :warns UserWarning: If abs(z) is larger than :py:attr:`z_threshold`; if Var_GLS is not positive or is
++        larger than Var_OLS by more than rounding, neither of which can arise from an exact inverse of C, so
++        that C is too close to singular for its pseudo-inverse; or if either gradient is not finite.
++    """
++    advice = 'Consider refitting with recondition=True, or inspecting the eigenvalues of Diffusion.covariance_matrix.'
++
++    # Rounding leaves a relative difference of order 1e-10 between the variances of estimators that coincide.
++    difference = ols_variance - gls_variance
++    tolerance = 1e-8 * ols_variance
++
++    if not gls_variance > 0 or not difference > -tolerance:
++        warnings.warn(
++            'The generalised least squares gradient has a larger variance than the ordinary least squares '
++            'gradient, or a variance that is not positive, which is impossible for a well-conditioned '
++            'covariance matrix. The covariance matrix is too close to singular for its pseudo-inverse to be '
++            f'reliable, and the diffusion coefficient may be unreliable. {advice}',
++            UserWarning,
++            stacklevel=3,
++        )
++        return np.nan
++
++    if difference <= tolerance:
++        return 0.0
++
++    z = (gls_gradient - ols_gradient) / np.sqrt(difference)
++
++    if not np.isfinite(z):
++        warnings.warn(
++            'The generalised or ordinary least squares gradient is not finite, so the consistency of the fit '
++            f'could not be checked. {advice}',
++            UserWarning,
++            stacklevel=3,
++        )
++    elif abs(z) > z_threshold:
++        warnings.warn(
++            f'The generalised least squares gradient differs from the ordinary least squares estimate by '
++            f'{abs(z):.1f} times the spread expected from the noise in the data (z = {z:.2f}). A difference '
++            'this large indicates that the covariance matrix may be unreliable, or that a straight line does '
++            'not describe the data from start_dt onwards, and that the diffusion coefficient may be wrong. '
++            'Consider a later start_dt, refitting with recondition=True, or inspecting the eigenvalues of '
++            'Diffusion.covariance_matrix.',
++            UserWarning,
++            stacklevel=3,
++        )
++
++    return z
+diff --git a/kinisi/tests/test_diffusion.py b/kinisi/tests/test_diffusion.py
+index faa8578..9a760d8 100644
+--- a/kinisi/tests/test_diffusion.py
++++ b/kinisi/tests/test_diffusion.py
+@@ -12,9 +12,17 @@
+ import numpy as np
+ import pytest
+ import scipp as sc
+-
+-from kinisi.diffusion import Diffusion, _straight_line, eigenvalue_clipping, marchenkopastur, minimum_eigenvalue_method
+-from kinisi.samples import Samples
++from scipy.stats import linregress
++
++from kinisi.diffusion import (
++    Diffusion,
++    _check_consistency,
++    _gradient_estimates,
++    _straight_line,
++    eigenvalue_clipping,
++    marchenkopastur,
++    minimum_eigenvalue_method,
++)
+ from kinisi.tests import TEST_FILE_PATH
+ 
+ # Random seed setting not yet implemented into bayesian regression and so cannot almost_equal
+@@ -62,10 +70,12 @@ def setUpClass(cls):
+         cls.msd_load = sc.io.load_hdf5(filename=TEST_FILE_PATH / 'example_msd2.hdf5')['_dg']
+         cls.RNG = np.random.RandomState(42)
+         cls.diff = Diffusion(dg=cls.msd_load)
++        # The mean-squared displacement in this file is curved up to about 1 ps, so fits that start earlier
++        # are flagged by the consistency check.
++        cls.start_dt = 2000 * sc.Unit('femtosecond')
+ 
+     def test_bayesian_regression(self):
+-        start_dt = 10 * sc.Unit('femtosecond')
+-        self.diff.bayesian_regression(start_dt=start_dt, random_state=self.RNG)
++        self.diff.bayesian_regression(start_dt=self.start_dt, random_state=self.RNG)
+ 
+         assert self.diff.gradient is not None
+         assert hasattr(self.diff.gradient, 'mean')
+@@ -78,7 +88,7 @@ def test_bayesian_regression(self):
+ 
+         cov = self.diff.covariance_matrix
+         assert cov.dims == ('time_interval1', 'time_interval2')
+-        assert cov.shape == (140, 140)
++        assert cov.shape == (121, 121)
+ 
+     def test_start_dt_beyond_data(self):
+         diff = Diffusion(dg=self.msd_load)
+@@ -86,9 +96,17 @@ def test_start_dt_beyond_data(self):
+         with pytest.raises(ValueError, match='later than the longest time interval'):
+             diff.bayesian_regression(start_dt=1e9 * sc.Unit('femtosecond'))
+ 
++    def test_warning_for_a_fit_that_starts_too_early(self):
++        diff = Diffusion(dg=self.msd_load)
++        with pytest.warns(UserWarning, match='differs from the ordinary least squares'):
++            diff.bayesian_regression(start_dt=10 * sc.Unit('femtosecond'), n_samples=100, n_burn=50, progress=False)
++        assert diff.consistency_z > 3
++
+     def test_bayesian_regression_without_intercept(self):
+         diff = Diffusion(dg=self.msd_load)
+-        diff.bayesian_regression(start_dt=10 * sc.Unit('femtosecond'), fit_intercept=False, n_samples=100, n_burn=50)
++        # The data have a non-zero intercept, so a line through the origin is flagged.
++        with pytest.warns(UserWarning, match='differs from the ordinary least squares'):
++            diff.bayesian_regression(start_dt=self.start_dt, fit_intercept=False, n_samples=100, n_burn=50)
+ 
+         assert diff.intercept is None
+         assert diff._flatchain.shape[1] == 1
+@@ -96,15 +114,13 @@ def test_bayesian_regression_without_intercept(self):
+         assert ppd.sizes['samples'] == 6
+ 
+     def test__diffusion(self):
+-        start_dt = 400 * sc.Unit('femtosecond')
+-        self.diff._diffusion(start_dt)
++        self.diff._diffusion(self.start_dt)
+ 
+         assert self.diff._diffusion_coefficient.to_unit('cm2/s').unit == sc.Unit('cm2/s')
+         assert self.diff.D.to_unit('cm2/s').unit == sc.Unit('cm2/s')
+ 
+     def test__jump_diffusion(self):
+-        start_dt = 200 * sc.Unit('femtosecond')
+-        self.diff._jump_diffusion(start_dt)
++        self.diff._jump_diffusion(self.start_dt)
+ 
+         assert self.diff._jump_diffusion_coefficient.to_unit('cm2/s').unit == sc.Unit('cm2/s')
+         assert self.diff.D_J.to_unit('cm2/s').unit == sc.Unit('cm2/s')
+@@ -113,25 +129,23 @@ def test__conductivity(self):
+         msd_load = sc.io.load_hdf5(filename=TEST_FILE_PATH / 'example_msd2.hdf5')['_dg']
+         diff_cond = Diffusion(dg=msd_load)
+         diff_cond.dg['da'] = diff_cond.dg['da'] * sc.scalar(1.0, unit=sc.Unit('coulomb2'))
+-        start_dt = 300 * sc.Unit('femtosecond')
+         temp = 320 * sc.Unit('kelvin')
+         volume = 300 * sc.Unit('angstrom3')
+ 
+-        diff_cond._conductivity(start_dt=start_dt, temperature=temp, volume=volume, number_of_particles=50)
++        diff_cond._conductivity(start_dt=self.start_dt, temperature=temp, volume=volume, number_of_particles=50)
+ 
+         assert diff_cond._sigma.to_unit('S/m').unit == 'S/m'
+         assert diff_cond.sigma.to_unit('S/m').unit == 'S/m'
+ 
+     def test_start_dt_unit_conversion(self):
+         diff = Diffusion(dg=self.msd_load)
+-        diff._jump_diffusion(0.2 * sc.Unit('ps'), n_samples=100, n_burn=50, progress=False)
++        diff._jump_diffusion(2 * sc.Unit('ps'), n_samples=100, n_burn=50, progress=False)
+         assert diff._start_dt.unit == self.msd_load['da'].coords['time interval'].unit
+-        expected = np.argwhere(self.msd_load['da'].coords['time interval'] >= 200 * sc.Unit('fs'))[0][0]
++        expected = np.argwhere(self.msd_load['da'].coords['time interval'] >= 2000 * sc.Unit('fs'))[0][0]
+         assert diff.diff_regime == expected
+ 
+     def test_compute_covariance_matrix(self):
+-        start_dt = 200 * sc.Unit('femtosecond')
+-        self.diff.bayesian_regression(start_dt=start_dt)
++        self.diff.bayesian_regression(start_dt=self.start_dt)
+ 
+         cov = self.diff.compute_covariance_matrix()
+ 
+@@ -168,30 +182,208 @@ def test_posterior_predictive(self):
+ 
+     def test_posterior_predictive_error(self):
+         diff_exc = Diffusion(dg=self.msd_load)
+-        start_dt = 400 * sc.Unit('femtosecond')
+-        diff_exc._diffusion(start_dt)
++        diff_exc._diffusion(self.start_dt)
+         diff_exc._covariance_matrix = diff_exc._covariance_matrix * sc.scalar(1.0, unit=sc.Unit('angstrom6'))
+ 
+         with pytest.raises(ValueError, match='Units of the covariance matrix and mu do not align correctly'):
+             diff_exc.posterior_predictive(n_posterior_samples=1, n_predictive_samples=400)
+ 
+ 
++def _msd_like_covariance(dt):
++    """
++    A covariance matrix shaped like that of a mean-squared displacement: the variances grow with the
++    time interval and neighbouring time intervals are strongly positively correlated.
++    """
++    return 0.01 * np.minimum.outer(dt, dt) ** 2
++
++
++class TestGradientEstimates(unittest.TestCase):
++    """
++    Testing the generalised and ordinary least squares gradient estimates.
++    """
++
++    dt = np.arange(2, 12, dtype=float)
++
++    def test_both_gradients_recover_a_straight_line(self):
++        gls_gradient, ols_gradient, _, _ = _gradient_estimates(self.dt, 6 * self.dt + 2, _msd_like_covariance(self.dt))
++        assert np.isclose(gls_gradient, 6)
++        assert np.isclose(ols_gradient, 6)
++
++    def test_both_gradients_recover_a_line_through_the_origin(self):
++        gls_gradient, ols_gradient, _, _ = _gradient_estimates(
++            self.dt, 6 * self.dt, _msd_like_covariance(self.dt), fit_intercept=False
++        )
++        assert np.isclose(gls_gradient, 6)
++        assert np.isclose(ols_gradient, 6)
++
++    def test_ols_gradient_matches_linregress(self):
++        y = 6 * self.dt + np.random.RandomState(0).normal(0, 1, self.dt.size)
++        _, ols_gradient, _, _ = _gradient_estimates(self.dt, y, _msd_like_covariance(self.dt))
++        assert np.isclose(ols_gradient, linregress(self.dt, y).slope)
++
++    def test_estimators_coincide_for_uncorrelated_equal_variances(self):
++        y = 6 * self.dt + np.random.RandomState(0).normal(0, 1, self.dt.size)
++        gls_gradient, ols_gradient, gls_variance, ols_variance = _gradient_estimates(
++            self.dt, y, 4.0 * np.eye(self.dt.size)
++        )
++        expected_variance = 4.0 / np.sum((self.dt - self.dt.mean()) ** 2)
++        assert np.isclose(gls_gradient, ols_gradient)
++        assert np.isclose(gls_variance, expected_variance)
++        assert np.isclose(ols_variance, expected_variance)
++
++    def test_estimators_coincide_for_uncorrelated_equal_variances_without_intercept(self):
++        y = 6 * self.dt + np.random.RandomState(0).normal(0, 1, self.dt.size)
++        gls_gradient, ols_gradient, gls_variance, ols_variance = _gradient_estimates(
++            self.dt, y, 4.0 * np.eye(self.dt.size), fit_intercept=False
++        )
++        expected_variance = 4.0 / np.sum(self.dt**2)
++        assert np.isclose(gls_gradient, ols_gradient)
++        assert np.isclose(gls_variance, expected_variance)
++        assert np.isclose(ols_variance, expected_variance)
++
++    def test_coinciding_estimators_pass_the_check(self):
++        y = 6 * self.dt + np.random.RandomState(0).normal(0, 1, self.dt.size)
++        z, messages = _consistency_warnings(*_gradient_estimates(self.dt, y, 4.0 * np.eye(self.dt.size)))
++        assert z == 0
++        assert not messages
++
++    def test_z_is_standard_normal_for_the_true_covariance(self):
++        covariance = _msd_like_covariance(self.dt)
++        cholesky = np.linalg.cholesky(covariance)
++        for fit_intercept in [True, False]:
++            with self.subTest(fit_intercept=fit_intercept):
++                rng = np.random.RandomState(0)
++                z = []
++                for _ in range(4000):
++                    y = 6 * self.dt + 2 * fit_intercept + cholesky @ rng.normal(size=self.dt.size)
++                    estimates = _gradient_estimates(self.dt, y, covariance, fit_intercept)
++                    z.append(_check_consistency(*estimates, z_threshold=np.inf))
++                assert abs(np.mean(z)) < 0.07
++                assert 0.93 < np.std(z) < 1.07
++
++    def test_gls_variance_is_smaller_for_a_well_conditioned_covariance(self):
++        _, _, gls_variance, ols_variance = _gradient_estimates(self.dt, 6 * self.dt, _msd_like_covariance(self.dt))
++        assert 0 < gls_variance < ols_variance
++
++    def test_gls_variance_is_not_smaller_for_a_near_singular_covariance(self):
++        # Collapse the covariance along a direction that overlaps the time intervals, so that the
++        # pseudo-inverse discards information the ordinary least squares estimate still uses.
++        centred = self.dt - self.dt.mean()
++        alternating = (-1.0) ** np.arange(self.dt.size)
++        direction = centred / np.linalg.norm(centred) + alternating / np.linalg.norm(alternating)
++        direction -= direction.mean()
++        direction /= np.linalg.norm(direction)
++        projection = np.eye(self.dt.size) - np.outer(direction, direction)
++        covariance = projection @ _msd_like_covariance(self.dt) @ projection
++        estimates = _gradient_estimates(self.dt, 6 * self.dt, covariance)
++        _, _, gls_variance, ols_variance = estimates
++        assert 0 < gls_variance < np.inf
++        assert ols_variance < gls_variance
++        z, messages = _consistency_warnings(*estimates)
++        assert np.isnan(z)
++        assert any('singular' in m for m in messages)
++
++    def test_gls_variance_is_infinite_when_the_covariance_carries_no_information(self):
++        gls_gradient, _, gls_variance, _ = _gradient_estimates(
++            self.dt, 6 * self.dt, np.zeros((self.dt.size, self.dt.size))
++        )
++        assert np.isnan(gls_gradient)
++        assert np.isinf(gls_variance)
++
++
++def _consistency_warnings(*args, **kwargs):
++    """
++    Run the consistency check and return its value and the messages of the warnings it raised.
++    """
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter('always')
++        z = _check_consistency(*args, **kwargs)
++    return z, [str(w.message) for w in caught]
++
++
++class TestCheckConsistency(unittest.TestCase):
++    """
++    Testing the decision of whether the generalised and ordinary least squares gradients agree.
++
++    The variances are chosen so that the standard deviation of the difference between the two
++    gradients is one, so the statistic is the difference itself.
++    """
++
++    def test_no_warning_when_the_gradients_agree(self):
++        z, messages = _consistency_warnings(6.5, 6.0, 1.0, 2.0)
++        assert np.isclose(z, 0.5)
++        assert not messages
++
++    def test_warning_when_the_gradient_is_inflated(self):
++        z, messages = _consistency_warnings(10.0, 6.0, 1.0, 2.0)
++        assert np.isclose(z, 4.0)
++        assert any('ordinary least squares' in m for m in messages)
++
++    def test_warning_when_the_gradient_is_suppressed(self):
++        z, messages = _consistency_warnings(2.0, 6.0, 1.0, 2.0)
++        assert np.isclose(z, -4.0)
++        assert any('ordinary least squares' in m for m in messages)
++
++    def test_threshold_is_respected(self):
++        _, messages = _consistency_warnings(7.0, 6.0, 1.0, 2.0)
++        assert not messages
++        _, messages = _consistency_warnings(7.0, 6.0, 1.0, 2.0, z_threshold=0.5)
++        assert any('ordinary least squares' in m for m in messages)
++
++    def test_no_warning_for_a_negative_gradient(self):
++        # Whether the data increase is checked by the regression, not here.
++        z, messages = _consistency_warnings(-1.0, -1.0, 1.0, 2.0)
++        assert z == 0
++        assert not messages
++
++    def test_warning_when_the_ols_variance_is_smaller(self):
++        z, messages = _consistency_warnings(6.0, 6.0, 2.0, 1.0)
++        assert np.isnan(z)
++        assert any('singular' in m for m in messages)
++
++    def test_no_warning_when_the_variances_are_equal(self):
++        z, messages = _consistency_warnings(6.0, 6.0, 1.0, 1.0)
++        assert z == 0
++        assert not messages
++
++    def test_no_warning_when_the_variances_differ_by_rounding(self):
++        z, messages = _consistency_warnings(6.0, 6.0, 1.0, 1.0 - 1e-12)
++        assert z == 0
++        assert not messages
++
++    def test_warning_when_the_gls_variance_is_not_positive(self):
++        z, messages = _consistency_warnings(6.0, 6.0, -5e13, 2.0)
++        assert np.isnan(z)
++        assert any('singular' in m for m in messages)
++
++    def test_warning_when_the_gls_variance_is_infinite(self):
++        z, messages = _consistency_warnings(np.nan, 6.0, np.inf, 2.0)
++        assert np.isnan(z)
++        assert any('singular' in m for m in messages)
++
++    def test_warning_when_the_statistic_is_not_finite(self):
++        z, messages = _consistency_warnings(np.nan, 6.0, 1.0, 2.0)
++        assert np.isnan(z)
++        assert any('not finite' in m for m in messages)
++
++
+ class TestConsistencyCheck(unittest.TestCase):
+     """
+     Testing the covariance consistency check.
+     """
+ 
+     @staticmethod
+-    def _datagroup(gradient=6.0, n_points=64, seed=0):
++    def _datagroup(gradient=6.0, intercept=0.0, n_points=64, seed=0, noise=0.05):
+         """
+         A DataGroup with a straight-line mean-squared displacement and a
+-        realistic number of independent samples at each lag time.
++        realistic number of independent samples at each lag time. The noise
++        added is the given fraction of the stated standard deviation.
+         """
+         rng = np.random.RandomState(seed)
+         dt = np.arange(2, 2 + n_points, dtype=float)
+         n_samples = 4096.0 / dt
+         variances = 24.0 * dt**2 / n_samples
+-        values = gradient * dt + rng.normal(0, np.sqrt(variances) * 0.05)
++        values = gradient * dt + intercept + rng.normal(0, np.sqrt(variances) * noise)
+         da = sc.DataArray(
+             sc.array(dims=['time interval'], values=values, variances=variances, unit='angstrom**2'),
+             coords={
+@@ -201,9 +393,30 @@ def _datagroup(gradient=6.0, n_points=64, seed=0):
+         )
+         return sc.DataGroup({'da': da, 'dimensionality': sc.scalar(3)})
+ 
++    @staticmethod
++    def _regress(diff, start_dt=2.0, **kwargs):
++        diff.bayesian_regression(sc.scalar(start_dt, unit='ps'), progress=False, n_samples=200, n_burn=100, **kwargs)
++        return diff
++
+     def _fit(self, **kwargs):
+-        diff = Diffusion(self._datagroup(**kwargs))
+-        diff.bayesian_regression(sc.scalar(2.0, unit='ps'), progress=False, n_samples=200, n_burn=100)
++        return self._regress(Diffusion(self._datagroup(**kwargs)))
++
++    def _messages(self, diff, **kwargs):
++        """
++        Run the regression and return the messages of the warnings it raised.
++        """
++        with warnings.catch_warnings(record=True) as caught:
++            warnings.simplefilter('always')
++            self._regress(diff, **kwargs)
++        return [str(w.message) for w in caught]
++
++    @staticmethod
++    def _overconfident(diff, factor=1e-3):
++        """
++        Make the covariance matrix used by the regression too small by the given factor.
++        """
++        compute_covariance_matrix = diff.compute_covariance_matrix
++        diff.compute_covariance_matrix = lambda: compute_covariance_matrix() * factor
+         return diff
+ 
+     def test_ratio_is_near_unity_for_a_healthy_fit(self):
+@@ -211,35 +424,71 @@ def test_ratio_is_near_unity_for_a_healthy_fit(self):
+         assert 0.8 < diff.consistency_ratio < 1.25
+ 
+     def test_no_warning_for_a_healthy_fit(self):
+-        with warnings.catch_warnings(record=True) as caught:
+-            warnings.simplefilter('always')
+-            self._fit(seed=1)
+-        assert not [w for w in caught if 'ordinary least squares' in str(w.message)]
++        messages = self._messages(Diffusion(self._datagroup(seed=1, noise=1.0)))
++        assert not [m for m in messages if 'ordinary least squares' in m]
++
++    def test_no_warning_for_a_healthy_fit_without_intercept(self):
++        messages = self._messages(Diffusion(self._datagroup(seed=1, noise=1.0)), fit_intercept=False)
++        assert not [m for m in messages if 'ordinary least squares' in m]
++
++    def test_z_is_reported_for_a_healthy_fit(self):
++        diff = self._fit(noise=1.0)
++        assert np.isfinite(diff.consistency_z)
++        assert abs(diff.consistency_z) < 3
++
++    def test_warning_for_an_overconfident_covariance(self):
++        diff = self._overconfident(Diffusion(self._datagroup(noise=1.0)))
++        messages = self._messages(diff)
++        assert abs(diff.consistency_z) > 3
++        assert any('differs from the ordinary least squares' in m for m in messages)
++
++    def test_z_threshold_is_respected(self):
++        diff = self._overconfident(Diffusion(self._datagroup(noise=1.0)))
++        assert any('differs from the ordinary least squares' in m for m in self._messages(diff))
++        messages = self._messages(diff, z_threshold=abs(diff.consistency_z) + 1)
++        assert not [m for m in messages if 'differs from the ordinary least squares' in m]
++
++    def test_warning_when_the_data_do_not_increase(self):
++        diff = Diffusion(self._datagroup(gradient=-0.5))
++        messages = self._messages(diff)
++        assert any('not positive' in m for m in messages)
++        assert np.isfinite(diff.consistency_z)
++        assert diff.consistency_ratio is None
+ 
+-    def test_warning_when_the_gradient_is_suppressed(self):
+-        diff = self._fit()
+-        diff.gradient = Samples(diff.gradient.values * 0.01, unit=diff.gradient.unit)
+-        with warnings.catch_warnings(record=True) as caught:
+-            warnings.simplefilter('always')
+-            diff._check_consistency()
+-        assert any('ordinary least squares' in str(w.message) for w in caught)
+-        assert diff.consistency_ratio < 0.7
++    def test_warning_when_the_data_do_not_increase_without_intercept(self):
++        # A line through the origin has a positive gradient for these data, although they fall.
++        diff = Diffusion(self._datagroup(gradient=-0.5, intercept=50.0))
++        messages = self._messages(diff, fit_intercept=False)
++        assert any('not positive' in m for m in messages)
+ 
+-    def test_threshold_is_respected(self):
+-        diff = self._fit()
+-        with warnings.catch_warnings(record=True) as caught:
+-            warnings.simplefilter('always')
+-            diff._check_consistency(warn_threshold=1.5)
+-        assert any('ordinary least squares' in str(w.message) for w in caught)
++    def test_estimators_coincide_for_two_time_intervals(self):
++        diff = Diffusion(self._datagroup())
++        messages = self._messages(diff, start_dt=64.0)
++        assert diff.consistency_z == 0
++        assert not [m for m in messages if 'singular' in m]
++
++    def test_one_time_interval_is_too_few(self):
++        with pytest.raises(ValueError, match='only one time interval'):
++            self._regress(Diffusion(self._datagroup()), start_dt=65.0)
++
++    def test_non_finite_data_are_rejected(self):
++        dg = self._datagroup()
++        dg['da'].values[10] = np.nan
++        with pytest.raises(ValueError, match='not all finite'):
++            self._regress(Diffusion(dg))
+ 
+     def test_check_can_be_disabled(self):
+-        diff = Diffusion(self._datagroup())
+-        diff.bayesian_regression(
+-            sc.scalar(2.0, unit='ps'), progress=False, n_samples=200, n_burn=100, check_consistency=False
+-        )
++        diff = self._regress(Diffusion(self._datagroup()), check_consistency=False)
++        assert diff.consistency_ratio is None
++        assert diff.consistency_z is None
++
++    def test_disabling_the_check_clears_earlier_results(self):
++        diff = self._fit()
++        self._regress(diff, check_consistency=False)
+         assert diff.consistency_ratio is None
++        assert diff.consistency_z is None
+ 
+-    def test_check_is_safe_before_a_regression(self):
++    def test_results_are_none_before_a_regression(self):
+         diff = Diffusion(self._datagroup())
+-        diff._check_consistency()
+         assert diff.consistency_ratio is None
++        assert diff.consistency_z is None

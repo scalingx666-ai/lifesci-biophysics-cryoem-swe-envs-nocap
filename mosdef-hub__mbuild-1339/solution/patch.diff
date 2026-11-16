@@ -1,0 +1,497 @@
+diff --git a/mbuild/path/build.py b/mbuild/path/build.py
+index baf01826b..ebfa6cd64 100644
+--- a/mbuild/path/build.py
++++ b/mbuild/path/build.py
+@@ -953,6 +953,13 @@ def hard_sphere_random_walk(
+         If True and CUDA path utilities are available, use GPU-accelerated
+         implementations.
+     """
++    # Create seed sequence used by multiple path classes
++    # The namer seed is separate, so that coordinates are impacted by naming methods.
++    previous_count = len(path.coordinates) if path else 0
++    seed_sequence = np.random.SeedSequence(seed + previous_count)
++    name_seed_sequence = seed_sequence.spawn(1)[0]
++    rng = np.random.default_rng(seed_sequence)
++
+     # Create state object to track random walk progress
+     state = RandomWalkState(
+         bond_length=bond_length,
+@@ -960,7 +967,7 @@ def hard_sphere_random_walk(
+         angles_sampler=rw_angles,
+         bead_name=bead_name,
+         initial_point=initial_point,
+-        previous_count=len(path.coordinates) if path else 0,
++        previous_count=previous_count,
+         include_compound=include_compound,
+         connectivity=connectivity,
+         seed=seed,
+@@ -969,6 +976,7 @@ def hard_sphere_random_walk(
+         trial_batch_size=int(trial_batch_size),
+         chunk_size=chunk_size,
+         run_on_gpu=bool(run_on_gpu) and _get_cuda_available(),
++        rng=rng,
+     )
+     if path is None:  # Create empty path
+         path = Path()
+@@ -989,10 +997,7 @@ def hard_sphere_random_walk(
+     state.termination._attach_path(path, state)
+ 
+     namer = BeadNamer.coerce(bead_name)
+-
+-    # Create RNG state
+-    rng = np.random.default_rng(seed + len(path.coordinates))
+-    state.rng = rng
++    namer._attach_rng(np.random.default_rng(name_seed_sequence))
+ 
+     # Set up PBC info from volume constraints
+     if isinstance(volume_constraint, CuboidConstraint):
+@@ -1259,6 +1264,7 @@ def __init__(
+         trial_batch_size=20,
+         chunk_size=512,
+         run_on_gpu=False,
++        rng=None,
+     ):
+         self.bond_length = bond_length
+         self.radius = radius
+@@ -1266,31 +1272,52 @@ def __init__(
+             raise ValueError(
+                 "Bond length should be greater than radius to prevent overlaps."
+             )
++        # Single RNG drives all walk randomness (angles, positions, bias,
++        # volume-constraint sampling).
++        if rng is None:
++            rng = np.random.default_rng(seed + previous_count)
++        self.rng = rng
++        # Multiple ways to handle angles_sampler arg:
+         if angles_sampler is None:
+             self.angles = AnglesSampler(
+-                "uniform", {"low": np.pi / 2, "high": np.pi}, seed
++                "uniform", {"low": np.pi / 2, "high": np.pi}, rng=self.rng
+             )
+-        elif isinstance(angles_sampler, tuple):
++        # Pass in a tupe or list of (low, high)
++        elif isinstance(angles_sampler, (tuple, list)) and len(angles_sampler) == 2:
+             self.angles = AnglesSampler(
+-                "uniform", {"low": angles_sampler[0], "high": angles_sampler[1]}, seed
++                "uniform",
++                {"low": angles_sampler[0], "high": angles_sampler[1]},
++                rng=self.rng,
+             )
+-        elif (
+-            isinstance(angles_sampler, dict)
+-            and angles_sampler.get("loc")
+-            and angles_sampler.get("scale")
+-        ):
+-            self.angles = AnglesSampler("normal", angles_sampler, seed)
++        # Pass in a dict with supported kwargs
++        elif isinstance(angles_sampler, dict):
++            if angles_sampler.get("loc") and angles_sampler.get("scale"):
++                self.angles = AnglesSampler("normal", angles_sampler, rng=self.rng)
++            elif angles_sampler.get("low") and angles_sampler.get("high"):
++                self.angles = AnglesSampler("uniform", angles_sampler, rng=self.rng)
++            else:
++                raise ValueError(
++                    f"kwargs {dict} cannot be used to create an AnglesSampler."
++                )
++        # Pass in an array of choices
+         elif isinstance(angles_sampler, np.ndarray):
+             if angles_sampler.ndim == 1:
+                 kwargs = {"a": angles_sampler}
+             elif angles_sampler.ndim == 2:
+                 kwargs = {"a": angles_sampler[0], "p": angles_sampler[1]}
+-            self.angles = AnglesSampler("choice", kwargs, seed)
++            else:
++                raise ValueError(
++                    "Sampling angles from an array of choices is only supported for 1D and 2D arrays."
++                )
++            self.angles = AnglesSampler("choice", kwargs, rng=self.rng)
++        # Pass in an AnglesSampler instance.
+         elif isinstance(angles_sampler, AnglesSampler):
+             self.angles = angles_sampler
++            self.angles.rng = self.rng
+         else:
+             raise ValueError(
+-                f"Please provide a reasonable value to set the rw_angles. Passed {angles_sampler}"
++                f"{angles_sampler} is not a supported form to sample angles. "
++                "See mbuild.path.points.AnglesSampler."
+             )
+         self.bead_name = bead_name
+         if hasattr(initial_point, "__len__") and len(initial_point) == 3:
+diff --git a/mbuild/path/constraints.py b/mbuild/path/constraints.py
+index 5dcca495c..3ebe0cd1d 100644
+--- a/mbuild/path/constraints.py
++++ b/mbuild/path/constraints.py
+@@ -27,13 +27,13 @@ def is_inside(self, points, buffer):
+         """Return True if point satisfies constraint (inside), else False."""
+         raise NotImplementedError("Must be implemented in subclasses")
+ 
+-    def sample_candidates(self, points, n_candiates, buffer):
+-        """Sample the volume for canidate points sorted by lowest local density."""
++    def sample_candidates(self, points, n_candidates, buffer, k=10, rng=None):
++        """Sample the volume for candidate points sorted by lowest local density."""
+         raise NotImplementedError("Must be implemented in subclasses")
+ 
+-    def find_low_density_points(self, points, n_candidates, buffer, k=10):
++    def find_low_density_points(self, points, n_candidates, buffer, k=10, rng=None):
+         low_density_points = self.sample_candidates(
+-            points=points, n_candidates=n_candidates, buffer=buffer, k=k
++            points=points, n_candidates=n_candidates, buffer=buffer, k=k, rng=rng
+         )
+         return low_density_points
+ 
+@@ -98,7 +98,7 @@ def is_inside(self, points, buffer):
+             pbc=self.pbc,
+         )
+ 
+-    def sample_candidates(self, points, n_candidates, buffer, k=10):
++    def sample_candidates(self, points, n_candidates, buffer, k=10, rng=None):
+         """Generate candidate points uniformly distributed inside the box,
+         optionally ranked by lowest local density around existing points.
+ 
+@@ -124,8 +124,10 @@ def sample_candidates(self, points, n_candidates, buffer, k=10):
+             the array is sorted so that points with the greatest distance to
+             the nearest neighbor (lowest local density) appear first.
+         """
++        if rng is None:
++            rng = np.random.default_rng()
+         # Create random candidates inside the box to test and sample from
+-        candidates = np.random.uniform(
++        candidates = rng.uniform(
+             self.mins + buffer, self.maxs - buffer, size=(n_candidates, 3)
+         )
+         if points is None or len(points) == 0:
+@@ -176,7 +178,7 @@ def is_inside(self, points, buffer):
+         """
+         return is_inside_sphere(points=points, sphere_radius=self.radius, buffer=buffer)
+ 
+-    def sample_candidates(self, points, n_candidates, buffer, k=10):
++    def sample_candidates(self, points, n_candidates, buffer, k=10, rng=None):
+         """Generate candidate points uniformly distributed inside the sphere,
+         optionally ranked by lowest local density around existing points.
+ 
+@@ -202,10 +204,12 @@ def sample_candidates(self, points, n_candidates, buffer, k=10):
+             the array is sorted so that points with the greatest distance to
+             the nearest neighbor (lowest local density) appear first.
+         """
++        if rng is None:
++            rng = np.random.default_rng()
+         effective_radius = self.radius - buffer
+-        dirs = np.random.normal(size=(n_candidates, 3))
++        dirs = rng.normal(size=(n_candidates, 3))
+         dirs /= np.linalg.norm(dirs, axis=1)[:, None]
+-        u = np.random.random(size=n_candidates)
++        u = rng.random(size=n_candidates)
+         radii = effective_radius * (u ** (1 / 3))
+         candidates = self.center + dirs * radii[:, None]
+         # If just sampling from the volume, no KDTree needed
+@@ -282,7 +286,7 @@ def is_inside(self, points, buffer):
+             periodic=self.periodic_height,
+         )
+ 
+-    def sample_candidates(self, points, n_candidates, buffer, k=10):
++    def sample_candidates(self, points, n_candidates, buffer, k=10, rng=None):
+         """Generate candidate points uniformly distributed inside the cylinder,
+         optionally ranked by lowest local density around existing points.
+ 
+@@ -308,13 +312,15 @@ def sample_candidates(self, points, n_candidates, buffer, k=10):
+             the array is sorted so that points with the greatest distance to
+             the nearest neighbor (lowest local density) appear first.
+         """
++        if rng is None:
++            rng = np.random.default_rng()
+         eff_radius = max(self.radius - buffer, 0.0)
+         eff_half_height = max(self.height * 0.5 - buffer, 0.0)
+-        z = self.center[2] + np.random.uniform(
++        z = self.center[2] + rng.uniform(
+             -eff_half_height, eff_half_height, size=n_candidates
+         )
+-        r = eff_radius * np.sqrt(np.random.random(size=n_candidates))
+-        theta = 2 * np.pi * np.random.random(size=n_candidates)
++        r = eff_radius * np.sqrt(rng.random(size=n_candidates))
++        theta = 2 * np.pi * rng.random(size=n_candidates)
+         x = self.center[0] + r * np.cos(theta)
+         y = self.center[1] + r * np.sin(theta)
+         candidates = np.column_stack((x, y, z))
+diff --git a/mbuild/path/namers.py b/mbuild/path/namers.py
+index 783fd7e52..567b91ada 100644
+--- a/mbuild/path/namers.py
++++ b/mbuild/path/namers.py
+@@ -26,6 +26,15 @@ def __next__(self) -> str: ...
+     def __iter__(self):
+         return self
+ 
++    def _attach_rng(self, rng):
++        """Drive this namer's randomness from an external rng.
++
++        Called by ``hard_sphere_random_walk`` so bead naming is reproducible
++        from the walk's ``seed``. No-op for deterministic namers.
++        """
++        if hasattr(self, "_rng"):
++            self._rng = rng
++
+     @classmethod
+     def coerce(cls, value):
+         """Return value unchanged if it is a BeadNamer or wrap strings in ConstantNamer."""
+@@ -68,13 +77,17 @@ class RandomNamer(BeadNamer):
+         If True, samples without replacement from a shuffled pool that is
+         rebuilt each period — composition is exact over every period.
+     seed : int, optional, default None
+-        Random seed for reproducibility.
++        Random seed for reproducibility. Leave unset when passing this namer to
++        ``hard_sphere_random_walk``; the walk drives naming from its own seed.
++    rng : numpy.random.Generator, optional, default None
++        Generator to draw from. Takes precedence over ``seed``. Mainly used
++        internally so the random walk can share its rng with the namer.
+     """
+ 
+-    def __init__(self, names, weights=None, strict=False, seed=None):
++    def __init__(self, names, weights=None, strict=False, seed=None, rng=None):
+         self.names = list(names)
+         self.strict = strict
+-        self._rng = np.random.default_rng(seed)
++        self._rng = rng if rng is not None else np.random.default_rng(seed)
+ 
+         if strict:
+             if weights is not None:
+@@ -130,7 +143,11 @@ class MarkovNamer(BeadNamer):
+         Starting state, given as a name string or index. If None, a state is
+         chosen uniformly at random.
+     seed : int, optional, default None
+-        Random seed for reproducibility.
++        Random seed for reproducibility. Leave unset when passing this namer to
++        ``hard_sphere_random_walk``; the walk drives naming from its own seed.
++    rng : numpy.random.Generator, optional, default None
++        Generator to draw from. Takes precedence over ``seed``. Mainly used
++        internally so the random walk can share its rng with the namer.
+ 
+     Examples
+     --------
+@@ -145,7 +162,7 @@ class MarkovNamer(BeadNamer):
+     >>> namer = MarkovNamer(["_A", "_B"], [[0.9, 0.1], [0.1, 0.9]], start="_A", seed=0)
+     """
+ 
+-    def __init__(self, names, transition_matrix, start=None, seed=None):
++    def __init__(self, names, transition_matrix, start=None, seed=None, rng=None):
+         self.names = list(names)
+         matrix = np.asarray(transition_matrix, dtype=float)
+         if matrix.shape != (len(self.names), len(self.names)):
+@@ -155,16 +172,19 @@ def __init__(self, names, transition_matrix, start=None, seed=None):
+             )
+         row_sums = matrix.sum(axis=1, keepdims=True)
+         self._matrix = matrix / row_sums
+-        self._rng = np.random.default_rng(seed)
++        self._rng = rng if rng is not None else np.random.default_rng(seed)
+ 
+         if start is None:
+-            self._current = int(self._rng.integers(len(self.names)))
++            # Resolved on first __next__ so it uses the active rng.
++            self._current = None
+         elif isinstance(start, str):
+             self._current = self.names.index(start)
+         else:
+             self._current = int(start)
+ 
+     def __next__(self) -> str:
++        if self._current is None:
++            self._current = int(self._rng.integers(len(self.names)))
+         name = self.names[self._current]
+         self._current = int(
+             self._rng.choice(len(self.names), p=self._matrix[self._current])
+@@ -193,7 +213,11 @@ class GradientNamer(BeadNamer):
+     n_steps : int
+         Number of steps over which the gradient is applied.
+     seed : int, optional, default None
+-        Random seed for reproducibility.
++        Random seed for reproducibility. Leave unset when passing this namer to
++        ``hard_sphere_random_walk``; the walk drives naming from its own seed.
++    rng : numpy.random.Generator, optional, default None
++        Generator to draw from. Takes precedence over ``seed``. Mainly used
++        internally so the random walk can share its rng with the namer.
+ 
+     Examples
+     --------
+@@ -202,14 +226,14 @@ class GradientNamer(BeadNamer):
+     >>> namer = GradientNamer(["_A", "_B"], [1, 0], [0, 1], n_steps=100, seed=0)
+     """
+ 
+-    def __init__(self, names, start_weights, end_weights, n_steps, seed=None):
++    def __init__(self, names, start_weights, end_weights, n_steps, seed=None, rng=None):
+         self.names = list(names)
+         start = np.asarray(start_weights, dtype=float)
+         end = np.asarray(end_weights, dtype=float)
+         self._start = start / start.sum()
+         self._end = end / end.sum()
+         self._n_steps = int(n_steps)
+-        self._rng = np.random.default_rng(seed)
++        self._rng = rng if rng is not None else np.random.default_rng(seed)
+         self._step = 0
+ 
+     def __next__(self) -> str:
+diff --git a/mbuild/path/points.py b/mbuild/path/points.py
+index c895674aa..2c5f69eb0 100644
+--- a/mbuild/path/points.py
++++ b/mbuild/path/points.py
+@@ -230,7 +230,10 @@ def get_initial_point(state, existing_points, beads, check_path, next_step):
+     # TODO: Use find_low_density_point here instead?
+     elif state.volume_constraint:
+         xyzs = state.volume_constraint.sample_candidates(
+-            points=existing_points, n_candidates=300, buffer=state.radius + 0.1
++            points=existing_points,
++            n_candidates=300,
++            buffer=state.radius + 0.1,
++            rng=state.rng,
+         )
+         for xyz in xyzs:
+             if check_path(
+@@ -278,28 +281,27 @@ class AnglesSampler:
+     "normal" distribution should use 'loc' and 'scale' as kwargs.
+     """
+ 
+-    def __init__(self, distributionStr, kwargs, seed):
+-        # Create a generator object for high-quality random numbers [9]
+-        self.rng = np.random.default_rng(seed)
+-        if distributionStr.lower() == "uniform":
+-            self.sampler = self.rng.uniform
++    def __init__(self, distributionStr, kwargs, rng=None):
++        self.rng = rng if rng is not None else np.random.default_rng()
++        distribution = distributionStr.lower()
++        if distribution == "uniform":
+             assert "low" in kwargs
+             assert "high" in kwargs
+-        elif distributionStr.lower() == "normal":
+-            self.sampler = self.rng.normal
++        elif distribution == "normal":
+             assert "loc" in kwargs
+             assert "scale" in kwargs
+-        elif distributionStr == "choice":
+-            self.sampler = self.rng.choice
++        elif distribution == "choice":
+             assert "a" in kwargs  # p is not required
+         else:
+             raise NotImplementedError(
+                 f"Sample Distribution {distributionStr} not supported."
+             )
++        self.distribution = distribution
+         self.kwargs = kwargs
+ 
+     def sample(self, size=None):
+-        return self.sampler(size=size, **self.kwargs)
++        # Resolve against self.rng at call time so the rng can be swapped in.
++        return getattr(self.rng, self.distribution)(size=size, **self.kwargs)
+ 
+ 
+ def generate_trials(state):
+diff --git a/mbuild/tests/test_path.py b/mbuild/tests/test_path.py
+index 5b4714ada..70aac6304 100644
+--- a/mbuild/tests/test_path.py
++++ b/mbuild/tests/test_path.py
+@@ -327,9 +327,7 @@ def test_dense_random_walk(self):
+                         termination=term,
+                         seed=i,
+                         initial_point=initial_point[attempt],
+-                        rw_angles=AnglesSampler(
+-                            "normal", dict(loc=2.4, scale=1), seed=i
+-                        ),
++                        rw_angles=AnglesSampler("normal", dict(loc=2.4, scale=1)),
+                         tolerance=tolerance,
+                     )
+                     if term.success:
+@@ -405,6 +403,38 @@ def test_seeds(self):
+         )
+         assert np.allclose(path1.coordinates, path2.coordinates, atol=1e-7)
+ 
++    def test_seeds_user_angles_sampler(self):
++        # A reused, stateful user sampler is still driven by the walk's seed,
++        # so same-seed walks reproduce.
++        sampler = AnglesSampler("normal", dict(loc=2.4, scale=0.3))
++        kwargs = dict(bond_length=0.25, radius=0.22, rw_angles=sampler, seed=14)
++        path1 = Path()
++        hard_sphere_random_walk(
++            path=path1,
++            termination=Termination([NumSites(20), NumAttempts(1e4)]),
++            **kwargs,
++        )
++        path2 = Path()
++        hard_sphere_random_walk(
++            path=path2,
++            termination=Termination([NumSites(20), NumAttempts(1e4)]),
++            **kwargs,
++        )
++        assert np.allclose(path1.coordinates, path2.coordinates, atol=1e-7)
++
++    def test_seeds_random_namer(self):
++        # An unseeded stochastic namer is driven by the walk's seed, so
++        # same-seed walks reproduce both names and coordinates.
++        kwargs = dict(radius=0.1, bond_length=0.15, termination=20, seed=42)
++        path1 = hard_sphere_random_walk(bead_name=RandomNamer(["_A", "_B"]), **kwargs)
++        path2 = hard_sphere_random_walk(bead_name=RandomNamer(["_A", "_B"]), **kwargs)
++        assert list(path1.beads) == list(path2.beads)
++        assert np.allclose(path1.coordinates, path2.coordinates, atol=1e-7)
++        # Naming draws from a separate substream, so the namer choice does not
++        # perturb geometry: same seed gives the same coordinates as a constant namer.
++        const = hard_sphere_random_walk(bead_name="_A", **kwargs)
++        assert np.allclose(path1.coordinates, const.coordinates, atol=1e-7)
++
+     def test_from_path(self):
+         path1 = Path()
+         num_sites = NumSites(20)
+@@ -428,6 +458,37 @@ def test_from_path(self):
+         assert len(path2.coordinates) == 20
+         assert np.allclose(path1.coordinates, path2.coordinates, atol=1e-6)
+ 
++    @pytest.mark.parametrize(
++        "constraint",
++        [
++            CuboidConstraint(Lx=6, Ly=6, Lz=6),
++            SphereConstraint(center=(0, 0, 0), radius=3),
++            CylinderConstraint(radius=3, height=6),
++        ],
++    )
++    def test_seeds_with_volume_constraint(self, constraint):
++        termination = Termination([NumSites(15), NumAttempts(1e4)])
++        path1 = Path()
++        hard_sphere_random_walk(
++            path=path1,
++            termination=termination,
++            bond_length=0.25,
++            radius=0.22,
++            volume_constraint=constraint,
++            seed=14,
++        )
++        path2 = Path()
++        hard_sphere_random_walk(
++            path=path2,
++            termination=termination,
++            bond_length=0.25,
++            radius=0.22,
++            volume_constraint=constraint,
++            seed=14,
++        )
++        assert len(path1.coordinates) == len(path2.coordinates)
++        assert np.allclose(path1.coordinates, path2.coordinates, atol=1e-6)
++
+     def test_walk_inside_cube(self):
+         path = Path()
+         cube = CuboidConstraint(Lx=5, Ly=5, Lz=5)
+@@ -863,7 +924,7 @@ def test_angles_sampler(self, distribution, kwargs, reference):
+ 
+         from mbuild.path.points import AnglesSampler
+ 
+-        sampler = AnglesSampler(distribution, kwargs, seed=0)
++        sampler = AnglesSampler(distribution, kwargs, rng=np.random.default_rng(0))
+         points = sampler.sample(1000)
+         if reference[0] == "kstest":
+             _, p_value = scipy.stats.kstest(points, "uniform", **reference[1])
+diff --git a/mbuild/tests/test_termination.py b/mbuild/tests/test_termination.py
+index 4ab9efb78..fb1e3f73b 100644
+--- a/mbuild/tests/test_termination.py
++++ b/mbuild/tests/test_termination.py
+@@ -103,7 +103,7 @@ def test_re_termination(self):
+             termination=termination,
+             bond_length=0.25,
+             radius=0.22,
+-            seed=14,
++            seed=11,
+         )
+         dist = np.linalg.norm(rw.coordinates[-1] - rw.coordinates[0])
+         assert np.allclose(dist, 2, atol=0.1)

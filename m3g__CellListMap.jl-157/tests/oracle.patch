@@ -1,0 +1,121 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a13519c3..eed6f8d8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -31,7 +31,7 @@ Version 0.10.0-DEV
+ - ![INFO][badge-info] Remove internal coordinate swapping by size.
+ - ![INFO][badge-info] Internal implementation of neighborlist moved to ParticleSystem interface.
+ - ![INFO][badge-info] The internal representation of coordinantes is done with `ParticleSytemPositions` array type - which is not a subtype of abstract array. 
+-- ![BUGFIX][badge-bugfix] Fix cross-computation (`pairwise!(f, x, sys)`) with `NonPeriodicCell` failing to find pairs when particle coordinates span negative values or large coordinate ranges. This bug was never released, it was created and fixed in the development version.
++- ![BUGFIX][badge-bugfix] Fix cross-computation (`pairwise!(f, x, sys)`) with `NonPeriodicCell` failing to find pairs when particle coordinates span negative values or large coordinate ranges / do not modify input coordinates in `NonPeriodicCell`. This bug was never released, it was created and fixed in the development version.
+ 
+ Version 0.9.17
+ --------------
+diff --git a/src/internals/Box.jl b/src/internals/Box.jl
+index eb08b0ac..7e42c9bd 100644
+--- a/src/internals/Box.jl
++++ b/src/internals/Box.jl
+@@ -96,11 +96,6 @@ Base.@kwdef struct Box{UnitCellType, N, T, TSQ, M, TR}
+     origin::SVector{N, T}
+ end
+ 
+-# Translation for NonPeriodicCell: shifts coordinates so that xmin maps to 0,
+-# placing all coordinates in [0, extent] ⊂ [0, sides). This avoids the
+-# discontinuity of modular wrapping that splits nearby particles.
+-@inline _nonperiodic_translate(p, box::Box{NonPeriodicCell}) = p .- box.origin
+-@inline _nonperiodic_untranslate(p, box::Box{NonPeriodicCell}) = p .+ box.origin
+ 
+ #=
+     unitcelltype(::Box{T}) where T = T
+@@ -255,7 +250,7 @@ function _construct_box(input_unit_cell::UnitCell{UnitCellType, N, T}, lcell, cu
+     xmin, xmax = cell_limits(aligned_unit_cell.matrix)
+ 
+     nc, cell_size = _compute_nc_and_cell_size(UnitCellType, xmin, xmax, cutoff, lcell)
+-    computing_box = (xmin .- lcell * cell_size, xmax .+ lcell * cell_size)
++    computing_box = (xmin .+ origin .- lcell * cell_size, xmax .+ origin .+ lcell * cell_size)
+ 
+     # Carry on the squared cutoff, to avoid repeated computation at hot inner loop
+     cutoff_sqr = cutoff^2
+diff --git a/src/internals/CellLists.jl b/src/internals/CellLists.jl
+index b3534190..8d27634a 100644
+--- a/src/internals/CellLists.jl
++++ b/src/internals/CellLists.jl
+@@ -939,13 +939,13 @@ function add_particles!(x, box, ishift, cl::CellList{N, T}) where {N, T}
+     return cl
+ end
+ 
+-# For NonPeriodicCell, translate coordinates instead of modular wrapping.
+-# This avoids a discontinuity at the wrap boundary that splits nearby particles.
++# For NonPeriodicCell, store original coordinates without wrapping or translation.
++# The computing_box is offset by box.origin so particle_cell maps original coordinates
++# to valid cell indices directly, avoiding the modular-wrapping discontinuity at x=0.
+ function add_particles!(x, box::Box{NonPeriodicCell}, ishift, cl::CellList{N, T}) where {N, T}
+     for ip in eachindex(x)
+         xp = x[ip]
+         p = SVector{N, T}(ntuple(i -> xp[i], Val(N)))
+-        p = _nonperiodic_translate(p, box)
+         add_particle_to_celllist!(ishift + ip, p, box, cl)
+         replicate_particle!(ishift + ip, p, box, cl)
+     end
+diff --git a/src/internals/cross.jl b/src/internals/cross.jl
+index 6941de5a..c03c669a 100644
+--- a/src/internals/cross.jl
++++ b/src/internals/cross.jl
+@@ -229,9 +229,9 @@ function single_particle_vs_list!(
+         cl::CellList{N, T}
+     ) where {F, N, T}
+     (; nc, cutoff_sqr) = box
+-    # Translate the cross particle into the same frame used by add_particles!
+-    xpᵢ = _nonperiodic_translate(x, box)
+-    ic = particle_cell(xpᵢ, box)
++    # No translation needed: the computing_box is offset by box.origin so particle_cell
++    # maps original coordinates to valid cell indices directly.
++    ic = particle_cell(x, box)
+     for neighbor_cell in current_and_neighbor_cells(box)
+         jc_cartesian = neighbor_cell + ic
+         # if cell is outside computing box, cycle
+@@ -249,9 +249,9 @@ function single_particle_vs_list!(
+             @inbounds pⱼ = cellⱼ.particles[j]
+             if pⱼ.real
+                 xpⱼ = pⱼ.coordinates
+-                d2 = sum(abs2, xpᵢ - xpⱼ)
++                d2 = sum(abs2, x - xpⱼ)
+                 if d2 <= cutoff_sqr
+-                    pair = NeighborPair(i, pⱼ.index, x, _nonperiodic_untranslate(xpⱼ, box), d2)
++                    pair = NeighborPair(i, pⱼ.index, x, xpⱼ, d2)
+                     output = f(pair, output)
+                 end
+             end
+diff --git a/test/API/ParticleSystem.jl b/test/API/ParticleSystem.jl
+index 0b416f3d..394d3c32 100644
+--- a/test/API/ParticleSystem.jl
++++ b/test/API/ParticleSystem.jl
+@@ -319,6 +319,28 @@ end
+     @test_throws ArgumentError pairwise!((pair, out) -> out += pair.d2, p)
+     p = ParticleSystem(xpositions = copy(y), ypositions = copy(y), cutoff = 0.1, unitcell = [1, 1, 1], output = 0.0, validate_coordinates = (x) -> nothing)
+     @test pairwise!((pair, out) -> out += pair.d2, p) > 0.0
++
++    # Tests to guarantee that future versions do not introduce internal changes that cause
++    # input coordinates in NonPeriodicCell to be modified
++    x = [ SVector(-0.5, -0.5, -0.5) + rand(SVector{3,Float64}) for _ in 1:100]
++    sys = ParticleSystem(
++        xpositions=x,
++        unitcell=nothing,
++        cutoff=0.1,
++        output=0.0,
++    )
++    @test all(sys.xpositions .== x)
++    y = [ SVector(-0.5, -0.5, -0.5) + rand(SVector{3,Float64}) for _ in 1:50]
++    sys = ParticleSystem(
++        xpositions=x,
++        ypositions=y,
++        unitcell=nothing,
++        cutoff=0.1,
++        output=0.0,
++    )
++    @test all(sys.xpositions .== x)
++    @test all(sys.ypositions .== y)
++
+ end
+ 
+ @testitem "reset output value" setup = [Testing] begin

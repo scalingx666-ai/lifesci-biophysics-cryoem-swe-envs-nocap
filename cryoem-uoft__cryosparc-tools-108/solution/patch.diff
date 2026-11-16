@@ -1,0 +1,792 @@
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 1af5fc02..cd52fb99 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -27,4 +27,5 @@ repos:
+     rev: v1.1.386
+     hooks:
+       - id: pyright
+-        additional_dependencies: [cython, httpretty, numpy, pytest, setuptools]
++        additional_dependencies:
++          [cython, httpretty, httpx, numpy, pydantic, pytest, setuptools]
+diff --git a/cryosparc/api.py b/cryosparc/api.py
+new file mode 100644
+index 00000000..7012e6ae
+--- /dev/null
++++ b/cryosparc/api.py
+@@ -0,0 +1,409 @@
++import json
++import re
++import urllib.parse
++import warnings
++from contextlib import contextmanager
++from enum import Enum
++from typing import Any, Dict, Iterator, Optional, Tuple, TypedDict, Union
++
++import httpx
++
++from . import registry
++from .errors import APIError
++from .json_util import api_default, api_object_hook
++from .models.auth import Token
++from .stream import Streamable
++
++_BASE_RESPONSE_TYPES = {"string", "integer", "number", "boolean"}
++
++Auth = Union[str, tuple[str, str]]
++"""
++Auth token or email/password.
++"""
++
++
++class APIRequest(TypedDict):
++    params: Dict[str, Any]
++    headers: Dict[str, str]
++    content: Any
++    data: Optional[Dict[str, Any]]  # form data
++    files: Optional[Dict[str, Any]]
++
++
++class APINamespace:
++    """
++    Collection of API methods that call a certain namespace, e.g., only the
++    methods under http://master:39004/pipelines/
++    """
++
++    _client: httpx.Client
++
++    def __init__(self, http_client: httpx.Client):
++        self._client = http_client
++
++    def _set_headers(self, update: Dict[str, str]):
++        """For testing only, reset client headers"""
++        self._client.headers.update(update)
++
++    def _prepare_request_stream(self, streamable):
++        return streamable.stream()
++
++    def _construct_request(self, _path: str, _schema, *args, **kwargs) -> Tuple[str, APIRequest]:
++        args = list(args)
++        query_params = {}
++        func_name = _schema["summary"]
++        headers = {}
++        client_headers = {h for h in self._client.headers.keys()}
++        request_body = None
++        data = None
++        files = None
++
++        for param_schema in _sort_params_schema(_path, _schema.get("parameters", [])):
++            # Compile function params
++            param_name: str = param_schema["name"]
++            param_in: str = param_schema["in"]
++            assert param_in in (
++                "path",
++                "query",
++                "header",
++            ), f"[API] Param specification for '{param_name}' in {param_in} NOT supported."
++
++            if param_in == "path" and args:
++                # path param must be specified positionally
++                param, args = args[0], args[1:]
++                _path = _path.replace("{%s}" % param_name, _uriencode(param))
++            elif param_in == "query" and param_name in kwargs:
++                # query param must be in kwargs
++                query_params[param_name] = kwargs.pop(param_name)
++            elif param_in == "header" and param_name in kwargs:
++                # header must be in kwargs
++                headers[param_name] = kwargs.pop(param_name)
++            elif param_in == "header" and param_name in client_headers:
++                pass  # in default headers, no action required
++            elif param_schema["required"]:
++                raise TypeError(f"[API] {func_name}() missing required argument: '{param_name}'")
++
++        if "requestBody" in _schema:
++            content_schema = _schema["requestBody"].get("content", {})
++            if stream_mime_type := registry.first_streamable_mime(content_schema.keys()):
++                body_name = _get_schema_param_name(content_schema[stream_mime_type]["schema"], "body")
++                headers["Content-Type"] = stream_mime_type
++                if args:
++                    streamable, args = args[0], args[1:]
++                elif body_name in kwargs:
++                    streamable = kwargs.pop(body_name)
++                elif content_schema.get("required", False):
++                    raise TypeError(f"[API] {func_name}() missing required argument: {body_name}")
++                else:
++                    streamable = None
++
++                if streamable:
++                    if not isinstance(streamable, Streamable):
++                        raise TypeError(f"[API] {func_name}() invalid argument {streamable}; expected Streamable type")
++                    request_body = self._prepare_request_stream(streamable)
++            elif "application/json" in content_schema:
++                body_name = _get_schema_param_name(content_schema["application/json"]["schema"], "body")
++                headers["Content-Type"] = "application/json"
++                if args:
++                    request_body, args = args[0], args[1:]
++                    request_body = json.dumps(request_body, default=api_default)
++                elif body_name in kwargs:
++                    request_body = kwargs.pop(body_name)
++                    request_body = json.dumps(request_body, default=api_default)
++                elif content_schema.get("required", False):
++                    raise TypeError(f"[API] {func_name}() missing required argument: {body_name}")
++            elif "application/x-www-form-urlencoded" in content_schema:
++                assert kwargs, (
++                    f"[API] {func_name}() requires x-www-form-urlencoded which "
++                    "does not yet support positional arguments for the content body."
++                )
++                data, kwargs = kwargs, {}
++            elif "multipart/form-data" in content_schema:
++                assert kwargs, (
++                    f"[API] {func_name}() requires multipart/form-data which "
++                    "does not yet support positional arguments for the content body."
++                )
++                files, kwargs = kwargs, {}
++            else:
++                raise TypeError(f"[API] Does not yet support request body with content schema {content_schema}")
++
++        # Fail if any extra parameters
++        if args:
++            raise TypeError(f"[API] {func_name}() given extra positional arguments ({', '.join(map(str, args))})")
++        if kwargs:
++            raise TypeError(f"[API] {func_name}() given unknown keyword arguments ({', '.join(kwargs.keys())})")
++
++        return _path, APIRequest(params=query_params, headers=headers, content=request_body, data=data, files=files)
++
++    def _handle_response(self, schema, res: httpx.Response):
++        responses_schema = schema.get("responses", {})
++        response_schema = responses_schema.get(str(res.status_code))
++        if not response_schema:
++            res.raise_for_status()
++            raise APIError("Received unknown response", res=res)
++
++        if "content" not in response_schema:
++            res.raise_for_status()
++            return None
++
++        content_schema = response_schema["content"]
++        stream_mime_type = registry.first_streamable_mime(content_schema.keys())
++        if stream_mime_type is not None:  # This is a streaming type
++            stream_class = registry.get_stream_class(stream_mime_type)
++            assert stream_class
++            return stream_class.from_iterator(res.iter_bytes())
++        elif "text/plain" in content_schema:
++            return res.text
++        elif "application/json" in content_schema:
++            data = res.json(object_hook=api_object_hook)
++            if res.status_code >= 400:
++                raise APIError("Received error response", res=res, data=data)
++            return _decode_json_response(data, content_schema["application/json"]["schema"])
++        else:
++            raise APIError(f"Received unimplemented response type in {content_schema.keys()}", res=res)
++
++    @contextmanager
++    def _request(self, method: str, url: str, *args, **kwargs) -> Iterator[httpx.Response]:
++        attempt = 0
++        max_attempts = 3
++        while attempt < max_attempts:
++            attempt += 1
++            try:
++                request = self._client.request(method, url, *args, **kwargs)
++                yield request
++                return
++            except httpx.TransportError as err:
++                warnings.warn(
++                    f"*** API client {method.upper()} {url} failed due to {err} (attempt {attempt}/{max_attempts})"
++                )
++                if attempt == max_attempts:
++                    raise
++
++    @contextmanager
++    def _request_stream(self, method: str, url: str, *args, **kwargs) -> Iterator[httpx.Response]:
++        attempt = 0
++        max_attempts = 3
++        while attempt < max_attempts:
++            attempt += 1
++            try:
++                with self._client.stream(method, url, *args, **kwargs) as response:
++                    yield response
++                    return
++            except httpx.TransportError as err:
++                warnings.warn(
++                    f"*** API client {method.upper()} {url} stream failed due to {err} (attempt {attempt}/{max_attempts})"
++                )
++                if attempt == max_attempts:
++                    raise
++
++        raise RuntimeError(f"[API] Could not complete request {method.upper()} {url}")
++
++    def _call(self, _method: str, _path: str, _schema, *args, **kwargs):
++        """Meta-call method that runs whenever a named function is called on
++        this namespace"""
++        responses_schema = _schema.get("responses", {})
++        _path, req = self._construct_request(_path, _schema, *args, **kwargs)
++
++        # Submit a response and get a generator for it. Resulting res_gen should
++        # only yield a single item. Cleaned up at the end of this function call.
++        content_schema = responses_schema.get("201", {}).get("content", {})
++        stream_mime_type = registry.first_streamable_mime(content_schema.keys())
++
++        try:
++            ctx = (
++                self._request(_method, _path, **req)
++                if stream_mime_type is None
++                else self._request_stream(_method, _path, **req)
++            )
++            with ctx as res:
++                return self._handle_response(_schema, res)
++        except httpx.HTTPStatusError as err:
++            raise APIError("received error response", res=err.response)
++
++
++class APIClient(APINamespace):
++    """Root API namespace interface for an OpenAPI server"""
++
++    _namespace_class = APINamespace
++
++    def __init__(
++        self,
++        base_url: Optional[str] = None,
++        *,
++        auth: Optional[Auth] = None,  # token or email/password
++        timeout: float = 300,
++        http_client: Optional[httpx.Client] = None,
++    ):
++        if base_url and http_client:
++            raise TypeError(f"Cannot specify both base_url ({base_url}) and http_client ({http_client})")
++        if not http_client:
++            if not base_url:
++                raise TypeError(f"Must specify either base_url ({base_url}) or http_client ({http_client})")
++            http_client = httpx.Client(base_url=base_url, timeout=timeout)
++        super().__init__(http_client)
++        self._attrs = set()
++        self(auth=auth)  # query the OpenAPI server and populate endpoint functions
++
++    def __del__(self):
++        # Clean up client when it gets garbage collected
++        self._client.close()
++
++    def __call__(self, auth: Optional[Auth] = None):
++        """
++        Re-generate all routes and internal namespaces. Optionally accepts
++        either an authentication bearer token or an email/password tuple. Note
++        that the password should be encoded in sha256.
++        """
++        self._reset()
++        try:
++            with self._request("get", "/openapi.json") as res:
++                res.raise_for_status()
++                schema = res.json()
++        except json.JSONDecodeError as e:
++            raise ValueError("Error reading JSON response") from e
++        self._process_schema(schema)
++        if auth:
++            self._authorize(auth)
++        return schema
++
++    def _reset(self):
++        for attr in self._attrs:
++            delattr(self, attr)
++        self._attrs.clear()
++
++    def _process_schema(self, schema):
++        assert isinstance(schema, dict), "[API] Invalid OpenAPI schema response: Not a dictionary"
++        for key in {"info", "paths", "components"}:
++            assert (
++                key in schema
++            ), f"[API] Invalid OpenAPI schema response: Missing '{key}' key, got keys {list(schema.keys())}"
++
++        for path, path_schema in schema["paths"].items():
++            for method, endpoint_schema in path_schema.items():
++                self._register_endpoint(method, path, endpoint_schema)
++
++    def _register_endpoint(self, method: str, path: str, schema):
++        """
++        CryoSPARC's OpenAPI server is configured such that the "summary"
++        property in the provided endpoint schemas at /openapi.json is the name
++        of the function in python. '.' used to delimit namespaced endpoints.
++        """
++        namespace = self
++        func_name: str = schema["summary"]
++        if "." in func_name:
++            namespace_name, func_name = func_name.split(".", 1)
++            namespace = self._get_namespace(namespace_name)
++        else:
++            self._attrs.add(func_name)
++
++        setattr(namespace, func_name, self._generate_endpoint(func_name, namespace, method, path, schema))
++
++    def _generate_endpoint(self, func_name: str, namespace, method: str, path: str, schema):
++        def endpoint(*args, **kwargs):
++            return namespace._call(method, path, schema, *args, **kwargs)
++
++        endpoint.__name__ = func_name
++        return endpoint
++
++    def _get_namespace(self, name: str):
++        if not hasattr(self, name):
++            setattr(self, name, self._namespace_class(self._client))
++            self._attrs.add(name)
++        namespace = getattr(self, name)
++        assert isinstance(
++            namespace, self._namespace_class
++        ), f"{self} name conflict with namespace '{name}'. This is likely a bug"
++        return namespace
++
++    def _authorize(self, auth: Auth):
++        token = (
++            Token(access_token=auth, token_type="bearer")
++            if isinstance(auth, str)
++            else self.login(grant_type="password", username=auth[0], password=auth[1])  # type: ignore
++        )
++        self._client.headers["Authorization"] = f"{token.token_type.title()} {token.access_token}"
++
++
++def _get_schema_param_name(schema: dict, default: str = "param") -> str:
++    """
++    Given a parameter schema, convert its title to a valid python argument
++    identifier. Used to determine kwarg name of body arguments.
++    """
++    return schema.get("title", default).lower().replace(" ", "_")
++
++
++def _matches_schema_type(value: Any, schema: dict) -> bool:
++    if "$ref" in schema:
++        model_class = registry.model_for_ref(schema["$ref"])
++        if model_class:
++            return True
++    schema_type = schema.get("type")
++    if schema_type == "object":
++        return isinstance(value, dict)
++    if schema_type == "array":
++        return isinstance(value, list)
++    if schema_type in _BASE_RESPONSE_TYPES:
++        return isinstance(value, (str, float, int, bool))
++    return False
++
++
++def _decode_json_response(value: Any, schema: dict):
++    # Check for empty schema/value, means just return JSON-decoded value as-is
++    if value is None or not schema:
++        return value
++
++    # Don't attempt parsing unions without a model
++    if "anyOf" in schema:
++        for subschema in schema["anyOf"]:
++            if _matches_schema_type(value, subschema):
++                try:
++                    return _decode_json_response(value, subschema)
++                except (TypeError, ValueError):
++                    continue
++        warnings.warn("[API] Warning: No union schemas matched response. Returning API result as plain object.")
++        return value
++
++    # Check for schema that links to one of our existing models
++    if "$ref" in schema:
++        model_class = registry.model_for_ref(schema["$ref"])
++        if model_class and issubclass(model_class, Enum):
++            return model_class(value)
++        elif model_class:
++            return model_class(**value)
++        warnings.warn(
++            f"[API] Warning: Received API response with unregistered schema type {schema['$ref']}. "
++            "Returning as plain object."
++        )
++        return value
++
++    # Check for Base case types
++    if "type" in schema and schema["type"] in _BASE_RESPONSE_TYPES:
++        return value
++
++    # Recursively decode list
++    if "type" in schema and schema["type"] == "array":
++        return [_decode_json_response(item, schema["items"]) for item in value]
++
++    # Recursively decode object
++    if "type" in schema and schema["type"] == "object":
++        prop_schemas = schema.get("properties", {})
++        default_prop_schema = schema.get("additionalProperties", {})
++        return {
++            key: _decode_json_response(val, prop_schemas.get(key, default_prop_schema)) for key, val in value.items()
++        }
++
++    # No other result found, return as plain JSON
++    return value
++
++
++def _uriencode(val: Any):
++    # Encode any string-compatible value so that it may be used in a URI.
++    return urllib.parse.quote(val if isinstance(val, (str, bytes)) else str(val))
++
++
++def _sort_params_schema(path: str, param_schema: list[dict]):
++    # Sort the OpenAPI endpoint parameters schema in order that path params
++    # appear in the given URI.
++    path_params = {p["name"]: p for p in param_schema if p["in"] == "path"}
++    known_path_params = re.findall(r"{([^}]*)}", path)
++    return [path_params[name] for name in known_path_params] + [p for p in param_schema if p["in"] != "path"]
+diff --git a/cryosparc/dataset.py b/cryosparc/dataset.py
+index 27a8e29e..e18075e3 100644
+--- a/cryosparc/dataset.py
++++ b/cryosparc/dataset.py
+@@ -146,6 +146,7 @@ class Dataset(Streamable, MutableMapping[str, Column], Generic[R]):
+ 
+     __slots__ = ("_row_class", "_rows", "_data")
+ 
++    media_type = "application/x-cryosparc-dataset"
+     _row_class: Type[R]
+     _rows: Optional[Spool[R]]
+     _data: Data
+diff --git a/cryosparc/errors.py b/cryosparc/errors.py
+index 24f72e1e..925e450d 100644
+--- a/cryosparc/errors.py
++++ b/cryosparc/errors.py
+@@ -2,10 +2,14 @@
+ Definitions for various error classes raised by cryosparc-tools functions
+ """
+ 
+-from typing import Any, List, TypedDict
++import json
++from typing import TYPE_CHECKING, Any, List, TypedDict
+ 
+ from .spec import Datafield, Datatype, SlotSpec
+ 
++if TYPE_CHECKING:
++    from httpx import Response
++
+ 
+ class DatasetLoadError(Exception):
+     """Exception type raised when a dataset cannot be loaded"""
+@@ -13,6 +17,36 @@ class DatasetLoadError(Exception):
+     pass
+ 
+ 
++class APIError(ValueError):
++    """
++    Raised by failed request to a CryoSPARC API server.
++    """
++
++    code: int
++    res: "Response"
++    data: Any
++
++    def __init__(
++        self,
++        reason: str,
++        *args: object,
++        res: "Response",
++        data: Any = None,
++    ) -> None:
++        msg = f"*** [API] ({res.request.method} {res.url}, code {res.status_code}) {reason}"
++        super().__init__(msg, *args)
++        self.res = res
++        self.code = res.status_code
++        self.data = data
++
++    def __str__(self):
++        s = super().__str__()
++        if self.data:
++            s += "\n"
++            s += json.dumps(self.data)
++        return s
++
++
+ class CommandError(Exception):
+     """
+     Raised by failed request to a CryoSPARC command server.
+diff --git a/cryosparc/json_util.py b/cryosparc/json_util.py
+new file mode 100644
+index 00000000..4859e209
+--- /dev/null
++++ b/cryosparc/json_util.py
+@@ -0,0 +1,84 @@
++import base64
++from datetime import datetime
++from pathlib import PurePath
++from typing import Any, Mapping
++
++import numpy as n
++from pydantic import BaseModel
++
++
++def api_default(obj: Any) -> Any:
++    """
++    json.dump "default" argument for sending objects over a JSON API. Ensures
++    that special non-JSON types such as Path are NDArray are encoded correctly.
++    """
++    if isinstance(obj, n.floating):
++        if n.isnan(obj):
++            return float(0)
++        elif n.isposinf(obj):
++            return float("inf")
++        elif n.isneginf(obj):
++            return float("-inf")
++        return float(obj)
++    elif isinstance(obj, n.integer):
++        return int(obj)
++    elif isinstance(obj, n.ndarray):
++        return ndarray_to_json(obj)
++    elif isinstance(obj, bytes):
++        return binary_to_json(obj)
++    elif isinstance(obj, datetime):
++        return obj.isoformat()
++    elif isinstance(obj, PurePath):
++        return str(obj)
++    elif isinstance(obj, BaseModel):
++        return obj.model_dump(exclude_none=True)
++    else:
++        return obj
++
++
++def api_object_hook(dct: Mapping[str, Any]):
++    """
++    json.dump "object_hook" argument for receiving JSON from an API request.
++    Ensures that special objects that are actually encoded numpy arrays or bytes
++    are decoded as such.
++    """
++    if "$ndarray" in dct:
++        return ndarray_from_json(dct)
++    elif "$binary" in dct:
++        return binary_from_json(dct)
++    else:
++        return dct  # pydantic will take care of everything else
++
++
++def binary_to_json(binary: bytes):
++    """
++    Encode bytes as a JSON-serializeable object
++    """
++    return {"$binary": {"base64": base64.b64encode(binary).decode()}}
++
++
++def binary_from_json(dct: Mapping[str, Any]) -> bytes:
++    if "base64" not in dct["$binary"] or not isinstance(b64 := dct["$binary"]["base64"], str):
++        raise TypeError(f"$binary base64 must be a string: {dct}")
++    return base64.b64decode(b64.encode())
++
++
++def ndarray_to_json(arr: n.ndarray):
++    """
++    Encode a numpy array a JSON-serializeable object.
++    """
++    return {
++        "$ndarray": {
++            "base64": base64.b64encode(arr.data).decode(),
++            "dtype": str(arr.dtype),
++            "shape": arr.shape,
++        }
++    }
++
++
++def ndarray_from_json(dct: Mapping[str, Any]):
++    """
++    Decode a serialized numpy array.
++    """
++    data = base64.b64decode(dct["$ndarray"]["base64"])
++    return n.frombuffer(data, dct["$ndarray"]["dtype"]).reshape(dct["$ndarray"]["shape"])
+diff --git a/cryosparc/models/__init__.py b/cryosparc/models/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/cryosparc/models/auth.py b/cryosparc/models/auth.py
+new file mode 100644
+index 00000000..aa91e66b
+--- /dev/null
++++ b/cryosparc/models/auth.py
+@@ -0,0 +1,8 @@
++# THIS FILE IS AUTO-GENERATED, DO NOT EDIT DIRECTLY
++# SEE dev/api_generate_models.py
++from pydantic import BaseModel
++
++
++class Token(BaseModel):
++    access_token: str
++    token_type: str
+diff --git a/cryosparc/registry.py b/cryosparc/registry.py
+new file mode 100644
+index 00000000..593508ec
+--- /dev/null
++++ b/cryosparc/registry.py
+@@ -0,0 +1,129 @@
++"""
++Model registration functions used by API client to determine how to interpret
++JSON responses. Used for either cryosparc-tools or cryosparc models.
++"""
++
++import re
++from collections.abc import Iterable
++from enum import Enum
++from inspect import isclass
++from types import ModuleType
++from typing import Dict, Optional, Type
++
++from pydantic import BaseModel
++
++from .stream import Streamable
++
++FINALIZED: bool = False
++REGISTERED_TYPED_DICTS: Dict[str, Type[dict]] = {}
++REGISTERED_ENUMS: Dict[str, Type[Enum]] = {}
++REGISTERED_MODEL_CLASSES: Dict[str, Type[BaseModel]] = {}
++REGISTERED_STREAM_CLASSES: Dict[str, Type[Streamable]] = {}
++
++
++def finalize():
++    """
++    Prevent registering additional types. Cannot be called twice.
++    """
++    global FINALIZED
++    check_finalized(False)
++    FINALIZED = True
++
++
++def check_finalized(finalized: bool = True):
++    """
++    Ensure the register has or hasn't been finalized. This is used in
++    special contexts such as cryosparcm icli or Jupyter Notebooks where
++    cryosparc-tools may be used alongside an API client.
++    """
++    assert FINALIZED is finalized, (
++        f"Cannot proceed because registry is {'finalized' if FINALIZED else 'not finalized'}. "
++        "This likely means that you're using both cryosparc-tools AND the "
++        "CryoSPARC API client from client/api_client.py. Please use either "
++        "`CryoSPARC` from tools or `APIClient` from cryosparc, but not both."
++    )
++
++
++def register_model(name, model_class: Type[BaseModel]):
++    check_finalized(False)
++    REGISTERED_MODEL_CLASSES[name] = model_class
++
++
++def register_typed_dict(name, typed_dict_class: Type[dict]):
++    check_finalized(False)
++    REGISTERED_TYPED_DICTS[name] = typed_dict_class
++
++
++def register_enum(name, enum_class: Type[Enum]):
++    check_finalized(False)
++    REGISTERED_ENUMS[name] = enum_class
++
++
++def register_model_module(mod: ModuleType):
++    for key, val in mod.__dict__.items():
++        if not re.match(r"^[A-Z]", key) or not isclass(val):
++            continue
++        if issubclass(val, BaseModel):
++            register_model(key, val)
++        if issubclass(val, dict):
++            register_typed_dict(key, val)
++        if issubclass(val, Enum):
++            register_enum(key, val)
++
++
++def model_for_ref(schema_ref: str) -> Optional[Type]:
++    """
++    Given a string with format either `#/components/schemas/X` or
++    `#/components/schemas/X_Y_`, looks up key X in `REGISTERED_MODEL_CLASSES``,
++    and return either X or X[Y] depending on whether the string includes the
++    final Y component.
++
++    Returns None if ref is not found.
++    """
++    import warnings
++
++    components = schema_ref.split("/")
++    if len(components) != 4 or components[0] != "#" or components[1] != "components" or components[2] != "schemas":
++        warnings.warn(f"Warning: Invalid schema reference {schema_ref}", stacklevel=2)
++        return
++
++    schema_name = components[3]
++    if "_" in schema_name:  # type var
++        generic, var, *_ = schema_name.split("_")
++        if generic in REGISTERED_MODEL_CLASSES and var in REGISTERED_MODEL_CLASSES:
++            return REGISTERED_MODEL_CLASSES[generic][REGISTERED_MODEL_CLASSES[var]]  # type: ignore
++    elif schema_name in REGISTERED_MODEL_CLASSES:
++        return REGISTERED_MODEL_CLASSES[schema_name]
++    elif schema_name in REGISTERED_TYPED_DICTS:
++        return REGISTERED_TYPED_DICTS[schema_name]
++    elif schema_name in REGISTERED_ENUMS:
++        return REGISTERED_ENUMS[schema_name]
++
++    warnings.warn(f"Warning: Unknown schema reference model {schema_ref}", stacklevel=2)
++
++
++def is_streamable_mime_type(mime: str):
++    return mime in REGISTERED_STREAM_CLASSES
++
++
++def register_stream_class(stream_class: Type[Streamable]):
++    mime = stream_class.media_type
++    assert mime not in REGISTERED_STREAM_CLASSES, (
++        f"Cannot register {stream_class}; "
++        f"stream class with mime-type {mime} is already registered "
++        f"({REGISTERED_STREAM_CLASSES[mime]})"
++    )
++    REGISTERED_STREAM_CLASSES[mime] = stream_class
++
++
++def get_stream_class(mime: str):
++    return REGISTERED_STREAM_CLASSES.get(mime)  # fails if mime-type not defined
++
++
++def streamable_mime_types():
++    return set(REGISTERED_STREAM_CLASSES.keys())
++
++
++def first_streamable_mime(strs: Iterable[str]) -> Optional[str]:
++    mimes = streamable_mime_types() & set(strs)
++    return mimes.pop() if len(mimes) > 0 else None
+diff --git a/cryosparc/stream.py b/cryosparc/stream.py
+index 8c5a1af6..acd0deb7 100644
+--- a/cryosparc/stream.py
++++ b/cryosparc/stream.py
+@@ -107,13 +107,11 @@ async def read(self, n: Optional[int] = None):
+ 
+ 
+ class Streamable(ABC):
+-    @classmethod
+-    def mime_type(cls) -> str:
+-        """
+-        Return the binary mime type to use in HTTP requests when streaming this
+-        data e.g., "application/x-cryosparc-dataset"
+-        """
+-        return f"application/x-cryosparc-{cls.__name__.lower()}"
++    media_type = "application/octet-stream"
++    """
++    May override in subclasses to derive correct stream type, e.g.,
++    "application/x-cryosparc-dataset"
++    """
+ 
+     @classmethod
+     def api_schema(cls):
+@@ -123,7 +121,7 @@ def api_schema(cls):
+         """
+         return {
+             "description": f"A binary stream representing a CryoSPARC {cls.__name__}",
+-            "content": {cls.mime_type(): {"schema": {"title": cls.__name__, "type": "string", "format": "binary"}}},
++            "content": {cls.media_type: {"schema": {"title": cls.__name__, "type": "string", "format": "binary"}}},
+         }
+ 
+     @classmethod
+diff --git a/cryosparc/stream_registry.py b/cryosparc/stream_registry.py
+new file mode 100644
+index 00000000..414a2195
+--- /dev/null
++++ b/cryosparc/stream_registry.py
+@@ -0,0 +1,4 @@
++from .dataset import Dataset
++from .registry import register_stream_class
++
++register_stream_class(Dataset)
+diff --git a/pyproject.toml b/pyproject.toml
+index 45e74284..34b17970 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -22,6 +22,8 @@ classifiers = [
+ license = { file = "LICENSE" }
+ dependencies = [
+     "numpy >= 1.17, < 3.0",
++    "httpx ~= 0.25",
++    "pydantic ~= 2.8",
+     "typing-extensions >= 4.0",
+ ]
+ 

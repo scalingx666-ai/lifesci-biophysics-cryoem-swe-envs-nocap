@@ -1,0 +1,384 @@
+diff --git a/Project.toml b/Project.toml
+index 54e105a34..a6c985730 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -58,7 +58,7 @@ AtomsBase = "0.5"
+ AtomsCalculators = "0.2"
+ BioStructures = "4"
+ CUDA = "4.2, 5, 6"
+-CellListMap = "0.8.11, 0.9"
++CellListMap = "0.10.2"
+ Chemfiles = "0.10.3"
+ Colors = "0.11, 0.12, 0.13"
+ Combinatorics = "1"
+diff --git a/src/Molly.jl b/src/Molly.jl
+index b8964ee25..8ec898803 100644
+--- a/src/Molly.jl
++++ b/src/Molly.jl
+@@ -9,7 +9,7 @@ using Atomix
+ import AtomsBase
+ import AtomsCalculators
+ import BioStructures
+-using CellListMap
++import CellListMap
+ import Chemfiles
+ using Combinatorics
+ using DataStructures
+diff --git a/src/free_energy/thermo.jl b/src/free_energy/thermo.jl
+index 626c1c1b7..f0f57870a 100644
+--- a/src/free_energy/thermo.jl
++++ b/src/free_energy/thermo.jl
+@@ -134,9 +134,9 @@ function AlchemicalPartition(thermo_states::AbstractArray{<:ThermoState};
+ 
+     # 4. Construct Partitioned Systems
+     master_nf = build_neighbor_finder(ref_nfinder, master_eligible, special_mask;
+-                                      reuse_neighbors=reuse_neighbors)
++                                      reuse_neighbors=reuse_neighbors, boundary=ref_sys.boundary)
+     λ_nf      = build_neighbor_finder(ref_nfinder, λ_eligible, special_mask;
+-                                      reuse_neighbors=reuse_neighbors)
++                                      reuse_neighbors=reuse_neighbors, boundary=ref_sys.boundary)
+ 
+     master_sys = System(deepcopy(ref_sys); 
+         pairwise_inters      = (master_pils...,),
+@@ -174,7 +174,7 @@ function AlchemicalPartition(thermo_states::AbstractArray{<:ThermoState};
+     )
+ end
+ 
+-function build_neighbor_finder(ref_nfinder, eligible, special; reuse_neighbors::Bool = true)
++function build_neighbor_finder(ref_nfinder, eligible, special; reuse_neighbors::Bool = true, boundary = nothing)
+     if ref_nfinder isa DistanceNeighborFinder
+         return DistanceNeighborFinder(
+             eligible = eligible, 
+@@ -187,7 +187,8 @@ function build_neighbor_finder(ref_nfinder, eligible, special; reuse_neighbors::
+             eligible = eligible,
+             dist_cutoff = ref_nfinder.dist_cutoff,
+             special = special,
+-            n_steps = 1
++            n_steps = 1,
++            boundary = boundary,
+         )
+     elseif ref_nfinder isa GPUNeighborFinder
+         if !reuse_neighbors
+diff --git a/src/neighbors.jl b/src/neighbors.jl
+index 0fce53218..df846d6ef 100644
+--- a/src/neighbors.jl
++++ b/src/neighbors.jl
+@@ -535,149 +535,114 @@ function find_neighbors(sys::System{<:Any, AT},
+ end
+ 
+ """
+-    CellListMapNeighborFinder(; eligible, dist_cutoff, special, n_steps, x0,
+-                              unit_cell, dims)
++    CellListMapNeighborFinder(; eligible, dist_cutoff, boundary,
++                                special, n_steps, x0)
+ 
+ Find close atoms by distance using a cell list algorithm from CellListMap.jl.
+ 
+ This is the recommended neighbor finder on CPU.
+-`x0` and `unit_cell` are optional initial coordinates and system unit cell that improve the
++`x0` are optional initial coordinates that improve the
+ first approximation of the cell list structure.
+-The number of dimensions `dims` is inferred from `unit_cell` or `x0`, or assumed
++The number of dimensions `dims` is inferred from the boundary or `x0`, or assumed
+ to be 3 otherwise.
+ 
+-Can not be used if one or more dimensions has infinite boundaries.
++The `boundary` parameter is required, and must be an `AbstractBoundary`. 
++Infinite boundaries are only accepted in all dimensions.
+ """
+-mutable struct CellListMapNeighborFinder{N, T}
++mutable struct CellListMapNeighborFinder{N, T, S}
+     eligible::BitArray{2}
+     dist_cutoff::T
+     special::BitArray{2}
+     n_steps::Int
+-    # Auxiliary arrays for multi-threaded in-place updating of the lists
+-    cl::CellListMap.CellList{N, T}
+-    aux::CellListMap.AuxThreaded{N, T}
+-    neighbors_threaded::Vector{NeighborList}
++    # The CellListMap.ParticleSystem object
++    clm_particlesystem::S
+ end
+ 
+-clm_box_arg(b::Union{CubicBoundary, RectangularBoundary}) = b.side_lengths
+-clm_box_arg(b::TriclinicBoundary) = hcat(b.basis_vectors...)
++function clm_unitcell_arg(b::Union{CubicBoundary, RectangularBoundary}) 
++    uc = b.side_lengths
++    D = size(uc, 1)
++    if any(isinf.(uc))
++        if all(isinf.(uc))
++            return nothing, D
++        else
++            throw(ArgumentError("Cannot use infinite boundaries in some, but not all, dimension."))
++        end
++    end
++    return uc, D
++end
++function clm_unitcell_arg(b::TriclinicBoundary) 
++    uc = hcat(b.basis_vectors...)
++    D = size(uc, 1)
++    return uc, D
++end
+ 
+-# This function sets up the box structure for CellListMap. It uses the unit cell
+-# if it is given, or guesses a box size from the number of particles, assuming
+-# that the atomic density is similar to that of liquid water at ambient conditions.
++# This function sets up the ParticleSystem structure for CellListMap. 
+ function CellListMapNeighborFinder(;
+                                    eligible,
+                                    dist_cutoff::T,
++                                   boundary::AbstractBoundary,
+                                    special=zero(eligible),
+                                    n_steps=10,
+                                    x0=nothing,
+-                                   unit_cell=nothing,
+-                                   dims=nothing,
+                                    number_of_batches=(0, 0)) where T
+-    n_atoms = size(eligible, 1)
+-    if !isnothing(dims)
+-        D = dims
+-    elseif !isnothing(unit_cell)
+-        D = n_dimensions(unit_cell)
+-    elseif !isnothing(x0)
+-        D = size(eltype(x0))[1]
+-    else
+-        D = 3
+-    end
+-
+-    if isnothing(unit_cell)
+-        twice_cutoff = nextfloat(2 * dist_cutoff)
+-        if unit(dist_cutoff) == NoUnits
+-            side = max(twice_cutoff, T((n_atoms * 0.01) ^ (1 / 3)))
+-        else
+-            side = max(
+-                twice_cutoff,
+-                uconvert(unit(dist_cutoff), T((n_atoms * 0.01u"nm^3") ^ (1 / 3))),
+-            )
+-        end
+-        sides = SVector(fill(side, D)...)
+-        box = CellListMap.Box(sides, dist_cutoff)
+-    else
+-        box = CellListMap.Box(clm_box_arg(unit_cell), dist_cutoff)
+-    end
+-    if isnothing(x0)
+-        x = [ustrip.(diag(box.input_unit_cell.matrix)) .* rand(SVector{D, T}) for _ in 1:n_atoms]
+-    else
+-        x = x0
+-    end
+-
+-    # Construct the cell list for the first time, to allocate
+-    cl = CellList(x, box; parallel=true, nbatches=number_of_batches)
+-    return CellListMapNeighborFinder{D, T}(
+-        eligible, dist_cutoff, special, n_steps,
+-        cl, CellListMap.AuxThreaded(cl),
+-        [NeighborList(0, [(Int32(0), Int32(0), false)]) for _ in 1:CellListMap.nbatches(cl)],
++                            
++                                   
++    # Obtain unit cell from boundary: If all boundaries are infinite, use `nothing`
++    uc, D = clm_unitcell_arg(boundary)
++
++    clm_system = CellListMap.ParticleSystem(;
++        positions=isnothing(x0) ? SVector{D,T}[] : x0,
++        cutoff=dist_cutoff,
++        unitcell=uc,
++        nbatches=number_of_batches,
++        parallel=true,
++        output=NeighborList(),
++        output_name=:neighbors,
+     )
++
++    return CellListMapNeighborFinder{D, T, typeof(clm_system)}(eligible, dist_cutoff, special, n_steps, clm_system)
+ end
+ 
+ # Add a pair to the pair list
+ # If the buffer size is large enough update the element, otherwise push a new element
+ #   to `neighbor.list`
+-function push_pair!(neighbors::NeighborList, i::Integer, j::Integer, eligible, special)
++function push_pair!(pair, neighbors::NeighborList, eligible, special)
++    (; i, j) = pair
+     if eligible[i, j]
+         push!(neighbors, (Int32(i), Int32(j), special[i, j]))
+     end
+     return neighbors
+ end
+ 
+-# This is only called in the parallel case
+-function reduce_pairs(neighbors::NeighborList, neighbors_threaded::Vector{NeighborList})
+-    neighbors.n = 0
+-    for i in eachindex(neighbors_threaded)
+-        append!(neighbors, neighbors_threaded[i])
+-    end
+-    return neighbors
+-end
++# Parallelization interface for custom output of CellListMap
++CellListMap.copy_output(nl::NeighborList) = NeighborList(nl.n, copy(nl.list)) 
++CellListMap.reset_output!(nl::NeighborList) = empty!(nl)
++CellListMap.reducer(nl1::NeighborList, nl2::NeighborList) = append!(nl1, nl2)
+ 
+ function find_neighbors(sys::System{D, AT},
+                         nf::CellListMapNeighborFinder,
+-                        current_neighbors=nothing,
++                        current_neighbors=sys.neighbor_finder.clm_particlesystem.neighbors, 
+                         step_n::Integer=0,
+                         force_recompute::Bool=false;
+                         n_threads::Integer=Threads.nthreads()) where {D, AT}
++
+     if !force_recompute && !iszero(step_n % nf.n_steps)
+         return current_neighbors
+     end
+ 
+-    if isnothing(current_neighbors)
+-        neighbors = NeighborList()
+-    elseif AT <: AbstractGPUArray
+-        neighbors = NeighborList(current_neighbors.n, from_device(current_neighbors.list))
+-    else
+-        neighbors = current_neighbors
+-    end
+-    aux = nf.aux
+-    cl = nf.cl
+-    neighbors.n = 0
+-    neighbors_threaded = nf.neighbors_threaded
+-    if n_threads > 1
+-        for i in eachindex(neighbors_threaded)
+-            neighbors_threaded[i].n = 0
+-        end
+-    else
+-        neighbors_threaded[1].n = 0
+-    end
++    # Update the CellListMap.ParticleSystem
++    CellListMap.update!(nf.clm_particlesystem; 
++        positions=from_device(sys.coords),
++        unitcell=first(clm_unitcell_arg(sys.boundary)), 
++        parallel=n_threads > 1,
++    )
+ 
+-    box = CellListMap.Box(clm_box_arg(sys.boundary), nf.dist_cutoff; lcell=1)
+-    parallel = n_threads > 1
+-    cl = UpdateCellList!(from_device(sys.coords), box, cl, aux; parallel=parallel)
+-
+-    map_pairwise!(
+-        (x, y, i, j, d2, pairs) -> push_pair!(pairs, i, j, nf.eligible, nf.special),
+-        neighbors,
+-        box,
+-        cl;
+-        reduce=reduce_pairs,
+-        output_threaded=neighbors_threaded,
+-        parallel=parallel,
++    # Update the neighborlist
++    neighbors = CellListMap.pairwise!(
++        (p, neighbors) -> push_pair!(p, neighbors, nf.eligible, nf.special), 
++        nf.clm_particlesystem
+     )
+ 
+-    nf.cl = cl
+     if AT <: AbstractGPUArray
+         return NeighborList(neighbors.n, to_device(neighbors.list, AT))
+     else
+diff --git a/src/setup.jl b/src/setup.jl
+index 89fc06d63..087b096e6 100644
+--- a/src/setup.jl
++++ b/src/setup.jl
+@@ -1903,7 +1903,7 @@ function System(T, AT, atoms, coords, boundary_used, velocities, atoms_data, vir
+             special=special,
+             n_steps=10,
+             x0=coords,
+-            unit_cell=boundary_used,
++            boundary=boundary_used,
+             dist_cutoff=T(dist_neighbors),
+         )
+     else
+diff --git a/test/basic.jl b/test/basic.jl
+index ae693cf06..d002edd63 100644
+--- a/test/basic.jl
++++ b/test/basic.jl
+@@ -342,7 +342,12 @@ end
+     reorder_neighbors(nbs) = map(t -> (min(t[1], t[2]), max(t[1], t[2]), t[3]), nbs)
+ 
+     for neighbor_finder in (DistanceNeighborFinder, TreeNeighborFinder, CellListMapNeighborFinder)
+-        nf = neighbor_finder(eligible=trues(3, 3), n_steps=10, dist_cutoff=2.0u"nm")
++        boundary=CubicBoundary(10.0u"nm")
++        if neighbor_finder == CellListMapNeighborFinder
++            nf = neighbor_finder(eligible=trues(3, 3), n_steps=10, dist_cutoff=2.0u"nm", boundary=boundary)
++        else
++            nf = neighbor_finder(eligible=trues(3, 3), n_steps=10, dist_cutoff=2.0u"nm")
++        end
+         s = System(
+             atoms=[Atom(), Atom(), Atom()],
+             coords=[
+@@ -350,7 +355,7 @@ end
+                 SVector(2.0, 2.0, 2.0)u"nm",
+                 SVector(5.0, 5.0, 5.0)u"nm",
+             ],
+-            boundary=CubicBoundary(10.0u"nm"),
++            boundary=boundary,
+             neighbor_finder=nf,
+         )
+         neighbors = find_neighbors(s, s.neighbor_finder; n_threads=1)
+@@ -371,7 +376,7 @@ end
+     boundary = CubicBoundary(10.0u"nm")
+     neighbor_finder=CellListMapNeighborFinder(
+         eligible=trues(3, 3), n_steps=10, x0=coords,
+-        unit_cell=boundary, dist_cutoff=2.0u"nm",
++        boundary=boundary, dist_cutoff=2.0u"nm",
+     )
+     sys = System(
+         atoms=[Atom(), Atom(), Atom()],
+@@ -396,7 +401,10 @@ end
+     coords = place_atoms(n_atoms, boundary; min_dist=0.01u"nm")
+     atoms = fill(Atom(), n_atoms)
+     dist_cutoff = 0.6u"nm"
+-    nf = CellListMapNeighborFinder(eligible=trues(n_atoms, n_atoms), dist_cutoff=dist_cutoff)
++    nf = CellListMapNeighborFinder(eligible=trues(n_atoms, n_atoms), 
++                                   dist_cutoff=dist_cutoff,
++                                   boundary=boundary,
++                                  )
+     sys = System(atoms=atoms, coords=coords, boundary=boundary, neighbor_finder=nf)
+     neighbors = find_neighbors(sys)
+ 
+@@ -460,11 +468,20 @@ end
+     eligible_cpu, special_cpu = dense_masks(sys.neighbor_finder)
+ 
+     for neighbor_finder in (DistanceNeighborFinder, TreeNeighborFinder, CellListMapNeighborFinder)
+-        nf = neighbor_finder(
+-            eligible=eligible_cpu,
+-            special=special_cpu,
+-            dist_cutoff=dist_cutoff,
+-        )
++        if neighbor_finder == CellListMapNeighborFinder
++            nf = neighbor_finder(
++                eligible=eligible_cpu,
++                special=special_cpu,
++                dist_cutoff=dist_cutoff,
++                boundary=sys.boundary,
++            )
++        else
++            nf = neighbor_finder(
++                eligible=eligible_cpu,
++                special=special_cpu,
++                dist_cutoff=dist_cutoff,
++            )
++        end
+         for n_threads in n_threads_list
+             neighbors = find_neighbors(sys, nf; n_threads=n_threads)
+             @test length(neighbors) == n_neighbors_ref
+@@ -507,6 +524,20 @@ end
+             @test identical_neighbors(neighbors_gpu, gpu_neighbors_ref)
+         end
+     end
++
++    # Tests specific for the interface of CellListMapNeighborFinder, when
++    # infinite boundaries are provided.
++    nf = CellListMapNeighborFinder(eligible=trues(100, 100), 
++                                   dist_cutoff=0.6u"nm",
++                                   boundary=CubicBoundary(SVector(Inf, Inf, Inf) .* u"nm"),
++                                  )
++    @test length(nf.clm_particlesystem.positions) == 0
++    @test size(nf.clm_particlesystem.unitcell) == (3,3)
++    @test first(nf.clm_particlesystem.unitcell) > 2 * 0.6u"nm"
++    @test_throws "Cannot use infinite boundaries" CellListMapNeighborFinder(eligible=trues(100,100), 
++                                                                            dist_cutoff=1.0u"nm",
++                                                                            boundary=CubicBoundary(SVector(Inf, 100.0, 100.0)))
++
+ end
+ 
+ @testset "GPUNeighborFinder sparse metadata" begin

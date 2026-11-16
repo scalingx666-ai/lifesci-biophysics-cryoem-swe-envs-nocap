@@ -1,0 +1,1240 @@
+diff --git a/so3lr/flash/cuda/__init__.py b/so3lr/flash/cuda/__init__.py
+index 6015013..4945715 100644
+--- a/so3lr/flash/cuda/__init__.py
++++ b/so3lr/flash/cuda/__init__.py
+@@ -8,8 +8,12 @@
+ ``attach(eng)`` replaces the engine's methods on the instance; the kernels are built with nvcc
+ on first use (see ``build``). Per force call the neighbour rows are sorted, and each unordered
+ pair's record (its atoms, its two directed slots, its geometry) is made once; every layer's
+-forward keeps the filter per pair and the scores per slot for its backward (``kib_per_atom``:
+-more than the Pallas fast mode holds, so the kernels decline where that does not fit).
++forward keeps the filter per pair and the scores per slot for its backward (``kib_per_atom``).
++Where that does not fit, the kernels serve the engine's attention alone, a chunk of rows at a
++time: each chunk's per-pair data is made in the forward for the scores and again in the
++backward, at about 1.3x the time of keeping it, and the engine's memory mode decides what is
++kept per atom (``chunked_kib_per_atom``; the modes picked: ``MODES``). Where none fits, the
++engine keeps the Pallas kernels.
+ 
+ Numerics: radial filter tables are the engine's at every 8th node (512 intervals, cubic
+ Hermite: the same accuracy, an 8x smaller table), the long-range pair tables at every 64th
+@@ -17,6 +21,7 @@
+ (the finite difference (f0 - f1) / h loses digits as h shrinks)."""
+ import functools
+ import logging
++import types
+ 
+ import jax
+ import jax.numpy as jnp
+@@ -36,6 +41,12 @@ def _f64(pos3):
+     return tuple(c if c.dtype == jnp.float64 else c.astype(jnp.float64) for c in pos3)
+ 
+ 
++def _row_arg(start, first_new):
++    """The kernels' row argument of a range of rows: its first row, and the first it writes
++    (the rows before are another range's: a chunk shifted back to end at the last row)."""
++    return jnp.stack([jnp.asarray(start, jnp.int32), jnp.asarray(first_new, jnp.int32)])
++
++
+ def variant(eng):
+     """The kernels' build variant of this engine's model: (features, heads, equivariant
+     components, the spherical filters' hidden units, the entries' degrees as nibbles, the
+@@ -48,19 +59,73 @@ def variant(eng):
+ 
+ 
+ def kib_per_atom(eng):
+-    """What the engine holds per atom at its peak on the kernels, in KiB (an estimate; the
+-    margin is unsupported's): the fast mode's arrays, per layer the filter per pair (K F
+-    floats), the scores per slot, the projections with their VJP's inputs and the post
+-    block's, the heads' VJP, and one layer's backward temporaries per slot (its slot scalars,
+-    and per channel copy the force and per-axis virial record and the ev gradient)."""
++    """What the engine holds per atom at its peak on the kernels, every layer's per-pair data
++    kept for its backward, in KiB (an estimate, MARGIN aside; on water so3lr-tauri-s/m/l hold
++    95/136/406 KiB): the fast mode's arrays, per layer the filter per pair (K F floats), the
++    scores per slot, the projections and the post block's VJP inputs, the heads' VJP, and one
++    layer's backward temporaries per slot (its slot scalars, and per channel copy the force and
++    per-axis virial record and the ev gradient)."""
+     from ..engine import mode_kib
+-    per_layer = eng.K * eng.F + 3 * eng.K * eng.nh + 16 * eng.F + 3 * eng.M     # floats
+-    bwd = eng.K * (5 * eng.nh + bwd_copies(variant(eng)) * (8 + eng.M))
+-    return mode_kib("fast", eng.statics) + (eng.statics["num_layers"] * per_layer + 8 * eng.F + bwd) * 4 / 1024
++    per_layer = eng.K * eng.F + 3 * eng.K * eng.nh + 3 * eng.F + 3 * eng.M     # floats
++    floats = eng.statics["num_layers"] * per_layer + 8 * eng.F + _slot_floats(eng)
++    return mode_kib("fast", eng.statics) + floats * 4 / 1024
++
++
++def _slot_floats(eng):
++    """One layer's backward temporaries per row, in floats: per slot its scalars, and per
++    channel copy the force and per-axis virial record and the ev gradient."""
++    return eng.K * (5 * eng.nh + bwd_copies(variant(eng)) * (8 + eng.M))
++
++
++def chunked_kib_per_atom(eng):
++    """What the engine holds per atom at its peak with the per-pair data made a chunk of rows
++    at a time (chunk_kib_per_row), in KiB (MARGIN aside; so3lr-tauri-s/m/l on water in MD:
++    the measured peaks within 2%). The peak is the top layer's backward: its projections and
++    gradients, the neighbour rows, the MD state, and what the memory mode keeps of the layers
++    below, their inputs and attention outputs; one program (jitted) holds more of the
++    backward's temporaries at once than its own stage does. PME's meshes are not alive then."""
++    F, M, K, L = eng.F, eng.M, eng.K, eng.statics["num_layers"]
++    w = F + M
++    floats = 6.5 * w + K + 145
++    if eng.keep:
++        floats += (L - 1) * w - F
++    if eng.keep_attention:
++        floats += (L - 1) * w
++    if not eng.staged:
++        floats += 4.8 * w
++    return floats * 4 / 1024
++
++
++def chunk_kib_per_row(eng):
++    """A chunk's per-pair and per-slot buffers per row, in KiB: its pairs' filters (at most K a
++    row: a pair with a partner outside the chunk is the chunk's too), its slots' and shadow
++    slots' scores, the pair records and slot index, the backward's slot records, and its
++    rows' projections' gradients."""
++    K, F, NH = eng.K, eng.F, eng.nh
++    return (K * 2 * F + 2 * K * 2 * NH + K * 12 + 2 * K + _slot_floats(eng) + 5 * F) * 4 / 1024
++
++
++GIB = 1 << 30
++MARGIN = 1.05            # on the per-atom estimates
++MIN_CHUNK = 2 * GIB      # bytes for a chunk's buffers: fewer rows would spend more on duplicated pairs
++CHUNK_BUDGET = (24 * GIB, 64 * GIB)  # bytes for a chunk's buffers: at least (room allowing), at most
++# staged: a stage's temporaries are one allocation, which the GPU's memory, fragmented by what
++# stays between the stages and steps, may not hold in one piece; the largest (every atom's
++# projections, the attention output where it is made again, a chunk's buffers) at most this
++# share of the free memory (larger ones failed after the first MD step)
++STAGE_SHARE = 0.4
++
++# The engine's memory modes (engine.MODES) picked for the kernels, fastest first; "default"
++# is "fast" staged (each stage a program of its own: fewer temporaries alive at once, the
++# same speed). The kernels serve the leaner modes too (the attention outputs, then the layer
++# inputs, made again in the backward; flash_mode), but they are not picked: on the systems
++# they are for, one stage holds every atom's projections in a single allocation of most of
++# the GPU, which after the first step the allocator does not always find in one piece.
++MODES = ("fast", "default")
+ 
+ 
+ def unsupported(eng):
+-    """Why the CUDA kernels cannot serve this engine (None: they can)."""
++    """Why the CUDA kernels cannot serve this engine (None: they can, memory aside)."""
+     why = problem()
+     if why:
+         return why
+@@ -70,12 +135,52 @@ def unsupported(eng):
+         return "float32 positions (the kernels take float64 ones: jax_enable_x64)"
+     if variant(eng) is None:
+         return "a model other than so3lr-tauri-s/m/l or so3lr (32 features per head, 4 or 8 heads of degrees 1-4)"
+-    if not eng.keep_attention or eng.split or eng.blocks:
+-        return "a memory mode other than fast"
+-    from ..md import _free_bytes
+-    need, free = eng.n * kib_per_atom(eng) * 1024 * 1.1 + (1 << 30), _free_bytes()
+-    if need > free:
+-        return f"{eng.n} atoms' pair filters and scores need ~{need / 2 ** 30:.0f} GiB of the {free / 2 ** 30:.0f} free"
++    if eng.split or eng.blocks:
++        return "a memory mode of the Pallas kernels' own (the attention in passes)"
++    return None
++
++
++def plan(eng, free=None):
++    """(bytes for a chunk's buffers, None) for the kernels on this engine: None where every
++    layer's per-pair data fits for its backward (in a mode keeping the attention outputs),
++    else a chunk's (CHUNK_BUDGET) next to the per-atom arrays of the engine's mode; or (None,
++    why) where neither fits."""
++    if free is None:
++        from ..md import _free_bytes
++        free = _free_bytes()
++    if eng.keep_attention and eng.n * kib_per_atom(eng) * 1024 * MARGIN + GIB <= free:
++        return None, None
++    room = free - eng.n * chunked_kib_per_atom(eng) * 1024 * MARGIN - GIB
++    # half the room, between the bounds: larger chunks make fewer pairs twice (at their edges)
++    budget = min(room, max(CHUNK_BUDGET[0], min(room / 2, CHUNK_BUDGET[1])))
++    if eng.staged:
++        stage = 4 * eng.n * (5 * eng.F + (0 if eng.keep_attention else eng.F + eng.M))
++        budget = min(budget, STAGE_SHARE * free - stage)
++    if budget < min(MIN_CHUNK, eng.nl * chunk_kib_per_row(eng) * 1024):
++        need = eng.n * chunked_kib_per_atom(eng) * 1024 * MARGIN + GIB + MIN_CHUNK
++        return None, (f"{eng.n} atoms need ~{need / GIB:.0f} GiB of the {free / GIB:.0f} free, a chunk of rows "
++                      f"at a time, and a stage's temporaries in one piece")
++    return budget, None
++
++
++def pick_mode(n, free, params, statics):
++    """The fastest of MODES in which the kernels fit n atoms in free bytes (their per-pair data
++    kept, or a chunk of rows at a time), or None: they do not serve this model here, or it
++    fits none (the Pallas kernels' modes go further)."""
++    from .. import engine as E
++    # what the estimates read of an engine for these atoms, as the engine would make it
++    F, nh, G, M, sh = E.model_widths(params, statics)
++    eng = types.SimpleNamespace(n=n, nl=n, statics=statics, dtype=statics.get("dtype", jnp.float32), F=F, nh=nh,
++                                G=G, M=M, sh=sh, K=E.neighbour_rows(float(statics["cutoff"])), split=False,
++                                blocks=False, keep=True, keep_attention=True, staged=False)
++    if unsupported(eng):
++        return None
++    for name in MODES:
++        kw, eng.staged = E.MODES[name][:2]
++        eng.keep = kw.get("keep_layer_inputs", True)
++        eng.keep_attention = kw.get("keep_attention", False) and eng.keep
++        if plan(eng, free)[1] is None:
++            return name
+     return None
+ 
+ 
+@@ -105,10 +210,16 @@ def ffi_prefix(var):
+ 
+ class CudaKernels:
+     """The engine's CUDA methods: build (sorted rows + pair records), the layers' forward
+-    and backward, the long range, and the heads with their VJP reused."""
+-
+-    def __init__(self, eng):
++    and backward, the long range, and the heads with their VJP reused. In chunks (``chunk``
++    rows, or as many as ``budget`` bytes hold) the per-pair data is made a chunk of rows at a
++    time, in the forward for the scores and again in the backward, instead of kept for every
++    layer (for systems whose per-pair data does not fit), and the kernels serve the engine's
++    attention alone: a chunk's pairs are those of its rows, a pair with a partner outside the
++    chunk made by both chunks, as the devices do."""
++
++    def __init__(self, eng, chunk=None, budget=None):
+         self.eng = eng
++        self._chunk, self._budget = chunk, budget
+         self.variant = variant(eng)
+         NH, rank = self.variant[1], self.variant[5]
+         self.copies = bwd_copies(self.variant)      # of the per-slot forces and ev gradients
+@@ -128,94 +239,141 @@ def __init__(self, eng):
+             self.layers.append(dict(W=W, tabs=[u1v, u1d, u2v, u2d], V=[v1, v2]))
+         self.scal = eng.scal.at[1].multiply(TABLE_SUB).at[2].divide(TABLE_SUB)
+         self.pair_tables = (eng.phi_v[::PAIR_SUB], eng.phi_d[::PAIR_SUB], eng.c6lr_v[::PAIR_SUB], eng.c6lr_d[::PAIR_SUB])
+-        self.kib = kib_per_atom(eng)
++        self.kib = (kib_per_atom(eng) if self.chunk is None
++                    else chunked_kib_per_atom(eng) + chunk_kib_per_row(eng) * self.chunk / eng.n)
+         self._orig_build, self._orig_heads, self._orig_head_backward = eng.build, eng._heads, eng._head_backward
+-        self._calls = None                # the FFI calls for the rows' current layout (_sized)
++        self._calls = {}                  # the FFI calls per layout of the rows and range (_sized)
+         self._pp = None                   # the current trace's pair records (PI, PG, PIDX, off)
+         self._post_vjp, self._proj, self._heads_vjp = {}, {}, None
+ 
+-    def _sized(self):
+-        """The FFI calls with their output shapes, and the pair capacity, for the rows as laid
+-        out now: made at trace time, so wider rows (widen) take effect at the next program."""
++    @property
++    def chunk(self):
++        """Rows per chunk (None: every layer's per-pair data kept): as asked, or as many as the
++        budget holds with the rows as laid out now (wider after an overflow: fewer), in chunks
++        of equal size (the last one, shifted back to end at the range's last row, then makes
++        fewer than one row a chunk twice)."""
++        if self._chunk is None and self._budget is None:
++            return None
++        nl = self.eng.nl
++        rows = self._chunk or self._budget // (chunk_kib_per_row(self.eng) * 1024)
++        rows = max(1, min(int(rows), nl))
++        return -(-nl // -(-nl // rows))
++
++    def _sized(self, rows=None):
++        """The FFI calls with their output shapes and fixed attributes, and the pair capacity,
++        for ranges of ``rows`` rows (default: the device's) and the rows as laid out now: made
++        at trace time, so wider rows (widen) take effect at the next program."""
+         eng = self.eng
+-        n, K, P = eng.n, eng.K, eng.P
+-        if self._calls is None or self._calls["key"] != (n, K, P):
++        n, K = eng.n, eng.K
++        nl = eng.nl if rows is None else rows
++        if (K, nl) not in self._calls:
+             F, NH, M = eng.F, eng.nh, eng.M
+             f32, i32, S = jnp.float32, jnp.int32, jax.ShapeDtypeStruct
+-            pmax = n * K // 2
+-            # several devices: each its rows' pairs; a partner on another device has no slot in
+-            # its row, its reverse score goes to the pair's shadow slot (n K + pair). The per-row
+-            # kernels then write this device's rows into the input (aliased), the other rows
+-            # keep the input's; one device writes every row, so its outputs need not alias
+-            al = lambda d: d if P > 1 else None
+-            call = lambda name, out, **kw: jax.ffi.ffi_call(f"{self.prefix}_{name}", out, **kw)
+-            self._calls = dict(
+-                key=(n, K, P), pmax=pmax, tiles16=-(-pmax // 16),
++            # the per-slot and per-pair buffers hold this device's range of rows: its nl K
++            # directed slots, and its pairs (each once where the range is every row: n K / 2;
++            # else at most K a row, a pair with a partner outside the range being the range's
++            # too). A partner outside the range has no slot in its row: its reverse score goes
++            # to the pair's shadow slot (nl K + pair). The per-row kernels then write the
++            # range's rows into the input (aliased), the other rows keep the input's; a range
++            # of every row writes them all, so its outputs need not alias
++            pmax, slots = min(n * K // 2, nl * K), nl * K
++            al = lambda d: d if nl < n else None
++
++            def call(name, out, aliases=None, **attrs):
++                """A kernel's FFI call, its attributes fixed."""
++                return functools.partial(jax.ffi.ffi_call(f"{self.prefix}_{name}", out, input_output_aliases=aliases),
++                                         **{k: np.int64(v) for k, v in attrs.items()})
++            scores = S(((slots + pmax) * 2 * NH,), f32)
++            # in chunks the gather writes the projections' gradients of the chunk's rows only
++            # (local), into a carry of the dE/dev and force sums (aliased)
++            local = self.chunk is not None
++            self._calls[K, nl] = dict(
++                pmax=pmax, tiles16=-(-pmax // 16),
+                 # the pair records; PIDX from a zeroed input (a slot without a pair, while a row
+                 # overflows, reads pair 0 rather than anything)
+-                prep=call("prep", (S((pmax * 4,), i32), S((pmax * 8,), f32), S((n * K,), i32)), input_output_aliases={14: 2}),
+-                fwd=call("fwd", (S(((n * K + pmax) * 2 * NH,), f32), S((pmax * 2 * F,), f32))),
+-                msg=call("msg", (S((n, F), f32), S((n, M), f32)), input_output_aliases=al({8: 0, 9: 1})),
++                prep=call("prep", (S((pmax * 4,), i32), S((pmax * 8,), f32), S((slots,), i32)), {14: 2},
++                          zmax=eng.zmax, P=pmax, NL=nl),
++                # the scores per slot, with the filters per pair for the backward (fwd) or not
++                fwd=call("fwd", (scores, S((pmax * 2 * F,), f32)), P=pmax, keep_w=1),
++                scores=call("fwd", (scores, S((1,), f32)), P=pmax, keep_w=0),
++                msg=call("msg", (S((n, F), f32), S((n, M), f32)), al({8: 0, 9: 1}), NL=nl),
+                 # the backward: slot scalars, and the forces and ev gradients per slot (a copy per
+                 # channel where each channel's CTA writes its own)
+-                bwd=call("bwd", (S((n * K * 5 * NH,), f32), S((self.copies * n * K * 8,), f32),   # 8 floats per slot (FVS)
+-                                 S((self.copies * n * K * M,), f32))),
+-                gather=call("gather", tuple(S((n, F), f32) for _ in range(5)) + (S((n, M), f32), S((6, n), f32)),
+-                            input_output_aliases=al({9: 5, 10: 6})),
+-                lr=call("lr", tuple(S((n,), f32) for _ in range(4)) + (S((6, n), f32),),
+-                        input_output_aliases=al({18: 0, 19: 4})))
+-        return self._calls
++                bwd=call("bwd", (S((slots * 5 * NH,), f32), S((self.copies * slots * 8,), f32),   # 8 floats per slot (FVS)
++                                 S((self.copies * slots * M,), f32)), P=pmax),
++                gather=call("gather", tuple(S((nl if local else n, F), f32) for _ in range(5))
++                            + (S((n, M), f32), S((6, n), f32)), {9: 5, 10: 6} if local else al({9: 5, 10: 6}),
++                            NL=nl, local=int(local)),
++                lr=call("lr", tuple(S((n,), f32) for _ in range(4)) + (S((6, n), f32),), al({18: 0, 19: 4})))
++        return self._calls[K, nl]
+ 
+     # ---- once per force call: sorted rows and the pair records ---------------------------
+     def build(self, pos3):
+         """The engine's build, with the neighbour rows sorted and, appended to its tuple,
+-        the pair records (PI, PG, PIDX, off) every layer reads."""
+-        eng, c = self.eng, self._sized()
++        the pair records (PI, PG, PIDX, off) every layer reads (in chunks: none, each chunk
++        makes its own)."""
++        eng = self.eng
+         pos3 = _f64(pos3)                 # the kernels form every distance in float64
+         order, cell_start, cell_of, nbr, cnt = self._orig_build(pos3)
+         n, Kc = nbr.shape
+         cm = jnp.minimum(cnt, Kc)
+         ns = jnp.sort(jnp.where(jnp.arange(Kc)[None, :] < cm[:, None], nbr, I32MAX), axis=1)
+-        # this device's rows [r0, r0 + nl): a row keeps its partners on other devices and the
+-        # larger local ones (sorted: columns [0, lo) and [hi, cnt))
+-        row0 = eng._row_arg()
+-        ar = jnp.arange(n, dtype=jnp.int32)
+-        local = (ar >= row0[0]) & (ar < row0[0] + eng.nl)
+-        lo = jnp.where(local, jnp.sum(ns < row0[0], axis=1), 0).astype(jnp.int32)
+-        hi = jnp.where(local, jnp.sum(ns < ar[:, None], axis=1), 0).astype(jnp.int32)
+-        npairs = jnp.where(local, cm - (hi - lo), 0)
+-        off = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(npairs).astype(jnp.int32)])
++        if self.chunk is not None:
++            return order, cell_start, cell_of, ns, cnt
++        self._pp = self._records(pos3, ns, cnt, _row_arg(eng._r0, eng._r0), eng.nl)
++        return (order, cell_start, cell_of, ns, cnt) + self._pp
++
++    def _records(self, pos3, ns, cnt, row0, nl):
++        """The pair records (PI, PG, PIDX, off) of the rows [r0, r0 + nl) (r0 = row0[0]), with
++        their per-row arrays: a row keeps its partners outside the range and the larger ones
++        inside it (sorted: columns [0, lo) and [hi, cnt))."""
++        eng, c = self.eng, self._sized(nl)
++        r0 = row0[0]
++        rows = jax.lax.dynamic_slice_in_dim(ns, r0, nl)
++        cm = jnp.minimum(jax.lax.dynamic_slice_in_dim(cnt, r0, nl), ns.shape[1])
++        lo = jnp.sum(rows < r0, axis=1).astype(jnp.int32)
++        hi = jnp.sum(rows < (r0 + jnp.arange(nl, dtype=jnp.int32))[:, None], axis=1).astype(jnp.int32)
++        off = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(cm - (hi - lo)).astype(jnp.int32)])
+         tile_atom = jnp.clip(jnp.searchsorted(off, 16 * jnp.arange(c["tiles16"], dtype=jnp.int32), side="right") - 1,
+-                             0, n - 1).astype(jnp.int32)
++                             0, nl - 1).astype(jnp.int32)
+         PI, PG, PIDX = c["prep"](*pos3, eng._box(pos3[0]), ns, cnt, eng.z, off, lo, hi, tile_atom, row0, eng.rmin,
+-                                 self.scal, jnp.zeros((n * Kc,), jnp.int32),
+-                                 zmax=np.int64(eng.zmax), P=np.int64(c["pmax"]), NL=np.int64(eng.nl))
+-        self._pp = (PI, PG, PIDX, off)
+-        return order, cell_start, cell_of, ns, cnt, PI, PG, PIDX, off
++                                 self.scal, jnp.zeros((nl * ns.shape[1],), jnp.int32))
++        return PI, PG, PIDX, off
++
++    def _pairs(self, c, li, proj, ev, rec, keep_w=True):
++        """Layer li's scores per slot and (keep_w) filters per pair, for the pair records rec."""
++        L = self.layers[li]
++        q1, k1, _, q2, k2 = proj
++        return c["fwd" if keep_w else "scores"](q1, k1, q2, k2, ev, rec[0], rec[1], rec[3], *L["tabs"], *L["W"],
++                                                *L["V"], self.eng.cdeg, self.scal)
++
++    def _pair_backward(self, c, li, proj, ev, gdx, gdev, rec, Wst, S):
++        """Layer li's backward per pair: (slot scalars, forces and virial records, ev gradients)."""
++        L, W = self.layers[li], self.layers[li]["W"]
++        return c["bwd"](*proj, ev, gdx, gdev, rec[0], rec[1], rec[3], *L["tabs"], *W[:3], *W[4:7], *L["V"],
++                        self.eng.cdeg, self.scal, self.eng.par, Wst, S)
+ 
+     def use(self, nb):
+         """The pair records of a build tuple, for a program traced apart from the build."""
+         if len(nb) > 5:
+             self._pp = tuple(nb[5:9])
+ 
+-    # ---- layers ------------------------------------------------------------------------
++    # ---- layers, every layer's per-pair data kept ----------------------------------------
+     def layer_forward(self, li, x, ev, pos3, nbr, cnt):
+-        eng, L, c = self.eng, self.layers[li], self._sized()
+-        PI, PG, PIDX, off = self._pp
++        eng, c = self.eng, self._sized()
+         pos3 = _f64(pos3)
+         xt = eng._x_in(li, x, eng.elem)
+-        (q1, k1, v1, q2, k2), pvjp = jax.vjp(lambda xx: tuple(eng._project(li, xx)), xt)
+-        S, Wst = c["fwd"](q1, k1, q2, k2, ev, PI, PG, off, *L["tabs"], *L["W"], *L["V"], eng.cdeg, self.scal,
+-                          P=np.int64(c["pmax"]))
+-        x1, ev1 = c["msg"](v1, S, *pos3, eng._box(pos3[0]), nbr, cnt, xt, ev, eng.scal, eng._row_arg(),
+-                           NL=np.int64(eng.nl))
++        proj, pvjp = jax.vjp(lambda xx: tuple(eng._project(li, xx)), xt)
++        S, Wst = self._pairs(c, li, proj, ev, self._pp)
++        x1, ev1 = c["msg"](proj[2], S, *pos3, eng._box(pos3[0]), nbr, cnt, xt, ev, eng.scal,
++                           _row_arg(eng._r0, eng._r0))
+         # the post block on this device's rows, gathered for the next layer's neighbours (the
+         # heads take the last layer's rows as they are)
+         (x2l, ev2l), post_vjp = jax.vjp(lambda a, b: eng._post(li, a, b), eng._mine(x1), eng._mine(ev1))
+         x2, ev2 = eng._gather_rows(x2l, ev2l) if li < eng.statics["num_layers"] - 1 else (x2l, ev2l)
+         # kept for the backward of the same program (the jitted force call runs both in one
+         # trace; the staged programs ask for fresh VJPs instead, see forget)
+-        self._proj[li] = (q1, k1, v1, q2, k2, pvjp)
++        self._proj[li] = (proj, pvjp)
+         self._post_vjp[li] = post_vjp
+         return (x2, ev2, x1, ev1, Wst, S)
+ 
+@@ -239,24 +397,21 @@ def post_backward(self, li, kept, g_x, g_ev, fresh=False):
+     def attention_backward(self, li, x_l, ev_l, Wst, Sf, gdx, gdev, f3, nbr, cnt, fresh=False):
+         """(dE/dx_in, dE/dev, forces) of layer li from dE/d(its attention output), with the
+         forward's filters per pair (Wst) and scores per slot (Sf)."""
+-        eng, L, c = self.eng, self.layers[li], self._sized()
+-        PI, PG, PIDX, off = self._pp
++        eng, c = self.eng, self._sized()
+         cached = None if fresh else self._proj.pop(li, None)
+         if cached is not None:
+-            q1, k1, v1, q2, k2, vjp = cached
++            proj, vjp = cached
+         else:
+             xt = eng._x_in(li, x_l, eng.elem)
+-            (q1, k1, v1, q2, k2), vjp = jax.vjp(lambda xx: tuple(eng._project(li, xx)), xt)
+-        W = L["W"]
+-        SC, FV, GEV = c["bwd"](q1, k1, v1, q2, k2, ev_l, gdx, gdev, PI, PG, off, *L["tabs"], *W[:3], *W[4:7], *L["V"],
+-                               eng.cdeg, self.scal, eng.par, Wst, Sf, P=np.int64(c["pmax"]))
+-        gq1, gk1, gv1, gq2, gk2, gev, f = c["gather"](q1, k1, q2, k2, gdx, Wst, SC, FV, GEV, gdev,
+-                                                      jnp.stack(f3).astype(jnp.float32), nbr, cnt, PIDX,
+-                                                      eng._row_arg(), NL=np.int64(eng.nl))
++            proj, vjp = jax.vjp(lambda xx: tuple(eng._project(li, xx)), xt)
++        SC, FV, GEV = self._pair_backward(c, li, proj, ev_l, gdx, gdev, self._pp, Wst, Sf)
++        q1, k1, _, q2, k2 = proj
++        *g, gev, f = c["gather"](q1, k1, q2, k2, gdx, Wst, SC, FV, GEV, gdev, jnp.stack(f3).astype(jnp.float32),
++                                 nbr, cnt, self._pp[2], _row_arg(eng._r0, eng._r0))
+         f = tuple(f)                          # forces and the per-axis virial
+         if li == 0:                           # no layer below takes dE/dx_in (_g_x_below)
+             return gdx, gev, f
+-        (gx,) = vjp((gq1, gk1, gv1, gq2, gk2))
++        (gx,) = vjp(tuple(g))
+         return gdx + gx, gev, f
+ 
+     def layer_backward(self, li, x_l, ev_l, kept, g_x, g_ev, f3, pos3, nbr, cnt):
+@@ -266,12 +421,66 @@ def layer_backward(self, li, x_l, ev_l, kept, g_x, g_ev, f3, pos3, nbr, cnt):
+         g_xin, gev, f3 = self.attention_backward(li, x_l, ev_l, kept[2], kept[3], gdx, gdev, f3, nbr, cnt)
+         return eng._g_x_below(li, g_xin), gev, f3
+ 
++    # ---- in chunks: the engine's attention, a chunk of rows at a time ---------------------
++    def attend(self, li, x_l, ev_l, pos3, nbr, cnt):
++        """The engine's _attend: (x_in + dx, ev + dev) of layer li, each chunk's pair records
++        and scores made, its rows' messages added, and dropped."""
++        eng, nc = self.eng, self.chunk
++        c = self._sized(nc)
++        pos3 = _f64(pos3)
++        box = eng._box(pos3[0])
++        proj = eng._projections(li, x_l, range(5))
++
++        def chunk(start, first_new, carry):
++            row = _row_arg(start, first_new)
++            S, _ = self._pairs(c, li, proj, ev_l, self._records(pos3, nbr, cnt, row, nc), keep_w=False)
++            return tuple(c["msg"](proj[2], S, *pos3, box, nbr, cnt, *carry, eng.scal, row))
++        # the messages added into x_in (its own buffer) and a copy of ev, each row once
++        return eng._tile_loop(chunk, (eng._x_in(li, x_l, eng.elem), ev_l + 0.0), nc)
++
++    def attention_backward_pass(self, li, pi, x_l, ev, pos3, nbr, cnt, gdx, gdev, carry):
++        """The engine's _attention_backward_pass (one pass: the kernels take both channels):
++        each chunk's pair records, filters and scores made again, its pairs' backward, its
++        rows' gathers, and its rows' dE/dx_in from their projections' gradients. carry = (dE/dx_in,
++        dE/dev, the per-atom force and virial sums); in place (x_l None), carry[0] holds the
++        layer input until a chunk overwrites its rows."""
++        eng, nc = self.eng, self.chunk
++        c = self._sized(nc)
++        pos3 = _f64(pos3)
++        inplace = eng._inplace(li)
++        proj = eng._projections(li, carry[0] if inplace else x_l, range(5))
++        q1, k1, _, q2, k2 = proj
++
++        def chunk(start, first_new, carry):
++            g_xin, g_ev, f = carry
++            row = _row_arg(start, first_new)
++            rec = self._records(pos3, nbr, cnt, row, nc)
++            S, Wst = self._pairs(c, li, proj, ev, rec)
++            SC, FV, GEV = self._pair_backward(c, li, proj, ev, gdx, gdev, rec, Wst, S)
++            *g, g_ev, f = c["gather"](q1, k1, q2, k2, gdx, Wst, SC, FV, GEV, g_ev, f, nbr, cnt, rec[2], row)
++            if li > 0:                        # layer 0's input is the constant embedding
++                rows = jax.lax.dynamic_slice_in_dim(g_xin if inplace else x_l, start, nc)
++                xt = eng._x_in(li, rows, jax.lax.dynamic_slice_in_dim(eng.elem, start, nc))
++                _, vjp = jax.vjp(lambda xx: tuple(eng._project(li, xx)), xt)
++                (gx,) = vjp(tuple(g))
++                old = jax.lax.dynamic_slice_in_dim(g_xin, start, nc)
++                new = (jax.lax.dynamic_slice_in_dim(gdx, start, nc) if inplace else old) + gx
++                # the rows the previous chunk wrote (the last chunk shifted back) keep theirs
++                g_xin = jax.lax.dynamic_update_slice_in_dim(
++                    g_xin, jnp.where(eng._rows_mask(start, first_new, nc), new, old), start, 0)
++            return g_xin, g_ev, f
++        g_xin, g_ev, f = eng._tile_loop(chunk, (carry[0], carry[1], jnp.stack(carry[2:])), nc)
++        return (g_xin, g_ev, *f)
++
+     # ---- the staged programs (domains, the staged memory path) --------------------------
+     def stage_fns(self, li):
+         """(post, att) for the staged backward: post(x_l, ev_l, kept, g_x, g_ev, R, nb) ->
+         (gdx, gdev); att(x_l, ev_l, gdx, gdev, carry, extra, R, nb) -> carry', extra being
+-        what the forward kept beyond (x1, ev1): the filters per pair and the scores."""
++        what the forward kept beyond (x1, ev1): the filters per pair and the scores. None in
++        chunks: the engine's own stages, its attention on the kernels."""
+         eng = self.eng
++        if self.chunk is not None:
++            return None
+ 
+         def post(x_l, ev_l, kept, g_x, g_ev, R, nb):
+             self.use(nb)
+@@ -327,29 +536,37 @@ def head_backward(self, x, g_raw, ga0, gc6, w_e=None):
+         return cached[1]((e_l.astype(g_raw.dtype), g_raw, ga0.astype(g_raw.dtype), gc6.astype(g_raw.dtype)))[0]
+ 
+ 
+-def attach(eng, strict=False):
++def attach(eng, strict=False, chunk=None):
+     """The engine's methods on the CUDA kernels (the instance only). Returns the kernels
+     object, or None (with a log line) where they do not apply or cannot be built; strict
+-    (kernels="cuda" asked for explicitly) raises instead of falling back."""
+-    why = unsupported(eng)
++    (kernels="cuda" asked for explicitly) raises instead of falling back. chunk (rows): the
++    per-pair data a chunk at a time whatever the memory (default: as plan finds room)."""
++    why, budget = unsupported(eng), None
++    if why is None and chunk is None:
++        budget, why = plan(eng)
+     if why:
+         if strict:
+             raise RuntimeError(f"Flash: the CUDA kernels do not serve this engine ({why})")
+         logger.info("Flash: CUDA kernels not used (%s); Pallas kernels", why)
+         return None
+     try:
+-        ck = CudaKernels(eng)
++        ck = CudaKernels(eng, chunk, budget)
+     except (BuildError, OSError) as e:       # nvcc failed or unusable, a library does not load, no lock
+         if strict:
+             raise
+         logger.warning("Flash: CUDA kernels not built (%s); Pallas kernels", str(e).splitlines()[0][:160])
+         return None
+     eng.build = ck.build
+-    eng._layer_forward = ck.layer_forward
+-    eng._layer_backward = ck.layer_backward
+     eng._long_range = ck.long_range
+-    eng._heads = ck.heads
+-    eng._head_backward = ck.head_backward
++    if ck.chunk is None:                     # the layers, with what the forward keeps for the backward
++        eng._layer_forward = ck.layer_forward
++        eng._layer_backward = ck.layer_backward
++        eng._heads = ck.heads
++        eng._head_backward = ck.head_backward
++    else:                                    # the attention alone, in the engine's layers and modes
++        eng._attend = ck.attend
++        eng._attention_backward_pass = ck.attention_backward_pass
+     eng.cuda_kernels = ck
+-    logger.info("Flash: CUDA kernels (TF32 x3 attention, gather-only messages and gradients; ~%.0f KiB/atom)", ck.kib)
++    logger.info("Flash: CUDA kernels (TF32 x3 attention, gather-only messages and gradients; %s; ~%.0f KiB/atom)",
++                f"chunks of {ck.chunk} rows" if ck.chunk else "per-pair data kept", ck.kib)
+     return ck
+diff --git a/so3lr/flash/cuda/attn_bwd7.cu b/so3lr/flash/cuda/attn_bwd7.cu
+index ae9b7a3..9db8a89 100644
+--- a/so3lr/flash/cuda/attn_bwd7.cu
++++ b/so3lr/flash/cuda/attn_bwd7.cu
+@@ -40,8 +40,8 @@ struct B7Params {
+   const float* Wst;
+   const float* Sf;               // the forward's scores per directed slot [slots][2 NH]
+   float *SC, *FV, *GEV;
+-  int n, nslot, pmax;            // nslot = n K directed slots (a pair's reverse slot >= nslot is a shadow:
+-};                               // its partner is another device's; no scalars, gradient or force for it
++  int n, nslot, pmax;            // nslot = nl K: the range's directed slots (a pair's reverse slot >= nslot
++};                               // is a shadow: its partner is outside the range; no scalars, gradient or force)
+ 
+ struct B7Stage {
+   float DZ[NCH][TP][SH + 8];     // silu'(z) (row stride 40: conflict-free float2 reads)
+@@ -557,6 +557,7 @@ struct GatherParams {
+   float *__restrict__ gq1, *__restrict__ gk1, *__restrict__ gv1, *__restrict__ gq2, *__restrict__ gk2,
+       *__restrict__ gev_out, *__restrict__ f_out;   // f: [6][n] (fx, fy, fz, wx, wy, wz)
+   int n, K, nl;
++  int local;                     // the projections' gradients for the range's rows only ([nl, F], from row0)
+ };
+ 
+ constexpr int GW_ = 8;
+@@ -576,9 +577,18 @@ __global__ void __launch_bounds__(GW_ * 32) bwd_gather(GatherParams p) {
+   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+   const int part = warp % GSPLIT, hw = (warp / GSPLIT) % HSPLIT;
+   const int r0 = p.row0[0];
+-  const int a = r0 + (blockIdx.x * GW_ + warp) / WPA;         // this device's rows
+-  const bool live = a < r0 + p.nl && a < p.n;
++  const int a = r0 + (blockIdx.x * GW_ + warp) / WPA;         // the range's rows, written from row0[1] on
++  const bool live = a >= p.row0[1] && a < r0 + p.nl && a < p.n;
+   const int n_a = live ? min(p.cnt[a], p.K) : 0;
++  if (p.local && part == 0 && a < p.row0[1]) {
++    // the range-local projections' gradients of a row before row0[1] (a chunk shifted back:
++    // the previous chunk's rows) zeros, not left unwritten
++#pragma unroll
++    for (int j = 0; j < HPW; ++j) {
++      const size_t o = (size_t)(a - r0) * F + (hw * HPW + j) * 32 + lane;
++      p.gq1[o] = 0.f; p.gk1[o] = 0.f; p.gv1[o] = 0.f; p.gq2[o] = 0.f; p.gk2[o] = 0.f;
++    }
++  }
+   float acc[5][HPW], sv[MS], fv = 0.f;
+ #pragma unroll
+   for (int i = 0; i < 5; ++i)
+@@ -586,11 +596,11 @@ __global__ void __launch_bounds__(GW_ * 32) bwd_gather(GatherParams p) {
+     for (int j = 0; j < HPW; ++j) acc[i][j] = 0.f;
+ #pragma unroll
+   for (int ms = 0; ms < MS; ++ms) sv[ms] = 0.f;
+-  const size_t row0 = (size_t)a * p.K;
++  const size_t nrow = (size_t)a * p.K, srow = (size_t)(a - r0) * p.K;   // the neighbour row, the range's slots
+ #pragma unroll 1
+   for (int c = part; c < n_a; c += GSPLIT) {
+-    const size_t slot = row0 + c;
+-    const int b = p.nbr[slot], pq = p.PIDX[slot];
++    const size_t slot = srow + c;
++    const int b = p.nbr[nrow + c], pq = p.PIDX[slot];
+     const float* sc = p.SC + slot * NSC;
+     const float* w1 = p.Wst + (size_t)pq * 2 * F;
+     const float* w2 = w1 + F;
+@@ -615,7 +625,7 @@ __global__ void __launch_bounds__(GW_ * 32) bwd_gather(GatherParams p) {
+       }
+       fv += lane < NFW ? p.FV[slot * FVS + lane] : 0.f;
+       if (NCH == 1) {
+-        const size_t s2 = (size_t)p.n * p.K + slot;
++        const size_t s2 = (size_t)p.nl * p.K + slot;                // the second channel's copy
+ #pragma unroll
+         for (int ms = 0; ms < MS; ++ms) {
+           const int m = ms * 32 + lane;
+@@ -646,7 +656,7 @@ __global__ void __launch_bounds__(GW_ * 32) bwd_gather(GatherParams p) {
+   }
+ #pragma unroll
+   for (int j = 0; j < HPW; ++j) {
+-    const size_t o = (size_t)a * F + (hw * HPW + j) * 32 + lane;
++    const size_t o = (size_t)(p.local ? a - r0 : a) * F + (hw * HPW + j) * 32 + lane;
+     p.gq1[o] = acc[0][j]; p.gk1[o] = acc[1][j]; p.gv1[o] = acc[2][j]; p.gq2[o] = acc[3][j]; p.gk2[o] = acc[4][j];
+   }
+   if (hw != 0) return;
+@@ -681,9 +691,10 @@ static ffi::Error B7Impl(cudaStream_t stream, F32 q1, F32 k1, F32 v1, F32 q2, F3
+   return launch_status();
+ }
+ 
++// local: the projections' gradients are the range's rows only ([nl, F] outputs, row r0 first)
+ static ffi::Error GatherImpl(cudaStream_t stream, F32 q1, F32 k1, F32 q2, F32 k2, F32 gdx, F32 Wst, F32 SC, F32 FV,
+                              F32 GEV, F32 gev_in, F32 f_in, S32 nbr, S32 cnt, S32 PIDX, S32 row0, RF32 gq1, RF32 gk1,
+-                             RF32 gv1, RF32 gq2, RF32 gk2, RF32 gev_out, RF32 f_out, int64_t NL) {
++                             RF32 gv1, RF32 gq2, RF32 gk2, RF32 gev_out, RF32 f_out, int64_t NL, int64_t local) {
+   GatherParams p;
+   p.q1 = q1.typed_data(); p.k1 = k1.typed_data(); p.q2 = q2.typed_data(); p.k2 = k2.typed_data();
+   p.gdx = gdx.typed_data(); p.Wst = Wst.typed_data(); p.SC = SC.typed_data(); p.FV = FV.typed_data();
+@@ -692,7 +703,7 @@ static ffi::Error GatherImpl(cudaStream_t stream, F32 q1, F32 k1, F32 q2, F32 k2
+   p.gq1 = gq1->typed_data(); p.gk1 = gk1->typed_data(); p.gv1 = gv1->typed_data(); p.gq2 = gq2->typed_data();
+   p.gk2 = gk2->typed_data(); p.gev_out = gev_out->typed_data(); p.f_out = f_out->typed_data();
+   auto d = nbr.dimensions();
+-  p.n = (int)d[0]; p.K = (int)d[1]; p.nl = (int)NL; p.row0 = row0.typed_data();
++  p.n = (int)d[0]; p.K = (int)d[1]; p.nl = (int)NL; p.row0 = row0.typed_data(); p.local = (int)local;
+   bwd_gather<<<(p.nl * WPA + GW_ - 1) / GW_, GW_ * 32, 0, stream>>>(p);
+   return launch_status();
+ }
+@@ -713,4 +724,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(BwdGather, GatherImpl,
+         .Arg<F32>().Arg<F32>().Arg<F32>().Arg<F32>().Arg<F32>()            // q1 k1 q2 k2 gdx
+         .Arg<F32>().Arg<F32>().Arg<F32>().Arg<F32>().Arg<F32>().Arg<F32>()  // Wst SC FV GEV gev_in f_in
+         .Arg<S32>().Arg<S32>().Arg<S32>().Arg<S32>()                         // nbr cnt PIDX row0
+-        .Ret<F32>().Ret<F32>().Ret<F32>().Ret<F32>().Ret<F32>().Ret<F32>().Ret<F32>().Attr<int64_t>("NL"));
++        .Ret<F32>().Ret<F32>().Ret<F32>().Ret<F32>().Ret<F32>().Ret<F32>().Ret<F32>().Attr<int64_t>("NL")
++        .Attr<int64_t>("local"));
+diff --git a/so3lr/flash/cuda/attn_pair7.cu b/so3lr/flash/cuda/attn_pair7.cu
+index 0e08ba9..de3a614 100644
+--- a/so3lr/flash/cuda/attn_pair7.cu
++++ b/so3lr/flash/cuda/attn_pair7.cu
+@@ -18,27 +18,30 @@ constexpr float FLOOR_W = 0.05f;          // the pair distance floor's width, as
+ // ===================================================================================== //
+ struct PrepParams {
+   const double *px, *py, *pz, *box;
+-  const int *nbr, *cnt, *z, *off, *lo, *hi, *tile_atom, *row0;
++  const int *nbr, *cnt, *z, *off, *lo, *hi, *tile_atom, *row0;   // off, lo, hi, tile_atom: per row of the range
+   const float *rmin, *scal;
+-  int4* PI;        // a, b, slot(a <- b), slot(b <- a) (a shadow slot >= n K when b is another device's)
++  int4* PI;        // a, b, slot(a <- b), slot(b <- a) (a shadow slot >= nl K when b is outside the range)
+   float4* PG;      // [2 per pair]: (ux, uy, uz, r), (ce, dce, drt, rt / spacing)
+   int* PIDX;       // directed slot -> pair
+-  int n, K, zmax, nl, pmax;      // pmax: the records' room (n K / 2 pairs; more only while a row overflows)
++  int n, K, zmax, nl, pmax;      // pmax: the records' room
+ };
+ 
+-// This device's pairs: for each of its rows a (row0 <= a < row0 + nl) the neighbours b of
+-// another device, and the larger local ones (a pair of two local atoms once). In the sorted
+-// row the kept columns are [0, lo) (b < row0) and [hi, cnt) (b > a). A partner on another
+-// device gets no slot in b's row: its reverse score goes to the pair's shadow slot n K + q.
++// The pairs of a range of rows (a device's, or a chunk of them): for each of its rows a
++// (row0 <= a < row0 + nl) the neighbours b outside the range, and the larger ones inside (a
++// pair of two atoms of the range once). In the sorted row the kept columns are [0, lo)
++// (b < row0) and [hi, cnt) (b > a). The directed slots and the per-row arrays are the
++// range's own: slot (a - row0) K + column, so a range's buffers hold its rows only. A
++// partner outside the range gets no slot: its reverse score goes to the shadow slot nl K + q.
+ __global__ void pair_prep(PrepParams p) {
+-  const int P = min(p.off[p.n], p.pmax);
++  const int P = min(p.off[p.nl], p.pmax);
+   const int q = blockIdx.x * blockDim.x + threadIdx.x;
+   if (q >= P) return;
+   const float spacing = p.scal[1], rc = p.scal[3];
+   const int r0 = p.row0[0];
+-  int a = p.tile_atom[q >> 4];
+-  while (p.off[a + 1] <= q) ++a;
+-  const int j = q - p.off[a], la = p.lo[a], ha = p.hi[a];
++  int al = p.tile_atom[q >> 4];                      // the row within the range
++  while (p.off[al + 1] <= q) ++al;
++  const int a = r0 + al;
++  const int j = q - p.off[al], la = p.lo[al], ha = p.hi[al];
+   const int c = j < la ? j : j + (ha - la);
+   const int b = p.nbr[(size_t)a * p.K + c];
+   const bool b_local = b >= r0 && b < r0 + p.nl;
+@@ -49,10 +52,10 @@ __global__ void pair_prep(PrepParams p) {
+     int mid = (lo + hi) >> 1;
+     if (row[mid] < a) lo = mid + 1; else hi = mid;
+   }
+-  // b's slot of a: none when b is another device's, or (a row overflowed; the engine widens the
+-  // rows and calls again) when b's truncated row lacks a: the reverse score goes to the shadow
++  // b's slot of a: none when b is outside the range, or (a row overflowed; the engine widens
++  // the rows and calls again) when b's truncated row lacks a: the reverse score goes to the shadow
+   const bool found = lo < cm && row[lo] == a;
+-  const int sba = found ? b * p.K + lo : p.n * p.K + q;
++  const int sba = found ? (b - r0) * p.K + lo : p.nl * p.K + q;
+   const double Lx = p.box[0], Ly = p.box[1], Lz = p.box[2];
+   double dxd = p.px[b] - p.px[a], dyd = p.py[b] - p.py[a], dzd = p.pz[b] - p.pz[a];
+   dxd -= Lx * floor(dxd * (1.0 / Lx) + 0.5);
+@@ -75,9 +78,9 @@ __global__ void pair_prep(PrepParams p) {
+   bool above = rr >= d_off;
+   float rt = above ? rr : d_off - FLOOR_W * th;
+   float drt = above ? 1.f : 1.f - th * th;
+-  p.PI[q] = make_int4(a, b, a * p.K + c, sba);
+-  p.PIDX[a * p.K + c] = q;
+-  if (found) p.PIDX[b * p.K + lo] = q;
++  p.PI[q] = make_int4(a, b, al * p.K + c, sba);
++  p.PIDX[al * p.K + c] = q;
++  if (found) p.PIDX[(b - r0) * p.K + lo] = q;
+   p.PG[2 * q] = make_float4(ok ? dx * inv : 1.f, ok ? dy * inv : 0.f, ok ? dz * inv : 0.f, rr);
+   p.PG[2 * q + 1] = make_float4(ce, dce, drt, rt / spacing);
+ }
+@@ -125,6 +128,8 @@ struct Stage {
+ #else
+ #define LQ(ptr) (*reinterpret_cast<const float2*>(ptr))
+ #endif
++// KEEPW: write the filters per pair for the backward (else the scores only)
++template <bool KEEPW>
+ __global__ void __launch_bounds__(NTH, MINB) att_pair(PairParams p) {
+   extern __shared__ float smf[];
+   float* Bs = smf;                                                   // [FC][KD + 4] fp32, transposed (n rows, k columns)
+@@ -320,10 +325,12 @@ __global__ void __launch_bounds__(NTH, MINB) att_pair(PairParams p) {
+           sab1 += qa1.x * w10 * kb1.x + qa1.y * w11 * kb1.y;
+           sba1 += qb1.x * w10 * ka1.x + qb1.y * w11 * ka1.y;
+ #ifndef NOWST
+-          if (pi0.z >= 0)
+-            WST_STORE(reinterpret_cast<float2*>(p.Wst + ((size_t)(t * TP + r0) * 2 + ch) * F + col), make_float2(w00, w01));
+-          if (pi1.z >= 0)
+-            WST_STORE(reinterpret_cast<float2*>(p.Wst + ((size_t)(t * TP + r1) * 2 + ch) * F + col), make_float2(w10, w11));
++          if constexpr (KEEPW) {
++            if (pi0.z >= 0)
++              WST_STORE(reinterpret_cast<float2*>(p.Wst + ((size_t)(t * TP + r0) * 2 + ch) * F + col), make_float2(w00, w01));
++            if (pi1.z >= 0)
++              WST_STORE(reinterpret_cast<float2*>(p.Wst + ((size_t)(t * TP + r1) * 2 + ch) * F + col), make_float2(w10, w11));
++          }
+ #endif
+         }
+ #pragma unroll
+@@ -383,12 +390,14 @@ __global__ void __launch_bounds__(MW * 32) att_msg(MsgParams p) {
+   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, e = lane & 15, half = lane >> 4;
+   const int r0 = p.row0[0];
+   const int a = r0 + blockIdx.x * MW + warp;
+-  if (a >= r0 + p.nl || a >= p.n) return;
++  // the range's rows from row0[1] on: a chunk shifted back to end at the last row leaves
++  // the rows it shares with the one before it as that one wrote them
++  if (a < p.row0[1] || a >= r0 + p.nl || a >= p.n) return;
+   const double Lx = p.box[0], Ly = p.box[1], Lz = p.box[2];
+   const double iLx = 1.0 / Lx, iLy = 1.0 / Ly, iLz = 1.0 / Lz;
+   const double ax = p.px[a], ay = p.py[a], az = p.pz[a];
+   const int n_a = min(p.cnt[a], p.K);
+-  const float* Sa = p.S + (size_t)a * p.K * 2 * NH;
++  const float* Sa = p.S + (size_t)(a - r0) * p.K * 2 * NH;         // the range's slots
+   const int* row = p.nbr + (size_t)a * p.K;
+   float acc[NH];
+ #pragma unroll
+@@ -477,7 +486,7 @@ static int smem_bytes() {
+ static ffi::Error PairImpl(cudaStream_t stream, F32 q1, F32 k1, F32 q2, F32 k2, F32 ev, S32 PI, F32 PG, S32 off,
+                            F32 u1v, F32 u1d, F32 u2v, F32 u2d, F32 wa1, F32 ba1, F32 wb1, F32 bb1, F32 wa2, F32 ba2,
+                            F32 wb2, F32 bb2, F32 vr1, F32 vr2, F32 cdeg, F32 scal, RF32 S,
+-                           RF32 Wst, int64_t P) {
++                           RF32 Wst, int64_t P, int64_t keep_w) {
+   PairParams p;
+   p.q1 = q1.typed_data(); p.k1 = k1.typed_data(); p.q2 = q2.typed_data(); p.k2 = k2.typed_data();
+   p.ev = ev.typed_data(); p.PI = reinterpret_cast<const int4*>(PI.typed_data());
+@@ -489,8 +498,13 @@ static ffi::Error PairImpl(cudaStream_t stream, F32 q1, F32 k1, F32 q2, F32 k2,
+   p.S = S->typed_data(); p.Wst = Wst->typed_data();
+   p.n = (int)off.dimensions()[0] - 1; p.pmax = (int)P;
+   const int smem = smem_bytes();
+-  set_max_smem<att_pair>(smem);
+-  att_pair<<<dim3(num_sms(), 2), NTH, smem, stream>>>(p);
++  if (keep_w) {
++    set_max_smem<att_pair<true>>(smem);
++    att_pair<true><<<dim3(num_sms(), 2), NTH, smem, stream>>>(p);
++  } else {
++    set_max_smem<att_pair<false>>(smem);
++    att_pair<false><<<dim3(num_sms(), 2), NTH, smem, stream>>>(p);
++  }
+   return launch_status();
+ }
+ 
+@@ -525,7 +539,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(AttPair, PairImpl,
+         .Arg<F32>().Arg<F32>().Arg<F32>().Arg<F32>()                       // wa1 ba1 wb1 bb1
+         .Arg<F32>().Arg<F32>().Arg<F32>().Arg<F32>()                       // wa2 ba2 wb2 bb2
+         .Arg<F32>().Arg<F32>().Arg<F32>().Arg<F32>()                       // vr1 vr2 cdeg scal
+-        .Ret<F32>().Ret<F32>().Attr<int64_t>("P"));                       // S, w per pair
++        .Ret<F32>().Ret<F32>().Attr<int64_t>("P").Attr<int64_t>("keep_w"));  // S, w per pair (if keep_w)
+ 
+ XLA_FFI_DEFINE_HANDLER_SYMBOL(AttMsg, MsgImpl,
+     ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+diff --git a/so3lr/flash/domains.py b/so3lr/flash/domains.py
+index 58f322e..d997dcb 100644
+--- a/so3lr/flash/domains.py
++++ b/so3lr/flash/domains.py
+@@ -326,8 +326,8 @@ def _engine(self, key, n_pad, sub_L, zz, p=0):
+             self._engines.pop((p, key), None)
+             gc.collect()
+             params = self._on(p, "params", lambda: self.params)
+-            eng = FlashSO3LR(params, self.statics, np.asarray(zz), np.diag(sub_L),
+-                             total_charge=self.total_charge, total_spin=self.total_spin, **kw)
++            eng = FlashSO3LR(params, self.statics, np.asarray(zz), np.diag(sub_L),     # run staged, a domain at a time
++                             total_charge=self.total_charge, total_spin=self.total_spin, **dict(kw, staged=True))
+             eng.x0_table = self._on(p, "x0", lambda: eng._embed_table(
+                 jnp.asarray(self.zu), jnp.asarray(self.counts, eng.dtype), self.total_charge,
+                 self.total_spin))                # before anything is traced
+diff --git a/so3lr/flash/engine.py b/so3lr/flash/engine.py
+index f4cc218..0432631 100644
+--- a/so3lr/flash/engine.py
++++ b/so3lr/flash/engine.py
+@@ -52,6 +52,7 @@
+ """
+ from __future__ import annotations
+ 
++import contextlib
+ import math
+ from functools import partial
+ 
+@@ -1180,6 +1181,19 @@ def mode_kib(mode, statics):
+     return MODES[mode][2] * width / 152.0
+ 
+ 
++def model_widths(params, statics):
++    """(features, heads, features per head, equivariant components, the spherical filters'
++    hidden units) of a model, as the engine takes them."""
++    F, nh = int(params["feature_embeddings_0"]["Embed_0"]["embedding"].shape[1]), int(statics["num_heads"])
++    sh = int(params["layers_0"]["attention_block"]["spherical_filter1_layer_1"]["kernel"].shape[1])
++    return F, nh, F // nh, sum(2 * int(d) + 1 for d in statics["degrees"]), sh
++
++
++def neighbour_rows(rc):
++    """Neighbour rows' width for water at cutoff rc (the engine widens them on overflow)."""
++    return int(math.ceil(64 * (rc / 4.5) ** 3 / 16) * 16)
++
++
+ def pick_mode(n, free_bytes, statics):
+     """The fastest of MODES whose peak for n atoms fits in free_bytes, else the leanest."""
+     for name in MODES:
+@@ -1206,17 +1220,51 @@ def pme_bytes(L, pme, itemsize):
+     return max((5 * math.prod(pme_mesh_shape(L, p[1])) * itemsize for p in pme if p), default=0)
+ 
+ 
++def spatial_order(R, L):
++    """The atoms at R (box sides L) along a Morton curve of the box (2^10 cells a side):
++    atoms near in the order are near in space."""
++    frac = R / L.astype(R.dtype)
++    c = jnp.clip(jnp.floor((frac - jnp.floor(frac)) * 1024), 0, 1023).astype(jnp.uint32)
++
++    def spread(v):                           # the 10 bits of v to every third of 30
++        v = (v | (v << 16)) & 0x030000FF
++        v = (v | (v << 8)) & 0x0300F00F
++        v = (v | (v << 4)) & 0x030C30C3
++        return (v | (v << 2)) & 0x09249249
++    key = spread(c[:, 0]) | (spread(c[:, 1]) << 1) | (spread(c[:, 2]) << 2)
++    return jnp.argsort(key, stable=True).astype(jnp.int32)
++
++
++@jax.jit
++def _sorted(R, L, z, elem):
++    """The spatial order of the atoms, and R, z, elem in it (the staged path's, one program)."""
++    perm = spatial_order(R, L)
++    return perm, R[perm], z[perm], elem[perm]
++
++
++@jax.jit
++def _unsorted(f, perm):
++    """Rows of f (the atoms in the order perm, or None: in the input's) in the input's order."""
++    return f if perm is None else jnp.zeros_like(f).at[perm].set(f, unique_indices=True)
++
++
+ class FlashSO3LR:
+     """Energy and forces of SO3LR (params, statics from ``loader.load_params``) for atoms
+     ``z`` in an orthorhombic periodic ``box``, or in free space (box None, laid out for
+     atoms of ``size``, ``check.vacuum_size``), with so3lr_dev's descriptor floor at
+-    contacts. The memory options are those of ``MODES``."""
++    contacts. The memory options are those of ``MODES``. sort_atoms: each force call runs
++    with the atoms along a Morton curve of the box (``spatial_order``), the forces given
++    back in the input's order, so the rows a device or a chunk of the CUDA kernels takes,
++    and the neighbours' rows every kernel reads, stay local whatever that order is. staged:
++    the caller runs the staged path (energy_forces_strain_staged), which the CUDA kernels
++    plan their memory for."""
+ 
+     def __init__(self, params, statics, z, box, *, total_charge=0.0, total_spin=0.0,
+                  equilibration_charge=None, tile=1 << 17, max_neighbours=None, lr_scratch=1024,
+                  keep_layer_inputs=True, keep_attention=False, split_channels=False,
+                  split_blocks=False, pme_electrostatics=None, pme_dispersion=None, box_margin=0.0,
+-                 devices=1, atoms_per_program=None, size=None, kernels=None):
++                 devices=1, atoms_per_program=None, size=None, kernels=None, sort_atoms=True,
++                 staged=False):
+         degrees = [int(d) for d in statics["degrees"]]
+         self.nh = int(statics["num_heads"])
+         # one head per degree entry, each on its own block of G features (so3lr-tauri-s/m: 4 x 32,
+@@ -1259,21 +1307,21 @@ def __init__(self, params, statics, z, box, *, total_charge=0.0, total_spin=0.0,
+         self.device_mesh = jax.sharding.Mesh(np.array(devs), (AXIS,)) if self.P > 1 else None
+         self.tile = min(int(tile), self.nl)
+         # neighbour rows sized for water at the model's cutoff (widened on overflow)
+-        self.K = int(max_neighbours or math.ceil(64 * (self.rc / 4.5) ** 3 / 16) * 16)
++        self.K = int(max_neighbours or neighbour_rows(self.rc))
+         self.keep = bool(keep_layer_inputs)
+         self.keep_attention = bool(keep_attention) and self.keep
+         self.split = bool(split_channels)
+         self.blocks = bool(split_blocks)
++        self.sort_atoms = bool(sort_atoms)
++        self.staged = bool(staged)
+         # the charge embedding sees total_charge, the charge equilibration conserves
+         # equilibration_charge (so3lr_dev's two overrides; both follow total_charge by default)
+         self.total_charge = float(total_charge if equilibration_charge is None else equilibration_charge)
+         dt = self.dtype
+-        self.F = int(params["feature_embeddings_0"]["Embed_0"]["embedding"].shape[1])
+-        self.G = self.F // self.nh
++        self.F, _, self.G, self.M, self.sh = model_widths(params, statics)
+         if self.G * self.nh != self.F or self.G & (self.G - 1):
+             raise ValueError(f"{self.F} features over {self.nh} heads: needs a power-of-two block per head")
+         mdeg = [i for i, d in enumerate(degrees) for _ in range(2 * d + 1)]
+-        self.M = len(mdeg)
+         self.MP = max(32, 1 << (self.M - 1).bit_length())     # the kernels' power-of-two width
+         self.mdeg = jnp.asarray(mdeg + [-1] * (self.MP - self.M), jnp.int32)
+         # where each degree entry's columns start, and its degree's first harmonic component
+@@ -1282,7 +1330,6 @@ def __init__(self, params, statics, z, box, *, total_charge=0.0, total_spin=0.0,
+         self.cdeg = jnp.asarray([(2 * d + 1) ** -0.5 for d in degrees], dt)
+         # the attention kernels' launch for this width of the spherical filters' hidden
+         # layer: the nearest wider one tabulated (the widest if none is)
+-        self.sh = int(params["layers_0"]["attention_block"]["spherical_filter1_layer_1"]["kernel"].shape[1])
+         self.launch = _att_launch(self.sh)
+         self.par = jnp.asarray([(-1.0) ** d for d in degrees], dt)
+         self.z = jnp.asarray(z)
+@@ -1501,10 +1548,11 @@ def _heads(self, x, z):
+         return e_loc, raw_q, a0, c6
+ 
+     # ---- tiles --------------------------------------------------------------------
+-    def _tile_loop(self, body, carry):
+-        """body(start, first_new, carry) over tiles of this device's rows; the last tile is
+-        shifted back to end at its last row, and first_new marks where its new atoms begin."""
+-        T, n, r0 = self.tile, self.nl, self._r0
++    def _tile_loop(self, body, carry, T=None):
++        """body(start, first_new, carry) over tiles of T rows (default: the engine's tile) of
++        this device's rows; the last tile is shifted back to end at its last row, and
++        first_new marks where its new atoms begin."""
++        T, n, r0 = T or self.tile, self.nl, self._r0
+         nt = -(-n // T)
+ 
+         def step(t, c):
+@@ -1571,8 +1619,8 @@ def _gather(self, *arrays):
+     def _sum(self, v):
+         return v if self.P == 1 else lax.psum(v, AXIS)
+ 
+-    def _rows_mask(self, start, first_new):
+-        return (start + jnp.arange(self.tile) >= first_new)[:, None]
++    def _rows_mask(self, start, first_new, T=None):
++        return (start + jnp.arange(T or self.tile) >= first_new)[:, None]
+ 
+     def _map_rows(self, fn, arrays, outs):
+         """outs[i][rows] = fn(*arrays[rows])[i] for every tile (new rows only). An input
+@@ -1944,22 +1992,37 @@ def _g_x_below(self, li, g_xin):
+         return g_xin * self.params["resid_lambdas"][li] if li > 0 else None
+ 
+     # ---- one jitted program (usable inside jax-md's jitted steps) --------------------
+-    def _energy_forces(self, R):
+-        """(energy, forces, overflow, dE/d(strain)); on several devices one program per
+-        device (shard_map), each computing its own rows, R and the results the same on all."""
+-        if self.P == 1:
+-            return self._energy_forces_rows(R)
+-        from jax.sharding import PartitionSpec
+-        rep = PartitionSpec()
+-
+-        def per_device(R, L):
+-            keep, self._Lt = self._Lt, L
+-            try:
++    def _energy_forces(self, R, L=None):
++        """(energy, forces, overflow, dE/d(strain)) in the box L (default the engine's; an
++        argument of the jitted program), the atoms in a spatial order inside (sort_atoms) and
++        the forces in R's; on several devices one program per device (shard_map), each
++        computing its own rows, R and the results the same on all."""
++        L = self.box if L is None else L
++        perm, Rs, z, elem = None, R, self.z, self.elem
++        if self.sort_atoms:
++            perm, Rs, z, elem = _sorted(R, L.astype(R.dtype), z, elem)
++
++        def rows(R, L, z, elem):
++            with self._atoms(z, elem, L):
+                 return self._energy_forces_rows(R)
+-            finally:
+-                self._Lt = keep
+-        return jax.shard_map(per_device, mesh=self.device_mesh, in_specs=(rep, rep), out_specs=(rep,) * 4,
+-                             check_vma=False)(R, self.box if self._Lt is None else self._Lt)
++        if self.P > 1:
++            from jax.sharding import PartitionSpec
++            rep = PartitionSpec()
++            rows = jax.shard_map(rows, mesh=self.device_mesh, in_specs=(rep,) * 4, out_specs=(rep,) * 4,
++                                 check_vma=False)
++        e, f, over, w = rows(Rs, L, z, elem)
++        return e, _unsorted(f, perm), over, w
++
++    @contextlib.contextmanager
++    def _atoms(self, z, elem, L=None):
++        """The engine's z and elem as given (the atoms sorted) and its box L (an argument of
++        the program; None: the engine's), while its methods trace or run."""
++        keep = self.z, self.elem, self._Lt
++        self.z, self.elem, self._Lt = z, elem, L
++        try:
++            yield
++        finally:
++            self.z, self.elem, self._Lt = keep
+ 
+     def _energy_forces_rows(self, R):
+         n, dt, M = self.n, self.dtype, self.M
+@@ -2013,12 +2076,8 @@ def _stage(self, fn, donate=()):
+         constants: one compiled program serves any box within the cell grid's margin
+         (NPT)."""
+         def g(z, elem, L, *args):
+-            keep = self.z, self.elem, self._Lt
+-            self.z, self.elem, self._Lt = z, elem, L
+-            try:
++            with self._atoms(z, elem, L):
+                 return fn(*args)
+-            finally:
+-                self.z, self.elem, self._Lt = keep
+         j = jax.jit(g, donate_argnums=tuple(d + 3 for d in donate))
+         return lambda *args: j(self.z, self.elem, self.box, *args)
+ 
+@@ -2040,8 +2099,9 @@ def fwd(x, ev, R, nb, li=li):
+                 # kept inputs must survive; otherwise the input is dead once read
+                 c["fwd", li] = jit(fwd, donate_argnums=() if self.keep else ((0, 1) if li else (1,)))
+ 
+-                if ck is not None:
+-                    post_fn, att_fn = ck.stage_fns(li)
++                fns = ck.stage_fns(li) if ck is not None else None
++                if fns:
++                    post_fn, att_fn = fns
+                     c["post", li] = jit(post_fn, donate_argnums=(2, 3, 4))
+                     c["att", li, 0] = jit(att_fn, donate_argnums=(4,))
+                     continue
+@@ -2120,15 +2180,21 @@ def energy_forces_strain_staged(self, R, diag=False):
+         per axis, shape [3], whose sum that is)."""
+         R = jnp.asarray(R)
+         R = R if R.dtype == jnp.float64 else R.astype(self.dtype)
+-        for _ in range(MAX_REBUILDS + 1):
+-            if bool(self._outgrown(R)) and self._recover(R, 2):     # before the work, which needs the box
+-                continue
+-            st = self._forward_staged(R)
+-            cnt = st["nb"][4]
+-            energy, f3, most = self._backward_staged(R, st)
+-            if not self._recover(R, int(int(jnp.max(cnt)) > self.K or int(most) > self.maxh)):
+-                w3 = self._strain(f3[3:], R)
+-                return energy, jnp.stack(f3[:3], -1), (w3 if diag else w3.sum())
++        # the atoms in a spatial order (sort_atoms) for the stages, as in the jitted call (any
++        # order gives the same result: one for all the rebuilds)
++        perm, Rs, z, elem = None, R, self.z, self.elem
++        if self.sort_atoms:
++            perm, Rs, z, elem = _sorted(R, self.box, z, elem)
++        with self._atoms(z, elem):
++            for _ in range(MAX_REBUILDS + 1):
++                if bool(self._outgrown(R)) and self._recover(R, 2):     # before the work, which needs the box
++                    continue
++                st = self._forward_staged(Rs)
++                cnt = st["nb"][4]
++                energy, f3, most = self._backward_staged(Rs, st)
++                if not self._recover(R, int(int(jnp.max(cnt)) > self.K or int(most) > self.maxh)):
++                    w3 = self._strain(f3[3:], Rs)
++                    return energy, _unsorted(jnp.stack(f3[:3], -1), perm), (w3 if diag else w3.sum())
+         raise RuntimeError(f"Flash: overflowed again after {MAX_REBUILDS} rebuilds")
+ 
+     def widen(self):
+@@ -2138,13 +2204,7 @@ def widen(self):
+         self._build_jit()
+ 
+     def _build_jit(self):
+-        def ef(R, L):
+-            keep, self._Lt = self._Lt, L
+-            try:
+-                return self._energy_forces(R)
+-            finally:
+-                self._Lt = keep
+-        self._jit = jax.jit(ef)
++        self._jit = jax.jit(self._energy_forces)
+         self._stage_cache = None
+         self.builds += 1                 # programs to compile at the next call
+         # programs others build on this engine's force (md's jitted step loops): they
+diff --git a/so3lr/flash/md.py b/so3lr/flash/md.py
+index fb9bb51..6ff1c24 100644
+--- a/so3lr/flash/md.py
++++ b/so3lr/flash/md.py
+@@ -122,21 +122,41 @@ def build_engine(atoms, settings, dtype, box_margin=None, positions=None):
+     devices = int(settings.get("flash_devices") or 1)
+     # several GPUs run the jitted fast mode (validate_options refuses another)
+     mode = "fast" if devices > 1 else (settings.get("flash_mode") or "auto")
++    kernels = settings.get("flash_kernels") or "auto"
++    picked = None
+     if mode == "auto":
+-        mode = pick_mode(n, _free_bytes() - reserve, statics)
++        from .cuda import pick_mode as cuda_mode
++        # the CUDA kernels' fastest mode that fits, else the Pallas kernels' (theirs go
++        # further); the CUDA kernels need no long-range scratch, and PME's meshes are not
++        # alive at their peak (2 GiB left for what the engine allocates before it plans)
++        picked = cuda_mode(n, _free_bytes() - (2 << 30), params, statics) if kernels != "pallas" else None
++        mode = picked or pick_mode(n, _free_bytes() - reserve, statics)
++        if not picked and kernels == "auto":
++            kernels = "pallas"           # not the CUDA kernels in a mode of theirs auto does not pick
+     total_charge = float(settings.get("total_charge") or 0)
+     embed = settings.get("charge_embed_total_charge")
+     equil = settings.get("charge_equilibration_total_charge")
+-    kw, staged, _ = MODES[mode]
+-    # the sides only: structure_problem takes a cell with off-diagonals up to 1e-9 as orthorhombic
+-    eng = FlashSO3LR(params, statics, atoms.get_atomic_numbers(), None if vacuum else np.diag(L),
+-                     total_charge=total_charge if embed is None else float(embed),
+-                     total_spin=float(settings.get("num_unpaired_electrons") or 0),
+-                     equilibration_charge=total_charge if equil is None else float(equil),
+-                     pme_electrostatics=pme_el, pme_dispersion=pme_disp,
+-                     box_margin=box_margin, devices=devices,
+-                     size=size, **kw,
+-                     kernels=settings.get("flash_kernels") or None)
++
++    def make(kw, staged, kernels):
++        # the sides only: structure_problem takes a cell with off-diagonals up to 1e-9 as orthorhombic
++        return FlashSO3LR(params, statics, atoms.get_atomic_numbers(), None if vacuum else np.diag(L),
++                          total_charge=total_charge if embed is None else float(embed),
++                          total_spin=float(settings.get("num_unpaired_electrons") or 0),
++                          equilibration_charge=total_charge if equil is None else float(equil),
++                          pme_electrostatics=pme_el, pme_dispersion=pme_disp,
++                          box_margin=box_margin, devices=devices,
++                          size=size, **kw,
++                          kernels=kernels, staged=staged)
++    kw, staged = MODES[mode][:2]
++    eng = make(kw, staged, kernels)
++    if picked and eng.cuda_kernels is None:
++        # the CUDA kernels declined after all (not built, or less free than the pick saw): the
++        # Pallas kernels' mode for the memory free now
++        del eng
++        gc.collect()                     # the engine's programs hold it in a cycle
++        mode = pick_mode(n, _free_bytes() - reserve, statics)
++        kw, staged = MODES[mode][:2]
++        eng = make(kw, staged, "pallas")
+     kib = eng.cuda_kernels.kib if eng.cuda_kernels is not None else mode_kib(mode, statics)
+     logger.info(f"Flash: {n} atoms, memory mode {mode} ({'staged' if staged else 'jitted'}), "
+                 f"~{kib:.1f} KiB/atom at peak")
+@@ -144,8 +164,9 @@ def build_engine(atoms, settings, dtype, box_margin=None, positions=None):
+         logger.info(f"Flash: {_free_space(eng)}")
+     if eng.P > 1:
+         logger.info(f"Flash: {eng.P} GPUs, {eng.nl} atoms' rows each")
+-        # each GPU holds every atom's arrays of the fast mode
+-        alone = pick_mode(n, _free_bytes() - reserve, statics)
++        # each GPU holds every atom's arrays of the fast mode (the CUDA kernels planned their
++        # own: the per-pair data kept, or a chunk of rows at a time)
++        alone = pick_mode(n, _free_bytes() - reserve, statics) if eng.cuda_kernels is None else "fast"
+         if alone != "fast":
+             logger.warning(f"Flash: {n} atoms may not fit the fast mode each of the {eng.P} GPUs runs "
+                            f"(one GPU would run {alone})")
+diff --git a/tests/test_flash.py b/tests/test_flash.py
+index 0d87c42..6a11938 100644
+--- a/tests/test_flash.py
++++ b/tests/test_flash.py
+@@ -914,6 +914,26 @@ def test_float32_follows_float64(model):
+     _check("forces", f, f_ref, 1e-4)
+ 
+ 
++@GPU
++def test_atoms_in_any_order():
++    """Each call runs with the atoms sorted in space: shuffled atoms give the energy, the
++    dE/d(strain) per axis and each atom's force (in the input's order) of the atoms in their
++    own order without the sort, jitted and staged (float64, PME)."""
++    atoms = _water((3, 3, 3))
++    perm = np.random.default_rng(0).permutation(len(atoms))
++    pme = dict(pme_electrostatics=(2.0, 1.55))
++    e0, f0, w0 = _engine(None, atoms, "float64", sort_atoms=False, **pme).energy_forces_strain(
++        jnp.asarray(atoms.get_positions(), jnp.float64), diag=True)
++    shuffled = atoms[perm]
++    R = jnp.asarray(shuffled.get_positions(), jnp.float64)
++    eng = _engine(None, shuffled, "float64", **pme)
++    for call in (eng.energy_forces_strain, eng.energy_forces_strain_staged):
++        e, f, w = call(R, diag=True)
++        _check("energy", e, e0, 1e-10)
++        _check("forces", f, np.asarray(f0)[perm], 1e-9)
++        _check("dE/d(strain) per axis", w, w0, 1e-9)
++
++
+ @GPU
+ def test_narrow_neighbour_rows_widen():
+     """Neighbour rows too short for water: the engine widens them and gives what wide ones
+@@ -1624,10 +1644,12 @@ def test_cuda_kernels_follow_float64(model):
+ 
+ @CUDA
+ def test_cuda_kernels_fall_back_where_they_do_not_apply():
+-    """auto takes the Pallas kernels for a float64 model and for the staged memory modes;
+-    cuda asked for explicitly raises there instead."""
++    """auto takes the Pallas kernels for a float64 model and for the memory modes that split
++    the attention into passes (the Pallas kernels' own); cuda asked for explicitly raises
++    there instead."""
+     atoms = _water((3, 3, 3))
+-    for precision, kw in (("float64", dict(keep_attention=True)), ("float32", dict())):
++    for precision, kw in (("float64", dict(keep_attention=True)),
++                          ("float32", dict(keep_layer_inputs=False, split_channels=True))):
+         R = jnp.asarray(atoms.get_positions(), jnp.float64 if precision == "float64" else jnp.float32)
+         eng = _engine("so3lr-tauri-m-2606", atoms, precision, **kw)
+         eng.energy_forces(R)
+@@ -1650,3 +1672,38 @@ def test_cuda_kernels_widen_rows():
+         assert eng.K > 16 and eng.cuda_kernels is not None
+         _check("energy", e, e_ref, 1e-6)
+         _check("forces", f, f_ref, 1e-5)
++
++
++@CUDA
++@pytest.mark.parametrize("model,kw", [
++    ("so3lr-tauri-m-2606", dict(keep_attention=True)),
++    ("so3lr-tauri-m-2606", dict()),                              # the attention outputs made again
++    ("so3lr-tauri-m-2606", dict(keep_layer_inputs=False)),       # the layer inputs too
++    ("so3lr-tauri-s-2606", dict(keep_attention=True)),
++    ("so3lr-tauri-l-2606", dict(keep_attention=True)),
++    ("so3lr-tauri-l-2606", dict(keep_layer_inputs=False)),
++])
++def test_cuda_kernels_in_chunks(model, kw):
++    """The CUDA kernels a chunk of rows at a time (each chunk's per-pair data made in the
++    forward and again in the backward; chunks forced small: several, the last one shifted back
++    over the one before it), in the engine's memory modes, give what the kernels keeping every
++    layer's per-pair data give: energy, forces and dE/d(strain) per axis, jitted and staged,
++    and on two GPUs."""
++    from so3lr.flash import cuda
++    atoms = _water((3, 3, 3))
++    R = jnp.asarray(atoms.get_positions(), jnp.float32)
++    ref = _engine(model, atoms, "float32", keep_attention=True, kernels="cuda")
++    assert ref.cuda_kernels is not None and ref.cuda_kernels.chunk is None
++    e_ref, f_ref, w_ref = ref.energy_forces_strain(R, diag=True)
++    runs = [(1, False, 1100), (1, True, 1100)]
++    if len(jax.local_devices()) >= 2 and kw.get("keep_attention"):
++        runs.append((2, False, 550))                               # several GPUs run the jitted fast mode
++    for devices, staged, rows in runs:
++        eng = _engine(model, atoms, "float32", kernels="pallas", devices=devices, **kw)
++        ck = cuda.attach(eng, strict=True, chunk=rows)
++        nchunks = -(-eng.nl // ck.chunk)
++        assert nchunks > 1 and nchunks * ck.chunk > eng.nl          # the last chunk shifted back
++        e, f, w = (eng.energy_forces_strain_staged if staged else eng.energy_forces_strain)(R, diag=True)
++        _check("energy", e, e_ref, 1e-6)
++        _check("forces", f, f_ref, 1e-5)
++        _check("dE/d(strain) per axis", w, w_ref, 1e-5)

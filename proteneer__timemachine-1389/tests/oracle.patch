@@ -1,0 +1,564 @@
+diff --git a/tests/test_md.py b/tests/test_md.py
+index b13702bab7..48504487c5 100644
+--- a/tests/test_md.py
++++ b/tests/test_md.py
+@@ -48,6 +48,9 @@ def test_multiple_steps_store_interval():
+     bps = [bp]
+ 
+     ctxt = custom_ops.Context(x0, v0, box, intg, bps)
++
++    with pytest.raises(RuntimeError, match="store_x_interval must be greater than or equal to zero"):
++        ctxt.multiple_steps(10, -1)
+     test_xs, test_boxes = ctxt.multiple_steps(10, 10)
+     assert len(test_xs) == 1
+     assert len(test_xs) == len(test_boxes)
+@@ -309,6 +312,9 @@ def test_multiple_steps_local_validation(freeze_reference):
+     with pytest.raises(RuntimeError, match=re.escape("k must be less than than 1e+06")):
+         ctxt.multiple_steps_local(100, np.array([1], dtype=np.int32), k=1e7)
+ 
++    with pytest.raises(RuntimeError, match="store_x_interval must be greater than or equal to zero"):
++        ctxt.multiple_steps_local(100, np.array([1], dtype=np.int32), store_x_interval=-1)
++
+ 
+ @pytest.mark.parametrize("freeze_reference", [True, False])
+ def test_multiple_steps_local_selection_validation(freeze_reference):
+@@ -377,6 +383,9 @@ def test_multiple_steps_local_selection_validation(freeze_reference):
+     with pytest.raises(RuntimeError, match=f"reference idx must be at least 0 and less than {N}"):
+         ctxt.multiple_steps_local_selection(100, -1, np.array([3], dtype=np.int32))
+ 
++    with pytest.raises(RuntimeError, match="store_x_interval must be greater than or equal to zero"):
++        ctxt.multiple_steps_local_selection(100, 1, np.array([2], dtype=np.int32), store_x_interval=-1)
++
+ 
+ @pytest.mark.parametrize("freeze_reference", [True, False])
+ def test_multiple_steps_local_consistency(freeze_reference):
+@@ -917,14 +926,11 @@ def test_context_invalid_boxes():
+     ctxt.set_box(box * 0.01)
+     err_msg = "cutoff with padding is more than half of the box width, neighborlist is no longer reliable"
+     with pytest.raises(RuntimeError, match=err_msg):
+-        _, boxes = ctxt.multiple_steps(steps)
+-        assert len(boxes) == 1
++        ctxt.multiple_steps(steps)
+     with pytest.raises(RuntimeError, match=err_msg):
+-        _, boxes = ctxt.multiple_steps_local(steps, ligand_idxs)
+-        assert len(boxes) == 1
++        ctxt.multiple_steps_local(steps, ligand_idxs)
+     with pytest.raises(RuntimeError, match=err_msg):
+-        _, boxes = ctxt.multiple_steps_local_selection(steps, reference_idx, selection)
+-        assert len(boxes) == 1
++        ctxt.multiple_steps_local_selection(steps, reference_idx, selection)
+ 
+     # Without returning boxes no check will be performed
+     _, boxes = ctxt.multiple_steps(steps, store_x_interval=steps + 1)
+@@ -961,7 +967,7 @@ def test_context_invalid_boxes_without_nonbonded_potentials():
+ 
+     ctxt = custom_ops.Context(coords, v0, box, intg.impl(), bps)
+ 
+-    # Make the box way too small, which should trigger the failure
++    # Make the box way too small, which would trigger the failure if the all pairs potential existed
+     ctxt.set_box(box * 0.01)
+     _, boxes = ctxt.multiple_steps(steps)
+     assert len(boxes) == 1
+diff --git a/timemachine/cpp/src/context.cu b/timemachine/cpp/src/context.cu
+index aa1845b2bd..1fa658b4f6 100644
+--- a/timemachine/cpp/src/context.cu
++++ b/timemachine/cpp/src/context.cu
+@@ -49,19 +49,17 @@ bool is_barostat(std::shared_ptr<Mover> &mover) {
+     return false;
+ }
+ 
+-void Context::_verify_box(cudaStream_t stream) {
++void Context::_verify_box(const double *box_buffer, cudaStream_t stream) {
+     // If there are no nonbonded potentials, nothing to check.
+     if (nonbonded_pots_.size() == 0) {
+         return;
+     }
+-    std::vector<double> h_box(9);
+-    gpuErrchk(cudaMemcpyAsync(&h_box[0], d_box_t_, 9 * sizeof(*d_box_t_), cudaMemcpyDeviceToHost, stream));
+     gpuErrchk(cudaStreamSynchronize(stream));
+     for (auto boundpot : nonbonded_pots_) {
+         double cutoff = get_nonbonded_all_pair_cutoff_with_padding(boundpot->potential);
+         double db_cutoff = 2 * cutoff;
+         for (int i = 0; i < 3; i++) {
+-            if (h_box[i * 3 + i] < db_cutoff) {
++            if (box_buffer[i * 3 + i] < db_cutoff) {
+                 throw std::runtime_error(
+                     "cutoff with padding is more than half of the box width, neighborlist is no longer reliable");
+             }
+@@ -100,29 +98,22 @@ void Context::_ensure_local_md_intialized() {
+     }
+ }
+ 
+-std::array<std::vector<double>, 2> Context::multiple_steps_local(
++void Context::multiple_steps_local(
+     const int n_steps,
+     const std::vector<int> &local_idxs,
+-    const int store_x_interval,
++    const int n_samples,
+     const double radius,
+     const double k,
+-    const int seed) {
+-    if (store_x_interval <= 0) {
+-        throw std::runtime_error("store_x_interval <= 0");
++    const int seed,
++    double *h_x,
++    double *h_box) {
++    const int store_x_interval = n_samples > 0 ? n_steps / n_samples : n_steps + 1;
++    if (n_samples < 0) {
++        throw std::runtime_error("n_samples < 0");
+     }
+-
+-    const int x_buffer_size = n_steps / store_x_interval;
+-
+-    const int box_buffer_size = x_buffer_size * 3 * 3;
+-
+-    // Store coordinates in host memory as it can be very large
+-    std::vector<double> h_x_buffer(x_buffer_size * N_ * 3);
+-    // Store boxes on GPU as boxes are a constant size and relatively small
+-    DeviceBuffer<double> d_box_traj;
+-    if (box_buffer_size > 0) {
+-        d_box_traj.realloc(box_buffer_size);
++    if (n_steps % store_x_interval != 0) {
++        std::cout << "warning:: n_steps modulo store_x_interval does not equal zero" << std::endl;
+     }
+-
+     this->_ensure_local_md_intialized();
+ 
+     cudaStream_t stream;
+@@ -142,18 +133,14 @@ std::array<std::vector<double>, 2> Context::multiple_steps_local(
+             this->_step(local_pots, d_free_idxs, stream);
+             if (i % store_x_interval == 0) {
+                 gpuErrchk(cudaMemcpyAsync(
+-                    &h_x_buffer[0] + ((i / store_x_interval) - 1) * N_ * 3,
++                    h_x + ((i / store_x_interval) - 1) * N_ * 3,
+                     d_x_t_,
+                     N_ * 3 * sizeof(*d_x_t_),
+                     cudaMemcpyDeviceToHost,
+                     stream));
+-                gpuErrchk(cudaMemcpyAsync(
+-                    &d_box_traj.data[0] + ((i / store_x_interval) - 1) * 3 * 3,
+-                    d_box_t_,
+-                    3 * 3 * sizeof(*d_box_traj.data),
+-                    cudaMemcpyDeviceToDevice,
+-                    stream));
+-                this->_verify_box(stream);
++                double *box_ptr = h_box + ((i / store_x_interval) - 1) * 3 * 3;
++                gpuErrchk(cudaMemcpyAsync(box_ptr, d_box_t_, 3 * 3 * sizeof(double), cudaMemcpyDeviceToHost, stream));
++                this->_verify_box(box_ptr, stream);
+             }
+         }
+         intg_->finalize(local_pots, d_x_t_, d_v_t_, d_box_t_, d_free_idxs, stream);
+@@ -165,36 +152,23 @@ std::array<std::vector<double>, 2> Context::multiple_steps_local(
+     }
+     gpuErrchk(cudaStreamSynchronize(stream));
+     gpuErrchk(cudaStreamDestroy(stream));
+-
+-    std::vector<double> h_box_buffer(box_buffer_size);
+-
+-    if (box_buffer_size > 0) {
+-        d_box_traj.copy_to(&h_box_buffer[0]);
+-    }
+-    return std::array<std::vector<double>, 2>({h_x_buffer, h_box_buffer});
+ }
+ 
+-std::array<std::vector<double>, 2> Context::multiple_steps_local_selection(
++void Context::multiple_steps_local_selection(
+     const int n_steps,
+     const int reference_idx,
+     const std::vector<int> &selection_idxs,
+-    const int store_x_interval,
++    const int n_samples,
+     const double radius,
+-    const double k) {
+-    if (store_x_interval <= 0) {
+-        throw std::runtime_error("store_x_interval <= 0");
++    const double k,
++    double *h_x,
++    double *h_box) {
++    const int store_x_interval = n_samples > 0 ? n_steps / n_samples : n_steps + 1;
++    if (n_samples < 0) {
++        throw std::runtime_error("n_samples < 0");
+     }
+-
+-    const int x_buffer_size = n_steps / store_x_interval;
+-
+-    const int box_buffer_size = x_buffer_size * 3 * 3;
+-
+-    // Store coordinates in host memory as it can be very large
+-    std::vector<double> h_x_buffer(x_buffer_size * N_ * 3);
+-    // Store boxes on GPU as boxes are a constant size and relatively small
+-    DeviceBuffer<double> d_box_traj;
+-    if (box_buffer_size > 0) {
+-        d_box_traj.realloc(box_buffer_size);
++    if (n_steps % store_x_interval != 0) {
++        std::cout << "warning:: n_steps modulo store_x_interval does not equal zero" << std::endl;
+     }
+ 
+     this->_ensure_local_md_intialized();
+@@ -216,18 +190,14 @@ std::array<std::vector<double>, 2> Context::multiple_steps_local_selection(
+             this->_step(local_pots, d_free_idxs, stream);
+             if (i % store_x_interval == 0) {
+                 gpuErrchk(cudaMemcpyAsync(
+-                    &h_x_buffer[0] + ((i / store_x_interval) - 1) * N_ * 3,
++                    h_x + ((i / store_x_interval) - 1) * N_ * 3,
+                     d_x_t_,
+                     N_ * 3 * sizeof(*d_x_t_),
+                     cudaMemcpyDeviceToHost,
+                     stream));
+-                gpuErrchk(cudaMemcpyAsync(
+-                    &d_box_traj.data[0] + ((i / store_x_interval) - 1) * 3 * 3,
+-                    d_box_t_,
+-                    3 * 3 * sizeof(*d_box_traj.data),
+-                    cudaMemcpyDeviceToDevice,
+-                    stream));
+-                this->_verify_box(stream);
++                double *box_ptr = h_box + ((i / store_x_interval) - 1) * 3 * 3;
++                gpuErrchk(cudaMemcpyAsync(box_ptr, d_box_t_, 3 * 3 * sizeof(double), cudaMemcpyDeviceToHost, stream));
++                this->_verify_box(box_ptr, stream);
+             }
+         }
+         intg_->finalize(local_pots, d_x_t_, d_v_t_, d_box_t_, d_free_idxs, stream);
+@@ -239,65 +209,38 @@ std::array<std::vector<double>, 2> Context::multiple_steps_local_selection(
+     }
+     gpuErrchk(cudaStreamSynchronize(stream));
+     gpuErrchk(cudaStreamDestroy(stream));
+-
+-    std::vector<double> h_box_buffer(box_buffer_size);
+-
+-    if (box_buffer_size > 0) {
+-        d_box_traj.copy_to(&h_box_buffer[0]);
+-    }
+-    return std::array<std::vector<double>, 2>({h_x_buffer, h_box_buffer});
+ }
+ 
+-std::array<std::vector<double>, 2> Context::multiple_steps(const int n_steps, int store_x_interval) {
+-    if (store_x_interval <= 0) {
+-        throw std::runtime_error("store_x_interval <= 0");
++void Context::multiple_steps(const int n_steps, const int n_samples, double *h_x, double *h_box) {
++    const int store_x_interval = n_samples > 0 ? n_steps / n_samples : n_steps + 1;
++    if (n_samples < 0) {
++        throw std::runtime_error("n_samples < 0");
+     }
+     if (n_steps % store_x_interval != 0) {
+         std::cout << "warning:: n_steps modulo store_x_interval does not equal zero" << std::endl;
+     }
+ 
+-    int x_buffer_size = n_steps / store_x_interval;
+-    int box_buffer_size = x_buffer_size * 3 * 3;
+-
+-    std::vector<double> h_x_buffer(x_buffer_size * N_ * 3);
+-
+     cudaStream_t stream = static_cast<cudaStream_t>(0);
+ 
+-    DeviceBuffer<double> d_box_buffer;
+-    if (box_buffer_size > 0) {
+-        d_box_buffer.realloc(box_buffer_size);
+-    }
+-
+     intg_->initialize(bps_, d_x_t_, d_v_t_, d_box_t_, nullptr, stream);
+     for (int i = 1; i <= n_steps; i++) {
+         this->_step(bps_, nullptr, stream);
+ 
+         if (i % store_x_interval == 0) {
+             gpuErrchk(cudaMemcpyAsync(
+-                &h_x_buffer[0] + ((i / store_x_interval) - 1) * N_ * 3,
++                h_x + ((i / store_x_interval) - 1) * N_ * 3,
+                 d_x_t_,
+                 N_ * 3 * sizeof(*d_x_t_),
+                 cudaMemcpyDeviceToHost,
+                 stream));
+-            gpuErrchk(cudaMemcpyAsync(
+-                &d_box_buffer.data[0] + ((i / store_x_interval) - 1) * 3 * 3,
+-                d_box_t_,
+-                3 * 3 * sizeof(*d_box_buffer.data),
+-                cudaMemcpyDeviceToDevice,
+-                stream));
+-            this->_verify_box(stream);
++            double *box_ptr = h_box + ((i / store_x_interval) - 1) * 3 * 3;
++            gpuErrchk(cudaMemcpyAsync(box_ptr, d_box_t_, 3 * 3 * sizeof(double), cudaMemcpyDeviceToHost, stream));
++            this->_verify_box(box_ptr, stream);
+         }
+     }
+     intg_->finalize(bps_, d_x_t_, d_v_t_, d_box_t_, nullptr, stream);
+ 
+     gpuErrchk(cudaStreamSynchronize(stream));
+-
+-    std::vector<double> h_box_buffer(box_buffer_size);
+-    if (box_buffer_size > 0) {
+-        d_box_buffer.copy_to(&h_box_buffer[0]);
+-    }
+-
+-    return std::array<std::vector<double>, 2>({h_x_buffer, h_box_buffer});
+ }
+ 
+ void Context::step() {
+diff --git a/timemachine/cpp/src/context.hpp b/timemachine/cpp/src/context.hpp
+index 036322d124..305836f882 100644
+--- a/timemachine/cpp/src/context.hpp
++++ b/timemachine/cpp/src/context.hpp
+@@ -26,23 +26,27 @@ class Context {
+     void initialize();
+     void finalize();
+ 
+-    std::array<std::vector<double>, 2> multiple_steps(const int n_steps, int store_x_interval);
++    void multiple_steps(const int n_steps, const int n_samples, double *h_x, double *h_box);
+ 
+-    std::array<std::vector<double>, 2> multiple_steps_local(
++    void multiple_steps_local(
+         const int n_steps,
+         const std::vector<int> &local_idxs,
+-        const int store_x_interval,
++        const int n_samples,
+         const double radius,
+         const double k,
+-        const int seed);
++        const int seed,
++        double *h_x,
++        double *h_box);
+ 
+-    std::array<std::vector<double>, 2> multiple_steps_local_selection(
++    void multiple_steps_local_selection(
+         const int n_steps,
+         const int reference_idx,
+         const std::vector<int> &selection_idxs,
+-        const int store_x_interval,
++        const int n_samples,
+         const double radius,
+-        const double k);
++        const double k,
++        double *h_x,
++        double *h_box);
+ 
+     int num_atoms() const;
+ 
+@@ -79,7 +83,7 @@ class Context {
+ 
+     void _ensure_local_md_intialized();
+ 
+-    void _verify_box(cudaStream_t stream);
++    void _verify_box(const double *box_buffer, cudaStream_t stream);
+ 
+     int step_;
+ 
+diff --git a/timemachine/cpp/src/wrap_kernels.cpp b/timemachine/cpp/src/wrap_kernels.cpp
+index 43d2687951..9e1d32ab1a 100644
+--- a/timemachine/cpp/src/wrap_kernels.cpp
++++ b/timemachine/cpp/src/wrap_kernels.cpp
+@@ -188,8 +188,7 @@ void declare_hilbert_sort(py::module &m) {
+                 verify_coords_and_box(coords, box);
+ 
+                 std::vector<unsigned int> sort_perm = sorter.sort_host(N, coords.data(), box.data());
+-                py::array_t<uint32_t, py::array::c_style> output_perm(sort_perm.size());
+-                std::memcpy(output_perm.mutable_data(), sort_perm.data(), sort_perm.size() * sizeof(unsigned int));
++                py::array_t<uint32_t, py::array::c_style> output_perm(sort_perm.size(), sort_perm.data());
+                 return output_perm;
+             },
+             py::arg("coords"),
+@@ -350,20 +349,23 @@ void declare_context(py::module &m) {
+         .def(
+             "multiple_steps",
+             [](Context &ctxt, const int n_steps, int store_x_interval) -> py::tuple {
++                if (store_x_interval < 0) {
++                    throw std::runtime_error("store_x_interval must be greater than or equal to zero");
++                }
+                 // (ytz): I hate C++
+-                int x_interval = (store_x_interval <= 0) ? n_steps : store_x_interval;
+-                std::array<std::vector<double>, 2> result = ctxt.multiple_steps(n_steps, x_interval);
+-
+                 int N = ctxt.num_atoms();
+                 int D = 3;
+-                int F = result[0].size() / (N * D);
+-                py::array_t<double, py::array::c_style> out_x_buffer({F, N, D});
+-                std::memcpy(out_x_buffer.mutable_data(), result[0].data(), result[0].size() * sizeof(double));
+-
+-                py::array_t<double, py::array::c_style> box_buffer({F, D, D});
+-                std::memcpy(box_buffer.mutable_data(), result[1].data(), result[1].size() * sizeof(double));
+ 
+-                return py::make_tuple(out_x_buffer, box_buffer);
++                // If the store_x_interval is 0, collect the last frame by setting x_interval to n_steps
++                const int x_interval = (store_x_interval == 0) ? n_steps : store_x_interval;
++                // n_samples determines the number of frames that will be collected, computed to be able to allocate
++                // the buffers up front to avoid allocating memory twice
++                const int n_samples = n_steps / x_interval;
++                py::array_t<double, py::array::c_style> out_x_buffer({n_samples, N, D});
++                py::array_t<double, py::array::c_style> box_buffer({n_samples, D, D});
++                auto res = py::make_tuple(out_x_buffer, box_buffer);
++                ctxt.multiple_steps(n_steps, n_samples, out_x_buffer.mutable_data(), box_buffer.mutable_data());
++                return res;
+             },
+             py::arg("n_steps"),
+             py::arg("store_x_interval") = 0,
+@@ -408,24 +410,36 @@ void declare_context(py::module &m) {
+                 if (n_steps <= 0) {
+                     throw std::runtime_error("local steps must be at least one");
+                 }
++                if (store_x_interval < 0) {
++                    throw std::runtime_error("store_x_interval must be greater than or equal to zero");
++                }
+                 verify_local_md_parameters(radius, k);
+ 
+                 const int N = ctxt.num_atoms();
+-                const int x_interval = (store_x_interval <= 0) ? n_steps : store_x_interval;
++                const int D = 3;
+ 
+                 std::vector<int> vec_local_idxs = py_array_to_vector(local_idxs);
+                 verify_atom_idxs(N, vec_local_idxs);
+ 
+-                std::array<std::vector<double>, 2> result =
+-                    ctxt.multiple_steps_local(n_steps, vec_local_idxs, x_interval, radius, k, seed);
+-                const int D = 3;
+-                const int F = result[0].size() / (N * D);
+-                py::array_t<double, py::array::c_style> out_x_buffer({F, N, D});
+-                std::memcpy(out_x_buffer.mutable_data(), result[0].data(), result[0].size() * sizeof(double));
+-
+-                py::array_t<double, py::array::c_style> box_buffer({F, D, D});
+-                std::memcpy(box_buffer.mutable_data(), result[1].data(), result[1].size() * sizeof(double));
+-                return py::make_tuple(out_x_buffer, box_buffer);
++                // If the store_x_interval is 0, collect the last frame by setting x_interval to n_steps
++                const int x_interval = (store_x_interval == 0) ? n_steps : store_x_interval;
++                // n_samples determines the number of frames that will be collected, computed to be able to allocate
++                // the buffers up front to avoid allocating memory twice
++                const int n_samples = n_steps / x_interval;
++                py::array_t<double, py::array::c_style> out_x_buffer({n_samples, N, D});
++                py::array_t<double, py::array::c_style> box_buffer({n_samples, D, D});
++                auto res = py::make_tuple(out_x_buffer, box_buffer);
++
++                ctxt.multiple_steps_local(
++                    n_steps,
++                    vec_local_idxs,
++                    n_samples,
++                    radius,
++                    k,
++                    seed,
++                    out_x_buffer.mutable_data(),
++                    box_buffer.mutable_data());
++                return res;
+             },
+             py::arg("n_steps"),
+             py::arg("local_idxs"),
+@@ -499,10 +513,13 @@ void declare_context(py::module &m) {
+                 if (n_steps <= 0) {
+                     throw std::runtime_error("local steps must be at least one");
+                 }
++                if (store_x_interval < 0) {
++                    throw std::runtime_error("store_x_interval must be greater than or equal to zero");
++                }
+                 verify_local_md_parameters(radius, k);
+ 
+                 const int N = ctxt.num_atoms();
+-                const int x_interval = (store_x_interval <= 0) ? n_steps : store_x_interval;
++                const int D = 3;
+ 
+                 if (reference_idx < 0 || reference_idx >= N) {
+                     throw std::runtime_error("reference idx must be at least 0 and less than " + std::to_string(N));
+@@ -513,17 +530,25 @@ void declare_context(py::module &m) {
+                 if (selection_set.find(reference_idx) != selection_set.end()) {
+                     throw std::runtime_error("reference idx must not be in selection idxs");
+                 }
+-
+-                std::array<std::vector<double>, 2> result = ctxt.multiple_steps_local_selection(
+-                    n_steps, reference_idx, vec_selection_idxs, x_interval, radius, k);
+-                const int D = 3;
+-                const int F = result[0].size() / (N * D);
+-                py::array_t<double, py::array::c_style> out_x_buffer({F, N, D});
+-                std::memcpy(out_x_buffer.mutable_data(), result[0].data(), result[0].size() * sizeof(double));
+-
+-                py::array_t<double, py::array::c_style> box_buffer({F, D, D});
+-                std::memcpy(box_buffer.mutable_data(), result[1].data(), result[1].size() * sizeof(double));
+-                return py::make_tuple(out_x_buffer, box_buffer);
++                // If the store_x_interval is 0, collect the last frame by setting x_interval to n_steps
++                const int x_interval = (store_x_interval == 0) ? n_steps : store_x_interval;
++                // n_samples determines the number of frames that will be collected, computed to be able to allocate
++                // the buffers up front to avoid allocating memory twice
++                const int n_samples = n_steps / x_interval;
++                py::array_t<double, py::array::c_style> out_x_buffer({n_samples, N, D});
++                py::array_t<double, py::array::c_style> box_buffer({n_samples, D, D});
++                auto res = py::make_tuple(out_x_buffer, box_buffer);
++
++                ctxt.multiple_steps_local_selection(
++                    n_steps,
++                    reference_idx,
++                    vec_selection_idxs,
++                    n_samples,
++                    radius,
++                    k,
++                    out_x_buffer.mutable_data(),
++                    box_buffer.mutable_data());
++                return res;
+             },
+             py::arg("n_steps"),
+             py::arg("reference_idx"),
+@@ -728,6 +753,7 @@ void declare_potential(py::module &m) {
+                 if (params.ndim() < 2) {
+                     throw std::runtime_error("parameters must have at least 2 dimensions");
+                 }
++
+                 const long unsigned int coord_batches = coords.shape()[0];
+                 const long unsigned int N = coords.shape()[1];
+                 const long unsigned int D = coords.shape()[2];
+@@ -1025,6 +1051,7 @@ void declare_potential(py::module &m) {
+                 const long unsigned int D = coords.shape()[1];
+                 const long unsigned int P = params.size();
+                 verify_coords_and_box(coords, box);
++
+                 // initialize with fixed garbage values for debugging convenience (these should be overwritten by `execute_host`)
+                 std::vector<unsigned long long> du_dx;
+                 if (compute_du_dx) {
+@@ -1134,6 +1161,7 @@ void declare_bound_potential(py::module &m) {
+                 const long unsigned int N = coords.shape()[0];
+                 const long unsigned int D = coords.shape()[1];
+                 verify_coords_and_box(coords, box);
++
+                 // initialize with fixed garbage values for debugging convenience (these should be overwritten by `execute_host`)
+                 std::vector<unsigned long long> du_dx;
+                 if (compute_du_dx) {
+@@ -1182,6 +1210,7 @@ void declare_bound_potential(py::module &m) {
+                 if (coords.shape()[0] != boxes.shape()[0]) {
+                     throw std::runtime_error("number of batches of coords and boxes don't match");
+                 }
++
+                 const long unsigned int coord_batches = coords.shape()[0];
+                 const long unsigned int N = coords.shape()[1];
+                 const long unsigned int D = coords.shape()[2];
+@@ -1594,13 +1623,9 @@ void declare_mover(py::module &m) {
+ 
+                 std::array<std::vector<double>, 2> result = mover.move_host(N, coords.data(), box.data());
+ 
+-                py::array_t<double, py::array::c_style> out_x_buffer({N, D});
+-                std::memcpy(
+-                    out_x_buffer.mutable_data(), result[0].data(), result[0].size() * sizeof(*result[0].data()));
+-
+-                py::array_t<double, py::array::c_style> box_buffer({D, D});
+-                std::memcpy(box_buffer.mutable_data(), result[1].data(), result[1].size() * sizeof(*result[1].data()));
++                py::array_t<double, py::array::c_style> out_x_buffer({N, D}, result[0].data());
+ 
++                py::array_t<double, py::array::c_style> box_buffer({D, D}, result[1].data());
+                 return py::make_tuple(out_x_buffer, box_buffer);
+             },
+             py::arg("coords"),
+@@ -1792,12 +1817,9 @@ template <typename RealType> void declare_biased_deletion_exchange_move(py::modu
+ 
+                 std::array<std::vector<double>, 2> result = mover.move_host(N, coords.data(), box.data());
+ 
+-                py::array_t<double, py::array::c_style> out_x_buffer({N, D});
+-                std::memcpy(
+-                    out_x_buffer.mutable_data(), result[0].data(), result[0].size() * sizeof(*result[0].data()));
++                py::array_t<double, py::array::c_style> out_x_buffer({N, D}, result[0].data());
+ 
+-                py::array_t<double, py::array::c_style> box_buffer({D, D});
+-                std::memcpy(box_buffer.mutable_data(), result[1].data(), result[1].size() * sizeof(*result[1].data()));
++                py::array_t<double, py::array::c_style> box_buffer({D, D}, result[1].data());
+ 
+                 return py::make_tuple(out_x_buffer, box_buffer);
+             },
+@@ -1863,9 +1885,7 @@ template <typename RealType> void declare_biased_deletion_exchange_move(py::modu
+                 std::vector<double> flat_params = mover.get_params();
+                 const int D = PARAMS_PER_ATOM;
+                 const int N = flat_params.size() / D;
+-                py::array_t<double, py::array::c_style> out_params({N, D});
+-                std::memcpy(
+-                    out_params.mutable_data(), flat_params.data(), flat_params.size() * sizeof(*flat_params.data()));
++                py::array_t<double, py::array::c_style> out_params({N, D}, flat_params.data());
+                 return out_params;
+             })
+         .def(

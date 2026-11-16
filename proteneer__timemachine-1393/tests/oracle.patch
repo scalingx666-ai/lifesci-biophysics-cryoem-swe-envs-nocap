@@ -1,0 +1,543 @@
+diff --git a/tests/test_jax_bonded.py b/tests/test_jax_bonded.py
+new file mode 100644
+index 0000000000..1ee066c291
+--- /dev/null
++++ b/tests/test_jax_bonded.py
+@@ -0,0 +1,45 @@
++import jax
++import numpy as np
++import pytest
++import scipy
++
++from timemachine.potentials.bonded import harmonic_positional_restraint
++from timemachine.potentials.jax_utils import delta_r
++
++
++@pytest.mark.nocuda
++@pytest.mark.parametrize("seed", [2024])
++@pytest.mark.parametrize("samples", [2, 5, 10, 600])
++@pytest.mark.parametrize("k", [2000.0, 4000.0])
++def test_harmonic_restraint_potential(seed, samples, k):
++    rng = np.random.default_rng(seed)
++    x_0 = rng.uniform(0.5, 1.5, (samples, 3))
++    x_1 = rng.uniform(0.5, 1.5, (samples, 3))
++    box = rng.uniform(1.0, 3.0, (3, 3))
++
++    assert harmonic_positional_restraint(x_0, x_0, box, k=k) == 0.0
++    assert harmonic_positional_restraint(x_1, x_1, box, k=k) == 0.0
++
++    assert harmonic_positional_restraint(x_0, x_1, box, k=k) > 0.0
++
++    val_and_grad = jax.value_and_grad(harmonic_positional_restraint, argnums=1)
++
++    def minimize_func(x_updated_flattened):
++        x_updated = x_updated_flattened.reshape((samples, 3))
++        u, grad = val_and_grad(x_0, x_updated, box, k=k)
++        return u, grad.reshape(-1)
++
++    # Verify that the coordinates are not close to begin with
++    assert not np.allclose(delta_r(x_0, x_1, box), 1e-14, atol=1e-9)
++
++    # Minimize the second coordinates to the first
++    res = scipy.optimize.minimize(
++        minimize_func,
++        x_1.reshape(-1),
++        method="BFGS",
++        jac=True,
++    )
++
++    x_final = res.x.reshape((samples, 3))
++    # Check that under PBCs, values are nearly identical
++    np.testing.assert_allclose(delta_r(x_0, x_final, box), 1e-14, atol=1e-9)
+diff --git a/tests/test_minimizer.py b/tests/test_minimizer.py
+index c5b95dd02b..447f68d37a 100644
+--- a/tests/test_minimizer.py
++++ b/tests/test_minimizer.py
+@@ -194,7 +194,7 @@ def test_local_minimize_water_box():
+ 
+     u_init, g_init = val_and_grad_fn(x0)
+ 
+-    x_opt = minimizer.local_minimize(x0, val_and_grad_fn, free_idxs)
++    x_opt = minimizer.local_minimize(x0, box0, val_and_grad_fn, free_idxs)
+ 
+     np.testing.assert_array_equal(x0[frozen_idxs], x_opt[frozen_idxs])
+     assert np.linalg.norm(x0[free_idxs] - x_opt[free_idxs]) > 0.01
+@@ -206,7 +206,9 @@ def test_local_minimize_water_box():
+     np.testing.assert_array_equal(g_init, g_init_test)
+ 
+ 
+-def test_local_minimize_strained_ligand():
++@pytest.mark.nocuda
++@pytest.mark.parametrize("restraint_k", [None, 3_000.0])
++def test_local_minimize_strained_ligand(restraint_k):
+     """
+     Test that we can minimize a ligand in vacuum using local_minimize when the ligand is strained.
+     """
+@@ -267,13 +269,14 @@ def test_local_minimize_strained_ligand():
+     val_and_grad_fn = get_vacuum_val_and_grad_fn(mol, ff)
+ 
+     x0 = get_romol_conf(mol)
++    box0 = np.eye(3) * 100.0
+ 
+     # All atoms will be free
+     free_idxs = np.arange(mol.GetNumAtoms())
+ 
+     u_init, g_init = val_and_grad_fn(x0)
+ 
+-    x_opt = minimizer.local_minimize(x0, val_and_grad_fn, free_idxs)
++    x_opt = minimizer.local_minimize(x0, box0, val_and_grad_fn, free_idxs, restraint_k=restraint_k)
+ 
+     assert np.linalg.norm(x0 - x_opt) > 0.01
+ 
+diff --git a/tests/test_single_topology_confgen.py b/tests/test_single_topology_confgen.py
+index 64df0e50b8..d5bb63c373 100644
+--- a/tests/test_single_topology_confgen.py
++++ b/tests/test_single_topology_confgen.py
+@@ -2,14 +2,23 @@
+ 
+ import numpy as np
+ import pytest
++from rdkit import Chem
+ 
+ from timemachine.constants import DEFAULT_ATOM_MAPPING_KWARGS, DEFAULT_TEMP
+ from timemachine.fe import atom_mapping, cif_writer, utils
+-from timemachine.fe.rbfe import HostConfig, setup_initial_states, setup_optimized_host
++from timemachine.fe.rbfe import (
++    HostConfig,
++    get_free_idxs,
++    optimize_coords_state,
++    setup_initial_state,
++    setup_initial_states,
++    setup_optimized_host,
++)
+ from timemachine.fe.single_topology import AtomMapMixin, SingleTopology
+ from timemachine.fe.utils import get_mol_name, read_sdf
+ from timemachine.ff import Forcefield
+ from timemachine.md import builders
++from timemachine.potentials.jax_utils import distance_on_pairs
+ 
+ SAVE_FRAMES = False
+ 
+@@ -191,3 +200,86 @@ def test_min_cutoff_failure(pair, seed, n_windows):
+     with pytest.raises(AssertionError) as res:
+         setup_initial_states(st, solvent_host, DEFAULT_TEMP, lambda_grid, seed, min_cutoff=min_cutoff)
+     assert f"moved atoms {expected_moved.tolist()} >" in str(res.value)
++
++
++def test_optimize_coords_with_positional_restraint():
++    mol = Chem.MolFromMolBlock(
++        """Cyclohexane with clashy methyls
++RDKit          3D
++
++ 24 24  0  0  1  0            999 V2000
++    9.9445  -15.4797  197.9278 C   0  0  0  0  0  0
++   10.4220  -14.4752  196.8506 C   0  0  2  0  0  0
++   11.9342  -14.2011  197.0256 C   0  0  0  0  0  0
++   12.7498  -15.5057  197.0172 C   0  0  0  0  0  0
++   12.3085  -16.4450  198.1504 C   0  0  0  0  0  0
++   10.8012  -16.7661  198.0776 C   0  0  1  0  0  0
++   10.0655  -14.8776  195.4099 C   0  0  0  0  0  0
++   10.4814  -17.8631  197.0485 C   0  0  0  0  0  0
++    8.9099  -15.7577  197.7270 H   0  0  0  0  0  0
++    9.8847  -14.9730  198.8910 H   0  0  0  0  0  0
++    9.9081  -13.5348  197.0495 H   0  0  0  0  0  0
++   12.1011  -13.6750  197.9656 H   0  0  0  0  0  0
++   12.2805  -13.5516  196.2216 H   0  0  0  0  0  0
++   13.8085  -15.2725  197.1309 H   0  0  0  0  0  0
++   12.6208  -16.0081  196.0585 H   0  0  0  0  0  0
++   12.5351  -15.9846  199.1120 H   0  0  0  0  0  0
++   12.8796  -17.3718  198.0963 H   0  0  0  0  0  0
++   10.5398  -17.1853  199.0492 H   0  0  0  0  0  0
++   10.4359  -14.1208  194.7184 H   0  0  0  0  0  0
++   10.5245  -15.8382  195.1762 H   0  0  0  0  0  0
++    8.9829  -14.9595  195.3123 H   0  0  0  0  0  0
++   11.1242  -18.7256  197.2243 H   0  0  0  0  0  0
++    9.4379  -18.1620  197.1478 H   0  0  0  0  0  0
++   10.6549  -17.4802  196.0428 H   0  0  0  0  0  0
++  1  2  1  0  0  0
++  1  6  1  0  0  0
++  1  9  1  0  0  0
++  1 10  1  0  0  0
++  2  3  1  0  0  0
++  2  7  1  0  0  0
++  2 11  1  0  0  0
++  3  4  1  0  0  0
++  3 12  1  0  0  0
++  3 13  1  0  0  0
++  4  5  1  0  0  0
++  4 14  1  0  0  0
++  4 15  1  0  0  0
++  5  6  1  0  0  0
++  5 16  1  0  0  0
++  5 17  1  0  0  0
++  6  8  1  0  0  0
++  6 18  1  0  0  0
++  7 19  1  0  0  0
++  7 20  1  0  0  0
++  7 21  1  0  0  0
++  8 22  1  0  0  0
++  8 23  1  0  0  0
++  8 24  1  0  0  0
++M  END
++$$$$
++""",
++        removeHs=False,
++    )
++
++    ff = Forcefield.load_default()
++    # Core doesn't matter here
++    core = np.array([[0, 0]])
++    st = SingleTopology(mol, mol, core, ff)
++
++    lambda_grid = np.linspace(0.0, 1.0, 2)
++
++    for lamb in lambda_grid:
++        state = setup_initial_state(st, lamb, None, DEFAULT_TEMP, 2024)
++
++        free_idxs = get_free_idxs(state)
++        x_opt_unrestrained = optimize_coords_state(state.potentials, state.x0, state.box0, free_idxs, False, k=None)
++        x_opt_restrained = optimize_coords_state(state.potentials, state.x0, state.box0, free_idxs, False, k=2000.0)
++        interacting_atoms = state.interacting_atoms
++        displacement_distances_unrestrained = distance_on_pairs(
++            state.x0[interacting_atoms], x_opt_unrestrained[interacting_atoms], box=state.box0
++        )
++        displacement_distances_restrained = distance_on_pairs(
++            state.x0[interacting_atoms], x_opt_restrained[interacting_atoms], box=state.box0
++        )
++        assert np.max(displacement_distances_unrestrained) > np.max(displacement_distances_restrained)
+diff --git a/timemachine/constants.py b/timemachine/constants.py
+index 999845fefe..fba45de2b9 100644
+--- a/timemachine/constants.py
++++ b/timemachine/constants.py
+@@ -27,6 +27,8 @@
+ DEFAULT_CHIRAL_ATOM_RESTRAINT_K = 1000.0
+ DEFAULT_CHIRAL_BOND_RESTRAINT_K = 999.9
+ 
++DEFAULT_POSITIONAL_RESTRAINT_K = 4000.0
++
+ # thresholds
+ MAX_FORCE_NORM = 50000.0  # used to check norms in the gradient computations
+ 
+diff --git a/timemachine/fe/rbfe.py b/timemachine/fe/rbfe.py
+index bd53c5f65e..2f198d9bfb 100644
+--- a/timemachine/fe/rbfe.py
++++ b/timemachine/fe/rbfe.py
+@@ -9,7 +9,7 @@
+ from openmm import app
+ from rdkit import Chem
+ 
+-from timemachine.constants import DEFAULT_PRESSURE, DEFAULT_TEMP
++from timemachine.constants import DEFAULT_POSITIONAL_RESTRAINT_K, DEFAULT_PRESSURE, DEFAULT_TEMP
+ from timemachine.fe import model_utils
+ from timemachine.fe.free_energy import (
+     HostConfig,
+@@ -274,6 +274,7 @@ def setup_optimized_initial_state(
+     optimized_initial_states: Sequence[InitialState],
+     temperature: float,
+     seed: int,
++    k: Optional[float] = DEFAULT_POSITIONAL_RESTRAINT_K,
+ ) -> InitialState:
+     """Setup an InitialState for the specified lambda and optimize the coordinates given a list of pre-optimized IntialStates.
+     If the specified lambda exists within the list of optimized_initial_states list, return the existing InitialState.
+@@ -308,6 +309,7 @@ def setup_optimized_initial_state(
+             free_idxs,
+             # assertion can lead to spurious errors when new state is close to an existing one
+             assert_energy_decreased=False,
++            k=k,
+         )
+         return initial_state
+ 
+@@ -318,10 +320,14 @@ def optimize_coords_state(
+     box: NDArray,
+     free_idxs: List[int],
+     assert_energy_decreased: bool,
++    k: Optional[float],
+ ) -> NDArray:
+     val_and_grad_fn = minimizer.get_val_and_grad_fn(potentials, box)
+     assert np.all(np.isfinite(x0)), "Initial coordinates contain nan or inf"
+-    x_opt = minimizer.local_minimize(x0, val_and_grad_fn, free_idxs, assert_energy_decreased=assert_energy_decreased)
++
++    x_opt = minimizer.local_minimize(
++        x0, box, val_and_grad_fn, free_idxs, assert_energy_decreased=assert_energy_decreased, restraint_k=k
++    )
+     assert np.all(np.isfinite(x_opt)), "Minimization resulted in a nan"
+     return x_opt
+ 
+@@ -335,9 +341,10 @@ def get_free_idxs(initial_state: InitialState, cutoff: float = 0.5) -> List[int]
+     return free_idxs
+ 
+ 
+-def _optimize_coords_along_states(initial_states: List[InitialState]) -> List[NDArray]:
++def _optimize_coords_along_states(initial_states: List[InitialState], k: Optional[float]) -> List[NDArray]:
+     # use the end-state to define the optimization settings
+     end_state = initial_states[0]
++
+     x_opt = end_state.x0
+ 
+     x_traj = []
+@@ -346,7 +353,7 @@ def _optimize_coords_along_states(initial_states: List[InitialState]) -> List[ND
+         free_idxs = get_free_idxs(initial_state)
+         try:
+             x_opt = optimize_coords_state(
+-                initial_state.potentials, x_opt, initial_state.box0, free_idxs, assert_energy_decreased=idx == 0
++                initial_state.potentials, x_opt, initial_state.box0, free_idxs, assert_energy_decreased=idx == 0, k=k
+             )
+         except (AssertionError, minimizer.MinimizationError) as e:
+             raise minimizer.MinimizationError(f"Failed to optimized state at λ={initial_state.lamb}") from e
+@@ -355,7 +362,11 @@ def _optimize_coords_along_states(initial_states: List[InitialState]) -> List[ND
+     return x_traj
+ 
+ 
+-def optimize_coordinates(initial_states: List[InitialState], min_cutoff: Optional[float] = 0.7) -> List[NDArray]:
++def optimize_coordinates(
++    initial_states: List[InitialState],
++    min_cutoff: Optional[float] = 0.7,
++    k: Optional[float] = DEFAULT_POSITIONAL_RESTRAINT_K,
++) -> List[NDArray]:
+     """
+     Optimize geometries of the initial states.
+ 
+@@ -366,6 +377,11 @@ def optimize_coordinates(initial_states: List[InitialState], min_cutoff: Optiona
+     min_cutoff: float, optional
+         Throw error if any atom moves more than this distance (nm) after minimization
+ 
++    k: float, optional
++        force constant for a positional harmonic restraint potential to apply to the initial positions.
++        If None, minimize with no positional restraint. Refer to `timemachine.potentials.bonded.harmonic_positional_restraint`
++        for implementation.
++
+     Returns
+     -------
+     list of np.array
+@@ -389,13 +405,13 @@ def optimize_coordinates(initial_states: List[InitialState], min_cutoff: Optiona
+ 
+     # go from lambda 0 -> 0.5
+     if len(lhs_initial_states) > 0:
+-        lhs_xs = _optimize_coords_along_states(lhs_initial_states)
++        lhs_xs = _optimize_coords_along_states(lhs_initial_states, k)
+         for xs in lhs_xs:
+             all_xs.append(xs)
+ 
+     # go from lambda 1 -> 0.5 and reverse the coordinate trajectory and lambda schedule
+     if len(rhs_initial_states) > 0:
+-        rhs_xs = _optimize_coords_along_states(rhs_initial_states[::-1])[::-1]
++        rhs_xs = _optimize_coords_along_states(rhs_initial_states[::-1], k)[::-1]
+         for xs in rhs_xs:
+             all_xs.append(xs)
+ 
+diff --git a/timemachine/md/minimizer.py b/timemachine/md/minimizer.py
+index 724b1fa06f..a72c3d01f0 100644
+--- a/timemachine/md/minimizer.py
++++ b/timemachine/md/minimizer.py
+@@ -2,6 +2,7 @@
+ from typing import Callable, Iterable, List, Optional, Tuple
+ 
+ import jax
++import jax.numpy as jnp
+ import numpy as np
+ import scipy.optimize
+ from numpy.typing import NDArray
+@@ -18,6 +19,7 @@
+ from timemachine.md.barostat.utils import get_bond_list, get_group_indices
+ from timemachine.md.fire import fire_descent
+ from timemachine.potentials import BoundPotential, HarmonicBond, Potential, SummedPotential
++from timemachine.potentials.bonded import harmonic_positional_restraint
+ from timemachine.potentials.potential import get_potential_by_type
+ 
+ 
+@@ -451,8 +453,35 @@ def val_and_grad_fn(coords):
+     return val_and_grad_fn
+ 
+ 
++def wrap_val_and_grad_with_positional_restraint(
++    val_and_grad_fn: Callable[[NDArray], Tuple[float, NDArray]],
++    x0: NDArray,
++    box0: NDArray,
++    free_idxs: NDArray,
++    k: float,
++) -> Callable[[NDArray], Tuple[float, NDArray]]:
++    restraint_val_and_grad = jax.value_and_grad(harmonic_positional_restraint, argnums=1)
++
++    starting_free = np.array(x0[free_idxs])
++
++    def wrapped_val_and_grad(x):
++        u, grad = val_and_grad_fn(x)
++        restraint_u, restraint_grad = restraint_val_and_grad(starting_free, x[free_idxs], box0, k=k)
++        u += restraint_u
++        grad = jnp.asarray(grad).at[free_idxs].add(restraint_grad)
++        return u, grad
++
++    return wrapped_val_and_grad
++
++
+ def local_minimize(
+-    x0: NDArray, val_and_grad_fn, local_idxs, verbose: bool = True, assert_energy_decreased: bool = True
++    x0: NDArray,
++    box0: NDArray,
++    val_and_grad_fn: Callable[[NDArray], Tuple[float, NDArray]],
++    local_idxs: List[int] | NDArray,
++    verbose: bool = True,
++    assert_energy_decreased: bool = True,
++    restraint_k: Optional[float] = None,
+ ):
+     """
+     Minimize a local region given selected idxs.
+@@ -462,6 +491,9 @@ def local_minimize(
+     x0: np.array (N,3)
+         Coordinates
+ 
++    box0: np.array (3,3)
++        Box
++
+     val_and_grad_fn: f: R^(Nx3) -> (R^1, R^Nx3)
+         Energy function
+ 
+@@ -474,6 +506,10 @@ def local_minimize(
+     assert_energy_decreased: bool
+         Throw an assertion if the energy does not decrease
+ 
++    restraint_k float, optional
++        Restraint k to wrap val_and_grad_fn in a positional harmonic restraint to the input positions of the local_idxs.
++        If None, minimize with no positional restraint. Refer to `timemachine.potentials.bonded.harmonic_positional_restraint`
++        for implementation.
+     Returns
+     -------
+     Optimized set of coordinates (N,3)
+@@ -484,18 +520,28 @@ def local_minimize(
+     n_local = len(local_idxs)
+     n_frozen = len(x0) - n_local
+ 
++    free_idxs = np.asarray(local_idxs)
++
+     x_local_shape = (n_local, 3)
+     u_0, _ = val_and_grad_fn(x0)
+ 
++    # Only use the restrained function when minimizing, don't otherwise use to compute energy/forces
++    minimizer_val_and_grad = val_and_grad_fn
++    if restraint_k is not None:
++        assert restraint_k > 0.0
++        minimizer_val_and_grad = wrap_val_and_grad_with_positional_restraint(
++            minimizer_val_and_grad, x0, box0, free_idxs, restraint_k
++        )
++
+     def val_and_grad_fn_local(x_local):
+         x_prime = x0.copy()
+-        x_prime[local_idxs] = x_local
+-        u_full, grad_full = val_and_grad_fn(x_prime)
++        x_prime[free_idxs] = x_local
++        u_full, grad_full = minimizer_val_and_grad(x_prime)
+         # The GPU Potentials can return NaN if value would have overflowed in uint64
+         if np.isnan(u_full):
+             u_full = np.inf
+             grad_full = np.nan * grad_full
+-        return u_full, grad_full[local_idxs]
++        return u_full, grad_full[free_idxs]
+ 
+     # deals with reshaping from (L,3) -> (Lx3,)
+     def val_and_grad_fn_bfgs(x_local_flattened):
+@@ -503,7 +549,7 @@ def val_and_grad_fn_bfgs(x_local_flattened):
+         u, grad_full = val_and_grad_fn_local(x_local)
+         return u, grad_full.reshape(-1)
+ 
+-    x_local_0 = x0[local_idxs]
++    x_local_0 = x0[free_idxs]
+     x_local_0_flat = x_local_0.reshape(-1)
+ 
+     method = "BFGS"
+@@ -511,7 +557,7 @@ def val_and_grad_fn_bfgs(x_local_flattened):
+     if verbose:
+         print("-" * 70)
+         print(f"performing {method} minimization on {n_local} atoms\n(holding the other {n_frozen} atoms frozen)")
+-        U_0, grad_0 = val_and_grad_fn_bfgs(x_local_0_flat)
++        U_0, grad_0 = val_and_grad_fn(x0)
+         print(f"U(x_0) = {U_0:.3f}")
+ 
+     res = scipy.optimize.minimize(
+@@ -524,16 +570,18 @@ def val_and_grad_fn_bfgs(x_local_flattened):
+ 
+     x_local_final_flat = res.x
+     x_local_final = x_local_final_flat.reshape(x_local_shape)
++    x_final = x0.copy()
++    x_final[free_idxs] = x_local_final
+ 
+-    U_final, grad_final = val_and_grad_fn_bfgs(x_local_final_flat)
+-    forces = -grad_final.reshape(x_local_shape)
+-    per_atom_force_norms = np.linalg.norm(forces, axis=1)
++    U_final, grad_final = val_and_grad_fn(x_final)
++    forces = -grad_final
+ 
+     if verbose:
++        per_atom_force_norms = np.linalg.norm(forces[free_idxs], axis=1)
+         print(f"U(x_final) = {U_final:.3f}")
+         # diagnose worst atom
+         argmax_local = np.argmax(per_atom_force_norms)
+-        worst_atom_idx = local_idxs[argmax_local]
++        worst_atom_idx = free_idxs[argmax_local]
+         print(f"atom with highest force norm after minimization: {worst_atom_idx}")
+         print(f"force(x_final)[{worst_atom_idx}] = {forces[argmax_local]}")
+         print("-" * 70)
+@@ -541,9 +589,6 @@ def val_and_grad_fn_bfgs(x_local_flattened):
+     # note that this over the local atoms only, as this function is not concerned
+     check_force_norm(forces)
+ 
+-    x_final = x0.copy()
+-    x_final[local_idxs] = x_local_final
+-
+     if assert_energy_decreased:
+         assert U_final < u_0, f"u_0: {u_0:.3f}, u_f: {U_final:.3f}"
+     elif U_final >= u_0:
+@@ -567,6 +612,7 @@ def replace_conformer_with_minimized(mol: Chem.rdchem.Mol, ff: Forcefield):
+     system = top.setup_end_state()
+     val_and_grad_fn = jax.value_and_grad(system.get_U_fn())
+     xs = get_romol_conf(mol)
++    box = np.eye(3) * 100.0
+     all_idxs = np.arange(mol.GetNumAtoms())
+-    xs_opt = local_minimize(xs, val_and_grad_fn, all_idxs, verbose=False)
++    xs_opt = local_minimize(xs, box, val_and_grad_fn, all_idxs, verbose=False)
+     set_romol_conf(mol, xs_opt)
+diff --git a/timemachine/potentials/bonded.py b/timemachine/potentials/bonded.py
+index f203eae116..65110a6b02 100644
+--- a/timemachine/potentials/bonded.py
++++ b/timemachine/potentials/bonded.py
+@@ -1,6 +1,8 @@
+ import jax.numpy as jnp
+ 
++from timemachine.constants import DEFAULT_POSITIONAL_RESTRAINT_K
+ from timemachine.potentials.jax_utils import delta_r
++from timemachine.potentials.types import Array
+ 
+ 
+ def centroid_restraint(conf, params, box, group_a_idxs, group_b_idxs, kb, b0):
+@@ -244,3 +246,19 @@ def log_flat_bottom_bond(conf, params, box, bond_idxs, beta):
+     # note the extra 1/beta is to be consistent with other potentials
+     # so that energies have units of kJ/mol
+     return jnp.sum(log_nrgs) / beta
++
++
++def harmonic_positional_restraint(
++    x_init: Array, x_new: Array, box: Array, k: float = DEFAULT_POSITIONAL_RESTRAINT_K
++) -> Array:
++    r"""Harmonic positional restraint useful for performing minimization to prevent initial conformations
++    from changing too much.
++
++    This implements a harmonic bond potential, while being PBC aware:
++        V(x_new, x_init, k) = \sum k / 2 * sum((x_new - x_init)^2)
++    """
++    assert x_init.shape == x_new.shape
++
++    d2ij = jnp.sum(delta_r(x_new, x_init, box=box) ** 2, axis=-1)
++    d2ij = jnp.where(d2ij == 0, 0, d2ij)  # stabilize derivative
++    return jnp.sum((k / 2) * d2ij)
+diff --git a/timemachine/potentials/rmsd.py b/timemachine/potentials/rmsd.py
+index d204c3d8c1..3aeb16a714 100644
+--- a/timemachine/potentials/rmsd.py
++++ b/timemachine/potentials/rmsd.py
+@@ -144,7 +144,7 @@ def rmsd_restraint(conf, params, box, group_a_idxs, group_b_idxs, k):
+     the rotation matrix. For relative binding free energy calculations, this restraint
+     does not need to be turned off.
+ 
+-    Note that you should add a center of mass restraint as well to accomodate for the translational
++    Note that you should add a center of mass restraint as well to accommodate for the translational
+     component.
+ 
+     Parameters

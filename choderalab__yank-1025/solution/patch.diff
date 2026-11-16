@@ -1,0 +1,1829 @@
+diff --git a/Yank/analyze.py b/Yank/analyze.py
+index cc482a3f..8de2d9e0 100644
+--- a/Yank/analyze.py
++++ b/Yank/analyze.py
+@@ -8,7 +8,7 @@
+ Analyze
+ =======
+ 
+-YANK Specific anlysis tools for YANK simulations from the :class:`yank.yank.AlchemicalPhase` classes
++YANK Specific analysis tools for YANK simulations from the :class:`yank.yank.AlchemicalPhase` classes
+ 
+ Extends classes from the MultiStateAnalyzer package to include the
+ 
+@@ -21,14 +21,21 @@
+ 
+ import os
+ import abc
++import copy
+ import yaml
+ import mdtraj
++import pickle
+ import logging
++from functools import wraps
+ import numpy as np
+ import simtk.unit as units
+ import openmmtools as mmtools
+ from pymbar import timeseries
+ from . import multistate
++from . import version
++from . import utils
++from . import mpi
++from .experiment import ExperimentBuilder
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -40,6 +47,7 @@
+ # Extend registry to support standard_state_correction
+ yank_registry = multistate.default_observables_registry
+ yank_registry.register_phase_observable('standard_state_correction')
++kB = units.BOLTZMANN_CONSTANT_kB * units.AVOGADRO_CONSTANT_NA
+ 
+ 
+ # =============================================================================================
+@@ -134,18 +142,18 @@ def analyze_phase(self, show_mixing=False, cutoff=0.05):
+             A dictionary of analysis objects, in this case Delta F, Delta H, and Standard State Free Energy
+             In units of kT (dimensionless)
+         """
+-        number_equilibrated, g_t, _ = self._equilibration_data
++        number_equilibrated, g_t, n_effective_max = self._equilibration_data
+         if show_mixing:
+             self.show_mixing_statistics(cutoff=cutoff, number_equilibrated=number_equilibrated)
+         data = {}
+         # Accumulate free energy differences
+         Deltaf_ij, dDeltaf_ij = self.get_free_energy()
+         DeltaH_ij, dDeltaH_ij = self.get_enthalpy()
+-        data['DeltaF'] = Deltaf_ij[self.reference_states[0], self.reference_states[1]]
+-        data['dDeltaF'] = dDeltaf_ij[self.reference_states[0], self.reference_states[1]]
+-        data['DeltaH'] = DeltaH_ij[self.reference_states[0], self.reference_states[1]]
+-        data['dDeltaH'] = dDeltaH_ij[self.reference_states[0], self.reference_states[1]]
+-        data['DeltaF_standard_state_correction'] = self.get_standard_state_correction()
++        data['free_energy_diff'] = Deltaf_ij[self.reference_states[0], self.reference_states[1]]
++        data['free_energy_diff_error'] = dDeltaf_ij[self.reference_states[0], self.reference_states[1]]
++        data['enthalpy_diff'] = DeltaH_ij[self.reference_states[0], self.reference_states[1]]
++        data['enthalpy_diff_error'] = dDeltaH_ij[self.reference_states[0], self.reference_states[1]]
++        data['free_energy_diff_standard_state_correction'] = self.get_standard_state_correction()
+         return data
+ 
+ 
+@@ -157,6 +165,542 @@ class YankParallelTemperingAnalyzer(multistate.ParallelTemperingAnalyzer, YankMu
+     pass
+ 
+ 
++def _copyout(wrap):
++    """Copy output of function. Small helper to avoid ending each function with the copy call"""
++    @wraps(wrap)
++    def make_copy(*args, **kwargs):
++        return copy.deepcopy(wrap(*args, **kwargs))
++    return make_copy
++
++
++class ExperimentAnalyzer(object):
++    """
++    Semi-automated YANK Experiment analysis with serializable data.
++
++    This class is designed to replace the older ``analyze_directory`` functions by providing a common analysis data
++    interface which other classes and methods can draw on. This is designed to semi-automate the combination of
++    multi-phase data
++
++    Each of the main methods fetches the data from each phase and returns them as a dictionary to the user. The total
++    dump of data to serialized YAML files can also be done.
++
++    Each function documents what its output data structure and entries surrounded by curly braces (``{ }``) indicate
++    variables which change per experiment, often the data.
++
++    Output dictionary is of the form:
++
++    .. code-block:: python
++
++        yank_version: {YANK Version}
++        phase_names: {Name of each phase, depends on simulation type}
++        general: {See :func:`get_general_simulation_data`}
++        equilibration: {See :func:`get_equilibration_data`}
++        mixing: {See :func:`get_mixing_data`}
++
++    Parameters
++    ----------
++    store_directory : string
++        Location where the analysis.yaml file is and where the NetCDF files are
++    **analyzer_kwargs
++        Keyword arguments to pass to the analyzer class. Quantities can be
++        passed as strings.
++
++    Attributes
++    ----------
++    use_full_trajectory : bool. Analyze with subsampled or complete trajectory
++    nphases : int. Number of phases detected
++    phases_names : list of phase names. Used as keys on all attributes below
++    signs : dict of str. Sign assigned to each phase
++    analyzers : dict of YankPhaseAnalyzer
++    iterations : dict of int. Number of maximum iterations in each phase
++    u_ns : dict of np.ndarray. Timeseries of each phase
++    nequils : dict of int. Number of equilibrium iterations in each phase
++    g_ts : dict of int. Subsample rate past nequils in each phase
++    Neff_maxs : dict of int. Number of effective samples in each phase
++
++    Examples
++    --------
++    Start with an experiment (Running from the :class:`yank.experiment.ExperimentBuilder` example)
++
++    >>> import textwrap
++    >>> import openmmtools as mmtools
++    >>> import yank.utils
++    >>> import yank.experiment.ExperimentBuilder as ExperimentBuilder
++    >>> setup_dir = yank.utils.get_data_filename(os.path.join('..', 'examples',
++    ...                                          'p-xylene-implicit', 'input'))
++    >>> pxylene_path = os.path.join(setup_dir, 'p-xylene.mol2')
++    >>> lysozyme_path = os.path.join(setup_dir, '181L-pdbfixer.pdb')
++    >>> with mmtools.utils.temporary_directory() as tmp_dir:
++    ...     yaml_content = '''
++    ...     ---
++    ...     options:
++    ...       default_number_of_iterations: 1
++    ...       output_dir: {}
++    ...     molecules:
++    ...       T4lysozyme:
++    ...         filepath: {}
++    ...       p-xylene:
++    ...         filepath: {}
++    ...         antechamber:
++    ...           charge_method: bcc
++    ...     solvents:
++    ...       vacuum:
++    ...         nonbonded_method: NoCutoff
++    ...     systems:
++    ...         my_system:
++    ...             receptor: T4lysozyme
++    ...             ligand: p-xylene
++    ...             solvent: vacuum
++    ...             leap:
++    ...               parameters: [leaprc.gaff, leaprc.ff14SB]
++    ...     protocols:
++    ...       absolute-binding:
++    ...         complex:
++    ...           alchemical_path:
++    ...             lambda_electrostatics: [1.0, 0.9, 0.8, 0.6, 0.4, 0.2, 0.0]
++    ...             lambda_sterics: [1.0, 0.9, 0.8, 0.6, 0.4, 0.2, 0.0]
++    ...         solvent:
++    ...           alchemical_path:
++    ...             lambda_electrostatics: [1.0, 0.8, 0.6, 0.3, 0.0]
++    ...             lambda_sterics: [1.0, 0.8, 0.6, 0.3, 0.0]
++    ...     experiments:
++    ...       system: my_system
++    ...       protocol: absolute-binding
++    ...     '''.format(tmp_dir, lysozyme_path, pxylene_path)
++    >>> yaml_builder = ExperimentBuilder(textwrap.dedent(yaml_content))
++    >>> yaml_builder.run_experiments()
++
++    Now analyze the experiment
++
++    >>> import os
++    >>> exp_analyzer = ExperimentAnalyzer(os.path.join(tmp_dir, 'experiment'))
++    >>> analysis_data = exp_analyzer.auto_analyze()
++
++    """
++
++    def __init__(self, store_directory, **analyzer_kwargs):
++        # Convert analyzer string quantities into variables.
++        for key, value in analyzer_kwargs.items():
++            try:
++                quantity = utils.quantity_from_string(value)
++            except:
++                pass
++            else:
++                analyzer_kwargs[key] = quantity
++
++        # Read in data
++        analysis_script_path = os.path.join(store_directory, 'analysis.yaml')
++        if not os.path.isfile(analysis_script_path):
++            err_msg = 'Cannot find analysis.yaml script in {}'.format(store_directory)
++            raise RuntimeError(err_msg)
++        with open(analysis_script_path, 'r') as f:
++            analysis = yaml.load(f)
++        phases_names = []
++        signs = {}
++        analyzers = {}
++        for phase, sign in analysis:
++            phases_names.append(phase)
++            signs[phase] = sign
++            storage_path = os.path.join(store_directory, phase + '.nc')
++            analyzers[phase] = get_analyzer(storage_path, **analyzer_kwargs)
++        self.phase_names = phases_names
++        self.signs = signs
++        self.analyzers = analyzers
++        self.nphases = len(phases_names)
++        # Additional data
++        self.use_full_trajectory = False
++        if 'use_full_trajectory' in analyzer_kwargs:
++            self.use_full_trajectory = bool(analyzer_kwargs['use_full_trajectory'])
++        # Assign flags for other sections along with their global variables
++        # General Data
++        self._general_run = False
++        self.iterations = {}
++        # Equilibration
++        self._equilibration_run = False
++        self.u_ns = {}
++        self.nequils = {}
++        self.g_ts = {}
++        self.Neff_maxs = {}
++        self._n_discarded = 0
++        # Mixing Run (state)
++        self._mixing_run = False
++        # Replica mixing
++        self._replica_mixing_run = False
++        self._free_energy_run = False
++        self._serialized_data = {'yank_version': version.version, 'phase_names': self.phase_names}
++
++    @_copyout
++    def get_general_simulation_data(self):
++        """
++        General purpose simulation data on number of iterations, number of states, and number of atoms.
++        This just prints out this data in a regular, formatted pattern.
++
++        Output is of the form:
++
++        .. code-block:: python
++
++            {for phase_name in phase_names}
++                iterations : {int}
++                natoms : {int}
++                nreplicas : {int}
++                nstates : {int}
++
++        Returns
++        -------
++        general_data : dict
++            General simulation data by phase.
++        """
++        if not self._general_run:
++            general_serial = {}
++            for phase_name in self.phase_names:
++                serial = {}
++                analyzer = self.analyzers[phase_name]
++                try:
++                    positions = analyzer.reporter.read_sampler_states(0)[0].positions
++                    natoms, _ = positions.shape
++                except AttributeError:  # Trap unloaded checkpoint file
++                    natoms = 'No Cpt.'
++                energies, _, _, = analyzer.reporter.read_energies()
++                iterations, nreplicas, nstates = energies.shape
++                serial['iterations'] = iterations
++                serial['nstates'] = nstates
++                serial['natoms'] = natoms
++                serial['nreplicas'] = nreplicas
++                general_serial[phase_name] = serial
++
++            self.iterations = {phase_name: general_serial[phase_name]['iterations'] for phase_name in self.phase_names}
++            self._serialized_data['general'] = general_serial
++            self._general_run = True
++        return self._serialized_data['general']
++
++    @_copyout
++    def get_equilibration_data(self, discard_from_start=1):
++        """
++        Create the equilibration scatter plots showing the trend lines, correlation time,
++        and number of effective samples
++
++        Output is of the form:
++
++        .. code-block:: python
++
++            {for phase_name in phase_names}
++                discarded_from_start : {int}
++                effective_samples : {float}
++                subsample_rate : {float}
++                iterations_considered : {1D np.ndarray of int}
++                subsample_rate_by_iterations_considered : {1D np.ndarray of float}
++                effective_samples_by_iterations_considered : {1D np.ndarray of float}
++                count_total_equilibration_samples : {int}
++                count_decorrelated_samples : {int}
++                count_correlated_samples : {int}
++                percent_total_equilibration_samples : {float}
++                percent_decorrelated_samples : {float}
++                percent_correlated_samples : {float}
++
++        Returns
++        -------
++        equilibration_data : dict
++            Dictionary with the equilibration data
++
++        """
++        if not self._equilibration_run or discard_from_start != self._n_discarded:
++            eq_serial = {}
++            for i, phase_name in enumerate(self.phase_names):
++                serial = {}
++                analyzer = self.analyzers[phase_name]
++                # Data crunching to get timeseries
++                # TODO: Figure out how not to discard the first sample
++                # Sample at index 0 is actually the minimized structure and NOT from the equilibrium distribution
++                # This throws off all of the equilibrium data
++                self._n_discarded = discard_from_start
++                series = analyzer.get_effective_energy_timeseries()
++                if series.size <= discard_from_start:
++                    # Trap case where user has dropped their whole set.
++                    # Rare, but happens, often with debugging
++                    discard_from_start = 0
++                    logger.warning("Alert: analyzed timeseries has the same or fewer number of values as "
++                                   "discard_from_start! The whole series has been preserved to ensure there is "
++                                   "*something* to analyze.")
++                    self._n_discarded = 0
++                self.u_ns[phase_name] = analyzer.get_effective_energy_timeseries()[discard_from_start:]
++                # Timeseries statistics
++                i_t, g_i, n_effective_i = multistate.get_equilibration_data_per_sample(self.u_ns[phase_name])
++                n_effective_max = n_effective_i.max()
++                i_max = n_effective_i.argmax()
++                n_equilibration = i_t[i_max]
++                g_t = g_i[i_max]
++                self.Neff_maxs[phase_name] = n_effective_max
++                self.nequils[phase_name] = n_equilibration
++                self.g_ts[phase_name] = g_t
++                serial['discarded_from_start'] = int(discard_from_start)
++                serial['effective_samples'] = float(self.Neff_maxs[phase_name])
++                serial['equilibration_samples'] = int(self.nequils[phase_name])
++                serial['subsample_rate'] = float(self.g_ts[phase_name])
++                serial['iterations_considered'] = i_t
++                serial['subsample_rate_by_iterations_considered'] = g_i
++                serial['effective_samples_by_iterations_considered'] = n_effective_i
++                # Determine total number of iterations
++                n_iter = self.iterations[phase_name]
++                eq = self.nequils[phase_name] + self._n_discarded  # Make sure we include the discarded
++                decor = int(np.floor(self.Neff_maxs[phase_name]))
++                cor = n_iter - eq - decor
++                dat = np.array([decor, cor, eq]) / float(n_iter)
++                serial['count_total_equilibration_samples'] = int(eq)
++                serial['count_decorrelated_samples'] = int(decor)
++                serial['count_correlated_samples'] = int(cor)
++                serial['percent_total_equilibration_samples'] = float(dat[2])
++                serial['percent_decorrelated_samples'] = float(dat[0])
++                serial['percent_correlated_samples'] = float(dat[1])
++                eq_serial[phase_name] = serial
++
++            self._serialized_data['equilibration'] = eq_serial
++            # Set flag
++            self._equilibration_run = True
++
++        return self._serialized_data['equilibration']
++
++    @_copyout
++    def get_mixing_data(self):
++        """
++        Get state diffusion mixing arrays
++
++        Output is of the form:
++
++        .. code-block:: python
++
++            {for phase_name in phase_names}
++                transitions : {[nstates, nstates] np.ndarray of float}
++                eigenvalues : {[nstates] np.ndarray of float}
++                stat_inefficiency : {float}
++
++        Returns
++        -------
++        mixing_data : dict
++            Dictionary of mixing data
++
++        """
++        if not self._mixing_run:
++            mixing_serial = {}
++            # Plot a diffusing mixing map for each phase.
++            for phase_name in self.phase_names:
++                serial = {}
++                # Generate mixing statistics.
++                analyzer = self.analyzers[phase_name]
++                mixing_statistics = analyzer.generate_mixing_statistics(
++                    number_equilibrated=self.nequils[phase_name])
++                transition_matrix, eigenvalues, statistical_inefficiency = mixing_statistics
++                serial['transitions'] = transition_matrix
++                serial['eigenvalues'] = eigenvalues
++                serial['stat_inefficiency'] = statistical_inefficiency
++                mixing_serial[phase_name] = serial
++            self._serialized_data['mixing'] = mixing_serial
++            self._mixing_run = True
++        return self._serialized_data['mixing']
++
++    @_copyout
++    def get_experiment_free_energy_data(self):
++        """
++        Get the free Yank Experiment free energy, broken down by phase and total experiment
++
++        Output is of the form:
++
++        .. code-block:: python
++
++            {for phase_name in phase_names}
++                sign : {str of either '+' or '-'}
++                kT : {units.quantity}
++                free_energy_diff : {float (has units of kT)}
++                free_energy_diff_error : {float (has units of kT)}
++                free_energy_diff_standard_state_correction : {float (has units of kT)}
++                enthalpy_diff : {float (has units of kT)}
++                enthalpy_diff_error : {float (has units of kT)}
++            free_energy_diff : {float (has units of kT)}
++            free_energy_diff_error : {float (has units of kT)}
++            free_energy_diff_unit : {units.quantity compatible with energy/mole. Corrected for different phase kT}
++            free_energy_diff_error_unit : {units.quantity compatible with energy/mole. Corrected for different phase kT}
++            enthalpy_diff : {float (has units of kT)}
++            enthalpy_diff_error : {float (has units of kT)}
++            enthalpy_diff_unit : {units.quantity compatible with energy/mole. Corrected for different phase kT}
++            enthalpy_diff_error_unit : {units.quantity compatible with energy/mole. Corrected for different phase kT}
++
++        Returns
++        -------
++        free_energy_data : dict
++            Dictionary of free energy data
++        """
++        # TODO: Possibly rename this function to not confuse with "experimental" free energy?
++        if not self._free_energy_run:
++            if not self._equilibration_run:
++                raise RuntimeError("Cannot run free energy without first running the equilibration. Please run the "
++                                   "corresponding function/cell first!")
++            fe_serial = dict()
++            data = dict()
++            for phase_name in self.phase_names:
++                analyzer = self.analyzers[phase_name]
++                data[phase_name] = analyzer.analyze_phase()
++
++            # Compute free energy and enthalpy
++            delta_f = 0.0
++            delta_f_err = 0.0
++            delta_h = 0.0
++            delta_h_err = 0.0
++            # Not assigning units to be more general to whatever kt is later
++            delta_f_unit = 0.0
++            delta_f_err_unit = 0.0
++            delta_h_unit = 0.0
++            delta_h_err_unit = 0.0
++            for phase_name in self.phase_names:
++                serial = {}
++                kt = self.analyzers[phase_name].kT
++                serial['kT'] = kt
++                if not isinstance(delta_f_unit, units.Quantity):
++                    # Assign units to the float if not assigned
++                    held_unit = kt.unit
++                    delta_f_unit *= held_unit
++                    delta_f_err_unit *= held_unit ** 2  # Errors are held in square until the end
++                    delta_h_unit *= held_unit
++                    delta_h_err_unit *= held_unit ** 2
++                serial['kT'] = kt
++                sign = self.signs[phase_name]
++                serial['sign'] = sign
++                phase_delta_f = data[phase_name]['free_energy_diff']
++                phase_delta_f_ssc = data[phase_name]['free_energy_diff_standard_state_correction']
++                phase_delta_f_err = data[phase_name]['free_energy_diff_error']
++                serial['free_energy_diff'] = phase_delta_f
++                serial['free_energy_diff_error'] = phase_delta_f_err
++                serial['free_energy_diff_standard_state_correction'] = data[phase_name][
++                    'free_energy_diff_standard_state_correction'
++                ]
++                phase_exp_delta_f = sign * (phase_delta_f + phase_delta_f_ssc)
++                delta_f -= phase_exp_delta_f
++                delta_f_err += phase_delta_f_err**2
++                delta_f_unit -= phase_exp_delta_f * kt
++                delta_f_err_unit += (phase_delta_f_err * kt)**2
++
++                phase_delta_h = data[phase_name]['enthalpy_diff']
++                phase_delta_h_err = data[phase_name]['enthalpy_diff_error']
++                serial['enthalpy_diff'] = phase_delta_h
++                serial['enthalpy_diff_error'] = np.sqrt(phase_delta_h_err)
++                phase_exp_delta_h = sign * (phase_delta_h + phase_delta_f_ssc)
++                delta_h -= phase_exp_delta_h
++                delta_h_err += phase_delta_h_err ** 2
++                delta_h_unit -= phase_exp_delta_h * kt
++                delta_h_err_unit += (phase_delta_h_err * kt) ** 2
++                fe_serial[phase_name] = serial
++            delta_f_err = np.sqrt(delta_f_err)  # np.sqrt is fine here since these dont have units
++            delta_h_err = np.sqrt(delta_h_err)
++            # Use ** 0.5 instead of np.sqrt since the function strips units, see github issue pandegroup/openmm#2106
++            delta_f_err_unit = delta_f_err_unit ** 0.5
++            delta_h_err_unit = delta_h_err_unit ** 0.5
++            fe_serial['free_energy_diff'] = delta_f
++            fe_serial['enthalpy_diff'] = delta_h
++            fe_serial['free_energy_diff_error'] = delta_f_err
++            fe_serial['enthalpy_diff_error'] = delta_h_err
++            fe_serial['free_energy_diff_unit'] = delta_f_unit
++            fe_serial['enthalpy_diff_unit'] = delta_h_unit
++            fe_serial['free_energy_diff_error_unit'] = delta_f_err_unit
++            fe_serial['enthalpy_diff_error_unit'] = delta_h_err_unit
++            self._serialized_data['free_energy'] = fe_serial
++            self._free_energy_run = True
++        return self._serialized_data['free_energy']
++
++    @_copyout
++    def auto_analyze(self):
++        """
++        Run the analysis
++
++        Output is of the form:
++
++        .. code-block:: python
++
++            yank_version: {YANK Version}
++            phase_names: {Name of each phase, depends on simulation type}
++            general:
++                {for phase_name in phase_names}
++                    iterations : {int}
++                    natoms : {int}
++                    nreplicas : {int}
++                    nstates : {int}
++            equilibration:
++                {for phase_name in phase_names}
++                    discarded_from_start : {int}
++                    effective_samples : {float}
++                    subsample_rate : {float}
++                    iterations_considered : {1D np.ndarray of int}
++                    subsample_rate_by_iterations_considered : {1D np.ndarray of float}
++                    effective_samples_by_iterations_considered : {1D np.ndarray of float}
++                    count_total_equilibration_samples : {int}
++                    count_decorrelated_samples : {int}
++                    count_correlated_samples : {int}
++                    percent_total_equilibration_samples : {float}
++                    percent_decorrelated_samples : {float}
++                    percent_correlated_samples : {float}
++            mixing:
++                {for phase_name in phase_names}
++                    transitions : {[nstates, nstates] np.ndarray of float}
++                    eigenvalues : {[nstates] np.ndarray of float}
++                    stat_inefficiency : {float}
++            free_energy:
++                {for phase_name in phase_names}
++                    sign : {str of either '+' or '-'}
++                    kT : {units.quantity}
++                    free_energy_diff : {float (has units of kT)}
++                    free_energy_diff_error : {float (has units of kT)}
++                    free_energy_diff_standard_state_correction : {float (has units of kT)}
++                    enthalpy_diff : {float (has units of kT)}
++                    enthalpy_diff_error : {float (has units of kT)}
++                free_energy_diff : {float (has units of kT)}
++                free_energy_diff_error : {float (has units of kT)}
++                free_energy_diff_unit : {units.quantity compatible with energy/mole. Corrected for different phase kT}
++                free_energy_diff_error_unit : {units.quantity compatible with energy/mole. Corrected for different phase kT}
++                enthalpy_diff : {float (has units of kT)}
++                enthalpy_diff_error : {float (has units of kT)}
++                enthalpy_diff_unit : {units.quantity compatible with energy/mole. Corrected for different phase kT}
++                enthalpy_diff_error_unit : {units.quantity compatible with energy/mole. Corrected for different phase kT}
++
++        Returns
++        -------
++        serialized_data : dict
++            Dictionary of all the auto-analysis calls organized by section headers.
++            See each of the functions to see each of the sub-dictionary structures
++
++        See Also
++        --------
++        get_general_simulation_data
++        get_equilibration_data
++        get_mixing_data
++        get_experiment_free_energy_data
++
++
++
++        """
++        _ = self.get_general_simulation_data()
++        _ = self.get_equilibration_data()
++        _ = self.get_mixing_data()
++        _ = self.get_experiment_free_energy_data()
++        return self._serialized_data
++
++    def dump_serial_data(self, path):
++        """
++        Dump the serialized data to YAML file
++
++        Parameters
++        ----------
++        path : str
++            File name to dump the data to
++        """
++        true_path, ext = os.path.splitext(path)
++        if not ext:  # empty string check
++            ext = '.yaml'
++        true_path += ext
++        with open(true_path, 'w') as f:
++            f.write(yaml.dump(self._serialized_data))
++
++    @staticmethod
++    def report_version():
++        print("Rendered with YANK Version {}".format(version.version))
++
++
+ # =============================================================================================
+ # MODULE FUNCTIONS
+ # =============================================================================================
+@@ -213,60 +757,197 @@ def analyze_directory(source_directory, **analyzer_kwargs):
+     **analyzer_kwargs
+         Keyword arguments to pass to the analyzer.
+ 
++    Returns
++    -------
++    analysis_data : dict
++        Dictionary containing all the automatic analysis data
++
++    """
++    auto_experiment_analyzer = ExperimentAnalyzer(source_directory, **analyzer_kwargs)
++    analysis_data = auto_experiment_analyzer.auto_analyze()
++    print_analysis_data(analysis_data)
++    return analysis_data
++
++
++@mpi.on_single_node(0)
++def print_analysis_data(analysis_data, header=None):
+     """
+-    analysis_script_path = os.path.join(source_directory, 'analysis.yaml')
+-    if not os.path.isfile(analysis_script_path):
+-        err_msg = 'Cannot find analysis.yaml script in {}'.format(source_directory)
+-        logger.error(err_msg)
+-        raise RuntimeError(err_msg)
+-    with open(analysis_script_path, 'r') as f:
+-        analysis = yaml.load(f)
+-    phase_names = [phase_name for phase_name, sign in analysis]
+-    data = dict()
+-    for phase_name, sign in analysis:
+-        phase_path = os.path.join(source_directory, phase_name + '.nc')
+-        phase = get_analyzer(phase_path, **analyzer_kwargs)
+-        data[phase_name] = phase.analyze_phase()
+-        kT = phase.kT
+-
+-    # Compute free energy and enthalpy
+-    DeltaF = 0.0
+-    dDeltaF = 0.0
+-    DeltaH = 0.0
+-    dDeltaH = 0.0
+-    for phase_name, sign in analysis:
+-        DeltaF -= sign * (data[phase_name]['DeltaF'] + data[phase_name]['DeltaF_standard_state_correction'])
+-        dDeltaF += data[phase_name]['dDeltaF']**2
+-        DeltaH -= sign * (data[phase_name]['DeltaH'] + data[phase_name]['DeltaF_standard_state_correction'])
+-        dDeltaH += data[phase_name]['dDeltaH']**2
+-    dDeltaF = np.sqrt(dDeltaF)
+-    dDeltaH = np.sqrt(dDeltaH)
++    Helper function of printing the analysis data payload from a :func:`ExperimentAnalyzer.auto_analyze` call
++
++    Parameters
++    ----------
++    analysis_data : dict
++        Output from :func:`ExperimentAnalyzer.auto_analyze`
++    header : str, Optional
++        Optional header string to print before the formatted helper, useful if you plan to make this call multiple
++        times but want to divide the outputs.
++    """
++
++    if header is not None:
++        print(header)
++    fe_data = analysis_data['free_energy']
++    delta_f = fe_data['free_energy_diff']
++    delta_h = fe_data['enthalpy_diff']
++    delta_f_err = fe_data['free_energy_diff_error']
++    delta_h_err = fe_data['enthalpy_diff_error']
++    delta_f_unit = fe_data['free_energy_diff_unit']
++    delta_h_unit = fe_data['enthalpy_diff_unit']
++    delta_f_err_unit = fe_data['free_energy_diff_error_unit']
++    delta_h_err_unit = fe_data['enthalpy_diff_error_unit']
+ 
+     # Attempt to guess type of calculation
+     calculation_type = ''
+-    for phase in phase_names:
++    for phase in analysis_data['phase_names']:
+         if 'complex' in phase:
+             calculation_type = ' of binding'
+         elif 'solvent1' in phase:
+             calculation_type = ' of solvation'
+ 
+-    # Print energies
+-    logger.info('')
+-    logger.info('Free energy{:<13}: {:9.3f} +- {:.3f} kT ({:.3f} +- {:.3f} kcal/mol)'.format(
+-        calculation_type, DeltaF, dDeltaF, DeltaF * kT / units.kilocalories_per_mole,
+-        dDeltaF * kT / units.kilocalories_per_mole))
+-    logger.info('')
+-
+-    for phase in phase_names:
+-        logger.info('DeltaG {:<17}: {:9.3f} +- {:.3f} kT'.format(phase, data[phase]['DeltaF'],
+-                                                                 data[phase]['dDeltaF']))
+-        if data[phase]['DeltaF_standard_state_correction'] != 0.0:
+-            logger.info('DeltaG {:<17}: {:18.3f} kT'.format('restraint',
+-                                                            data[phase]['DeltaF_standard_state_correction']))
+-    logger.info('')
+-    logger.info('Enthalpy{:<16}: {:9.3f} +- {:.3f} kT ({:.3f} +- {:.3f} kcal/mol)'.format(
+-        calculation_type, DeltaH, dDeltaH, DeltaH * kT / units.kilocalories_per_mole,
+-        dDeltaH * kT / units.kilocalories_per_mole))
++    print('Free energy{:<13}: {:9.3f} +- {:.3f} kT ({:.3f} +- {:.3f} kcal/mol)'.format(
++        calculation_type, delta_f, delta_f_err, delta_f_unit / units.kilocalories_per_mole,
++        delta_f_err_unit / units.kilocalories_per_mole))
++
++    for phase in analysis_data['phase_names']:
++        delta_f_phase = fe_data[phase]['free_energy_diff']
++        delta_f_err_phase = fe_data[phase]['free_energy_diff_error']
++        detla_f_ssc_phase = fe_data[phase]['free_energy_diff_standard_state_correction']
++        print('DeltaG {:<17}: {:9.3f} +- {:.3f} kT'.format(phase, delta_f_phase,
++                                                           delta_f_err_phase))
++        if detla_f_ssc_phase != 0.0:
++            print('DeltaG {:<17}: {:18.3f} kT'.format('standard state correction', detla_f_ssc_phase))
++    print('')
++    print('Enthalpy{:<16}: {:9.3f} +- {:.3f} kT ({:.3f} +- {:.3f} kcal/mol)'.format(
++        calculation_type, delta_h, delta_h_err, delta_h_unit / units.kilocalories_per_mole,
++        delta_h_err_unit / units.kilocalories_per_mole))
++
++
++class MultiExperimentAnalyzer(object):
++    """
++    Automatic Analysis tool for Multiple YANK Experiments from YAML file
++
++    This class takes in a YAML file, infers the experiments from expansion of all combinatorial options,
++    then does the automatic analysis run from :func:`ExperimentAnalyzer.auto_analyze` yielding a final
++    dictionary output.
++
++    Parameters
++    ----------
++    script : str or dict
++        Full path to the YAML file which made the YANK experiments.
++        OR
++        The loaded yaml content of said script.
++    builder_kwargs
++        Additional keyword arguments which normally are passed to the :class:`ExperimentBuilder` constructor.
++        The experiments are not setup or built, only the output structure is referenced.
++
++    See Also
++    --------
++    ExperimentAnalyzer.auto_analyze
++
++    """
++    def __init__(self, script, **builder_kwargs):
++        self.script = script
++        self.builder = ExperimentBuilder(script=script, **builder_kwargs)
++        self.paths = self.builder.get_experiment_directories()
++
++    def run_all_analysis(self, serialize_data=True, serial_data_path=None, **analyzer_kwargs):
++        """
++        Run all the automatic analysis through the :func:`ExperimentAnalyzer.auto_analyze`
++
++        Parameters
++        ----------
++        serialize_data : bool, Default: True
++            Choose whether or not to serialize the data
++        serial_data_path: str, Optional
++            Name of the serial data file. If not specified, name will be {YAML file name}_analysis.pkl`
++        analyzer_kwargs
++            Additional keywords which will be fed into the :class:`YankMultiStateSamplerAnalyzer` for each phase of
++            each experiment.
++
++        Returns
++        -------
++        serial_output : dict
++            Dictionary of each experiment's output of format
++            {exp_name: ExperimentAnalyzer.auto_analyze() for exp_name in ExperimentBuilder's Experiments}
++            The sub-dictionary of each key can be seen in :func:`ExperimentAnalyzer.auto_analyze()` docstring
++
++        See Also
++        --------
++        ExperimentAnalyzer.auto_analyze
++
++        """
++        if serial_data_path is None:
++            serial_ending = 'analysis.pkl'
++            try:
++                if not os.path.isfile(self.script):
++                    # Not a file, string like input
++                    raise TypeError
++                script_base, _ = os.path.splitext(self.script)
++                serial_data_path = script_base + '_' + serial_ending
++            except TypeError:
++                # Traps both YAML content as string, and YAML content as dict
++                serial_data_path = os.path.join('.', serial_ending)
++
++        analysis_serials = mpi.distribute(self._run_analysis,
++                                          self.paths,
++                                          **analyzer_kwargs)
++        output = {}
++        for path, analysis in zip(self.paths, analysis_serials):
++            name = os.path.split(path)[-1]  # Get the name of the experiment
++            # Corner case where user has specified a singular experiment and name is just an empty directory
++            # Impossible with any type of combinatorial action
++            if name == '':
++                name = 'experiment'
++            # Check to ensure the output is stable
++            output[name] = analysis if not isinstance(analysis, Exception) else str(analysis)
++        if serialize_data:
++            self._serialize(serial_data_path, output)
++        return output
++
++    @staticmethod
++    def _serialize(serial_path, payload):
++        """
++        Helper function to serialize data which can be subclassed
++
++        Parameters
++        ----------
++        serial_path : str
++            Path of serial file
++        payload : object
++            Object to serialize (pickle)
++        """
++        with open(serial_path, 'wb') as f:
++            pickle.dump(payload, f)
++
++    def _run_analysis(self, path, **analyzer_kwargs):
++        """
++        Helper function to allow parallel through MPI analysis of the experiments
++
++        Parameters
++        ----------
++        path : str
++            Location of YANK experiment output data.
++        analyzer_kwargs
++            Additional keywords which will be fed into the :class:`YankMultiStateSamplerAnalyzer` for each phase of
++            each experiment.
++
++        Returns
++        -------
++        payload : dict or Exception
++            Results from automatic analysis output or the exception that was thrown.
++            Having the exception trapped but thrown later allows for one experiment to fail but not stop the others
++            from analyzing.
++        """
++        try:
++            # Allow the _run_specific_analysis to be subclassable without requiring the error trap to be re-written.
++            return self._run_specific_analysis(path, **analyzer_kwargs)
++        except Exception as e:
++            # Trap any error in a non-crashing way
++            return e
++
++    @staticmethod
++    def _run_specific_analysis(path, **analyzer_kwargs):
++        """ Helper function to run an individual auto analysis which can be subclassed"""
++        return ExperimentAnalyzer(path, **analyzer_kwargs).auto_analyze()
+ 
+ 
+ # ==========================================
+@@ -314,7 +995,7 @@ def extract_u_n(ncfile):
+     u_kln = np.zeros([nstates, nstates, niterations], np.float64)
+     for iteration in range(niterations):
+         state_indices = ncfile.variables['states'][iteration, :]
+-        u_kln[state_indices,:,iteration] = energies[iteration, :, :]
++        u_kln[state_indices, :, iteration] = energies[iteration, :, :]
+     logger.info("Done.")
+ 
+     # Compute total negative log probability over all iterations.
+diff --git a/Yank/commands/analyze.py b/Yank/commands/analyze.py
+index 8e62f7bb..ac76c0ce 100644
+--- a/Yank/commands/analyze.py
++++ b/Yank/commands/analyze.py
+@@ -16,11 +16,12 @@
+ import io
+ import re
+ import os
++import pickle
+ 
+ from simtk import unit
+ 
+ import pkg_resources
+-from .. import utils, analyze
++from .. import utils, analyze, mpi
+ 
+ # =============================================================================================
+ # COMMAND-LINE INTERFACE
+@@ -29,17 +30,39 @@
+ usage = """
+ YANK analyze
+ 
+-Usage:
+-  yank analyze (-s STORE | --store=STORE) [--skipunbiasing] [--distcutoff=DISTANCE] [--energycutoff=ENERGY] [-v | --verbose] [--fulltraj]
+-  yank analyze report (-s STORE | --store=STORE) (-o REPORT | --output=REPORT) [-e | --serial] [--skipunbiasing] [--distcutoff=DISTANCE] [--energycutoff=ENERGY] [--fulltraj]
++Usage: 
++  yank analyze ((-s STORE | --store=STORE) | (-y YAML | --yaml=YAML)) [-e SERIAL | --serial=SERIAL] [--skipunbiasing] [--distcutoff=DISTANCE] [--energycutoff=ENERGY] [-v | --verbose] [--fulltraj]
++  yank analyze report ((-s STORE | --store=STORE) | (-y YAML | --yaml=YAML)) (-o OUTPUT | --output=OUTPUT) [--format=FORMAT] [-e SERIAL | --serial=SERIAL] [--skipunbiasing] [--distcutoff=DISTANCE] [--energycutoff=ENERGY] [-v | --verbose] [--fulltraj]
+   yank analyze extract-trajectory --netcdf=FILEPATH [--checkpoint=FILEPATH ] (--state=STATE | --replica=REPLICA) --trajectory=FILEPATH [--start=START_FRAME] [--skip=SKIP_FRAME] [--end=END_FRAME] [--nosolvent] [--discardequil] [--imagemol] [-v | --verbose]
+ 
+ Description:
+-  Analyze the data to compute Free Energies OR extract the trajectory from the NetCDF file into a common fortmat.
++  Analyze the data to compute Free Energies OR extract the trajectory from the NetCDF file into a common format.
+   yank analyze report generates a Jupyter (Ipython) notebook of the report instead of writing it to standard output
+ 
+ Free Energy Required Arguments:
+-  -s=STORE, --store=STORE       Storage directory for NetCDF data files.
++  -s STORE, --store=STORE       Storage directory for NetCDF data files. 
++                                EXCLUSIVE with -y and --yaml
++  -y YAML, --yaml=YAML          Target YAML file which setup and ran the experiment(s) being analyzed. 
++                                This slightly changes the optional -o|--output flag.
++                                EXCLUSIVE with -s and --store
++  
++YANK Analysis Output Arguments:
++  -e SERIAL, --serial=SERIAL    Save data in Pickle serialized output. This behaves differently in report mode. 
++                                In normal mode, this is a SINGULAR output file in Pickle format
++                                In report mode, this is the base name of the individual serial files. If not provided, 
++                                then the name is inferred from the storage (-s) or the yaml (-y) file
++  report                        Toggles output to be of the Jupyter Notebook analysis as a rendered notebook or as 
++                                a static file. Can use a path + name as well. File format is set by the --format flag
++                                
++  -o=REPORT, --output=REPORT    Name of the health report Jupyter notebook or static file, can use a path + name as well
++                                If the filename ends in .pdf or .html, the notebook is auto run and converted to a
++                                static PDF or HTML file respectively
++                                PDF requires xelatex binary in OS path, often provided by LaTeX packages
++                                MODIFIED BY -y|--yaml: This becomes the DIRECTORY of the output. The names are inferred 
++                                from the input YAML file
++  --format=FORMAT               File format of the notebook. If the filename ends in .pdf or .html, the notebook is run 
++                                and converted to a static PDF or HTML file respectively. If --format is NOT set, it 
++                                defaults to '.ipynb'                                
+ 
+ Free Energy Optional Arguments:
+   --skipunbiasing               Skip the radially-symmetric restraint unbiasing. This can be an expensive step.
+@@ -56,15 +79,6 @@
+                                 equivalent to placing a hard wall potential at a restraint distance such that the
+                                 restraint potential energy is equal to "energycutoff".
+ 
+-YANK Health Report Arguments:
+-  -o=REPORT, --output=REPORT    Name of the health report Jupyter notebook or static file, can use a path + name as well
+-                                If the filename ends in .pdf or .html, the notebook is auto run and converted to a
+-                                static PDF or HTML file respectively
+-                                PDF requires xelatex binary in OS path, often provided by LaTeX packages
+-                                Static generation may be slow
+-  -e, --serial                  Save data in YAML serialized output, name will be same as REPORT but with .yaml
+-                                extension
+-
+ Extract Trajectory Required Arguments:
+   --netcdf=FILEPATH             Path to the NetCDF file.
+   --checkpoint=FILEPATH         Path to the NetCDF checkpoint file if not the default name inferned from "netcdf" option
+@@ -98,14 +112,41 @@ def dispatch(args):
+     utils.config_root_logger(args['--verbose'])
+ 
+     if args['report']:
++        if not args['--format']:
++            args['--format'] = '.ipynb'
++        elif args['--format'][0] != '.':
++            # Ensure format is not double dotted
++            args['--format'] = '.' + args['--format']
++        if args['--yaml'] is not None and args['--output']:
++            # Ensure the last output is treated as a directory in all cases
++            if not os.path.isdir(args['--output']):
++                raise ValueError("{} is not a directory, which is required when specifying a YAML file as a source for "
++                                 "analysis".format(args['--output']))
++            base, last_item = os.path.split(args['--output'])
++            if last_item != '':
++                args['--output'] = os.path.join(base, last_item, '')
+         return dispatch_report(args)
+ 
+-    if args['extract-trajectory']:
+-        return dispatch_extract_trajectory(args)
+-
+     # Configure analyzer keyword arguments.
+     analyzer_kwargs = extract_analyzer_kwargs(args)
+-    analyze.analyze_directory(args['--store'], **analyzer_kwargs)
++    do_serialize = True if args['--serial'] is not None else False
++    if args['--yaml']:
++        multi_analyzer = analyze.MultiExperimentAnalyzer(args['--yaml'])
++        output = multi_analyzer.run_all_analysis(serial_data_path=args['--serial'], serialize_data=do_serialize,
++                                                 **analyzer_kwargs)
++        for exp_name, data in output.items():
++            analyze.print_analysis_data(data, header="######## EXPERIMENT: {} ########".format(exp_name))
++
++    else:
++        @mpi.on_single_node(0)
++        def single_run():
++            # Helper to ensure case someone does MPI on a single diretory
++            output = analyze.analyze_directory(args['--store'], **analyzer_kwargs)
++            if do_serialize:
++                with open(args['--serial'], 'wb') as f:
++                    pickle.dump(output, f)
++                print("Results have been serialized to {}".format(args['--serial']))
++        single_run()
+     return True
+ 
+ 
+@@ -169,16 +210,16 @@ def dispatch_extract_trajectory(args):
+ 
+ 
+ def dispatch_report(args):
++
+     # Check modules for render
+     store = args['--store']
++    yaml_input = args['--yaml']
+     output = args['--output']
++    do_serialize = True if args['--serial'] is not None else False
+     analyzer_kwargs = extract_analyzer_kwargs(args, quantities_as_strings=True)
+-    file_full_path, file_extension = os.path.splitext(output)
+-    _, file_base_name = os.path.split(file_full_path)
++    file_extension = args['--format']
++    # requires_prerendering = file_extension.lower() in {'.pdf', '.html', '.ipynb'}
+ 
+-    # If we need to pre-render the notebook, check if we have the necessary libraries.
+-    # PDF requires xelatex binary in the OS (provided by LaTeX such as TeXLive and MiKTeX)
+-    requires_prerendering = file_extension.lower() in {'.pdf', '.html', '.ipynb'}
+     try:
+         import seaborn
+         import matplotlib
+@@ -188,31 +229,19 @@ def dispatch_report(args):
+                      " - seaborn\n"
+                      " - matplotlib\n"
+                      " - jupyter\n"
+-                     "These are not required to generate the notebook however")
+-        if requires_prerendering:
+-            error_msg += "\nRendering as static {} is not possible without the packages!".format(file_extension)
+-            raise ImportError(error_msg)
+-        else:
+-            print(error_msg)
+-
+-    # Read template notebook and inject variables.
+-    template_path = pkg_resources.resource_filename('yank', 'reports/YANK_Health_Report_Template.ipynb')
+-    with open(template_path, 'r') as template:
+-        notebook_text = re.sub('STOREDIRBLANK', store, template.read())
+-        notebook_text = re.sub('ANALYZERKWARGSBLANK', str(analyzer_kwargs), notebook_text)
+-        if args['--serial']:
+-            # Uncomment the line. Traps '#' and the rest, reports only the rest
+-            notebook_text = re.sub(r"(#)(report\.dump_serial_data\('SERIALOUTPUT'\))", r'\2', notebook_text)
+-            serial_base, _ = os.path.splitext(output)
+-            serial_out = serial_base + '.yaml'
+-            notebook_text = re.sub('SERIALOUTPUT', serial_out, notebook_text)
+-
+-    # Determine whether to pre-render the notebook or not.
+-    if not requires_prerendering:
+-        # No pre-rendering, no need to process anything
+-        with open(output, 'w') as notebook:
+-            notebook.write(notebook_text)
+-    else:
++                     "Rendering as {} is not possible without the packages!".format(file_extension))
++        raise ImportError(error_msg)
++
++    def run_notebook(source_path, output_file, serial_file, **analyzer_kwargs):
++        template_path = pkg_resources.resource_filename('yank', 'reports/YANK_Health_Report_Template.ipynb')
++        with open(template_path, 'r') as template:
++            notebook_text = re.sub('STOREDIRBLANK', source_path, template.read())
++            notebook_text = re.sub('ANALYZERKWARGSBLANK', str(analyzer_kwargs), notebook_text)
++            if serial_file is not None:
++                # Uncomment the line. Traps '#' and the rest, reports only the rest
++                notebook_text = re.sub(r"(#)(report\.dump_serial_data\('SERIALOUTPUT'\))", r'\2', notebook_text)
++                notebook_text = re.sub('SERIALOUTPUT', serial_file, notebook_text)
++
+         # Cast to static output
+         print("Rendering notebook as a {} file...".format(file_extension))
+         import nbformat
+@@ -234,7 +263,8 @@ def dispatch_report(args):
+         # Sometimes the default startup timeout exceed the default of 60 seconds.
+         ep.startup_timeout = 180
+         # Set the title name, does not appear in all exporters
+-        resource_data = {'metadata': {'name': 'YANK Simulation Report: {}'.format(file_base_name)}}
++        _, output_file_name = os.path.split(output_file)
++        resource_data = {'metadata': {'name': 'YANK Simulation Report: {}'.format(output_file_name)}}
+         print("Processing notebook now, this may take a while...")
+         processed_notebook, resources = ep.preprocess(loaded_notebook, resource_data)
+ 
+@@ -243,8 +273,40 @@ def dispatch_report(args):
+         # Determine exporter and data output type
+         exporter = exporter_data['exporter']
+         write_type = exporter_data['write_type']
+-        with open(output, 'w{}'.format(write_type)) as notebook:
++        with open(output_file, 'w{}'.format(write_type)) as notebook:
+             exported_notebook, _ = nbconvert.exporters.export(exporter, processed_notebook, resources=resources)
+             notebook.write(exported_notebook)
+ 
++    def cast_notebook_serial_path(relative_notebook_path):
++        if args['--serial'] is None:
++            serial_file = None
++        else:
++            serial_file = os.path.splitext(relative_notebook_path)[0] + '_' + args['--serial']
++        return serial_file
++
++    class NotebookMultiExperimentAnalyzer(analyze.MultiExperimentAnalyzer):
++        """Custom Multi Experiment Analyzer for notebooks"""
++
++        @staticmethod
++        def _run_specific_analysis(path, **analyzer_kwargs):
++            _, exp_name = os.path.split(path)
++            single_output_file = os.path.join(output, exp_name + args['--format'])
++            single_serial_file = cast_notebook_serial_path(single_output_file)
++            run_notebook(path, single_output_file, single_serial_file, **analyzer_kwargs)
++            return
++
++        @staticmethod
++        def _serialize(serial_path, payload):
++            """The notebooks do not have a general serial dump"""
++            pass
++
++    if yaml_input is not None:
++        multi_notebook = NotebookMultiExperimentAnalyzer(yaml_input)
++        _ = multi_notebook.run_all_analysis(serialize_data=do_serialize,
++                                            serial_data_path=args['--serial'],
++                                            **analyzer_kwargs)
++    else:
++        notebook_serial_file = cast_notebook_serial_path(output)
++        run_notebook(store, output, notebook_serial_file, **analyzer_kwargs)
++
+     return True
+diff --git a/Yank/commands/script.py b/Yank/commands/script.py
+index e46d69e6..06b9f17b 100644
+--- a/Yank/commands/script.py
++++ b/Yank/commands/script.py
+@@ -120,7 +120,7 @@ def dispatch(args):
+                 # Take the value of the environment variable
+                 n_jobs = int(os.environ[n_jobs])
+             else:
+-                raise ValueError("--njobs '%s' unknown" % njobs)
++                raise ValueError("--njobs '%s' unknown" % n_jobs)
+     else:
+         n_jobs = None
+ 
+diff --git a/Yank/commands/selftest.py b/Yank/commands/selftest.py
+index c16e77ec..cdc28206 100644
+--- a/Yank/commands/selftest.py
++++ b/Yank/commands/selftest.py
+@@ -94,7 +94,7 @@ def dispatch(args):
+             import openeye
+             import openeye.examples.openeye_tests as OETests
+             print("OpenEye version {} Found! Checking install...".format(openeye.__version__))
+-            OETests.run_test_suite()
++            # OETests.run_test_suite([])  # Disabled for now as its slow
+             # Check that the required tools work
+             from ..utils import is_openeye_installed
+             complete_tool_set = set('oechem', 'oequacpac', 'oeiupac', 'oeomega')
+diff --git a/Yank/experiment.py b/Yank/experiment.py
+index fbc3a6c1..9ebe05d1 100644
+--- a/Yank/experiment.py
++++ b/Yank/experiment.py
+@@ -1120,7 +1120,7 @@ def _expand_experiments(self):
+ 
+         """
+         # We need to distribute experiments among jobs, but different
+-        # experiments sectiona may have a different number of combinations,
++        # experiments sections may have a different number of combinations,
+         # so we need to count them.
+         experiment_id = 0
+ 
+@@ -2082,6 +2082,20 @@ def _get_experiment_dir(self, experiment_path):
+         return os.path.join(self._options['output_dir'], self._options['experiments_dir'],
+                             experiment_path)
+ 
++    def get_experiment_directories(self):
++        """
++        Helper function to return the experiment directory for each experiment in the yaml file
++
++        Returns
++        -------
++        directories : tuple of str
++            Tuple of strings providing the relative paths to each experiment from this location
++        """
++        directories = []
++        for exp_name, _ in self._expand_experiments():
++            directories.append(self._get_experiment_dir(exp_name))
++        return tuple(directories)
++
+     def _get_nc_file_paths(self, experiment_path, experiment):
+         """Return the paths to the two output .nc files of the experiment.
+ 
+diff --git a/Yank/multistate/__init__.py b/Yank/multistate/__init__.py
+index 1e45246e..7cd2575c 100644
+--- a/Yank/multistate/__init__.py
++++ b/Yank/multistate/__init__.py
+@@ -26,6 +26,9 @@
+ - :class:`yank.multistate.ParallelTemperingSampler`
+     Convenience subclass of ReplicaExchange for parallel tempering simulations
+     (one System object, many temperatures).
++- :class:`yank.multistate.SAMSSampler`
++    Single-replica sampler which samples through multiple thermodynamic states
++    on the fly.
+ - :class:`yank.multistate.MultiStateReporter`
+     Replica Exchange reporter class to store all variables and data
+ 
+diff --git a/Yank/multistate/multistateanalyzer.py b/Yank/multistate/multistateanalyzer.py
+index 86e2f7b0..b0e23139 100644
+--- a/Yank/multistate/multistateanalyzer.py
++++ b/Yank/multistate/multistateanalyzer.py
+@@ -573,7 +573,6 @@ def __init__(self, reporter, name=None, reference_states=(0, -1),
+         self._use_online_data = use_online_data
+         self._read_online_data_if_present()
+ 
+-
+     def clear(self):
+         """Reset all cached objects.
+ 
+diff --git a/Yank/reports/notebook.py b/Yank/reports/notebook.py
+index f84547e7..b18af8e3 100644
+--- a/Yank/reports/notebook.py
++++ b/Yank/reports/notebook.py
+@@ -18,102 +18,31 @@
+ import seaborn as sns
+ from simtk import unit as units
+ 
+-from .. import version
+-from .. import analyze, utils
+-
++from .. import analyze
+ 
+ kB = units.BOLTZMANN_CONSTANT_kB * units.AVOGADRO_CONSTANT_NA
+ 
+ 
+-class HealthReportData(object):
++class HealthReportData(analyze.ExperimentAnalyzer):
+     """
+     Class which houses the data used for the notebook and the generation of all plots including formatting
+     """
+-    def __init__(self, store_directory, **analyzer_kwargs):
+-        """
+-        Initial data read in and object assignment
+-
+-        Parameters
+-        ----------
+-        store_directory : string
+-            Location where the analysis.yaml file is and where the NetCDF files are
+-        **analyzer_kwargs
+-            Keyword arguments to pass to the analyzer class. Quantities can be
+-            passed as strings.
+-        """
+-        # Convert analyzer string quantities into variables.
+-        for key, value in analyzer_kwargs.items():
+-            try:
+-                quantity = utils.quantity_from_string(value)
+-            except:
+-                pass
+-            else:
+-                analyzer_kwargs[key] = quantity
+-
+-        # Read in data
+-        analysis_script_path = os.path.join(store_directory, 'analysis.yaml')
+-        if not os.path.isfile(analysis_script_path):
+-            err_msg = 'Cannot find analysis.yaml script in {}'.format(store_directory)
+-            raise RuntimeError(err_msg)
+-        with open(analysis_script_path, 'r') as f:
+-            analysis = yaml.load(f)
+-        phases_names = []
+-        signs = {}
+-        analyzers = {}
+-        for phase, sign in analysis:
+-            phases_names.append(phase)
+-            signs[phase] = sign
+-            storage_path = os.path.join(store_directory, phase + '.nc')
+-            analyzers[phase] = analyze.get_analyzer(storage_path, **analyzer_kwargs)
+-        self.phase_names = phases_names
+-        self.signs = signs
+-        self.analyzers = analyzers
+-        self.nphases = len(phases_names)
+-        # Additional data
+-        self.use_full_trajectory = False
+-        if 'use_full_trajectory' in analyzer_kwargs:
+-            self.use_full_trajectory = bool(analyzer_kwargs['use_full_trajectory'])
+-        # Assign flags for other sections along with their global variables
+-        # General Data
+-        self._general_run = False
+-        self.iterations = {}
+-        # Equilibration
+-        self._equilibration_run = False
+-        self.u_ns = {}
+-        self.nequils = {}
+-        self.g_ts = {}
+-        self.Neff_maxs = {}
+-        self._n_discarded = 0
+-        # Decorrelation break-down
+-        self._decorrelation_run = False
+-        # Mixing Run (state)
+-        self._mixing_run = False
+-        # Replica mixing
+-        self._replica_mixing_run = False
+-        self._free_energy_run = False
+-        self._serialized_data = {}
+ 
+     def general_simulation_data(self):
+         """
+         General purpose simulation data on number of iterations, number of states, and number of atoms.
+         This just prints out this data in a regular, formatted pattern.
+         """
++        general = self.get_general_simulation_data()
+         iterations = {}
++        nreplicas = {}
+         nstates = {}
+         natoms = {}
+-        nreplicas = {}
+         for phase_name in self.phase_names:
+-            if phase_name not in self._serialized_data:
+-                self._serialized_data[phase_name] = {}
+-            self._serialized_data[phase_name]['general'] = {}
+-            analyzer = self.analyzers[phase_name]
+-            try:
+-                positions = analyzer.reporter.read_sampler_states(0)[0].positions
+-                natoms[phase_name], _ = positions.shape
+-            except AttributeError:  # Trap unloaded checkpoint file
+-                natoms[phase_name] = 'No Cpt.'
+-            energies, _, _, = analyzer.reporter.read_energies()
+-            iterations[phase_name], nreplicas[phase_name], nstates[phase_name] = energies.shape
++            iterations[phase_name] = general[phase_name]['iterations']
++            nreplicas[phase_name] = general[phase_name]['nreplicas']
++            nstates[phase_name] = general[phase_name]['nstates']
++            natoms[phase_name] = general[phase_name]['natoms']
+ 
+         leniter = max(len('Iterations'), *[len(str(i)) for i in iterations.values()]) + 2
+         lenreplica = max(len('Replicas'), *[len(str(i)) for i in nreplicas.values()]) + 2
+@@ -134,16 +63,9 @@ def general_simulation_data(self):
+         lines.append(topdiv)
+         for phase in self.phase_names:
+             phasestring = ''
+-            serial = self._serialized_data[phase]['general']
+             phasestring += ('{:^' + '{}'.format(lenleftcol) + '}').format(phase) + '|'
+-            phase_iter = iterations[phase]
+-            serial['iterations'] = phase_iter
+             phasestring += ('{:^' + '{}'.format(leniter) + '}').format(iterations[phase]) + '|'
+-            phase_states = nstates[phase]
+-            serial['states'] = phase_states
+             phasestring += ('{:^' + '{}'.format(lenreplica) + '}').format(nreplicas[phase]) + '|'
+-            phase_atoms = natoms[phase]
+-            serial['natoms'] = phase_atoms
+             phasestring += ('{:^' + '{}'.format(lenstates) + '}').format(nstates[phase]) + '|'
+             phasestring += ('{:^' + '{}'.format(lennatoms) + '}').format(natoms[phase])
+             lines.append(phasestring)
+@@ -151,8 +73,6 @@ def general_simulation_data(self):
+ 
+         for line in lines:
+             print(line)
+-        self.iterations = iterations
+-        self._general_run = True
+ 
+     def generate_equilibration_plots(self, discard_from_start=1):
+         """
+@@ -165,6 +85,7 @@ def generate_equilibration_plots(self, discard_from_start=1):
+             Figure showing the equilibration between both phases
+ 
+         """
++        serial_data = self.get_equilibration_data(discard_from_start=discard_from_start)
+         # Adjust figure size
+         plt.rcParams['figure.figsize'] = 20, 6 * self.nphases * 2
+         plot_grid = gridspec.GridSpec(self.nphases, 1)  # Vertical distribution
+@@ -172,31 +93,8 @@ def generate_equilibration_plots(self, discard_from_start=1):
+         # Add some space between the figures
+         equilibration_figure.subplots_adjust(hspace=0.4)
+         for i, phase_name in enumerate(self.phase_names):
+-            if phase_name not in self._serialized_data:
+-                self._serialized_data[phase_name] = {}
+-            self._serialized_data[phase_name]['equilibration'] = {}
+-            serial = self._serialized_data[phase_name]['equilibration']
++            phase_data = serial_data[phase_name]
+             sub_grid = gridspec.GridSpecFromSubplotSpec(3, 1, subplot_spec=plot_grid[i])
+-            analyzer = self.analyzers[phase_name]
+-            # Data crunching to get timeseries
+-            # TODO: Figure out how not to discard the first sample
+-            # Sample at index 0 is actually the minimized structure and NOT from the equilibrium distribution
+-            # This throws off all of the equilibrium data
+-            self._n_discarded = discard_from_start
+-            self.u_ns[phase_name] = analyzer.get_effective_energy_timeseries()[discard_from_start:]
+-            # Timeseries statistics
+-            i_t, g_i, n_effective_i = analyze.multistate.get_equilibration_data_per_sample(self.u_ns[phase_name])
+-            n_effective_max = n_effective_i.max()
+-            i_max = n_effective_i.argmax()
+-            n_equilibration = i_t[i_max]
+-            g_t = g_i[i_max]
+-            self.Neff_maxs[phase_name] = n_effective_max
+-            self.nequils[phase_name] = n_equilibration
+-            self.g_ts[phase_name] = g_t
+-            serial['discarded_from_start'] = int(discard_from_start)
+-            serial['effective_samples'] = float(self.Neff_maxs[phase_name])
+-            serial['equilibration_samples'] = int(self.nequils[phase_name])
+-            serial['subsample_rate'] = float(self.g_ts[phase_name])
+ 
+             # FIRST SUBPLOT: energy scatter
+             # Attach subplot to figure
+@@ -245,6 +143,9 @@ def generate_equilibration_plots(self, discard_from_start=1):
+                    )
+ 
+             # SECOND SUBPLOT: g_t trace
++            i_t = phase_data['iterations_considered']
++            g_i = phase_data['subsample_rate_by_iterations_considered']
++            n_effective_i = phase_data['effective_samples_by_iterations_considered']
+             x = i_t
+             g = equilibration_figure.add_subplot(sub_grid[1])
+             g.plot(x, g_i)
+@@ -264,9 +165,6 @@ def generate_equilibration_plots(self, discard_from_start=1):
+             ne.set_ylabel(r'Neff samples', fontsize=20)
+             ne.set_xlabel(r'Iteration', fontsize=20)
+ 
+-        # Set class variables to be used elsewhere
+-        # Set flag
+-        self._equilibration_run = True
+         return equilibration_figure
+ 
+     def compute_rmsds(self):
+@@ -334,31 +232,25 @@ def generate_decorrelation_plots(self, decorrelation_threshold=0.1):
+         if not self._general_run or not self._equilibration_run:
+             raise RuntimeError("Cannot generate decorrelation data without general simulation data and equilibration "
+                                "data first! Please run the corresponding functions/cells.")
++        # This will exist because of _equilibration_run
++        eq_data = self.get_equilibration_data(discard_from_start=self._n_discarded)
+         # Readjust figure output
+         plt.rcParams['figure.figsize'] = 20, 8
+         decorrelation_figure = plt.figure()
+         decorrelation_figure.subplots_adjust(wspace=0.2)
+-        plotkeys = [100 + (10 * self.nphases) + (i + 1) for i in range(self.nphases)]  # Horizonal distribution
++        plotkeys = [100 + (10 * self.nphases) + (i + 1) for i in range(self.nphases)]  # Horizontal distribution
+         for phase_name, plotid in zip(self.phase_names, plotkeys):
+-            serial = self._serialized_data[phase_name]['equilibration']  # This will exist because of _equilibration_run
++            serial = eq_data[phase_name]
+             # Create subplot
+             p = decorrelation_figure.add_subplot(plotid)
+-            # Determine toal number of iterations
+-            N = self.iterations[phase_name]
+             labels = ['Decorrelated', 'Correlated', 'Equilibration']
+             colors = ['#2c7bb6', '#abd0e0', '#fdae61']  # blue, light blue, and orange
+             explode = [0, 0, 0.0]
+-            # Determine the wedges
+-            eq = self.nequils[phase_name] + self._n_discarded  # Make sure we include the discarded
+-            decor = int(np.floor(self.Neff_maxs[phase_name]))
+-            cor = N - eq - decor
+-            dat = np.array([decor, cor, eq]) / float(N)
+-            serial['count_total_equilibration_samples'] = int(eq)
+-            serial['count_decorrelated_samples'] = int(decor)
+-            serial['count_correlated_samples'] = int(cor)
+-            serial['percent_total_equilibration_samples'] = float(dat[2])
+-            serial['percent_decorrelated_samples'] = float(dat[0])
+-            serial['percent_correlated_samples'] = float(dat[1])
++            n_iter = self.iterations[phase_name]
++            decor = serial['count_decorrelated_samples']
++            eq = serial['count_total_equilibration_samples']
++            cor = serial['count_correlated_samples']
++            dat = np.array([decor, cor, eq]) / float(n_iter)
+             if dat[0] <= decorrelation_threshold:
+                 colors[0] = '#d7191c'  # Red for warning
+             patch, txt, autotxt = p.pie(
+@@ -388,8 +280,6 @@ def generate_decorrelation_plots(self, decorrelation_threshold=0.1):
+                     color='red',
+                     bbox={'alpha': 1.0, 'facecolor': 'white', 'lw': 0, 'pad': 0}
+                 )
+-        # Set globals
+-        self._decorrelation_run = True
+         return decorrelation_figure
+ 
+     def generate_mixing_plot(self, mixing_cutoff=0.05, mixing_warning_threshold=0.90, cmap_override=None):
+@@ -415,6 +305,7 @@ def generate_mixing_plot(self, mixing_cutoff=0.05, mixing_warning_threshold=0.90
+         mixing_figure : matplotlib.figure
+             Figure showing the state mixing as a color diffusion map instead of grid of numbers
+         """
++        mixing_serial = self.get_mixing_data()
+         # Set up image
+         mixing_figure, subplots = plt.subplots(1, 2)
+         # Create custom cmap goes from white to pure blue, goes red if the threshold is reached
+@@ -449,18 +340,10 @@ def generate_mixing_plot(self, mixing_cutoff=0.05, mixing_warning_threshold=0.90
+ 
+         # Plot a diffusing mixing map for each phase.
+         for phase_name, subplot in zip(self.phase_names, subplots):
+-            if phase_name not in self._serialized_data:
+-                self._serialized_data[phase_name] = {}
+-            self._serialized_data[phase_name]['mixing'] = {}
+-            serial = self._serialized_data[phase_name]['mixing']
+-            # Generate mixing statistics.
+-            analyzer = self.analyzers[phase_name]
+-            mixing_statistics = analyzer.generate_mixing_statistics(
+-                number_equilibrated=self.nequils[phase_name])
+-            transition_matrix, eigenvalues, statistical_inefficiency = mixing_statistics
+-            serial['transitions'] = transition_matrix.tolist()
+-            serial['eigenvalues'] = eigenvalues.tolist()
+-            serial['stat_inefficiency'] = float(statistical_inefficiency)
++            serial = mixing_serial[phase_name]
++            transition_matrix = serial['transitions']
++            eigenvalues = serial['eigenvalues']
++            statistical_inefficiency = serial['stat_inefficiency']
+ 
+             # Without vmin/vmax, the image normalizes the values to mixing_data.max
+             # which screws up the warning colormap.
+@@ -510,7 +393,6 @@ def generate_mixing_plot(self, mixing_cutoff=0.05, mixing_warning_threshold=0.90
+                     color='red',
+                     bbox={'alpha': 1.0, 'facecolor': 'white', 'lw': 0, 'pad': 0}
+                 )
+-        self._mixing_run = True
+         return mixing_figure
+ 
+     def generate_replica_mixing_plot(self, phase_stacked_replica_plots=False):
+@@ -534,8 +416,7 @@ def generate_replica_mixing_plot(self, phase_stacked_replica_plots=False):
+         for i, phase_name in enumerate(self.phase_names):
+             # Gather state NK
+             analyzer = self.analyzers[phase_name]
+-            sampled_energies, _, _, state_kn = analyzer.read_energies()
+-            n_replicas, n_states, n_iterations = sampled_energies.shape
++            n_replicas = analyzer.reporter.n_replicas
+             max_n_replicas = max(n_replicas, max_n_replicas)
+ 
+         # Create Parent Gridspec
+@@ -559,7 +440,7 @@ def generate_replica_mixing_plot(self, phase_stacked_replica_plots=False):
+                 # Add plot
+                 plot = replica_figure.add_subplot(sub_grid[replica_index])
+                 # Actually plot
+-                plot.plot(state_kn[replica_index,:], 'k.')
++                plot.plot(state_kn[replica_index, :], 'k.')
+                 # Format plot
+                 plot.set_yticks([])
+                 plot.set_xlim([0, n_iterations])
+@@ -573,28 +454,15 @@ def generate_replica_mixing_plot(self, phase_stacked_replica_plots=False):
+         return replica_figure
+ 
+     def generate_free_energy(self):
+-        if not self._equilibration_run:
+-            raise RuntimeError("Cannot run free energy without first running the equilibration. Please run the "
+-                               "corresponding function/cell first!")
+-        data = dict()
+-        for phase_name in self.phase_names:
+-            analyzer = self.analyzers[phase_name]
+-            data[phase_name] = analyzer.analyze_phase()
+-            kT = analyzer.kT
+-
+-        # Compute free energy and enthalpy
+-        DeltaF = 0.0
+-        dDeltaF = 0.0
+-        DeltaH = 0.0
+-        dDeltaH = 0.0
+-        for phase_name in self.phase_names:
+-            sign = self.signs[phase_name]
+-            DeltaF -= sign * (data[phase_name]['DeltaF'] + data[phase_name]['DeltaF_standard_state_correction'])
+-            dDeltaF += data[phase_name]['dDeltaF'] ** 2
+-            DeltaH -= sign * (data[phase_name]['DeltaH'] + data[phase_name]['DeltaF_standard_state_correction'])
+-            dDeltaH += data[phase_name]['dDeltaH'] ** 2
+-        dDeltaF = np.sqrt(dDeltaF)
+-        dDeltaH = np.sqrt(dDeltaH)
++        fe_data = self.get_experiment_free_energy_data()
++        delta_f = fe_data['free_energy_diff']
++        delta_h = fe_data['enthalpy_diff']
++        delta_f_err = fe_data['free_energy_diff_error']
++        delta_h_err = fe_data['enthalpy_diff_error']
++        delta_f_unit = fe_data['free_energy_diff_unit']
++        delta_h_unit = fe_data['enthalpy_diff_unit']
++        delta_f_err_unit = fe_data['free_energy_diff_error_unit']
++        delta_h_err_unit = fe_data['enthalpy_diff_error_unit']
+ 
+         # Attempt to guess type of calculation
+         calculation_type = ''
+@@ -605,20 +473,22 @@ def generate_free_energy(self):
+                 calculation_type = ' of solvation'
+ 
+         print('Free energy{:<13}: {:9.3f} +- {:.3f} kT ({:.3f} +- {:.3f} kcal/mol)'.format(
+-            calculation_type, DeltaF, dDeltaF, DeltaF * kT / units.kilocalories_per_mole,
+-                                               dDeltaF * kT / units.kilocalories_per_mole))
++            calculation_type, delta_f, delta_f_err, delta_f_unit / units.kilocalories_per_mole,
++            delta_f_err_unit / units.kilocalories_per_mole))
+ 
+         for phase in self.phase_names:
+-            print('DeltaG {:<17}: {:9.3f} +- {:.3f} kT'.format(phase, data[phase]['DeltaF'],
+-                                                               data[phase]['dDeltaF']))
+-            if data[phase]['DeltaF_standard_state_correction'] != 0.0:
+-                print('DeltaG {:<17}: {:18.3f} kT'.format('standard state correction',
+-                                                          data[phase]['DeltaF_standard_state_correction']))
++            delta_f_phase = fe_data[phase]['free_energy_diff']
++            delta_f_err_phase = fe_data[phase]['free_energy_diff_error']
++            detla_f_ssc_phase = fe_data[phase]['free_energy_diff_standard_state_correction']
++            print('DeltaG {:<17}: {:9.3f} +- {:.3f} kT'.format(phase, delta_f_phase,
++                                                               delta_f_err_phase))
++            if detla_f_ssc_phase != 0.0:
++                print('DeltaG {:<17}: {:18.3f} kT'.format('standard state correction', detla_f_ssc_phase))
+         print('')
+         print('Enthalpy{:<16}: {:9.3f} +- {:.3f} kT ({:.3f} +- {:.3f} kcal/mol)'.format(
+-            calculation_type, DeltaH, dDeltaH, DeltaH * kT / units.kilocalories_per_mole,
+-                                               dDeltaH * kT / units.kilocalories_per_mole))
+-        self._free_energy_run = True
++            calculation_type, delta_h, delta_h_err, delta_h_unit / units.kilocalories_per_mole,
++            delta_h_err_unit / units.kilocalories_per_mole)
++        )
+ 
+     def free_energy_trace(self, discard_from_start=1, n_trace=10):
+         """
+@@ -789,8 +659,7 @@ def restraint_distributions_plot(self):
+         return figure
+ 
+     def report_version(self):
+-        current_version = version.version
+-        self._serialized_data['yank_version'] = current_version
++        current_version = self._serialized_data['yank_version']
+         print("Rendered with YANK Version {}".format(current_version))
+ 
+     def dump_serial_data(self, path):
+@@ -801,7 +670,3 @@ def dump_serial_data(self, path):
+         true_path += ext
+         with open(true_path, 'w') as f:
+             f.write(yaml.dump(self._serialized_data))
+-
+-    @staticmethod
+-    def report_version():
+-        print("Rendered with YANK Version {}".format(version.version))
+diff --git a/Yank/tests/test_analyze.py b/Yank/tests/test_analyze.py
+index a799a7ea..3eca5b72 100644
+--- a/Yank/tests/test_analyze.py
++++ b/Yank/tests/test_analyze.py
+@@ -13,6 +13,7 @@
+ import shutil
+ import os
+ import tempfile
++import logging
+ 
+ import numpy as np
+ from nose.tools import assert_raises, assert_equal
+@@ -25,6 +26,7 @@
+ from yank.restraints import RestraintState
+ from yank.multistate import MultiStateReporter, MultiStateSampler, ReplicaExchangeSampler, SAMSSampler, utils
+ import yank.analyze as analyze
++from .test_experiment import solvation_stock
+ 
+ # ==============================================================================
+ # MODULE CONSTANTS
+@@ -116,6 +118,30 @@ def test_timeseries():
+     assert np.allclose(m_equilibration_data, a_equilibration_data)
+ 
+ 
++def test_auto_analyze():
++    """Test that the auto analysis and multi-exp analysis code works"""
++    with mmtools.utils.temporary_directory() as tmp_dir:
++        # Make the logger less noisy
++        logging.disable(21)  # Raise threshold to just above INFO logging
++        # Ensure 1 iteration runs to allow analysis
++        run_one = {'options': {'default_number_of_iterations': 1}}
++        script, builder = solvation_stock(tmp_dir, overwrite_options=run_one)
++        output_dir = builder._get_experiment_dir('')
++        assert os.path.isdir(output_dir)
++        single_auto = analyze.ExperimentAnalyzer(output_dir)
++        exp_directories = builder.get_experiment_directories()
++        multi_auto = analyze.MultiExperimentAnalyzer(script)
++        assert sorted(exp_directories) == sorted(multi_auto.paths)
++        payload = multi_auto.run_all_analysis(serial_data_path=os.path.join(tmp_dir, '_analysis.pkl'))
++        _, exp_name = os.path.split(output_dir)
++        # Check like in the code
++        if exp_name == '':
++            exp_name = 'experiment'
++        np.testing.assert_equal(payload[exp_name], single_auto.auto_analyze())
++        # Restore logger
++        logging.disable(logging.NOTSET)
++
++
+ # ==============================================================================
+ # TEST ANALYZER
+ # ==============================================================================
+@@ -322,13 +348,13 @@ def test_mbar_creation_process(self):
+         # Test reference states and full work up creation
+         iinit, jinit = phase.reference_states
+         output = phase.analyze_phase()
+-        fe_out, dfe_out = output['DeltaF'], output['dDeltaF']
++        fe_out, dfe_out = output['free_energy_diff'], output['free_energy_diff_error']
+         assert fe_out == fe[iinit, jinit]
+         assert dfe_out == dfe[iinit, jinit]
+         inew, jnew = 1, 2
+         phase.reference_states = [inew, jnew]
+         new_output = phase.analyze_phase()
+-        new_fe_out, new_dfe_out = new_output['DeltaF'], new_output['dDeltaF']
++        new_fe_out, new_dfe_out = new_output['free_energy_diff'], new_output['free_energy_diff_error']
+         assert new_fe_out == fe[inew, jnew]
+         assert new_dfe_out == dfe[inew, jnew]
+ 
+diff --git a/Yank/tests/test_experiment.py b/Yank/tests/test_experiment.py
+index ccb64884..8e38b74e 100644
+--- a/Yank/tests/test_experiment.py
++++ b/Yank/tests/test_experiment.py
+@@ -2771,35 +2771,49 @@ def solvation_stock(tmp_dir, overwrite_options=None):
+     yaml_script = get_template_script(tmp_dir)
+     yaml_script['experiments']['system'] = 'hydration-system'
+     yaml_script['experiments']['protocol'] = 'hydration-protocol'
++    # Pop out all non-hydration system items for setup speed
++    molecule_poppers = []
++    for molecule in yaml_script['molecules'].keys():
++        if molecule not in yaml_script['systems']['hydration-system'].values():
++            molecule_poppers.append(molecule)
++    for molecule in molecule_poppers:
++        yaml_script['molecules'].pop(molecule, None)
++    system_poppers = []
++    for system in yaml_script['systems'].keys():
++        if system != 'hydration-system':
++            system_poppers.append(system)
++    for system in system_poppers:
++        yaml_script['systems'].pop(system, None)
++
+     if overwrite_options is not None:
+         yaml_script = utils.update_nested_dict(yaml_script, overwrite_options)
+ 
+     exp_builder = ExperimentBuilder(yaml_script)
+     exp_builder._check_resume()  # check_resume should not raise exceptions
+     exp_builder.run_experiments()
+-
+-    # The experiments folders are correctly named and positioned
+-    output_dir = exp_builder._get_experiment_dir('')
+-
+-    assert os.path.isdir(output_dir)
+-    for solvent in ['solvent1.nc', 'solvent2.nc']:
+-        solvent_path = os.path.join(output_dir, solvent)
+-        reporter = multistate.MultiStateReporter(solvent_path, open_mode=None)
+-        assert reporter.storage_exists()
+-        del reporter
+-    assert os.path.isfile(os.path.join(output_dir, 'experiments.yaml'))
+-    assert os.path.isfile(os.path.join(output_dir, 'experiments.log'))
+-
+-    # Analysis script is correct
+-    analysis_script_path = os.path.join(output_dir, 'analysis.yaml')
+-    with open(analysis_script_path, 'r') as f:
+-        assert yaml.load(f) == [['solvent1', 1], ['solvent2', -1]]
++    return yaml_script, exp_builder
+ 
+ 
+ def test_run_solvation_experiment():
+     """Test solvation free energy experiment run."""
+     with mmtools.utils.temporary_directory() as tmp_dir:
+-        solvation_stock(tmp_dir)
++        _, exp_builder = solvation_stock(tmp_dir)
++        # The experiments folders are correctly named and positioned
++        output_dir = exp_builder._get_experiment_dir('')
++
++        assert os.path.isdir(output_dir)
++        for solvent in ['solvent1.nc', 'solvent2.nc']:
++            solvent_path = os.path.join(output_dir, solvent)
++            reporter = multistate.MultiStateReporter(solvent_path, open_mode=None)
++            assert reporter.storage_exists()
++            del reporter
++        assert os.path.isfile(os.path.join(output_dir, 'experiments.yaml'))
++        assert os.path.isfile(os.path.join(output_dir, 'experiments.log'))
++
++        # Analysis script is correct
++        analysis_script_path = os.path.join(output_dir, 'analysis.yaml')
++        with open(analysis_script_path, 'r') as f:
++            assert yaml.load(f) == [['solvent1', 1], ['solvent2', -1]]
+ 
+ 
+ def test_automatic_alchemical_path():
+diff --git a/docs/analysis.rst b/docs/analysis.rst
+index 37c1d7a6..90c8d50d 100644
+--- a/docs/analysis.rst
++++ b/docs/analysis.rst
+@@ -109,8 +109,35 @@ running.
+ 
+   $ yank analyze --store={experiments}
+ 
+-Replace ``{experiments}`` with the output directory for your simulation. The output is printed to standard terminal
+-output.
++Replace ``{experiments}`` with the output directory for your simulation. This minimal form of the command has a few
++limitations which can be corrected with more complex flags: it only outputs to terminal, it can only target single
++directories. Both of these can be corrected with more complex invocation of the command:
++
++.. code-block:: bash
++
++  $ yank analyze --yaml={Some YAML file which ran with ``yank script``}
++
++This form with the ``-y YAML`` or ``--yaml=YAML`` flag tells the analysis to look inside of a YAML file which was read
++to run the experiment(s) you want to analyze. In this form, the experiment paths and names are determined from the YAML
++file and can analyze any number of :ref:`combinatorial experiments <yaml_combinatorial_head>` found within the file.
++The ``-y`` flag is exclusive from ``-s``. This will still output to terminal though, so we need another flag to
++save the data to disk.
++
++.. code-block:: bash
++
++  $ yank analyze -y YAML -e {serial Pickle file}
++
++The ``-e SERIAL`` (alternately ``--serial=SERIAL``) flag tells YANK analyze to save the analysis data to the ``SERIAL``
++file in Pickle format. This saves not only the final free energy, but also all intermediate values in between. See the
++docs for the :ref:`ExperimentAnalyzer class <API_analysis>` for how the output data is formatted and what values
++you can extract. The ``-e`` option can be set with either the ``-s`` or the ``-y`` flags.
++
++.. note::
++
++    We know Pickle has problems when importing across Python versions and are working on a solution to carry the
++    data in a more universal way. The data are composed of simple numbers, NumPy arrays, and SimTK Quantities for
++    unit handling, so we are exploring options to represent them in a transferable way which does not require intamate
++    knowledge of what unit system YANK outputs in.
+ 
+ 
+ .. _visual_analyze:
+diff --git a/docs/api/analysis_api.rst b/docs/api/analysis_api.rst
+new file mode 100644
+index 00000000..4d995373
+--- /dev/null
++++ b/docs/api/analysis_api.rst
+@@ -0,0 +1,5 @@
++.. _API_analysis:
++
++.. automodule:: yank.analyze
++   :members:
++   :inherited-members:
+diff --git a/docs/api/index.rst b/docs/api/index.rst
+index 7e2e653a..c2b07ba4 100644
+--- a/docs/api/index.rst
++++ b/docs/api/index.rst
+@@ -10,6 +10,7 @@ YAML input files, please see the command line interface and the YAML options.
+ .. toctree::
+    :maxdepth: 2
+ 
++   analysis_api
+    experiment_api
+    mpi_api
+    multistate_api/index
+diff --git a/docs/api/multistate_api/index.rst b/docs/api/multistate_api/index.rst
+index 57674ca2..b394e3dd 100644
+--- a/docs/api/multistate_api/index.rst
++++ b/docs/api/multistate_api/index.rst
+@@ -29,3 +29,7 @@ This is the API for the Multi State sub-module and its classes.
+ .. automodule:: yank.multistate.paralleltempering
+    :members:
+    :inherited-members:
++
++.. automodule:: yank.multistate.sams
++   :members:
++   :inherited-members:
+diff --git a/docs/whatsnew.rst b/docs/whatsnew.rst
+index 9bc4bb73..e8ff053b 100644
+--- a/docs/whatsnew.rst
++++ b/docs/whatsnew.rst
+@@ -6,6 +6,16 @@ This section features and improvements of note in each release.
+ 
+ The full release history can be viewed `at the GitHub yank releases page <https://github.com/choderalab/yank/releases>`_.
+ 
++0.22.4 Multi-Analysis
++---------------------
++- Added new ``ExperimentAnalyzer`` class as API call for ``auto_analyze`` like functions. Supports serialized output to Pickle
++- Added new ``MultiExperimentAnalyzer`` class to analyze all experiments found in a YAML input file with the ``ExperimentAnalyzer``. Supported by MPI for parallel action
++- Unified all ``auto_analyze`` like objects to go through the ``ExperimentAnalyzer``, such as the API and Jupyter Notebook calls
++- Existing API calls should remain unchanged and serve as pass-throughs to the new classes
++- Major changes to the CLI behavior of ``yank analyze`` and ``yank analyze report`` to support the new features. These should not affect existing code, only support new features.
++- Fixed bug in ``yank selftest`` with the OpenEye tests. Also silenced the OpenEye internal tests due to time. Dependency checks are still active
++- Update API docs
++
+ 0.22.3 Balance Checkpoint with IO
+ ---------------------------------
+ - Reduced default checkpoint interval to 50 (was 200) to balance disk IO time with time between checkpoints

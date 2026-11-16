@@ -1,0 +1,1005 @@
+diff --git a/scilink/agents/meta_agent/fanout.py b/scilink/agents/meta_agent/fanout.py
+index 79a823582..4fab2c3ce 100644
+--- a/scilink/agents/meta_agent/fanout.py
++++ b/scilink/agents/meta_agent/fanout.py
+@@ -183,6 +183,21 @@ def __getattr__(self, name: str):
+         return getattr(self._original, name)
+ 
+ 
++def _attributed_branch(fn):
++    """Bind a branch worker to the coordinator's session for its run.
++
++    A branch thread prints the child orchestrator's whole narration and is
++    the thread a user's Stop must reach. Both ride the session route keyed
++    by the coordinator (chat) thread — the Streamlit-era global capture saw
++    every thread, the per-thread web router sees only attributed ones
++    (#627) — so the worker registers as the coordinator's child for the
++    duration of the branch. Routing only: no ``[tag]`` log prefix and no
++    panel trimming, so CLI output is unchanged.
++    """
++    from ...utils.log_context import attributed_to_current
++    return attributed_to_current(fn)
++
++
+ def _ensure_stop_guard_installed() -> None:
+     """Install the thread-aware stop guard on stdout/stderr (idempotent).
+ 
+@@ -1280,8 +1295,8 @@ def resume_fanout(orch, retry_failed: bool = False) -> str:
+                 "_resume": has_ckpt,
+             }
+             stop_ev = _threading.Event()
+-            fut = pool.submit(_run_one_branch, orch, branch, [], e,
+-                              None, None, stop_ev)
++            fut = pool.submit(_attributed_branch(_run_one_branch), orch,
++                              branch, [], e, None, None, stop_ev)
+             fut_entry[fut] = e
+             fut_stop[fut] = stop_ev
+             fut_label[fut] = e.get("label") or f"branch {e['index']}"
+@@ -1794,9 +1809,10 @@ def _companions_for(i):
+             entries[i]["_budget_s"] = resolve_branch_budget(
+                 run_branches[i], budget, explicit=branch_time_budget_s is not None)
+             stop_ev = _threading.Event()
+-            fut = pool.submit(_run_one_branch, orch, run_branches[i],
+-                              branch_companions[i], entries[i],
+-                              queue_channel, branch_autonomy, stop_ev)
++            fut = pool.submit(_attributed_branch(_run_one_branch), orch,
++                              run_branches[i], branch_companions[i],
++                              entries[i], queue_channel, branch_autonomy,
++                              stop_ev)
+             fut_label[fut] = run_branches[i]["label"]
+             fut_entry[fut] = entries[i]
+             fut_stop[fut] = stop_ev
+diff --git a/scilink/agents/meta_agent/meta_orchestrator.py b/scilink/agents/meta_agent/meta_orchestrator.py
+index c34a93497..188f2b16a 100644
+--- a/scilink/agents/meta_agent/meta_orchestrator.py
++++ b/scilink/agents/meta_agent/meta_orchestrator.py
+@@ -775,7 +775,6 @@ def _get_analysis_child(self):
+                 base_url=self.base_url,
+                 embedding_model=self.embedding_model,
+                 embedding_api_key=self.embedding_api_key,
+-                embedding_base_url=self.embedding_base_url,
+                 futurehouse_api_key=self.futurehouse_api_key,
+                 restore_checkpoint=restore,
+                 analysis_mode=AnalysisMode.CO_PILOT,
+diff --git a/scilink/agents/planning_agents/orchestrator_tools.py b/scilink/agents/planning_agents/orchestrator_tools.py
+index 846dcca28..149d41a09 100644
+--- a/scilink/agents/planning_agents/orchestrator_tools.py
++++ b/scilink/agents/planning_agents/orchestrator_tools.py
+@@ -1938,7 +1938,12 @@ def _heartbeat():
+                               f"{'es' if _hb_state['total'] != 1 else ''} still "
+                               f"running ({mins} min elapsed{_of}; {_eta})")
+ 
+-            _threading.Thread(target=_heartbeat, daemon=True).start()
++            # Attributed to this (chat) thread: under the web app's per-thread
++            # stdout router a bare Thread's prints reach only the server
++            # console, and the ticker's whole purpose is the browser (#627).
++            from ...utils.log_context import (attributed_to_current,
++                                              start_attributed_thread)
++            start_attributed_thread(_heartbeat, name="lit-search-heartbeat")
+ 
+             try:
+                 clean_queries = [optimize_search_query(
+@@ -1988,8 +1993,13 @@ def _task_label(oi, t):
+                             for oi, t in batch:
+                                 _l = _task_label(oi, t)
+                                 _hb_mark_running(_l)
+-                                f = ex.submit(search_methods[t],
+-                                              clean_queries[oi])
++                                # Attributed like the heartbeat: the
++                                # agent's "Submitting ... query" / result
++                                # log records come from these workers and
++                                # otherwise never reach the browser (#627).
++                                f = ex.submit(
++                                    attributed_to_current(search_methods[t]),
++                                    clean_queries[oi])
+                                 f.add_done_callback(
+                                     lambda _f, _l=_l: _hb_mark_done(_l))
+                                 futures[(oi, t)] = f
+diff --git a/scilink/server/stdout_router.py b/scilink/server/stdout_router.py
+index 8eaf13b6d..46bb1963f 100644
+--- a/scilink/server/stdout_router.py
++++ b/scilink/server/stdout_router.py
+@@ -14,6 +14,12 @@
+ capture (and still reaches the real console). Unrouted threads (HTTP
+ handlers, the main thread) pass straight through.
+ 
++The contract that follows: ONLY a registered thread's output reaches the
++browser. A tool that spawns a background thread which prints (a progress
++heartbeat, a pool of branch workers) must attribute it to the session —
++``log_context.start_attributed_thread`` / ``attributed_to_current`` — or its
++output silently stays on the server console (#627).
++
+ ``RoutedCapture`` keeps the surface of ``OutputCapture`` that the turn
+ runner uses (context manager, ``getvalue``, ``request_stop`` with the
+ print-driven ``AgentStoppedError`` + subprocess kill), so the runner swaps
+@@ -28,7 +34,8 @@
+ from typing import Dict, Optional, TextIO, Tuple
+ 
+ from scilink.ui.output_capture import AgentStoppedError
+-from scilink.utils.log_context import effective_thread
++from scilink.utils.log_context import (clear_stop, effective_thread,
++                                       stop_workers_of, worker_stopped)
+ 
+ class _Route:
+     """One turn's capture target + console-attribution state."""
+@@ -61,8 +68,15 @@ def __init__(self, original: TextIO) -> None:
+ 
+     def write(self, data: str) -> int:
+         out = data
+-        route = _ROUTES.get(effective_thread(threading.get_ident()))
+-        if route is not None:
++        tid = threading.get_ident()
++        route = _ROUTES.get(effective_thread(tid))
++        if route is None:
++            if worker_stopped(tid):
++                # The turn is gone (route removed) but this worker still
++                # belongs to it — a fan-out branch outliving its stopped
++                # coordinator.
++                raise AgentStoppedError("Agent stopped by user")
++        else:
+             if route.stop.is_set():
+                 raise AgentStoppedError("Agent stopped by user")
+             if not getattr(_tls, "routing", False):
+@@ -128,6 +142,7 @@ def request_stop(self) -> None:
+         """Abort the turn on its next print/log; kill its subprocesses."""
+         self._stop_event.set()
+         if self._agent_thread_id is not None:
++            stop_workers_of(self._agent_thread_id)
+             try:
+                 from scilink.executors import kill_subprocesses_for_thread
+                 kill_subprocesses_for_thread(self._agent_thread_id)
+@@ -137,6 +152,7 @@ def request_stop(self) -> None:
+     def __enter__(self) -> "RoutedCapture":
+         install()
+         self._agent_thread_id = threading.get_ident()
++        clear_stop(self._agent_thread_id)   # a fresh turn on a reused id
+         with _ROUTES_LOCK:
+             _ROUTES[self._agent_thread_id] = _Route(
+                 self._buffer, self._buffer_lock, self._stop_event, self._tag)
+diff --git a/scilink/ui/output_capture.py b/scilink/ui/output_capture.py
+index 3c1cc744b..859a17dc1 100644
+--- a/scilink/ui/output_capture.py
++++ b/scilink/ui/output_capture.py
+@@ -78,6 +78,8 @@ def request_stop(self) -> None:
+         self._stop_event.set()
+         # Kill any subprocess the agent thread is waiting on.
+         if self._agent_thread_id is not None:
++            from scilink.utils.log_context import stop_workers_of
++            stop_workers_of(self._agent_thread_id)   # outlives this stream
+             try:
+                 from scilink.executors import kill_subprocesses_for_thread
+                 kill_subprocesses_for_thread(self._agent_thread_id)
+@@ -85,7 +87,9 @@ def request_stop(self) -> None:
+                 pass  # Best-effort; stop event will still propagate via print()
+ 
+     def __enter__(self) -> "OutputCapture":
++        from scilink.utils.log_context import clear_stop
+         self._agent_thread_id = threading.get_ident()
++        clear_stop(self._agent_thread_id)
+         self._old_stdout = sys.stdout
+         self._old_stderr = sys.stderr
+         sys.stdout = TeeStream(self._old_stdout, self._buffer, self._stop_event)
+diff --git a/scilink/utils/log_context.py b/scilink/utils/log_context.py
+index 5ba520b99..d5b4bec4f 100644
+--- a/scilink/utils/log_context.py
++++ b/scilink/utils/log_context.py
+@@ -14,18 +14,38 @@
+ as belonging to the parent thread, and a root-logger filter prefixes each
+ registered worker's messages with its candidate tag so the interleave is
+ attributable everywhere (UI, CLI, log files).
++
++The same mapping is the ONLY way a background thread's ``print()`` reaches
++the web app: ``scilink.server.stdout_router`` routes each write by the
++calling thread's *effective* thread, so an unregistered helper thread's
++output lands on the server console and nowhere else (issue #627 — the
++``search_literature`` heartbeat read as a 10-minute hang in the browser).
++Any thread that prints or logs on a session's behalf must therefore inherit
++the session's route: use ``start_attributed_thread`` for a fire-and-forget
++helper and ``attributed_to_current`` for a callable handed to a thread pool,
++rather than a bare ``threading.Thread`` / ``pool.submit``.
+ """
+ 
+ from __future__ import annotations
+ 
++import functools
+ import logging
+ import threading
+-from typing import Dict, Tuple
++from typing import Callable, Dict, Optional, Tuple
+ 
+ # worker thread id -> (parent thread id, candidate tag, prefix messages?)
+ _WORKERS: Dict[int, Tuple[int, str, bool]] = {}
+ _LOCK = threading.Lock()
+ _FILTER_INSTALLED = False
++# Chat threads whose turn was stopped while workers were still attributed to
++# them. A worker's stop signal used to be the session route itself
++# (``AgentStoppedError`` raised from a routed write) — but the route goes
++# away when the chat thread exits, and a fan-out branch inside a long model
++# call at Stop time next printed AFTER that, found no route, and kept
++# running (seen live: a branch kept fitting after its turn was stopped).
++# A stopped parent stays flagged until its last worker unregisters, so a
++# straggler is stopped by its next print OR log record regardless of route.
++_STOPPED_PARENTS: set = set()
+ 
+ 
+ def register_worker(parent_thread_id: int, tag: str, prefix: bool = True) -> None:
+@@ -44,13 +64,113 @@ def register_worker(parent_thread_id: int, tag: str, prefix: bool = True) -> Non
+ 
+ def unregister_worker() -> None:
+     with _LOCK:
+-        _WORKERS.pop(threading.get_ident(), None)
++        entry = _WORKERS.pop(threading.get_ident(), None)
++        if entry and _STOPPED_PARENTS:
++            root = effective_thread(entry[0])
++            if root in _STOPPED_PARENTS and not any(
++                    effective_thread(t) == root for t in _WORKERS):
++                _STOPPED_PARENTS.discard(root)   # last straggler is gone
++
++
++def stop_workers_of(chat_thread_id: int) -> None:
++    """A turn on ``chat_thread_id`` was stopped: every thread attributed to
++    it (now or later) raises ``AgentStoppedError`` on its next print or log
++    record, even after the chat thread and its session route are gone."""
++    with _LOCK:
++        _STOPPED_PARENTS.add(chat_thread_id)
++
++
++def clear_stop(chat_thread_id: int) -> None:
++    """A fresh turn starts on ``chat_thread_id`` (thread ids are reused)."""
++    with _LOCK:
++        _STOPPED_PARENTS.discard(chat_thread_id)
++
++
++def worker_stopped(thread_id: int) -> bool:
++    """True for an attributed worker whose owning turn was stopped."""
++    if not _STOPPED_PARENTS:
++        return False
++    root = effective_thread(thread_id)
++    return root != thread_id and root in _STOPPED_PARENTS
++
++
++def raise_if_stopped_worker() -> None:
++    if worker_stopped(threading.get_ident()):
++        from scilink.ui.output_capture import AgentStoppedError
++        raise AgentStoppedError("Agent stopped by user")
++
++
++# Longest worker chain resolved by ``effective_thread`` — a bound, not a
++# design limit: chat -> fan-out branch -> best-of-N candidate -> helper is
++# four hops, and a stale (thread-id reuse) entry must never spin forever.
++_MAX_WORKER_DEPTH = 8
+ 
+ 
+ def effective_thread(thread_id: int) -> int:
+-    """Parent thread id for registered workers; identity otherwise."""
+-    entry = _WORKERS.get(thread_id)
+-    return entry[0] if entry else thread_id
++    """Root (chat) thread id for registered workers; identity otherwise.
++
++    Follows the chain, so a worker spawned BY a worker (a best-of-N
++    candidate inside a fan-out branch, or a heartbeat inside a candidate)
++    still resolves to the chat thread that owns the session route.
++    """
++    for _ in range(_MAX_WORKER_DEPTH):
++        entry = _WORKERS.get(thread_id)
++        if not entry or entry[0] == thread_id:
++            break
++        thread_id = entry[0]
++    return thread_id
++
++
++def attributed_to_current(fn: Callable, tag: str = "",
++                          prefix: bool = False) -> Callable:
++    """Wrap ``fn`` so that, wherever it later runs, that thread is attributed
++    to the CALLING thread's session for the duration of the call.
++
++    Call this on the owning (chat / worker) thread and hand the result to a
++    ``ThreadPoolExecutor`` or ``threading.Thread``. Registration is scoped to
++    the call — a pool thread that outlives the call is unregistered again,
++    so no stale mapping survives thread-id reuse. Exceptions propagate
++    unchanged (a pool future must still see them).
++    """
++    parent = effective_thread(threading.get_ident())
++
++    @functools.wraps(fn)
++    def _attributed(*args, **kwargs):
++        register_worker(parent, tag, prefix=prefix)
++        try:
++            return fn(*args, **kwargs)
++        finally:
++            unregister_worker()
++
++    return _attributed
++
++
++def start_attributed_thread(target: Callable, *, args: tuple = (),
++                            kwargs: Optional[dict] = None,
++                            name: Optional[str] = None,
++                            daemon: bool = True, tag: str = "",
++                            prefix: bool = False) -> threading.Thread:
++    """Start a background thread whose prints and log records belong to the
++    calling thread's session (drop-in for ``threading.Thread(...).start()``).
++
++    A session stop reaches the helper through the routed stream exactly as
++    it reaches the chat thread (``AgentStoppedError`` on its next write); the
++    helper then simply ends — a stopped session's progress ticker has nothing
++    left to report, and a traceback for it would only be console noise.
++    """
++    from scilink.ui.output_capture import AgentStoppedError
++
++    attributed = attributed_to_current(target, tag=tag, prefix=prefix)
++
++    def _run():
++        try:
++            attributed(*args, **(kwargs or {}))
++        except AgentStoppedError:
++            pass
++
++    t = threading.Thread(target=_run, name=name, daemon=daemon)
++    t.start()
++    return t
+ 
+ 
+ def is_concise_fanout_worker(thread_id: int) -> bool:
+@@ -119,6 +239,11 @@ def _install_prefix_filter() -> None:
+         previous_factory = logging.getLogRecordFactory()
+ 
+         def factory(*args, **kwargs):
++            # The one hook on the LOGGING path that every worker record
++            # passes through in the emitting thread — the turn's own log
++            # handler (whose filter raises on stop) is removed with the
++            # turn, so a straggler's log records must raise here.
++            raise_if_stopped_worker()
+             record = previous_factory(*args, **kwargs)
+             entry = _WORKERS.get(record.thread)
+             if entry and entry[2]:          # entry[2] = prefix?  (routing is separate)
+diff --git a/tests/test_fanout_stdout_routing.py b/tests/test_fanout_stdout_routing.py
+new file mode 100644
+index 000000000..ff1815baa
+--- /dev/null
++++ b/tests/test_fanout_stdout_routing.py
+@@ -0,0 +1,179 @@
++"""Fan-out branch threads must ride the coordinator's session route (#627).
++
++Branch workers run whole child orchestrators and print their narration from
++pool threads. Under the Streamlit-era global capture every thread's output
++reached the UI and every thread's next print raised on a user Stop; the
++web app's per-thread router forwards (and stops) only ATTRIBUTED threads,
++so branch narration vanished from the browser and Stop no longer reached
++the branches. Both are restored by attributing each branch to the
++coordinator thread for its run.
++
++  conda run -n scilink python -m pytest tests/test_fanout_stdout_routing.py -v
++"""
++import contextlib
++import io
++import json
++import os
++import sys
++import threading
++import time
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++import numpy as np
++import pytest
++
++import scilink.agents.meta_agent.fanout as fo
++from scilink.server import stdout_router as sr
++from scilink.ui.output_capture import AgentStoppedError
++
++MARKER = "BRANCH-NARRATION-0627"
++
++
++def _install_fakes(behaviors):
++    """Fake child + gate/fusion LLM, mirroring
++    tests/test_fanout_branch_cancellation.py."""
++    def fake_child(orch, base_dir):
++        class C:
++            def run_task(self, task, context=None, autonomy=None):
++                import re
++                m = re.search(r"PRIMARY dataset for THIS analysis: (\S+)", task)
++                beh = behaviors.get(m.group(1) if m else "", "good")
++                if beh == "chatty":
++                    for _ in range(400):
++                        print(f"{MARKER} still working...")
++                        time.sleep(0.05)
++                elif beh == "late":
++                    # Silent 'model call' that outlives the coordinator's
++                    # exit after a Stop, THEN chatty — the live shape.
++                    time.sleep(2.5)
++                    for _ in range(400):
++                        print(f"{MARKER} late branch still working...")
++                        time.sleep(0.05)
++                else:
++                    print(f"{MARKER} quick branch")
++                return {"status": "success", "summary": f"{beh} ok",
++                        "key_findings": ["finding"], "files_produced": []}
++        return C()
++    fo._make_ephemeral_analysis_child = fake_child
++
++    def fake_llm(orch, prompt, extra_parts=None):
++        if "SCRIPT CONTRACT" in prompt or "AUDITING a computed" in prompt:
++            return {"verdict": "accept", "issues": [],
++                    "refinement_instructions": "", "method": "qualitative",
++                    "rationale": "r", "script": ""}
++        if "complementary measurements of ONE system" in prompt:
++            return {"detailed_analysis": "fused", "scientific_claims": []}
++        return {"verdict": "complementary", "confidence": 0.9, "rationale": "r",
++                "join_axis": "T", "join_type": "shared_parameter_axis",
++                "fanout_set": list(behaviors), "redundant_clusters": [],
++                "unrelated": [], "excluded_notes": ""}
++    fo._llm_json = fake_llm
++
++
++@contextlib.contextmanager
++def routed_console():
++    """Install the web app's router over a fake console.
++
++    Entered INSIDE the test body, not from a fixture: pytest re-installs its
++    own ``sys.stdout`` at the start of the call phase, which would silently
++    unwind a router installed during setup."""
++    console = io.StringIO()
++    old_out, old_err = sys.stdout, sys.stderr
++    sys.stdout = sr._RoutingStream(console)
++    sys.stderr = sr._RoutingStream(io.StringIO())
++    try:
++        yield console
++    finally:
++        sys.stdout, sys.stderr = old_out, old_err
++
++
++@pytest.fixture
++def meta(tmp_path):
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent, MetaMode)
++    import scilink.agents.exp_agents.analysis_orchestrator  # noqa: F401
++    ag = MetaOrchestratorAgent(base_dir=str(tmp_path), api_key="sk-dummy",
++                               meta_mode=MetaMode.AUTONOMOUS)
++    orig = (fo._make_ephemeral_analysis_child, fo._llm_json, fo._FANOUT_POLL_S,
++            fo._FANOUT_HEARTBEAT_S)
++    fo._FANOUT_POLL_S = 0.2
++    fo._FANOUT_HEARTBEAT_S = 0.5   # the coordinator prints (and so raises) soon
++    yield ag
++    (fo._make_ephemeral_analysis_child, fo._llm_json, fo._FANOUT_POLL_S,
++     fo._FANOUT_HEARTBEAT_S) = orig
++
++
++def _datasets(tmp_path, names):
++    paths = [str(tmp_path / f"{n}.npy") for n in names]
++    for p in paths:
++        np.save(p, np.zeros((8, 8)))
++    return paths
++
++
++def test_branch_prints_reach_the_coordinator_session(meta, tmp_path):
++    from scilink.utils import log_context as lc
++    workers_before = set(lc._WORKERS)
++    A, B = _datasets(tmp_path, "AB")
++    _install_fakes({A: "good", B: "good"})
++    cap = sr.RoutedCapture(tag="")
++    with routed_console() as console, cap:
++        out = json.loads(meta._run_fanout(
++            [{"data_path": p, "task": f"Analyze {p}",
++              "label": os.path.basename(p)} for p in (A, B)]))
++    assert out.get("status") == "success"
++    captured = cap.getvalue()
++    assert captured.count(MARKER) == 2, (
++        "branch narration did not reach the session stream")
++    assert "analysis branch finished" in captured   # coordinator lines too
++    assert console.getvalue().count(MARKER) == 2    # console still tees
++    # No branch stays attributed once the fan-out has returned (relative to
++    # whatever an earlier test may have left running).
++    from scilink.utils import log_context as lc
++    assert set(lc._WORKERS) <= workers_before
++
++
++@pytest.mark.parametrize("shape", ["chatty", "late"])
++def test_user_stop_reaches_the_branch_threads(meta, tmp_path, shape):
++    """Stop during a fan-out must abort the branch workers, not only the
++    coordinator: a branch would otherwise run ~20 s on. 'chatty' raises
++    while the coordinator (and its route) is still there; 'late' is the
++    live shape — the branch is silent inside a model call until after the
++    coordinator has exited, and must still be stopped by its next print."""
++    from scilink.utils import log_context as lc
++    workers_before, stopped_before = set(lc._WORKERS), set(lc._STOPPED_PARENTS)
++    A, B = _datasets(tmp_path, "AB")
++    _install_fakes({A: shape, B: shape})
++    cap = sr.RoutedCapture(tag="")
++    threading.Timer(0.8, cap.request_stop).start()
++    t0 = time.monotonic()
++    # The router stays installed for the whole test, as it does for the
++    # server process: the stragglers' prints must still pass through it
++    # after the coordinator's capture is gone.
++    with routed_console():
++        with cap:
++            with pytest.raises(AgentStoppedError):
++                meta._run_fanout(
++                    [{"data_path": p, "task": f"Analyze {p}",
++                      "label": os.path.basename(p)} for p in (A, B)])
++        assert not sr._ROUTES   # coordinator turn is over; route removed
++        # Both branch threads released their admission slots well before
++        # the ~20 s they would have run to completion.
++        deadline = time.monotonic() + 8.0
++        while fo._mem_running and time.monotonic() < deadline:
++            time.sleep(0.1)
++        assert not fo._mem_running, "a branch thread outlived the user Stop"
++        assert time.monotonic() - t0 < 12.0
++        if shape == "chatty":
++            assert MARKER in cap.getvalue()
++        deadline = time.monotonic() + 5.0
++        while (set(lc._WORKERS) - workers_before
++               or set(lc._STOPPED_PARENTS) - stopped_before) \
++                and time.monotonic() < deadline:
++            time.sleep(0.05)
++        assert set(lc._WORKERS) <= workers_before
++        assert set(lc._STOPPED_PARENTS) <= stopped_before
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-v"]))
+diff --git a/tests/test_literature_cross_domain.py b/tests/test_literature_cross_domain.py
+index fcd98aa87..f85169312 100644
+--- a/tests/test_literature_cross_domain.py
++++ b/tests/test_literature_cross_domain.py
+@@ -17,6 +17,7 @@
+ """
+ 
+ import json
++import logging
+ import threading
+ from pathlib import Path
+ import time
+@@ -40,6 +41,8 @@ def __init__(self, delay=0.4, fail=()):
+         self._lock = threading.Lock()
+ 
+     def _run(self, kind, query):
++        # The real agent logs its submission from the worker thread.
++        logging.getLogger("LitAgent").info(f"🚀 Submitting ({kind}) query")
+         with self._lock:
+             self._active += 1
+             self.max_concurrent = max(self.max_concurrent, self._active)
+@@ -57,6 +60,9 @@ def search_for_hypothesis_context(self, q):
+     def search_for_cross_domain(self, q):
+         return self._run("cross_domain", q)
+ 
++    def search_for_technique_limitations(self, q):
++        return self._run("technique_limitations", q)
++
+     def search_for_economic_data(self, q):
+         return self._run("economic_data", q)
+ 
+@@ -349,17 +355,20 @@ def test_one_wedged_search_cannot_hold_the_whole_call(tool, monkeypatch,
+     func, lit, *_ = tool
+     monkeypatch.setattr(ot, "_LIT_BATCH_DEADLINE", 1)   # 1s instead of 25 min
+ 
+-    started = threading.Event()
++    started, release = threading.Event(), threading.Event()
+ 
+     def wedged(q):
+         started.set()
+-        time.sleep(30)                                   # never returns in time
++        release.wait(30)                                 # never returns in time
+         return {"status": "success", "content": "too late"}
+ 
+     lit.search_for_cross_domain = wedged
+     t0 = time.time()
+-    out = json.loads(func({"hypothesis_context": ["a", "b"],
+-                           "cross_domain": ["stuck"]}))
++    try:
++        out = json.loads(func({"hypothesis_context": ["a", "b"],
++                               "cross_domain": ["stuck"]}))
++    finally:
++        release.set()   # the abandoned worker must not outlive the test
+     elapsed = time.time() - t0
+ 
+     assert started.is_set()
+@@ -377,10 +386,14 @@ def test_all_searches_wedged_reports_failure_not_success(tool, monkeypatch):
+     from scilink.agents.planning_agents import orchestrator_tools as ot
+     func, lit, *_ = tool
+     monkeypatch.setattr(ot, "_LIT_BATCH_DEADLINE", 1)
+-    lit.search_for_hypothesis_context = lambda q: time.sleep(30)
+-    lit.search_for_cross_domain = lambda q: time.sleep(30)
+-
+-    out = json.loads(func(["x", "y"], "hypothesis_context,cross_domain"))
++    release = threading.Event()
++    lit.search_for_hypothesis_context = lambda q: release.wait(30)
++    lit.search_for_cross_domain = lambda q: release.wait(30)
++
++    try:
++        out = json.loads(func(["x", "y"], "hypothesis_context,cross_domain"))
++    finally:
++        release.set()
+     assert out["status"] != "success"
+ 
+ 
+@@ -403,7 +416,7 @@ def test_heartbeat_clock_restarts_with_each_batch(monkeypatch, capsys):
+     # ...and the reset happens INSIDE the batch loop, before the work
+     i_loop = flat.index("for start in range(0, len(tasks), MAX_CONCURRENT):")
+     i_reset = flat.index('_hb_state["t0"] = _time.time()')
+-    i_submit = flat.index("f = ex.submit(search_methods[t]")
++    i_submit = flat.index("attributed_to_current(search_methods[t])")
+     assert i_loop < i_reset < i_submit
+ 
+     # the display reads that clock and names the batch when there are several
+@@ -422,3 +435,65 @@ def test_batch_count_matches_the_announced_split():
+     MAX = 6
+     for n, expected in ((1, 1), (6, 1), (7, 2), (12, 2), (13, 3)):
+         assert -(-n // MAX) == expected, n
++
++
++def test_heartbeat_reaches_the_web_session_stream(tool, monkeypatch):
++    """#627: under the web app's per-thread stdout router the heartbeat ran
++    on an unregistered thread, so its '⏳ … still running' ticks reached
++    the server console only and a 10-15 min search read as a hang in the
++    browser. The ticker must land in the calling turn's capture."""
++    import io
++    import sys
++
++    from scilink.agents.planning_agents import orchestrator_tools as ot
++    from scilink.server import stdout_router as sr
++
++    func, lit, *_ = tool
++    monkeypatch.setattr(ot, "_LIT_HEARTBEAT_SECONDS", 0.15)
++    lit.delay = 0.9
++    console = io.StringIO()
++    old_out, old_err = sys.stdout, sys.stderr
++    sys.stdout = sr._RoutingStream(console)
++    try:
++        cap = sr.RoutedCapture(tag="")
++        with cap:
++            func("q1", "hypothesis_context,cross_domain")
++        captured = cap.getvalue()
++    finally:
++        sys.stdout, sys.stderr = old_out, old_err
++    assert "still running" in captured, (
++        "heartbeat ticks did not reach the session stream")
++    assert "still running" in console.getvalue()   # console still sees them
++
++
++def test_search_worker_log_records_reach_the_web_session_stream(tool, monkeypatch):
++    """The pool workers running the searches log 'Submitting ... query'
++    and the result lines; the web turn's log handler keeps a record only
++    when its thread is attributed to the chat thread, so those lines were
++    dropped from the browser too (#627)."""
++    import io
++    import logging
++    import threading
++
++    from scilink.utils.log_context import effective_thread
++
++    func, lit, *_ = tool
++    prev_disable = logging.root.manager.disable
++    logging.disable(logging.NOTSET)
++    chat_thread = threading.get_ident()
++    buf = io.StringIO()
++    handler = logging.StreamHandler(buf)
++    handler.setLevel(logging.INFO)
++    handler.setFormatter(logging.Formatter("%(message)s"))
++    handler.addFilter(lambda r: effective_thread(r.thread) == chat_thread)
++    root = logging.getLogger()
++    prev_level = root.level
++    root.setLevel(logging.INFO)
++    root.addHandler(handler)
++    try:
++        func("q1", "hypothesis_context,cross_domain")   # 2 jobs -> a pool
++    finally:
++        root.removeHandler(handler)
++        root.setLevel(prev_level)
++        logging.disable(prev_disable)
++    assert buf.getvalue().count("Submitting (") == 2, buf.getvalue()
+diff --git a/tests/test_log_context_attribution.py b/tests/test_log_context_attribution.py
+new file mode 100644
+index 000000000..13dd89a2f
+--- /dev/null
++++ b/tests/test_log_context_attribution.py
+@@ -0,0 +1,280 @@
++"""Background threads must inherit their session's stdout route (#627).
++
++The web app's per-thread stdout router only forwards a REGISTERED thread's
++writes to the session stream; a bare ``threading.Thread`` / ``pool.submit``
++worker's prints stay on the server console. ``start_attributed_thread`` and
++``attributed_to_current`` are the helpers that make a helper thread a child
++of the calling session for exactly the duration of its work.
++
++  conda run -n scilink python -m pytest tests/test_log_context_attribution.py -v
++"""
++import io
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from scilink.server import stdout_router as sr
++from scilink.ui.output_capture import AgentStoppedError
++from scilink.utils import log_context as lc
++
++
++def _routed_session():
++    """A routing stream over a fake console plus a capture registered for
++    the CALLING thread — the shape of one web-app turn."""
++    console = io.StringIO()
++    stream = sr._RoutingStream(console)
++    cap = sr.RoutedCapture(tag="")
++    return console, stream, cap
++
++
++def test_bare_thread_is_dropped_from_the_session_stream():
++    """The bug as observed: an unregistered thread's write reaches the
++    console only."""
++    console, stream, cap = _routed_session()
++    with cap:
++        t = threading.Thread(target=stream.write, args=("orphan\n",))
++        t.start()
++        t.join()
++    assert "orphan" in console.getvalue()
++    assert "orphan" not in cap.getvalue()
++
++
++def test_start_attributed_thread_routes_into_the_session_capture():
++    console, stream, cap = _routed_session()
++    with cap:
++        t = lc.start_attributed_thread(stream.write, args=("heartbeat\n",),
++                                       name="hb")
++        t.join(5)
++    assert "heartbeat" in cap.getvalue()
++    assert "heartbeat" in console.getvalue()   # still tees to the console
++
++
++def test_attributed_thread_unregisters_after_its_target_returns():
++    """No stale mapping survives the thread (thread ids are reused)."""
++    seen = {}
++
++    def target():
++        seen["tid"] = threading.get_ident()
++        seen["during"] = lc.effective_thread(threading.get_ident())
++
++    t = lc.start_attributed_thread(target)
++    t.join(5)
++    assert seen["during"] == threading.get_ident()
++    assert lc.effective_thread(seen["tid"]) == seen["tid"]
++
++
++def test_attributed_thread_swallows_a_session_stop():
++    """A helper stopped through the routed stream ends quietly — no
++    'Exception in thread' traceback on the console."""
++    hooked = []
++    orig_hook = threading.excepthook
++    threading.excepthook = lambda a: hooked.append(a)
++    try:
++        console, stream, cap = _routed_session()
++        with cap:
++            cap.request_stop()
++            t = lc.start_attributed_thread(stream.write, args=("tick\n",))
++            t.join(5)
++    finally:
++        threading.excepthook = orig_hook
++    assert not hooked
++    assert "tick" not in cap.getvalue()
++
++
++def test_attributed_to_current_scopes_registration_to_each_call():
++    """A pool worker is a child of the session only while it runs the
++    wrapped callable; afterwards the reused thread is unattributed again."""
++    parent = threading.get_ident()
++    tids = {}
++
++    def job():
++        tids["tid"] = threading.get_ident()
++        return lc.effective_thread(threading.get_ident())
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        assert pool.submit(lc.attributed_to_current(job)).result() == parent
++        # The SAME worker thread, unwrapped: no leftover attribution.
++        assert pool.submit(job).result() == tids["tid"]
++
++
++def test_attributed_to_current_propagates_exceptions():
++    def boom():
++        raise ValueError("branch failed")
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        with pytest.raises(ValueError, match="branch failed"):
++            pool.submit(lc.attributed_to_current(boom)).result()
++
++
++def test_attributed_to_current_receives_the_session_stop():
++    """The whole point for fan-out branches: a user Stop must reach the
++    worker (the Streamlit-era global capture did; the router only reaches
++    attributed threads)."""
++    console, stream, cap = _routed_session()
++    with cap:
++        cap.request_stop()
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            fut = pool.submit(lc.attributed_to_current(stream.write), "x\n")
++            with pytest.raises(AgentStoppedError):
++                fut.result(5)
++
++
++def test_effective_thread_follows_a_worker_chain():
++    """A best-of-N candidate inside a fan-out branch (worker of a worker)
++    resolves to the chat thread, so its output reaches the session too."""
++    chat = threading.get_ident()
++    seen = {}
++
++    def candidate():
++        seen["candidate"] = lc.effective_thread(threading.get_ident())
++
++    def branch():
++        seen["branch"] = lc.effective_thread(threading.get_ident())
++        t = lc.start_attributed_thread(candidate)
++        t.join(5)
++
++    t = lc.start_attributed_thread(branch)
++    t.join(5)
++    assert seen == {"branch": chat, "candidate": chat}
++
++
++def test_effective_thread_chain_is_bounded():
++    """A self-referencing (stale) entry must not spin forever."""
++    tid = 424242
++    with lc._LOCK:
++        lc._WORKERS[tid] = (tid, "", False)
++    try:
++        assert lc.effective_thread(tid) == tid
++    finally:
++        with lc._LOCK:
++            lc._WORKERS.pop(tid, None)
++
++
++def test_plain_register_worker_is_unchanged():
++    """The existing one-level registration keeps its exact behavior."""
++    parent = 777
++    lc.register_worker(parent, "cand_00", prefix=True)
++    try:
++        me = threading.get_ident()
++        assert lc.effective_thread(me) == parent
++        assert lc.is_concise_fanout_worker(me)
++    finally:
++        lc.unregister_worker()
++    assert lc.effective_thread(threading.get_ident()) == threading.get_ident()
++
++
++# ---------------------------------------------------------------- stop persistence
++
++
++@pytest.fixture
++def logging_enabled():
++    """Some test modules call ``logging.disable(logging.CRITICAL)`` at import
++    time, which short-circuits ``logger.info`` before the record factory —
++    the hook these tests exercise. Lift it for the test, restore after."""
++    import logging
++    prev = logging.root.manager.disable
++    logging.disable(logging.NOTSET)
++    try:
++        yield
++    finally:
++        logging.disable(prev)
++
++
++def _blocked_worker(stream, gate, results, logger_name="test.stop.persist"):
++    """An attributed worker parked in a 'long model call' (the gate) that
++    prints and logs only after being released."""
++    import logging
++
++    def body():
++        gate.wait(10)
++        try:
++            stream.write("late print\n")
++            results["print"] = "wrote"
++        except AgentStoppedError:
++            results["print"] = "raised"
++        try:
++            logging.getLogger(logger_name).info("late log record")
++            results["log"] = "emitted"
++        except AgentStoppedError:
++            results["log"] = "raised"
++    return body
++
++
++def test_stop_persists_for_workers_after_the_route_is_gone(logging_enabled):
++    """Live failure: a fan-out branch inside a long model call at Stop time
++    next printed AFTER the coordinator had exited (route removed, turn log
++    handler removed), found nothing to raise on, and kept running. The
++    stop must outlive the route for every thread attributed to the turn —
++    on the print path and on the logging path."""
++    import logging
++    logging.getLogger("test.stop.persist").setLevel(logging.INFO)
++    console, stream, cap = _routed_session()
++    gate, results = threading.Event(), {}
++    with cap:
++        t = lc.start_attributed_thread(_blocked_worker(stream, gate, results))
++        cap.request_stop()
++    assert not sr._ROUTES                      # the turn is gone...
++    gate.set()                                 # ...now the worker wakes up
++    t.join(5)
++    assert results == {"print": "raised", "log": "raised"}
++    assert not lc._STOPPED_PARENTS, "flag must clear with the last straggler"
++    assert not lc._WORKERS
++
++
++def test_worker_attributed_after_the_stop_is_stopped_too(logging_enabled):
++    """A queued fan-out branch admitted after Stop (seen live: the second
++    branch was still waiting for memory headroom) must not start narrating."""
++    import logging
++    logging.getLogger("test.stop.persist").setLevel(logging.INFO)
++    console, stream, cap = _routed_session()
++    with cap:
++        wrapped = lc.attributed_to_current(lambda: None)   # captured pre-stop
++        cap.request_stop()
++    gate, results = threading.Event(), {}
++    gate.set()
++    late = lc.attributed_to_current(_blocked_worker(stream, gate, results))
++    t = threading.Thread(target=lambda: (late(), None))
++    t.start(); t.join(5)
++    assert results == {"print": "raised", "log": "raised"}
++    assert not lc._STOPPED_PARENTS
++
++
++def test_stop_does_not_touch_unrelated_threads_or_a_fresh_turn():
++    import logging
++    console, stream, cap = _routed_session()
++    with cap:
++        lc.start_attributed_thread(lambda: None).join(5)
++        cap.request_stop()
++    # An unrelated (never attributed) thread writes and logs freely.
++    out = {}
++    def other():
++        stream.write("unrelated\n")
++        logging.getLogger("test.stop.other").warning("unrelated record")
++        out["ok"] = True
++    t = threading.Thread(target=other); t.start(); t.join(5)
++    assert out.get("ok")
++    # A fresh turn on the SAME thread id starts clean.
++    cap2 = sr.RoutedCapture(tag="")
++    with cap2:
++        res = {}
++        lc.start_attributed_thread(
++            lambda: res.setdefault("w", stream.write("fresh\n"))).join(5)
++    assert res.get("w") == 6
++    assert "fresh" in cap2.getvalue()
++    assert not lc._STOPPED_PARENTS
++
++
++def test_streamlit_capture_stop_also_persists_for_workers(logging_enabled):
++    """The Streamlit OutputCapture shares the gap (its TeeStream is
++    restored when the turn exits); same wiring, same guarantee."""
++    from scilink.ui.output_capture import OutputCapture
++    cap = OutputCapture()
++    gate, results = threading.Event(), {}
++    with cap:
++        t = lc.start_attributed_thread(_blocked_worker(sr._RoutingStream(io.StringIO()), gate, results))
++        cap.request_stop()
++    gate.set(); t.join(5)
++    assert results == {"print": "raised", "log": "raised"}
++    assert not lc._STOPPED_PARENTS
+diff --git a/tests/test_meta_analysis_child_construction.py b/tests/test_meta_analysis_child_construction.py
+new file mode 100644
+index 000000000..613a71820
+--- /dev/null
++++ b/tests/test_meta_analysis_child_construction.py
+@@ -0,0 +1,23 @@
++"""The meta must be able to construct its analysis child for real.
++
++Commit 30940a44 forwarded ``embedding_base_url`` to BOTH children, but only
++the planning orchestrator takes it — every ``delegate_to_analysis`` then
++failed with a TypeError before the child existed (seen live). The child
++factories are monkeypatched in most meta tests, which is why nothing
++caught it; this test builds the real child.
++"""
++import os
++
++os.environ.setdefault("ANTHROPIC_API_KEY", "sk-dummy")
++
++
++def test_meta_builds_a_real_analysis_child(tmp_path):
++    from scilink.agents.exp_agents.analysis_orchestrator import (
++        AnalysisOrchestratorAgent)
++    from scilink.agents.meta_agent.meta_orchestrator import (
++        MetaOrchestratorAgent)
++    meta = MetaOrchestratorAgent(base_dir=str(tmp_path), api_key="sk-dummy",
++                                 embedding_base_url="http://embed.local/v1")
++    child = meta._get_analysis_child()
++    assert isinstance(child, AnalysisOrchestratorAgent)
++    assert meta._get_analysis_child() is child   # persistent, reused
