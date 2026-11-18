@@ -1,0 +1,681 @@
+diff --git a/README.md b/README.md
+index 5c7e23909..532399ff8 100644
+--- a/README.md
++++ b/README.md
+@@ -338,7 +338,8 @@ CloudVolume(cloudpath,
+      cache=False, compress_cache=None, cdn_cache=False, progress=INTERACTIVE, info=None, provenance=None, 
+      compress=None, non_aligned_writes=False, parallel=1,
+      delete_black_uploads=False, background_color=0, 
+-     green_threads=False)
++     green_threads=False, use_https=False,
++     max_redirects=10)
+ ```
+ 
+ * mip - Which mip level to access
+@@ -359,6 +360,8 @@ CloudVolume(cloudpath,
+ * delete_black_uploads - True/False. If True, issue a DELETE http request instead of a PUT when an individual uploaded chunk is all background (usually all zeros). This is useful for avoiding creating many tiny files, which some storage system designs do not handle well.
+ * background_color - Number. Determines the background color that `delete_black_uploads` will scan for (typically zero).
+ * green_threads - True/False. If True, use the gevent cooperative threading library instead of preemptive threads. This requires monkey patching your program which may be undesirable. However, for certain workloads this can be a significant performance improvement on multi-core devices.
++* use_https - True/False. If True, use the same read-only access urls that neuroglancer does that may be cached vs the secured read/write strongly consistent API. Use this when you do not have credentials.  
++* max_redirects - Integer. If > 0, allow info files containing a 'redirect' field to forward the CloudVolume instance across this many hops before raising an error. If set to <= 0, then do not allow redirection, but also do not raise an error (which allows for easy editing of info files with a redirect in them).  
+ 
+ ### CloudVolume Methods
+ 
+diff --git a/cloudvolume/cloudvolume.py b/cloudvolume/cloudvolume.py
+index 9d2d50f80..0222c24d9 100644
+--- a/cloudvolume/cloudvolume.py
++++ b/cloudvolume/cloudvolume.py
+@@ -57,7 +57,8 @@ def __new__(cls,
+     cdn_cache=True, progress=INTERACTIVE, info=None, provenance=None,
+     compress=None, non_aligned_writes=False, parallel=1,
+     delete_black_uploads=False, background_color=0,
+-    green_threads=False, use_https=False
++    green_threads=False, use_https=False,
++    max_redirects=10
+   ):
+     """
+     A "serverless" Python client for reading and writing arbitrarily large 
+@@ -155,15 +156,18 @@ def __new__(cls,
+       info: (dict) In lieu of fetching a neuroglancer info file, use this one.
+           This is useful when creating new datasets and for repeatedly initializing
+           a new cloudvolume instance.
++      max_redirects: (int) if > 0, allow up to this many redirects via info file 'redirect'
++          data fields. If <= 0, allow no redirections and access the current info file directly
++          without raising an error.
++      mip: (int or iterable) Which level of downsampling to read and write from.
++          0 is the highest resolution. You can also specify the voxel resolution
++          like mip=[6,6,30] which will search for the appropriate mip level.
+       non_aligned_writes: (bool) Enable non-aligned writes. Not multiprocessing 
+           safe without careful design. When not enabled, a 
+           cloudvolume.exceptions.AlignmentError is thrown for non-aligned writes. 
+           
+           https://github.com/seung-lab/cloud-volume/wiki/Advanced-Topic:-Non-Aligned-Writes
+ 
+-      mip: (int or iterable) Which level of downsampling to read and write from.
+-          0 is the highest resolution. You can also specify the voxel resolution
+-          like mip=[6,6,30] which will search for the appropriate mip level.
+       parallel (int: 1, bool): Number of extra processes to launch, 1 means only 
+           use the main process. If parallel is True use the number of CPUs 
+           returned by multiprocessing.cpu_count(). When parallel > 1, shared
+diff --git a/cloudvolume/datasource/__init__.py b/cloudvolume/datasource/__init__.py
+index db0cbf0cc..e6a66c85c 100644
+--- a/cloudvolume/datasource/__init__.py
++++ b/cloudvolume/datasource/__init__.py
+@@ -43,6 +43,13 @@ def delete(self, bbox, mip):
+   def transfer_to(self, cloudpath, bbox, mip):
+     raise NotImplementedError()
+ 
++def readonlyguard(fn):
++  def guardfn(self, *args, **kwargs):
++    if self.readonly:
++      raise exceptions.ReadOnlyException(self.meta.cloudpath)
++    return fn(self, *args, **kwargs)
++  return guardfn
++
+ def check_grid_aligned(meta, img, bounds, mip, throw_error=False):
+   """Raise a cloudvolume.exceptions.AlignmentError if the provided image is not grid aligned."""
+   shape = Vec(*img.shape)[:3]
+diff --git a/cloudvolume/datasource/boss/image.py b/cloudvolume/datasource/boss/image.py
+index e3cb0e851..fe30e06e1 100644
+--- a/cloudvolume/datasource/boss/image.py
++++ b/cloudvolume/datasource/boss/image.py
+@@ -5,7 +5,7 @@
+   ChannelResource, ExperimentResource, CoordinateFrameResource
+ )
+ 
+-from .. import autocropfn
++from .. import autocropfn, readonlyguard, ImageSourceInterface
+ 
+ from ... import exceptions 
+ from ...lib import ( 
+@@ -15,12 +15,13 @@
+ from ...secrets import boss_credentials
+ from ...volumecutout import VolumeCutout
+ 
+-class BossImageSource(object):
++class BossImageSource(ImageSourceInterface):
+   def __init__(
+     self, config, meta, cache,
+     autocrop=False, bounded=True,
+     non_aligned_writes=False,
+-    delete_black_uploads=False
++    delete_black_uploads=False,
++    readonly=False,
+   ):
+     self.config = config
+     self.meta = meta 
+@@ -29,6 +30,7 @@ def __init__(
+     self.autocrop = bool(autocrop)
+     self.bounded = bool(bounded)
+     self.non_aligned_writes = bool(non_aligned_writes)
++    self.readonly = bool(readonly)
+ 
+   def download(self, bbox, mip):
+     bounds = Bbox.clamp(bbox, self.meta.bounds(mip))
+@@ -74,6 +76,7 @@ def download(self, bbox, mip):
+     txrx.shade(renderbuffer, bbox, cutout, bounds)
+     return VolumeCutout.from_volume(self.meta, mip, renderbuffer, bbox)
+ 
++  @readonlyguard
+   def upload(self, image, offset, mip):
+     shape = Vec(*image.shape[:3])
+     offset = Vec(*offset)
+@@ -118,6 +121,7 @@ def upload(self, image, offset, mip):
+   def exists(self, bbox, mip=None):
+     raise NotImplementedError()
+ 
++  @readonlyguard
+   def delete(self, bbox, mip=None):
+     raise NotImplementedError()
+ 
+diff --git a/cloudvolume/datasource/precomputed/__init__.py b/cloudvolume/datasource/precomputed/__init__.py
+index 646b93d84..e2b3178ec 100644
+--- a/cloudvolume/datasource/precomputed/__init__.py
++++ b/cloudvolume/datasource/precomputed/__init__.py
+@@ -6,6 +6,7 @@
+ from ...cloudvolume import register_plugin, SharedConfiguration
+ from ...cacheservice import CacheService
+ from ...frontends import CloudVolumePrecomputed
++from ...lib import yellow
+ from ...paths import strict_extract
+ 
+ def create_precomputed(
+@@ -14,7 +15,8 @@ def create_precomputed(
+     cdn_cache=True, progress=False, info=None, provenance=None,
+     compress=None, non_aligned_writes=False, parallel=1,
+     delete_black_uploads=False, background_color=0, 
+-    green_threads=False, use_https=False
++    green_threads=False, use_https=False,
++    max_redirects=10
+   ):
+     path = strict_extract(cloudpath)
+     config = SharedConfiguration(
+@@ -36,8 +38,33 @@ def create_precomputed(
+     meta = PrecomputedMetadata(
+       cloudpath, cache=cache,
+       info=info, provenance=provenance,
++      max_redirects=max_redirects
+     )
+ 
++    readonly = bool(meta.redirected_from)
++
++    if readonly:
++      print(yellow("""
++        Redirected 
++
++        From: {} 
++        To:   {}
++        Hops: {}
++
++        Volume set to readonly to mitigate accidental
++        redirection resulting in writing data to the wrong 
++        location.
++
++        To set the data to writable, access the destination
++        location directly or set:
++
++        vol.image.readonly = False
++        vol.mesh.readonly = False 
++        vol.skeleton.readonly = False
++      """.format(
++        cloudpath, meta.cloudpath, len(meta.redirected_from)
++      )))
++
+     image = PrecomputedImageSource(
+       config, meta, cache,
+       autocrop=bool(autocrop),
+@@ -46,10 +73,11 @@ def create_precomputed(
+       fill_missing=bool(fill_missing),
+       delete_black_uploads=bool(delete_black_uploads),
+       background_color=background_color,
++      readonly=readonly,
+     )
+ 
+-    mesh = PrecomputedMeshSource(meta, cache, config)
+-    skeleton = PrecomputedSkeletonSource(meta, cache, config)
++    mesh = PrecomputedMeshSource(meta, cache, config, readonly)
++    skeleton = PrecomputedSkeletonSource(meta, cache, config, readonly)
+ 
+     return CloudVolumePrecomputed(
+       meta, cache, config, 
+diff --git a/cloudvolume/datasource/precomputed/image/__init__.py b/cloudvolume/datasource/precomputed/image/__init__.py
+index f5c4ebd6a..e3006e909 100644
+--- a/cloudvolume/datasource/precomputed/image/__init__.py
++++ b/cloudvolume/datasource/precomputed/image/__init__.py
+@@ -18,7 +18,7 @@
+ from .... import sharedmemory
+ from ....storage import Storage
+ 
+-from ... import autocropfn, ImageSourceInterface
++from ... import autocropfn, readonlyguard, ImageSourceInterface
+ from .. import sharding
+ from .common import chunknames
+ from . import tx, rx
+@@ -31,6 +31,7 @@ def __init__(
+     fill_missing=False, 
+     delete_black_uploads=False,
+     background_color=0,
++    readonly=False,
+   ):
+     self.config = config
+     self.meta = meta 
+@@ -40,6 +41,7 @@ def __init__(
+     self.bounded = bool(bounded)
+     self.fill_missing = bool(fill_missing)
+     self.non_aligned_writes = bool(non_aligned_writes)
++    self.readonly = bool(readonly)
+     
+     self.delete_black_uploads = bool(delete_black_uploads)
+     self.background_color = background_color
+@@ -136,6 +138,7 @@ def download(
+         green=self.config.green,
+       )
+ 
++  @readonlyguard
+   def upload(
+       self, 
+       image, offset, mip, 
+@@ -194,6 +197,7 @@ def exists(self, bbox, mip=None):
+       existence_report = storage.files_exist(cloudpaths)
+     return existence_report
+ 
++  @readonlyguard
+   def delete(self, bbox, mip=None):
+     if mip is None:
+       mip = self.config.mip
+diff --git a/cloudvolume/datasource/precomputed/mesh.py b/cloudvolume/datasource/precomputed/mesh.py
+index 14ed115c9..3d1d6afaa 100644
+--- a/cloudvolume/datasource/precomputed/mesh.py
++++ b/cloudvolume/datasource/precomputed/mesh.py
+@@ -25,11 +25,13 @@ def filename_to_segid(filename):
+   return int(segid)
+ 
+ class PrecomputedMeshSource(object):
+-  def __init__(self, meta, cache, config):
++  def __init__(self, meta, cache, config, readonly=False):
+     self.meta = meta
+     self.cache = cache
+     self.config = config
+ 
++    self.readonly = bool(readonly)
++
+   @property
+   def path(self):
+     return self.meta.info['mesh']
+diff --git a/cloudvolume/datasource/precomputed/metadata.py b/cloudvolume/datasource/precomputed/metadata.py
+index 2f5ea4c40..ee84a9a10 100644
+--- a/cloudvolume/datasource/precomputed/metadata.py
++++ b/cloudvolume/datasource/precomputed/metadata.py
+@@ -19,7 +19,7 @@
+   colorize, red, mkdir, 
+   Vec, Bbox, jsonify, 
+ )
+-from ...paths import strict_extract
++from ...paths import strict_extract, ascloudpath
+ 
+ def downscale(size, factor_in_mip, roundingfn):
+   smaller = Vec(*size, dtype=np.float32) / Vec(*factor_in_mip)
+@@ -35,15 +35,21 @@ class PrecomputedMetadata(object):
+   This class is a building block for building a class that can
+   read and write Precomputed data types.
+   """
+-  def __init__(self, cloudpath, cache=None, info=None, provenance=None):
++  def __init__(
++    self, cloudpath, cache=None, 
++    info=None, provenance=None, 
++    max_redirects=10
++  ):
+     self.path = strict_extract(cloudpath)
+     self.cache = cache
+     if self.cache:
+       self.cache.meta = self
+     self.info = None
+ 
++    self.redirected_from = []
++
+     if info is None:
+-      self.refresh_info()
++      self.refresh_info(max_redirects=max_redirects)
+       if self.cache and self.cache.enabled:
+         self.cache.check_info_validity()
+     else:
+@@ -63,7 +69,7 @@ def create_info(cls,
+     resolution, voxel_offset, volume_size, 
+     mesh=None, skeletons=None, chunk_size=(128,128,64),
+     compressed_segmentation_block_size=(8,8,8),
+-    max_mip=0, factor=Vec(2,2,1) 
++    max_mip=0, factor=Vec(2,2,1), redirect=None
+   ):
+     """
+     Create a new neuroglancer Precomputed info file.
+@@ -85,6 +91,7 @@ def create_info(cls,
+         (only used when encoding is 'compressed_segmentation')
+       max_mip: (int), the maximum mip level id.
+       factor: (Vec), the downsampling factor for each mip level
++      redirect: (str), cloudpath to redirect to
+ 
+     Returns: dict representing a single mip level that's JSON encodable
+     """
+@@ -107,6 +114,9 @@ def create_info(cls,
+         "size": list(map(int, volume_size)),
+       }],
+     }
++
++    if redirect is not None:
++      info['redirect'] = str(redirect)
+     
+     fullres = info['scales'][0]
+     factor_in_mip = factor.clone()
+@@ -136,13 +146,18 @@ def create_info(cls,
+     
+     return info
+ 
+-  def refresh_info(self):
++  def refresh_info(self, max_redirects=10):
+     """
+     Refresh the current info file from the cache (if enabled) 
+     or primary storage (e.g. the cloud) if not cached.
+ 
+-    Raises cloudvolume.exceptions.InfoUnavailableError when the info file 
+-    is unable to be retrieved.
++    Raises:
++      cloudvolume.exceptions.InfoUnavailableError when the info file 
++        is unable to be retrieved.
++      cloudvolume.exceptions.TooManyRedirects if more than max_redirects
++        are followed.
++      cloudvolume.exceptions.CyclicRedirect if a previously visited 
++        location is revisited.
+ 
+     See also: fetch_info
+ 
+@@ -154,7 +169,7 @@ def refresh_info(self):
+         self.info = info
+         return self.info
+ 
+-    self.info = self.fetch_info()
++    self.info = self.redirectable_fetch_info(max_redirects)
+ 
+     if self.cache:
+       self.cache.maybe_cache_info()
+@@ -179,6 +194,75 @@ def fetch_info(self):
+       raise exceptions.InfoUnavailableError(
+         red('No info file was found: {}'.format(self.infopath))
+       )
++
++    return info
++
++  def redirectable_fetch_info(self, max_redirects=10):
++    """
++    Refresh the current info file from primary storage (e.g. the cloud) without
++    refrence to the cache. The cache will not be updated. 'redirect' links
++    in the info file will be followed up to `max_redirects` times after which
++    an exception will be raised.
++
++    Raises:
++      cloudvolume.exceptions.InfoUnavailableError when the info file 
++        is unable to be retrieved.
++      cloudvolume.exceptions.TooManyRedirects if more than max_redirects
++        are followed.
++      cloudvolume.exceptions.CyclicRedirect if a previously visited 
++        location is revisited.
++
++    See also: refresh_info, fetch_info
++
++    Optional:
++      max_redirects: if 'redirect' is specified in an info file, 
++        follow the link up to this many times to the pointed locations.
++
++    Returns: dict
++    """
++    visited = []
++
++    if max_redirects <= 0:
++      return self.fetch_info()
++
++    if self.path.format == 'graphene':
++      start = self.server_url
++    else:
++      start = self.cloudpath
++
++    for _ in range(max_redirects):
++      info = self.fetch_info()
++
++      if 'redirect' not in info or not info['redirect']:
++        break
++
++      path = strict_extract(info['redirect'])
++      if path == self.path:
++        break 
++      elif path in visited:
++        raise exceptions.CyclicRedirect(
++          """
++Tried to redirect through a cycle.
++
++Start: {}
++Hops: 
++\t{}
++\n""".format(
++          start, 
++          "\n\t".join([ 
++            str(i+1) + ". " + ascloudpath(v) for i, v in enumerate(visited) 
++          ]))
++        )
++
++      visited.append(path)
++      self.path = path
++    else:
++      raise exceptions.TooManyRedirects(
++        "Tried to redirect more than {} hops.".format(max_redirects)
++      )
++
++    self.redirected_from = visited[:-1]
++
+     return info
+ 
+   def commit_info(self):
+diff --git a/cloudvolume/datasource/precomputed/skeleton/__init__.py b/cloudvolume/datasource/precomputed/skeleton/__init__.py
+index 1ca867d49..0081e5a17 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/__init__.py
++++ b/cloudvolume/datasource/precomputed/skeleton/__init__.py
+@@ -10,13 +10,13 @@
+ from ....cloudvolume import SharedConfiguration
+ 
+ class PrecomputedSkeletonSource(object):
+-  def __new__(cls, meta, cache, config):
++  def __new__(cls, meta, cache, config, readonly=False):
+     skel_meta = PrecomputedSkeletonMetadata(meta, cache)
+ 
+     if skel_meta.is_sharded():
+-      return ShardedPrecomputedSkeletonSource(skel_meta, cache, config)      
++      return ShardedPrecomputedSkeletonSource(skel_meta, cache, config, readonly) 
+ 
+-    return UnshardedPrecomputedSkeletonSource(skel_meta, cache, config)
++    return UnshardedPrecomputedSkeletonSource(skel_meta, cache, config, readonly)
+ 
+   @classmethod
+   def from_cloudpath(cls, cloudpath, cache=False, progress=False):
+diff --git a/cloudvolume/datasource/precomputed/skeleton/sharded.py b/cloudvolume/datasource/precomputed/skeleton/sharded.py
+index 93f816fbd..c6cb7af05 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/sharded.py
++++ b/cloudvolume/datasource/precomputed/skeleton/sharded.py
+@@ -3,10 +3,11 @@
+ 
+ 
+ class ShardedPrecomputedSkeletonSource(object):
+-  def __init__(self, meta, cache, config):
++  def __init__(self, meta, cache, config, readonly=False):
+     self.meta = meta
+     self.cache = cache
+     self.config = config
++    self.readonly = bool(readonly)
+ 
+     spec = ShardingSpecification.from_dict(self.meta.info['sharding'])
+     self.reader = ShardReader(meta, cache, spec)
+diff --git a/cloudvolume/datasource/precomputed/skeleton/unsharded.py b/cloudvolume/datasource/precomputed/skeleton/unsharded.py
+index eb3d72b32..0d1676c74 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/unsharded.py
++++ b/cloudvolume/datasource/precomputed/skeleton/unsharded.py
+@@ -14,15 +14,18 @@
+ from cloudvolume.storage import Storage, SimpleStorage
+ 
+ from ..common import cdn_cache_control
++from ... import readonlyguard
+ 
+ from ....skeleton import Skeleton
+ 
+ class UnshardedPrecomputedSkeletonSource(object):
+-  def __init__(self, meta, cache, config):
++  def __init__(self, meta, cache, config, readonly=False):
+     self.meta = meta
+     self.cache = cache
+     self.config = config
+ 
++    self.readonly = bool(readonly)
++
+   @property
+   def path(self):
+     return self.meta.skeleton_path 
+@@ -84,6 +87,7 @@ def get(self, segids, allow_missing=False):
+ 
+     return None
+ 
++  @readonlyguard
+   def upload_raw(self, segid, vertices, edges, radii=None, vertex_types=None):
+     skel = Skeleton(
+       vertices, edges, radii, 
+@@ -91,6 +95,7 @@ def upload_raw(self, segid, vertices, edges, radii=None, vertex_types=None):
+     )
+     return self.upload(skel)
+     
++  @readonlyguard
+   def upload(self, skeletons):
+     if type(skeletons) == Skeleton:
+       skeletons = [ skeletons ]
+diff --git a/cloudvolume/exceptions.py b/cloudvolume/exceptions.py
+index 710d07469..13ba87de3 100644
+--- a/cloudvolume/exceptions.py
++++ b/cloudvolume/exceptions.py
+@@ -1,12 +1,30 @@
+ 
+-class InfoUnavailableError(ValueError):
++class InfoError(Exception):
++  pass
++
++class InfoUnavailableError(InfoError):
+   """CloudVolume was unable to access this layer's info file."""
+   pass
+ 
++class RedirectError(InfoError):
++  pass
++
++class TooManyRedirects(RedirectError):
++  """The chain of redirects became unconvincingly long."""
++  pass
++
++class CyclicRedirect(RedirectError):
++  """Unable to resolve redirects due to cycle."""
++  pass
++
+ class ScaleUnavailableError(IndexError):
+   """The info file is not configured to support this scale / mip level."""
+   pass
+ 
++class ReadOnlyException(Exception):
++  """Attempted to write to a readonly data source."""
++  pass
++
+ class AlignmentError(ValueError):
+   """Signals that an operation requiring chunk alignment was not aligned."""
+   pass 
+diff --git a/cloudvolume/frontends/precomputed.py b/cloudvolume/frontends/precomputed.py
+index fe2f6ac43..b23746fe8 100644
+--- a/cloudvolume/frontends/precomputed.py
++++ b/cloudvolume/frontends/precomputed.py
+@@ -202,7 +202,8 @@ def create_new_info(cls,
+     resolution, voxel_offset, volume_size, 
+     mesh=None, skeletons=None, chunk_size=(64,64,64),
+     compressed_segmentation_block_size=(8,8,8),
+-    max_mip=0, factor=Vec(2,2,1), *args, **kwargs
++    max_mip=0, factor=Vec(2,2,1), redirect=None, 
++    *args, **kwargs
+   ):
+     """
+     Create a new neuroglancer Precomputed info file.
+@@ -224,6 +225,8 @@ def create_new_info(cls,
+         (only used when encoding is 'compressed_segmentation')
+       max_mip: (int), the maximum mip level id.
+       factor: (Vec), the downsampling factor for each mip level
++      redirect: If this volume has moved, you can set an automatic redirect
++        by specifying a cloudpath here.
+ 
+     Returns: dict representing a single mip level that's JSON encodable
+     """
+diff --git a/cloudvolume/paths.py b/cloudvolume/paths.py
+index 2f1d260be..33afa4af4 100644
+--- a/cloudvolume/paths.py
++++ b/cloudvolume/paths.py
+@@ -1,5 +1,6 @@
+ from collections import namedtuple
+ import os
++import posixpath
+ import re
+ import sys
+ 
+@@ -28,6 +29,12 @@
+   ", ".join(ALLOWED_FORMATS), ", ".join(ALLOWED_PROTOCOLS), '{}' # curry first two
+ )
+ 
++def ascloudpath(epath):
++  return "{}://{}://{}".format(
++    epath.format, epath.protocol, 
++    posixpath.join(epath.basepath, epath.dataset, epath.layer)
++  )
++
+ def pop_protocol(cloudpath):
+   protocol_re = re.compile(r'(\w+)://')
+ 
+diff --git a/test/test_cloudvolume.py b/test/test_cloudvolume.py
+index c1a591d89..027d13746 100644
+--- a/test/test_cloudvolume.py
++++ b/test/test_cloudvolume.py
+@@ -1300,7 +1300,80 @@ def test_get_mesh_order_stability():
+ #   bimg = bossvol[:,:,5:6]
+ #   assert np.any(bimg > 0)
+ 
++def test_redirects():
++  info = CloudVolume.create_new_info(
++    num_channels=1, # Increase this number when we add more tests for RGB
++    layer_type='image', 
++    data_type='uint8', 
++    encoding='raw',
++    resolution=[ 1,1,1 ], 
++    voxel_offset=[0,0,0], 
++    volume_size=[128,128,64],
++    mesh='mesh', 
++    chunk_size=[ 64,64,64 ],
++  )
++
++  vol = CloudVolume('file:///tmp/cloudvolume/redirects_0', mip=0, info=info)
++  vol.commit_info()
++  vol.refresh_info()
++
++  vol.info['redirect'] = 'file:///tmp/cloudvolume/redirects_0'
++  vol.commit_info()
++  vol.refresh_info()
++
++  del vol.info['redirect']
++
++  for i in range(0, 10):
++    info['redirect'] = 'file:///tmp/cloudvolume/redirects_' + str(i + 1)  
++    vol = CloudVolume('file:///tmp/cloudvolume/redirects_' + str(i), mip=0, info=info)
++    vol.commit_info()
++  else:
++    del vol.info['redirect']
++    vol.commit_info()
++
++  vol = CloudVolume('file:///tmp/cloudvolume/redirects_0', mip=0)
++
++  assert vol.cloudpath == 'file:///tmp/cloudvolume/redirects_9'
++
++  info['redirect'] = 'file:///tmp/cloudvolume/redirects_10'
++  vol = CloudVolume('file:///tmp/cloudvolume/redirects_9', mip=0, info=info)
++  vol.commit_info()
++
++  try:
++    CloudVolume('file:///tmp/cloudvolume/redirects_0', mip=0)  
++    assert False 
++  except exceptions.TooManyRedirects:
++    pass
++
++  vol = CloudVolume('file:///tmp/cloudvolume/redirects_9', max_redirects=0)
++  del vol.info['redirect']
++  vol.commit_info()
++
++  vol = CloudVolume('file:///tmp/cloudvolume/redirects_5', max_redirects=0)  
++  vol.info['redirect'] = 'file:///tmp/cloudvolume/redirects_1'
++  vol.commit_info()
++
++  try:
++    vol = CloudVolume('file:///tmp/cloudvolume/redirects_5')
++    assert False
++  except exceptions.CyclicRedirect:
++    pass
+ 
++  vol.info['redirect'] = 'file:///tmp/cloudvolume/redirects_6'
++  vol.commit_info()
++
++  vol = CloudVolume('file:///tmp/cloudvolume/redirects_1')
++
++  try:
++    vol[:,:,:] = 1
++    assert False 
++  except exceptions.ReadOnlyException:
++    pass
++
++  for i in range(0, 10):
++    delete_layer('/tmp/cloudvolume/redirects_' + str(i))  
+   
+ 
+ 
++
++

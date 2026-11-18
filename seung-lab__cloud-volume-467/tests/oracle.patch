@@ -1,0 +1,538 @@
+diff --git a/.travis.yml b/.travis.yml
+index f0d170baf..058cc4def 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -10,7 +10,6 @@ before_install:
+ - mkdir -p ~/.cloudvolume/secrets/
+ - echo $AWS_SECRET > ~/.cloudvolume/secrets/aws-secret.json
+ - echo $GOOGLE_SECRET > ~/.cloudvolume/secrets/google-secret.json
+-- echo $BOSS_SECRET > ~/.cloudvolume/secrets/boss-secret.json
+ install:
+ - virtualenv -p python3 venv
+ - source venv/bin/activate
+diff --git a/cloudvolume/cloudvolume.py b/cloudvolume/cloudvolume.py
+index 993806a38..7d4d9ee32 100644
+--- a/cloudvolume/cloudvolume.py
++++ b/cloudvolume/cloudvolume.py
+@@ -4,7 +4,7 @@
+ import multiprocessing as mp
+ import numpy as np
+ 
+-from .exceptions import UnsupportedFormatError
++from .exceptions import UnsupportedFormatError, DimensionError
+ from .lib import generate_random_string
+ from .paths import strict_extract, to_https_protocol
+ 
+@@ -240,21 +240,22 @@ def from_numpy(cls,
+                         or np.issubdtype(arr.dtype, np.floating):
+         layer_type = 'image'
+       else:
+-        raise NotImplementedError
++        raise ValueError(f"{arr.dtype} is not supported.")
+ 
+     if arr.ndim == 3:
+       num_channels = 1
+     elif arr.ndim == 4:
+       num_channels = arr.shape[-1]
+     else:
+-      raise NotImplementedError
+-
++      raise DimensionError(f"CloudVolume only accepts 3 or 4 dimensional images. Got: {arr.ndim}")
++      
+     info = cls.create_new_info(
+       num_channels, layer_type, arr.dtype.name,
+       encoding, resolution,
+       voxel_offset, arr.shape[:3],
+       chunk_size=chunk_size, max_mip=max_mip
+     )
++    
+     vol = CloudVolume(vol_path, info=info, bounded=True, compress=compress)
+     # save the info file
+     vol.commit_info()
+diff --git a/cloudvolume/datasource/precomputed/mesh/unsharded.py b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+index d065aa1ff..cb52a9d45 100644
+--- a/cloudvolume/datasource/precomputed/mesh/unsharded.py
++++ b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+@@ -41,7 +41,8 @@ def __init__(self, meta, cache, config, readonly=False):
+       self.spatial_index = CachedSpatialIndex(
+         self.cache, self.config,
+         cloudpath=self.meta.layerpath, 
+-        bounds=self.meta.meta.bounds(mip) * self.meta.meta.resolution(mip),
++        bounds=self.meta.meta.bounds(mip), 
++        resolution=self.meta.info['spatial_index'].get('resolution', self.meta.meta.resolution(mip)),
+         chunk_size=self.meta.info['spatial_index']['chunk_size'],
+       )
+ 
+diff --git a/cloudvolume/datasource/precomputed/metadata.py b/cloudvolume/datasource/precomputed/metadata.py
+index a69f70054..34c2ac80d 100644
+--- a/cloudvolume/datasource/precomputed/metadata.py
++++ b/cloudvolume/datasource/precomputed/metadata.py
+@@ -82,7 +82,7 @@ def create_info(cls,
+       layer_type: (str) typically "image" or "segmentation"
+       data_type: (str) e.g. "uint8", "uint16", "uint32", "float32"
+       encoding: (str) "raw" for binaries like numpy arrays, "jpeg"
+-      resolution: int (x,y,z), x,y,z voxel dimensions in nanometers
++      resolution: float (x,y,z), x,y,z voxel dimensions in nanometers
+       voxel_offset: int (x,y,z), beginning of dataset in positive cartesian space
+       volume_size: int (x,y,z), extent of dataset in cartesian space from voxel_offset
+     
+@@ -104,15 +104,20 @@ def create_info(cls,
+     if not isinstance(data_type, str):
+       data_type = np.dtype(data_type).name
+ 
++    precision = max(map(lib.getprecision, resolution))
++    res_dtype = float
++    if precision == 0:
++      res_dtype = int
++
+     info = {
+       "num_channels": int(num_channels),
+       "type": layer_type,
+       "data_type": data_type,
+       "scales": [{
+         "encoding": encoding,
+-        "chunk_sizes": [chunk_size],
++        "chunk_sizes": [ list(map(int, chunk_size)) ],
+         "key": "_".join(map(str, resolution)),
+-        "resolution": list(map(int, resolution)),
++        "resolution": list(map(res_dtype, resolution)),
+         "voxel_offset": list(map(int, voxel_offset)),
+         "size": list(map(int, volume_size)),
+       }],
+@@ -126,17 +131,8 @@ def create_info(cls,
+  
+     # add mip levels
+     for _ in range(max_mip):
+-      new_resolution = list(map(int, Vec(*fullres['resolution']) * factor_in_mip ))
+-      newscale = {
+-        u"encoding": encoding,
+-        u"chunk_sizes": [ list(map(int, chunk_size)) ],
+-        u"key": "_".join(map(str, new_resolution)),
+-        u"resolution": new_resolution,
+-        u"voxel_offset": downscale(fullres['voxel_offset'], factor_in_mip, np.floor),
+-        u"size": downscale(fullres['size'], factor_in_mip, np.ceil),
+-      }
+-      info['scales'].append(newscale)
+-      factor_in_mip *= factor
++      scale = cls.add_scale(None, factor, encoding=encoding, chunk_size=chunk_size, info=info)
++      info["scales"].append(scale)
+ 
+     if encoding == 'compressed_segmentation':
+       info['scales'][0]['compressed_segmentation_block_size'] = list(map(int, compressed_segmentation_block_size))
+@@ -547,7 +543,9 @@ def voxel_offset(self, mip):
+ 
+   def resolution(self, mip):
+     """Vec(x,y,z) dimensions of each voxel in nanometers"""
+-    return Vec(*self.info['scales'][mip]['resolution'])
++    res = self.info['scales'][mip]['resolution']
++    dtype = float if lib.floating(res) else int
++    return Vec(*res, dtype=dtype)
+ 
+   def to_mip(self, mip):
+     mip = list(mip) if isinstance(mip, Iterable) else int(mip)
+@@ -631,8 +629,12 @@ def reset_scales(self):
+     """Used for manually resetting downsamples if something messed up."""
+     self.info['scales'] = self.info['scales'][0:1]
+ 
+-  def add_resolution(self, res, encodig=None, chunk_size=None, info=None):
+-    factor = Vec(res, dtype=np.float32) // self.meta.resolution(0)
++  def add_resolution(self, res, encoding=None, chunk_size=None, info=None):
++    if isinstance(res[0], float):
++      factor = Vec(*res, dtype=float) / self.resolution(0)
++    else:
++      factor = Vec(*res, dtype=float) // self.resolution(0)
++
+     return self.add_scale(factor, encoding, chunk_size, info)
+ 
+   def add_scale(self, factor, encoding=None, chunk_size=None, info=None):
+@@ -669,10 +671,17 @@ def add_scale(self, factor, encoding=None, chunk_size=None, info=None):
+     if encoding is None:
+       encoding = fullres['encoding']
+ 
++    precision = max(map(lib.getprecision, fullres['resolution']))
++    precision = max(precision, max(map(lib.getprecision, factor)))
++
++    dtype = float
++    if precision == 0:
++      dtype = int
++
+     newscale = {
+       u"encoding": encoding,
+       u"chunk_sizes": [ list(map(int, chunk_size)) ],
+-      u"resolution": list(map(int, Vec(*fullres['resolution']) * factor )),
++      u"resolution": list(map(dtype, Vec(*fullres['resolution'], dtype=dtype) * factor )),
+       u"voxel_offset": downscale(fullres.get('voxel_offset', (0,0,0)), factor, np.floor),
+       u"size": downscale(fullres['size'], factor, np.ceil),
+     }
+@@ -685,11 +694,11 @@ def add_scale(self, factor, encoding=None, chunk_size=None, info=None):
+ 
+     newscale[u'key'] = str("_".join([ str(res) for res in newscale['resolution']]))
+ 
+-    new_res = np.array(newscale['resolution'], dtype=int)
++    new_res = np.array(newscale['resolution'], dtype=dtype)
+ 
+     preexisting = False
+     for index, scale in enumerate(info['scales']):
+-      res = np.array(scale['resolution'], dtype=int)
++      res = np.array(scale['resolution'], dtype=dtype)
+       if np.array_equal(new_res, res):
+         preexisting = True
+         info['scales'][index] = newscale
+diff --git a/cloudvolume/datasource/precomputed/skeleton/metadata.py b/cloudvolume/datasource/precomputed/skeleton/metadata.py
+index 6b5ef6f50..e50688652 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/metadata.py
++++ b/cloudvolume/datasource/precomputed/skeleton/metadata.py
+@@ -1,3 +1,4 @@
++import copy
+ import re
+ 
+ from ....lib import jsonify
+@@ -79,14 +80,20 @@ def refresh_info(self):
+     return self.info
+ 
+   def commit_info(self):
+-    if self.info:
+-      self.cache.upload_single(
+-        self.meta.join(self.skeleton_path, 'info'),
+-        jsonify(self.info), 
+-        content_type='application/json',
+-        compress=False,
+-        cache_control='no-cache',
+-      )
++    if self.info is None:
++      return 
++
++    info = copy.deepcopy(self.info)
++    if info.get("sharding", None) is None:
++      del info["sharding"]
++
++    self.cache.upload_single(
++      self.meta.join(self.skeleton_path, 'info'),
++      jsonify(info), 
++      content_type='application/json',
++      compress=False,
++      cache_control='no-cache',
++    )
+ 
+   def default_info(self):
+     return {
+diff --git a/cloudvolume/datasource/precomputed/skeleton/sharded.py b/cloudvolume/datasource/precomputed/skeleton/sharded.py
+index b97c97ab3..a3cdc8d33 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/sharded.py
++++ b/cloudvolume/datasource/precomputed/skeleton/sharded.py
+@@ -19,7 +19,8 @@ def __init__(self, meta, cache, config, readonly=False):
+       self.spatial_index = CachedSpatialIndex(
+         self.cache, self.config,
+         cloudpath=self.meta.layerpath, 
+-        bounds=self.meta.meta.bounds(mip) * self.meta.meta.resolution(mip),
++        bounds=self.meta.meta.bounds(mip),
++        resolution=self.meta.info['spatial_index'].get('resolution', self.meta.meta.resolution(mip)),
+         chunk_size=self.meta.info['spatial_index']['chunk_size'],
+       )
+ 
+diff --git a/cloudvolume/datasource/precomputed/skeleton/unsharded.py b/cloudvolume/datasource/precomputed/skeleton/unsharded.py
+index 74b90dc8b..5b251aa5e 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/unsharded.py
++++ b/cloudvolume/datasource/precomputed/skeleton/unsharded.py
+@@ -32,7 +32,8 @@ def __init__(self, meta, cache, config, readonly=False):
+       self.spatial_index = CachedSpatialIndex(
+         self.cache, self.config,
+         cloudpath=self.meta.layerpath, 
+-        bounds=self.meta.meta.bounds(mip) * self.meta.meta.resolution(mip),
++        bounds=self.meta.meta.bounds(mip),
++        resolution=self.meta.info['spatial_index'].get('resolution', self.meta.meta.resolution(mip)),
+         chunk_size=self.meta.info['spatial_index']['chunk_size'],
+       )
+ 
+diff --git a/cloudvolume/datasource/precomputed/spatial_index.py b/cloudvolume/datasource/precomputed/spatial_index.py
+index 80edc854c..521a54847 100644
+--- a/cloudvolume/datasource/precomputed/spatial_index.py
++++ b/cloudvolume/datasource/precomputed/spatial_index.py
+@@ -10,7 +10,10 @@
+ 
+ from ...exceptions import SpatialIndexGapError
+ from ... import paths
+-from ...lib import Bbox, Vec, xyzrange, min2, toiter, sip, nvl
++from ...lib import (
++  Bbox, Vec, xyzrange, min2, 
++  toiter, sip, nvl, getprecision
++)
+ 
+ class SpatialIndex(object):
+   """
+@@ -41,13 +44,25 @@ class SpatialIndex(object):
+   """
+   def __init__(
+     self, cloudpath, bounds, chunk_size, 
+-    config=None, sqlite_db=None
++    config=None, sqlite_db=None, resolution=None
+   ):
+     self.cloudpath = cloudpath
+     self.path = paths.extract(cloudpath)
+     self.bounds = Bbox.create(bounds)
+     self.chunk_size = Vec(*chunk_size)
+     self.sqlite_db = sqlite_db # optional DB for higher performance
++    self.resolution = None
++    self.precision = None
++
++    if resolution is None:
++      self.physical_bounds = self.bounds.clone()
++    else:
++      self.resolution = Vec(*resolution, dtype=float)
++      self.precision = max(map(getprecision, resolution))
++      if self.precision == 0:
++        self.resolution = Vec(*resolution, dtype=int)
++
++      self.physical_bounds = self.bounds.astype(self.resolution.dtype) * self.resolution
+ 
+     if config is None:
+       self.config = {}
+@@ -100,13 +115,15 @@ def fetch_all_index_files(self, allow_missing=False, progress=None):
+     pbar.close()
+ 
+   def index_file_paths_for_bbox(self, bbox):
+-    bbox = bbox.expand_to_chunk_size(self.chunk_size, offset=self.bounds.minpt)
++    bbox = bbox.expand_to_chunk_size(self.chunk_size, offset=self.physical_bounds.minpt)
+ 
+     if bbox.subvoxel():
+       return []
+ 
+     chunk_size = self.chunk_size
+     bounds = self.bounds
++    resolution = self.resolution
++    precision = self.precision
+ 
+     class IndexPathIterator():
+       def __len__(self):
+@@ -114,7 +131,8 @@ def __len__(self):
+       def __iter__(self):
+         for pt in xyzrange(bbox.minpt, bbox.maxpt, chunk_size):
+           search = Bbox( pt, min2(pt + chunk_size, bounds.maxpt) )
+-          yield search.to_filename() + '.spatial'
++          search *= resolution
++          yield search.to_filename(precision) + '.spatial'
+ 
+     return IndexPathIterator()
+ 
+@@ -309,15 +327,15 @@ def query(self, bbox, allow_missing=False):
+ 
+     Returns: set(labels)
+     """
+-    bbox = Bbox.create(bbox, context=self.bounds, autocrop=True)
++    bbox = Bbox.create(bbox, context=self.physical_bounds, autocrop=True)
+     original_bbox = bbox.clone()
+-    bbox = bbox.expand_to_chunk_size(self.chunk_size, offset=self.bounds.minpt)
++    bbox = bbox.expand_to_chunk_size(self.chunk_size.astype(self.physical_bounds.dtype), offset=self.physical_bounds.minpt)
+ 
+     if bbox.subvoxel():
+       return []
+ 
+     labels = set()
+-    fast_path = bbox.contains_bbox(self.bounds)
++    fast_path = bbox.contains_bbox(self.physical_bounds)
+ 
+     if self.sqlite_db and fast_path:
+       conn = sqlite3.connect(self.sqlite_db)
+@@ -363,12 +381,17 @@ def query(self, bbox, allow_missing=False):
+     return labels
+ 
+ class CachedSpatialIndex(SpatialIndex):
+-  def __init__(self, cache, config, cloudpath, bounds, chunk_size):
++  def __init__(
++    self, cache, config, 
++    cloudpath, bounds, chunk_size,
++    resolution
++  ):
+     self.cache = cache
+     self.subdir = os.path.relpath(cloudpath, cache.meta.cloudpath)
+ 
+     super(CachedSpatialIndex, self).__init__(
+-      cloudpath, bounds, chunk_size, config
++      cloudpath, bounds, chunk_size, config, 
++      resolution=resolution
+     )
+ 
+   def fetch_index_files(self, index_files, progress=None):
+diff --git a/cloudvolume/exceptions.py b/cloudvolume/exceptions.py
+index dd7de1095..ab07509c8 100644
+--- a/cloudvolume/exceptions.py
++++ b/cloudvolume/exceptions.py
+@@ -4,6 +4,10 @@ class AuthenticationError(BaseException):
+   """Incorrect credentials."""
+   pass
+ 
++class DimensionError(BaseException):
++  """Wrong number of dimensions."""
++  pass
++
+ class InfoError(Exception):
+   pass
+ 
+diff --git a/cloudvolume/lib.py b/cloudvolume/lib.py
+index 10ef9827f..e956955a1 100644
+--- a/cloudvolume/lib.py
++++ b/cloudvolume/lib.py
+@@ -1,15 +1,14 @@
+-from __future__ import print_function
+-from six.moves import range, reduce
+-
++import decimal
++from functools import reduce
+ import json
++import math
++import operator
+ import os
++import random
+ import re 
+ import sys
+-import math
+-import operator
+ import time
+ import types
+-import random
+ import string 
+ from itertools import product
+ 
+@@ -154,6 +153,12 @@ def touch(path):
+   mkdir(os.path.dirname(path))
+   open(path, 'a').close()
+ 
++def getprecision(num):
++  try:
++    return len(str(num).split('.')[1])
++  except IndexError:
++    return 0
++
+ def find_closest_divisor(to_divide, closest_to):
+   """
+   This is used to find the right chunk size for
+@@ -457,9 +462,23 @@ def from_points(cls, arr):
+ 
+     return Bbox( mins, maxes, dtype=np.int64)
+ 
+-  def to_filename(self):
++  def to_filename(self, precision=None):
++    """
++    Renders the Bbox as a string. For example:
++    
++    >>> Bbox([0,2,4],[1,3,5]).to_filename()
++    > '0-1_2-3_4-5'
++
++    If the data is floating point, adding a precision
++    allows will round the numbers to that decimal place.
++    """
++    def render(x):
++      if precision:
++        return f"{round(x, precision):.{precision}f}"
++      return str(x)
++
+     return '_'.join(
+-      ( str(self.minpt[i]) + '-' + str(self.maxpt[i]) for i in range(self.ndim) )
++      ( render(self.minpt[i]) + '-' + render(self.maxpt[i]) for i in range(self.ndim) )
+     )
+ 
+   def to_slices(self):
+@@ -728,25 +747,27 @@ def transpose(self):
+ 
+   # note that operand can be a vector 
+   # or a scalar thanks to numpy
+-  def __sub__(self, operand): 
+-    tmp = self.clone()
+-    
++  def __isub__(self, operand): 
+     if isinstance(operand, Bbox):
+-      tmp.minpt -= operand.minpt
+-      tmp.maxpt -= operand.maxpt
++      self.minpt = np.subtract(self.minpt, operand.minpt, casting="safe")
++      self.maxpt = np.subtract(self.maxpt, operand.maxpt, casting="safe")
+     else:
+-      tmp.minpt -= operand
+-      tmp.maxpt -= operand
++      self.minpt = np.subtract(self.minpt, operand, casting="safe")
++      self.maxpt = np.subtract(self.maxpt, operand, casting="safe")
+ 
+-    return tmp
++    return self.astype(self.minpt.dtype)
++
++  def __sub__(self, operand):
++    tmp = self.clone()
++    return tmp.__isub__(operand)
+ 
+   def __iadd__(self, operand):
+     if isinstance(operand, Bbox):
+-      self.minpt += operand.minpt
+-      self.maxpt += operand.maxpt
++      self.minpt = np.add(self.minpt, operand.minpt, casting="safe")
++      self.maxpt = np.add(self.maxpt, operand.maxpt, casting="safe")
+     else:
+-      self.minpt += operand
+-      self.maxpt += operand
++      self.minpt = np.add(self.minpt, operand, casting="safe")
++      self.maxpt = np.add(self.maxpt, operand, casting="safe")
+ 
+     return self
+ 
+@@ -755,14 +776,15 @@ def __add__(self, operand):
+     return tmp.__iadd__(operand)
+ 
+   def __imul__(self, operand):
+-    self.minpt *= operand
+-    self.maxpt *= operand
++    self.minpt = np.multiply(self.minpt, operand, casting="safe")
++    self.maxpt = np.multiply(self.maxpt, operand, casting="safe")
++    self._dtype = self.minpt.dtype 
+     return self
+ 
+   def __mul__(self, operand):
+     tmp = self.clone()
+-    tmp.minpt *= operand
+-    tmp.maxpt *= operand
++    tmp.minpt = np.multiply(tmp.minpt, operand, casting="safe")
++    tmp.maxpt = np.multiply(tmp.maxpt, operand, casting="safe")
+     return tmp.astype(tmp.minpt.dtype)
+ 
+   def __idiv__(self, operand):
+diff --git a/test/test_lib.py b/test/test_lib.py
+index 0813598b6..a69c2a339 100644
+--- a/test/test_lib.py
++++ b/test/test_lib.py
+@@ -194,3 +194,23 @@ def test_bbox_from_filename():
+   for fn in filenames:
+     with pytest.raises(ValueError):
+       bbox = Bbox.from_filename(fn)
++
++def test_bbox_to_filename():
++  bbx = Bbox([0,2,4], [1,3,5])
++
++  assert bbx.to_filename() == "0-1_2-3_4-5"
++  assert bbx.to_filename(None) == "0-1_2-3_4-5"
++  assert bbx.to_filename(0) == "0-1_2-3_4-5"
++  assert bbx.to_filename(1) == "0.0-1.0_2.0-3.0_4.0-5.0"
++
++  bbx = Bbox([1.1,3.2,5.49], [2.000003,4.0000000000000005,6.12372412421])
++
++  assert bbx.to_filename(3) == "1.100-2.000_3.200-4.000_5.490-6.124"
++
++
++
++
++
++
++
++
+diff --git a/test/test_skeletons.py b/test/test_skeletons.py
+index 25b3f61de..26a4cfa77 100644
+--- a/test/test_skeletons.py
++++ b/test/test_skeletons.py
+@@ -738,9 +738,9 @@ def test_sharded():
+ 
+   shutil.rmtree('/tmp/removeme/skeletons')
+ 
+-def test_spatial_index():
++def test_integer_spatial_index():
+   test_dir = os.path.dirname(os.path.abspath(__file__))
+-  vol = CloudVolume('file://{}/test_cv'.format(test_dir))
++  vol = CloudVolume(f'file://{test_dir}/test_cv')
+   
+   spatial_index = vol.skeleton.spatial_index
+ 

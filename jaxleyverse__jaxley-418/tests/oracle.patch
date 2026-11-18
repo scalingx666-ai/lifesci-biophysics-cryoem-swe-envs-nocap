@@ -1,0 +1,1707 @@
+diff --git a/jaxley/build_branched_tridiag.py b/jaxley/build_branched_tridiag.py
+index b14ba8220..74c6f27d6 100644
+--- a/jaxley/build_branched_tridiag.py
++++ b/jaxley/build_branched_tridiag.py
+@@ -54,10 +54,10 @@ def _define_tridiag_for_branch(
+     """
+ 
+     # Diagonal and solve.
+-    a_v = 1.0 + dt * voltage_terms + dt * summed_coupling_conds
+-    b_v = voltages + dt * i_ext
++    diags = 1.0 + dt * voltage_terms + dt * summed_coupling_conds
++    solves = voltages + dt * i_ext
+ 
+     # Subdiagonals.
+     upper = jnp.asarray(-dt * coupling_conds_upper)
+     lower = jnp.asarray(-dt * coupling_conds_lower)
+-    return lower, a_v, upper, b_v
++    return lower, diags, upper, solves
+diff --git a/jaxley/integrate.py b/jaxley/integrate.py
+index c95e6ba09..5695d6722 100644
+--- a/jaxley/integrate.py
++++ b/jaxley/integrate.py
+@@ -120,7 +120,7 @@ def integrate(
+     if param_state is not None:
+         pstate += param_state
+ 
+-    all_params = module.get_all_parameters(pstate)
++    all_params = module.get_all_parameters(pstate, voltage_solver=voltage_solver)
+     all_states = (
+         module.get_all_states(pstate, all_params, delta_t)
+         if all_states is None
+diff --git a/jaxley/modules/base.py b/jaxley/modules/base.py
+index 490814ffb..f9eb93ecc 100644
+--- a/jaxley/modules/base.py
++++ b/jaxley/modules/base.py
+@@ -15,19 +15,24 @@
+ from matplotlib.axes import Axes
+ 
+ from jaxley.channels import Channel
+-from jaxley.solver_voltage import step_voltage_explicit, step_voltage_implicit
++from jaxley.solver_voltage import (
++    step_voltage_explicit,
++    step_voltage_implicit_with_custom_spsolve,
++    step_voltage_implicit_with_jax_spsolve,
++)
+ from jaxley.synapses import Synapse
+ from jaxley.utils.cell_utils import (
+     _compute_index_of_child,
+     _compute_num_children,
+     compute_levels,
+     convert_point_process_to_distributed,
++    convert_to_csc,
+     interpolate_xyz,
+     loc_of_index,
+     query_channel_states_and_params,
+     v_interp,
+ )
+-from jaxley.utils.debug_solver import compute_morphology_indices, convert_to_csc
++from jaxley.utils.debug_solver import compute_morphology_indices
+ from jaxley.utils.misc_utils import childview, concat_and_ignore_empty
+ from jaxley.utils.plot_utils import plot_morph
+ 
+@@ -251,8 +256,41 @@ def _show(
+ 
+         return printable_nodes
+ 
++    def init_morph(self):
++        """Initialize the morphology such that it can be processed by the solvers."""
++        self._init_morph_custom_spsolve()
++        self._init_morph_jax_spsolve()
++        self.initialized_morph = True
++
++    @abstractmethod
++    def _init_morph_jax_spsolve(self):
++        """Initialize the morphology for the JAX sparse solver."""
++        raise NotImplementedError
++
++    @abstractmethod
++    def _init_morph_custom_spsolve(self):
++        """Initialize the morphology for the custom Jaxley solver."""
++        raise NotImplementedError
++
++    def init_conds(self, params: Dict, voltage_solver: str):
++        """Given radius, length, r_a, compute the axial coupling conductances."""
++        if voltage_solver.startswith("jaxley"):
++            return self._init_conds_custom_spsolve(params)
++        else:
++            return self._init_conds_jax_spsolve(params)
++
+     @abstractmethod
+-    def init_conds(self, params: Dict):
++    def _init_conds_jax_spsolve(self, params: Dict):
++        """Initialize coupling conductances.
++
++        Args:
++            params: Conductances and morphology parameters, not yet including
++                coupling conductances.
++        """
++        raise NotImplementedError
++
++    @abstractmethod
++    def _init_conds_custom_spsolve(self, params: Dict):
+         """Initialize coupling conductances.
+ 
+         Args:
+@@ -482,7 +520,9 @@ def get_parameters(self) -> List[Dict[str, jnp.ndarray]]:
+         """
+         return self.trainable_params
+ 
+-    def get_all_parameters(self, pstate: List[Dict]) -> Dict[str, jnp.ndarray]:
++    def get_all_parameters(
++        self, pstate: List[Dict], voltage_solver: str
++    ) -> Dict[str, jnp.ndarray]:
+         """Return all parameters (and coupling conductances) needed to simulate.
+ 
+         Runs `init_conds()` and return every parameter that is needed to solve the ODE.
+@@ -502,7 +542,13 @@ def get_all_parameters(self, pstate: List[Dict]) -> Dict[str, jnp.ndarray]:
+ 
+         Args:
+             pstate: The state of the trainable parameters. pstate takes the form
+-                [{"key": "gNa", "indices": jnp.array([0, 1, 2]), "val": jnp.array([0.1, 0.2, 0.3])}, ...].
++                [{
++                    "key": "gNa", "indices": jnp.array([0, 1, 2]),
++                    "val": jnp.array([0.1, 0.2, 0.3])
++                }, ...].
++            voltage_solver: The voltage solver that is used. Since `jax.sparse` and
++                `jaxley.xyz` require different formats of the axial conductances, this
++                function will default to different building methods.
+ 
+         Returns:
+             A dictionary of all module parameters.
+@@ -531,7 +577,7 @@ def get_all_parameters(self, pstate: List[Dict]) -> Dict[str, jnp.ndarray]:
+                 params[key] = params[key].at[inds].set(set_param[:, None])
+ 
+         # Compute conductance params and append them.
+-        cond_params = self.init_conds(params)
++        cond_params = self.init_conds(params=params, voltage_solver=voltage_solver)
+         for key in cond_params:
+             params[key] = cond_params[key]
+ 
+@@ -611,7 +657,9 @@ def init_states(self, delta_t: float = 0.025):
+ 
+         # We do not use any `pstate` for initializing. In principle, we could change
+         # that by allowing an input `params` and `pstate` to this function.
+-        params = self.get_all_parameters([])
++        # `voltage_solver` could also be `jax.sparse` here, because both of them
++        # build the channel parameters in the same way.
++        params = self.get_all_parameters([], voltage_solver="jaxley.thomas")
+ 
+         for channel in self.channels:
+             name = channel._name
+@@ -850,9 +898,6 @@ def _insert(self, channel, view):
+     def init_syns(self):
+         self.initialized_syns = True
+ 
+-    def init_morph(self):
+-        self.initialized_morph = True
+-
+     def step(
+         self,
+         u: Dict[str, jnp.ndarray],
+@@ -918,43 +963,66 @@ def step(
+         # Voltage steps.
+         cm = params["capacitance"]  # Abbreviation.
+ 
+-        solver_kwargs = {
+-            "voltages": voltages,
+-            "voltage_terms": (v_terms + syn_v_terms) / cm,
+-            "constant_terms": (const_terms + i_ext + syn_const_terms) / cm,
+-            "coupling_conds_upper": params["branch_uppers"],
+-            "coupling_conds_lower": params["branch_lowers"],
+-            "summed_coupling_conds": params["branch_diags"],
+-            "branchpoint_conds_children": params["branchpoint_conds_children"],
+-            "branchpoint_conds_parents": params["branchpoint_conds_parents"],
+-            "branchpoint_weights_children": params["branchpoint_weights_children"],
+-            "branchpoint_weights_parents": params["branchpoint_weights_parents"],
+-            "par_inds": self.par_inds,
+-            "child_inds": self.child_inds,
+-            "nbranches": self.total_nbranches,
+-            "solver": voltage_solver,
+-            "children_in_level": self.children_in_level,
+-            "parents_in_level": self.parents_in_level,
+-            "root_inds": self.root_inds,
+-            "branchpoint_group_inds": self.branchpoint_group_inds,
+-            "debug_states": self.debug_states,
+-        }
++        if voltage_solver == "jax.sparse":
++            solver_kwargs = {
++                "voltages": voltages,
++                "voltage_terms": (v_terms + syn_v_terms) / cm,
++                "constant_terms": (const_terms + i_ext + syn_const_terms) / cm,
++                "axial_conductances": params["axial_conductances"],
++                "data_inds": self._data_inds,
++                "indices": self._indices_jax_spsolve,
++                "indptr": self._indptr_jax_spsolve,
++                "sinks": np.asarray(self._comp_edges["sink"].to_list()),
++                "n_nodes": self._n_nodes,
++                "internal_node_inds": self._internal_node_inds,
++            }
++            # Only for `bwd_euler` and `cranck-nicolson`.
++            step_voltage_implicit = step_voltage_implicit_with_jax_spsolve
++        else:
++            # Our custom sparse solver requires a different format of all conductance
++            # values to perform triangulation and backsubstution optimally.
++            #
++            # Currently, the forward Euler solver also uses this format. However,
++            # this is only for historical reasons and we are planning to change this in
++            # the future.
++            solver_kwargs = {
++                "voltages": voltages,
++                "voltage_terms": (v_terms + syn_v_terms) / cm,
++                "constant_terms": (const_terms + i_ext + syn_const_terms) / cm,
++                "coupling_conds_upper": params["branch_uppers"],
++                "coupling_conds_lower": params["branch_lowers"],
++                "summed_coupling_conds": params["branch_diags"],
++                "branchpoint_conds_children": params["branchpoint_conds_children"],
++                "branchpoint_conds_parents": params["branchpoint_conds_parents"],
++                "branchpoint_weights_children": params["branchpoint_weights_children"],
++                "branchpoint_weights_parents": params["branchpoint_weights_parents"],
++                "par_inds": self.par_inds,
++                "child_inds": self.child_inds,
++                "nbranches": self.total_nbranches,
++                "solver": voltage_solver,
++                "children_in_level": self.children_in_level,
++                "parents_in_level": self.parents_in_level,
++                "root_inds": self.root_inds,
++                "branchpoint_group_inds": self.branchpoint_group_inds,
++                "debug_states": self.debug_states,
++            }
++            # Only for `bwd_euler` and `cranck-nicolson`.
++            step_voltage_implicit = step_voltage_implicit_with_custom_spsolve
++
+         if solver == "bwd_euler":
+-            new_voltages = step_voltage_implicit(**solver_kwargs, delta_t=delta_t)
+-            u["v"] = new_voltages.ravel(order="C")
+-        elif solver == "fwd_euler":
+-            new_voltages = step_voltage_explicit(**solver_kwargs, delta_t=delta_t)
+-            u["v"] = new_voltages.ravel(order="C")
++            u["v"] = step_voltage_implicit(**solver_kwargs, delta_t=delta_t)
+         elif solver == "crank_nicolson":
+-            # Crank Nicolson advances by half a step of backward and half a step of
++            # Crank-Nicolson advances by half a step of backward and half a step of
+             # forward Euler.
+             half_step_delta_t = delta_t / 2
+             half_step_voltages = step_voltage_implicit(
+                 **solver_kwargs, delta_t=half_step_delta_t
+             )
+-            # The forward Euler step in Crank Nicolson can be performed easily as
++            # The forward Euler step in Crank-Nicolson can be performed easily as
+             # `V_{n+1} = 2 * V_{n+1/2} - V_n`. See also NEURON book Chapter 4.
+-            u["v"] = 2 * half_step_voltages.ravel(order="C") - voltages
++            u["v"] = 2 * half_step_voltages - voltages
++        elif solver == "fwd_euler":
++            u["v"] = step_voltage_explicit(**solver_kwargs, delta_t=delta_t)
+         else:
+             raise ValueError(
+                 f"You specified `solver={solver}`. The only allowed solvers are "
+diff --git a/jaxley/modules/branch.py b/jaxley/modules/branch.py
+index 5b5c27006..6d5deeef1 100644
+--- a/jaxley/modules/branch.py
++++ b/jaxley/modules/branch.py
+@@ -7,10 +7,16 @@
+ import jax.numpy as jnp
+ import numpy as np
+ import pandas as pd
++from jax import vmap
+ 
+ from jaxley.modules.base import GroupView, Module, View
+ from jaxley.modules.compartment import Compartment, CompartmentView
+-from jaxley.utils.cell_utils import compute_coupling_cond
++from jaxley.utils.cell_utils import (
++    comp_edges_to_indices,
++    compute_axial_conductances,
++    compute_children_and_parents,
++    compute_coupling_cond,
++)
+ 
+ 
+ class Branch(Module):
+@@ -55,6 +61,7 @@ def __init__(
+             compartment_list = compartments
+ 
+         self.nseg = len(compartment_list)
++        self.nseg_per_branch = [self.nseg]
+         self.total_nbranches = 1
+         self.nbranches_per_cell = [1]
+         self.cumsum_nbranches = jnp.asarray([0, 1])
+@@ -78,19 +85,13 @@ def __init__(
+         )
+ 
+         # For morphology indexing.
+-        self.child_inds = np.asarray([]).astype(int)
+-        self.child_belongs_to_branchpoint = np.asarray([]).astype(int)
+-        self.par_inds = np.asarray([]).astype(int)
+-        self.total_nbranchpoints = 0
+-        self.branchpoint_group_inds = np.asarray([]).astype(int)
+-
+-        self.children_in_level = []
+-        self.parents_in_level = []
++        self.par_inds, self.child_inds, self.child_belongs_to_branchpoint = (
++            compute_children_and_parents(self.branch_edges)
++        )
+         self.root_inds = jnp.asarray([0])
+ 
+         self.initialize()
+         self.init_syns()
+-        self.initialized_conds = False
+ 
+         # Coordinates.
+         self.xyzr = [float("NaN") * np.zeros((2, 4))]
+@@ -117,8 +118,35 @@ def __getattr__(self, key: str):
+         else:
+             raise KeyError(f"Key {key} not recognized.")
+ 
+-    def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
+-        conds = self.init_branch_conds(
++    def _init_morph_custom_spsolve(self):
++        self.branchpoint_group_inds = np.asarray([]).astype(int)
++        self.children_in_level = []
++        self.parents_in_level = []
++
++    def _init_morph_jax_spsolve(self):
++        """Initialize morphology for the jax sparse voltage solver.
++
++        Explanation of `type`:
++        `type == 0`: compartment-to-compartment (within branch)
++        `type == 1`: branchpoint-to-compartment
++        `type == 2`: compartment-to-branchpoint
++        """
++        self._internal_node_inds = jnp.arange(self.nseg)
++        self._comp_edges = pd.DataFrame().from_dict(
++            {
++                "source": list(range(self.nseg - 1)) + list(range(1, self.nseg)),
++                "sink": list(range(1, self.nseg)) + list(range(self.nseg - 1)),
++            }
++        )
++        self._comp_edges["type"] = 0
++        n_nodes, data_inds, indices, indptr = comp_edges_to_indices(self._comp_edges)
++        self._n_nodes = n_nodes
++        self._data_inds = data_inds
++        self._indices_jax_spsolve = indices
++        self._indptr_jax_spsolve = indptr
++
++    def _init_conds_custom_spsolve(self, params: Dict) -> Dict[str, jnp.ndarray]:
++        conds = self.init_branch_conds_custom_spsolve(
+             params["axial_resistivity"], params["radius"], params["length"], self.nseg
+         )
+         cond_params = {
+@@ -133,8 +161,12 @@ def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
+ 
+         return cond_params
+ 
++    def _init_conds_jax_spsolve(self, params: Dict) -> Dict[str, jnp.ndarray]:
++        conds = compute_axial_conductances(self._comp_edges, params)
++        return {"axial_conductances": conds}
++
+     @staticmethod
+-    def init_branch_conds(
++    def init_branch_conds_custom_spsolve(
+         axial_resistivity: jnp.ndarray,
+         radiuses: jnp.ndarray,
+         lengths: jnp.ndarray,
+diff --git a/jaxley/modules/cell.py b/jaxley/modules/cell.py
+index 10b0f7004..8578e2bbc 100644
+--- a/jaxley/modules/cell.py
++++ b/jaxley/modules/cell.py
+@@ -16,6 +16,9 @@
+ from jaxley.synapses import Synapse
+ from jaxley.utils.cell_utils import (
+     build_branchpoint_group_inds,
++    comp_edges_to_indices,
++    compute_axial_conductances,
++    compute_children_and_parents,
+     compute_children_in_level,
+     compute_children_indices,
+     compute_coupling_cond,
+@@ -76,9 +79,9 @@ def __init__(
+         parents = [-1] if parents is None else parents
+ 
+         if isinstance(branches, Branch):
+-            branch_list = [branches for _ in range(len(parents))]
++            self.branch_list = [branches for _ in range(len(parents))]
+         else:
+-            branch_list = branches
++            self.branch_list = branches
+ 
+         if xyzr is not None:
+             assert len(xyzr) == len(parents)
+@@ -91,24 +94,28 @@ def __init__(
+             # self.xyzr at `.vis()`.
+             self.xyzr = [float("NaN") * np.zeros((2, 4)) for _ in range(len(parents))]
+ 
+-        self.nseg = branch_list[0].nseg
+-        self.total_nbranches = len(branch_list)
+-        self.nbranches_per_cell = [len(branch_list)]
++        self.nseg_per_branch = jnp.asarray([branch.nseg for branch in self.branch_list])
++        self.nseg = int(jnp.max(self.nseg_per_branch))
++        self.cumsum_nseg = jnp.concatenate(
++            [jnp.asarray([0]), jnp.cumsum(self.nseg_per_branch)]
++        )
++        self.total_nbranches = len(self.branch_list)
++        self.nbranches_per_cell = [len(self.branch_list)]
+         self.comb_parents = jnp.asarray(parents)
+         self.comb_children = compute_children_indices(self.comb_parents)
+-        self.cumsum_nbranches = jnp.asarray([0, len(branch_list)])
++        self.cumsum_nbranches = jnp.asarray([0, len(self.branch_list)])
+ 
+         # Indexing.
+-        self.nodes = pd.concat([c.nodes for c in branch_list], ignore_index=True)
++        self.nodes = pd.concat([c.nodes for c in self.branch_list], ignore_index=True)
+         self._append_params_and_states(self.cell_params, self.cell_states)
+-        self.nodes["comp_index"] = np.arange(self.nseg * self.total_nbranches).tolist()
+-        self.nodes["branch_index"] = (
+-            np.arange(self.nseg * self.total_nbranches) // self.nseg
++        self.nodes["comp_index"] = np.arange(self.cumsum_nseg[-1])
++        self.nodes["branch_index"] = np.repeat(
++            np.arange(self.total_nbranches), self.nseg_per_branch
+         ).tolist()
+-        self.nodes["cell_index"] = [0] * (self.nseg * self.total_nbranches)
++        self.nodes["cell_index"] = np.repeat(0, self.cumsum_nseg[-1]).tolist()
+ 
+         # Channels.
+-        self._gather_channels_from_constituents(branch_list)
++        self._gather_channels_from_constituents(self.branch_list)
+ 
+         # Synapse indexing.
+         self.syn_edges = pd.DataFrame(
+@@ -122,19 +129,12 @@ def __init__(
+         )
+ 
+         # For morphology indexing.
+-        par_inds = self.branch_edges["parent_branch_index"].to_numpy()
+-        self.child_inds = self.branch_edges["child_branch_index"].to_numpy()
+-        self.child_belongs_to_branchpoint = remap_to_consecutive(par_inds)
+-
+-        # TODO: does order have to be preserved?
+-        self.par_inds = np.unique(par_inds)
+-        self.total_nbranchpoints = len(self.par_inds)
+-        self.root_inds = jnp.asarray([0])
++        self.par_inds, self.child_inds, self.child_belongs_to_branchpoint = (
++            compute_children_and_parents(self.branch_edges)
++        )
+ 
+         self.initialize()
+-
+         self.init_syns()
+-        self.initialized_conds = False
+ 
+     def __getattr__(self, key: str):
+         # Ensure that hidden methods such as `__deepcopy__` still work.
+@@ -157,10 +157,12 @@ def __getattr__(self, key: str):
+         else:
+             raise KeyError(f"Key {key} not recognized.")
+ 
+-    def init_morph(self):
+-        """Initialize morphology."""
++    def _init_morph_custom_spsolve(self):
++        """Initialize morphology for the custom sparse solver.
+ 
+-        # For Jaxley custom implementation.
++        Running this function is only required for custom Jaxley solvers, i.e., for
++        `voltage_solver={'jaxley.stone', 'jaxley.thomas'}`.
++        """
+         children_and_parents = compute_morphology_indices_in_levels(
+             len(self.par_inds),
+             self.child_belongs_to_branchpoint,
+@@ -170,8 +172,7 @@ def init_morph(self):
+         self.branchpoint_group_inds = build_branchpoint_group_inds(
+             len(self.par_inds),
+             self.child_belongs_to_branchpoint,
+-            self.nseg,
+-            self.total_nbranches,
++            self.cumsum_nseg[-1],
+         )
+         parents = self.comb_parents
+         children_inds = children_and_parents["children"]
+@@ -182,10 +183,85 @@ def init_morph(self):
+         self.parents_in_level = compute_parents_in_level(
+             levels, self.par_inds, parents_inds
+         )
++        self.root_inds = jnp.asarray([0])
++
++    def _init_morph_jax_spsolve(self):
++        """For morphology indexing with the `jax.sparse` voltage volver.
+ 
+-        self.initialized_morph = True
++        Explanation of `type`:
++        `type == 0`: compartment-to-compartment (within branch)
++        `type == 1`: branchpoint-to-compartment
++        `type == 2`: compartment-to-branchpoint
+ 
+-    def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
++        Running this function is only required for generic sparse solvers, i.e., for
++        `voltage_solver='jax.sparse'`.
++        """
++        self._internal_node_inds = np.arange(self.cumsum_nseg[-1])
++
++        # Edges between compartments within the branches.
++        # `[offset, offset, 0]` because we want to offset `source` and `sink`, but
++        # not `type`.
++        self._comp_edges = pd.concat(
++            [
++                [offset, offset, 0] + branch._comp_edges
++                for offset, branch in zip(self.cumsum_nseg, self.branch_list)
++            ]
++        )
++        # `branch_list` is not needed anymore because all information it contained is
++        # now also in `self._comp_edges`.
++        del self.branch_list
++
++        # Edges from branchpoints to compartments.
++        branchpoint_to_child_edges = pd.DataFrame().from_dict(
++            {
++                "source": self.child_belongs_to_branchpoint + self.cumsum_nseg[-1],
++                "sink": self.cumsum_nseg[self.child_inds],
++                "type": 1,
++            }
++        )
++        branchpoint_to_parent_edges = pd.DataFrame().from_dict(
++            {
++                "source": np.arange(len(self.par_inds)) + self.cumsum_nseg[-1],
++                "sink": self.cumsum_nseg[self.par_inds + 1] - 1,
++                "type": 1,
++            }
++        )
++        self._comp_edges = pd.concat(
++            [
++                self._comp_edges,
++                branchpoint_to_parent_edges,
++                branchpoint_to_child_edges,
++            ],
++            ignore_index=True,
++        )
++
++        # Edges from compartments to branchpoints.
++        child_to_branchpoint_edges = branchpoint_to_child_edges.rename(
++            columns={"sink": "source", "source": "sink"}
++        )
++        child_to_branchpoint_edges["type"] = 2
++
++        parent_to_branchpoint_edges = branchpoint_to_parent_edges.rename(
++            columns={"sink": "source", "source": "sink"}
++        )
++        parent_to_branchpoint_edges["type"] = 2
++
++        self._comp_edges = pd.concat(
++            [
++                self._comp_edges,
++                parent_to_branchpoint_edges,
++                child_to_branchpoint_edges,
++            ],
++            ignore_index=True,
++        )
++
++        n_nodes, data_inds, indices, indptr = comp_edges_to_indices(self._comp_edges)
++        self._n_nodes = n_nodes
++        self._data_inds = data_inds
++        self._indices_jax_spsolve = indices
++        self._indptr_jax_spsolve = indptr
++
++    def _init_conds_custom_spsolve(self, params: Dict) -> Dict[str, jnp.ndarray]:
+         """Given an axial resisitivity, set the coupling conductances."""
+         nbranches = self.total_nbranches
+         nseg = self.nseg
+@@ -194,7 +270,7 @@ def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
+         radiuses = jnp.reshape(params["radius"], (nbranches, nseg))
+         lengths = jnp.reshape(params["length"], (nbranches, nseg))
+ 
+-        conds = vmap(Branch.init_branch_conds, in_axes=(0, 0, 0, None))(
++        conds = vmap(Branch.init_branch_conds_custom_spsolve, in_axes=(0, 0, 0, None))(
+             axial_resistivity, radiuses, lengths, self.nseg
+         )
+         coupling_conds_fwd = conds[0]
+@@ -232,7 +308,7 @@ def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
+             lengths[self.par_inds, -1],
+         )
+ 
+-        summed_coupling_conds = self.update_summed_coupling_conds(
++        summed_coupling_conds = self.update_summed_coupling_conds_custom_spsolve(
+             summed_coupling_conds,
+             self.child_inds,
+             self.par_inds,
+@@ -251,8 +327,13 @@ def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
+         }
+         return cond_params
+ 
++    def _init_conds_jax_spsolve(self, params: Dict) -> Dict[str, jnp.ndarray]:
++        """Given length, radius, and r_a, set the coupling conductances."""
++        conds = compute_axial_conductances(self._comp_edges, params)
++        return {"axial_conductances": conds}
++
+     @staticmethod
+-    def update_summed_coupling_conds(
++    def update_summed_coupling_conds_custom_spsolve(
+         summed_conds,
+         child_inds,
+         par_inds,
+diff --git a/jaxley/modules/compartment.py b/jaxley/modules/compartment.py
+index 0ab294691..2f8c320c6 100644
+--- a/jaxley/modules/compartment.py
++++ b/jaxley/modules/compartment.py
+@@ -9,7 +9,13 @@
+ from matplotlib.axes import Axes
+ 
+ from jaxley.modules.base import Module, View
+-from jaxley.utils.cell_utils import index_of_loc, interpolate_xyz, loc_of_index
++from jaxley.utils.cell_utils import (
++    comp_edges_to_indices,
++    compute_children_and_parents,
++    index_of_loc,
++    interpolate_xyz,
++    loc_of_index,
++)
+ 
+ 
+ class Compartment(Module):
+@@ -31,6 +37,7 @@ def __init__(self):
+         super().__init__()
+ 
+         self.nseg = 1
++        self.nseg_per_branch = [1]
+         self.total_nbranches = 1
+         self.nbranches_per_cell = [1]
+         self.cumsum_nbranches = jnp.asarray([0, 1])
+@@ -47,25 +54,42 @@ def __init__(self):
+         )
+ 
+         # For morphology indexing.
+-        self.child_inds = np.asarray([]).astype(int)
+-        self.child_belongs_to_branchpoint = np.asarray([]).astype(int)
+-        self.par_inds = np.asarray([]).astype(int)
+-        self.total_nbranchpoints = 0
+-        self.branchpoint_group_inds = np.asarray([]).astype(int)
+-
+-        self.children_in_level = []
+-        self.parents_in_level = []
++        self.par_inds, self.child_inds, self.child_belongs_to_branchpoint = (
++            compute_children_and_parents(self.branch_edges)
++        )
+         self.root_inds = jnp.asarray([0])
+ 
+         # Initialize the module.
+         self.initialize()
+         self.init_syns()
+-        self.initialized_conds = True
+ 
+         # Coordinates.
+         self.xyzr = [float("NaN") * np.zeros((2, 4))]
+ 
+-    def init_conds(self, params):
++    def _init_morph_custom_spsolve(self):
++        self.branchpoint_group_inds = np.asarray([]).astype(int)
++        self.children_in_level = []
++        self.parents_in_level = []
++
++    def _init_morph_jax_spsolve(self):
++        """Initialize morphology for the jax sparse voltage solver.
++
++        Explanation of `type`:
++        `type == 0`: compartment-to-compartment (within branch)
++        `type == 1`: compartment-to-branchpoint
++        `type == 2`: branchpoint-to-compartment
++        """
++        self._internal_node_inds = jnp.asarray([0])
++        self._comp_edges = pd.DataFrame().from_dict(
++            {"source": [], "sink": [], "type": []}
++        )
++        n_nodes, data_inds, indices, indptr = comp_edges_to_indices(self._comp_edges)
++        self._n_nodes = n_nodes
++        self._data_inds = data_inds
++        self._indices_jax_spsolve = indices
++        self._indptr_jax_spsolve = indptr
++
++    def _init_conds_custom_spsolve(self, params):
+         return {
+             "branchpoint_conds_children": jnp.asarray([]),
+             "branchpoint_conds_parents": jnp.asarray([]),
+@@ -76,6 +100,9 @@ def init_conds(self, params):
+             "branch_diags": jnp.asarray([0.0]),
+         }
+ 
++    def _init_conds_jax_spsolve(self, params):
++        return {"axial_conductances": jnp.asarray([])}
++
+ 
+ class CompartmentView(View):
+     """CompartmentView."""
+diff --git a/jaxley/modules/network.py b/jaxley/modules/network.py
+index fae3831eb..d4b0eaca4 100644
+--- a/jaxley/modules/network.py
++++ b/jaxley/modules/network.py
+@@ -17,6 +17,10 @@
+ from jaxley.modules.cell import Cell, CellView
+ from jaxley.utils.cell_utils import (
+     build_branchpoint_group_inds,
++    comp_edges_to_indices,
++    compute_axial_conductances,
++    compute_children_and_parents,
++    compute_coupling_cond,
+     compute_coupling_cond_branchpoint,
+     compute_impact_on_node,
+     convert_point_process_to_distributed,
+@@ -49,25 +53,27 @@ def __init__(
+             self.xyzr += deepcopy(cell.xyzr)
+ 
+         self.cells = cells
+-        self.nseg = cells[0].nseg
++        self.nseg_per_branch = jnp.concatenate(
++            [cell.nseg_per_branch for cell in self.cells]
++        )
++        self.nseg = int(jnp.max(self.nseg_per_branch))
++        self.cumsum_nseg = jnp.concatenate(
++            [jnp.asarray([0]), jnp.cumsum(self.nseg_per_branch)]
++        )
+         self._append_params_and_states(self.network_params, self.network_states)
+ 
+         self.nbranches_per_cell = [cell.total_nbranches for cell in self.cells]
+-        self.nbranchpoints_per_cell = [cell.total_nbranchpoints for cell in self.cells]
+         self.total_nbranches = sum(self.nbranches_per_cell)
+         self.cumsum_nbranches = jnp.cumsum(jnp.asarray([0] + self.nbranches_per_cell))
+-        self.cumsum_nbranchpoints = jnp.cumsum(
+-            jnp.asarray([0] + self.nbranchpoints_per_cell)
+-        )
+ 
+         self.nodes = pd.concat([c.nodes for c in cells], ignore_index=True)
+-        self.nodes["comp_index"] = np.arange(self.nseg * self.total_nbranches).tolist()
+-        self.nodes["branch_index"] = (
+-            np.arange(self.nseg * self.total_nbranches) // self.nseg
++        self.nodes["comp_index"] = np.arange(self.cumsum_nseg[-1])
++        self.nodes["branch_index"] = np.repeat(
++            np.arange(self.total_nbranches), self.nseg_per_branch
+         ).tolist()
+         self.nodes["cell_index"] = list(
+             itertools.chain(
+-                *[[i] * (self.nseg * b) for i, b in enumerate(self.nbranches_per_cell)]
++                *[[i] * int(cell.cumsum_nseg[-1]) for i, cell in enumerate(self.cells)]
+             )
+         )
+ 
+@@ -88,20 +94,22 @@ def __init__(
+             )
+         )
+ 
+-        # For morphology indexing.
+-        par_inds = self.branch_edges["parent_branch_index"].to_numpy()
+-        self.child_inds = self.branch_edges["child_branch_index"].to_numpy()
+-        self.child_belongs_to_branchpoint = remap_to_consecutive(par_inds)
+-        self.par_inds = np.unique(par_inds)  # TODO: does order have to be preserved?
+-        self.total_nbranchpoints = len(self.par_inds)
+-        self.root_inds = self.cumsum_nbranches[:-1]
++        # For morphology indexing of both `jax.sparse` and the custom `jaxley` solvers.
++        self.par_inds, self.child_inds, self.child_belongs_to_branchpoint = (
++            compute_children_and_parents(self.branch_edges)
++        )
++
++        # `nbranchpoints` in each cell == cell.par_inds (because `par_inds` are unique).
++        nbranchpoints = jnp.asarray([len(cell.par_inds) for cell in self.cells])
++        self.cumsum_nbranchpoints_per_cell = jnp.concatenate(
++            [jnp.asarray([0]), jnp.cumsum(nbranchpoints)]
++        )
+ 
+         # Channels.
+         self._gather_channels_from_constituents(cells)
+ 
+         self.initialize()
+         self.init_syns()
+-        self.initialized_conds = False
+ 
+     def __getattr__(self, key: str):
+         # Ensure that hidden methods such as `__deepcopy__` still work.
+@@ -127,28 +135,108 @@ def __getattr__(self, key: str):
+         else:
+             raise KeyError(f"Key {key} not recognized.")
+ 
+-    def init_morph(self):
++    def _init_morph_custom_spsolve(self):
+         self.branchpoint_group_inds = build_branchpoint_group_inds(
+             len(self.par_inds),
+             self.child_belongs_to_branchpoint,
+-            self.nseg,
+-            self.total_nbranches,
++            self.cumsum_nseg[-1],
+         )
+         self.children_in_level = merge_cells(
+             self.cumsum_nbranches,
+-            self.cumsum_nbranchpoints,
++            self.cumsum_nbranchpoints_per_cell,
+             [cell.children_in_level for cell in self.cells],
+             exclude_first=False,
+         )
+         self.parents_in_level = merge_cells(
+             self.cumsum_nbranches,
+-            self.cumsum_nbranchpoints,
++            self.cumsum_nbranchpoints_per_cell,
+             [cell.parents_in_level for cell in self.cells],
+             exclude_first=False,
+         )
+-        self.initialized_morph = True
++        self.root_inds = self.cumsum_nbranches[:-1]
++
++    def _init_morph_jax_spsolve(self):
++        """Initialize the morphology for networks.
++
++        The reason that this is a bit involved is that Jaxley considers branchpoint
++        nodes to be at the very end of __all__ nodes (i.e. the branchpoints of the
++        first cell are even after the compartments of the second cell. The reason for
++        this is that, otherwise, `cumsum_nseg` becomes tricky).
++
++        To achieve this, we first loop over all compartments and append them, and then
++        loop over all branchpoints and append those. The code for building the indices
++        from the `comp_edges` is identical to `jx.Cell`.
++        """
++        self._internal_node_inds = np.arange(self.cumsum_nseg[-1])
++        self._cumsum_nseg_per_cell = jnp.concatenate(
++            [
++                jnp.asarray([0]),
++                jnp.cumsum(jnp.asarray([cell.cumsum_nseg[-1] for cell in self.cells])),
++            ]
++        )
++
++        self._comp_edges = pd.DataFrame()
++
++        # Add all the internal nodes.
++        for offset, cell in zip(self._cumsum_nseg_per_cell, self.cells):
++            condition = cell._comp_edges["type"].to_numpy() == 0
++            rows = cell._comp_edges[condition]
++            self._comp_edges = pd.concat(
++                [self._comp_edges, [offset, offset, 0] + rows], ignore_index=True
++            )
++
++        # All branchpoint-to-compartment nodes.
++        start_branchpoints = self.cumsum_nseg[-1]  # Index of the first branchpoint.
++        for offset, offset_branchpoints, cell in zip(
++            self._cumsum_nseg_per_cell, self.cumsum_nbranchpoints_per_cell, self.cells
++        ):
++            offset_within_cell = cell.cumsum_nseg[-1]
++            condition = cell._comp_edges["type"].to_numpy() == 1
++            rows = cell._comp_edges[condition]
++            self._comp_edges = pd.concat(
++                [
++                    self._comp_edges,
++                    [
++                        start_branchpoints - offset_within_cell + offset_branchpoints,
++                        offset,
++                        0,
++                    ]
++                    + rows,
++                ],
++                ignore_index=True,
++            )
++
++        # All compartment-to-branchpoint nodes.
++        for offset, offset_branchpoints, cell in zip(
++            self._cumsum_nseg_per_cell, self.cumsum_nbranchpoints_per_cell, self.cells
++        ):
++            offset_within_cell = cell.cumsum_nseg[-1]
++            condition = cell._comp_edges["type"].to_numpy() == 2
++            rows = cell._comp_edges[condition]
++            self._comp_edges = pd.concat(
++                [
++                    self._comp_edges,
++                    [
++                        offset,
++                        start_branchpoints - offset_within_cell + offset_branchpoints,
++                        0,
++                    ]
++                    + rows,
++                ],
++                ignore_index=True,
++            )
+ 
+-    def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
++        # Note that, unlike in `cell.py`, we cannot delete `self.cells` here because
++        # it is used in plotting.
++
++        # Convert comp_edges to the index format required for `jax.sparse` solvers.
++        n_nodes, data_inds, indices, indptr = comp_edges_to_indices(self._comp_edges)
++        self._n_nodes = n_nodes
++        self._data_inds = data_inds
++        self._indices_jax_spsolve = indices
++        self._indptr_jax_spsolve = indptr
++
++    def _init_conds_custom_spsolve(self, params: Dict) -> Dict[str, jnp.ndarray]:
+         """Given an axial resisitivity, set the coupling conductances."""
+         nbranches = self.total_nbranches
+         nseg = self.nseg
+@@ -158,7 +246,7 @@ def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
+         radiuses = jnp.reshape(params["radius"], (nbranches, nseg))
+         lengths = jnp.reshape(params["length"], (nbranches, nseg))
+ 
+-        conds = vmap(Branch.init_branch_conds, in_axes=(0, 0, 0, None))(
++        conds = vmap(Branch.init_branch_conds_custom_spsolve, in_axes=(0, 0, 0, None))(
+             axial_resistivity, radiuses, lengths, self.nseg
+         )
+         coupling_conds_fwd = conds[0]
+@@ -196,7 +284,7 @@ def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
+             lengths[self.par_inds, -1],
+         )
+ 
+-        summed_coupling_conds = Cell.update_summed_coupling_conds(
++        summed_coupling_conds = Cell.update_summed_coupling_conds_custom_spsolve(
+             summed_coupling_conds,
+             self.child_inds,
+             self.par_inds,
+@@ -215,6 +303,11 @@ def init_conds(self, params: Dict) -> Dict[str, jnp.ndarray]:
+         }
+         return cond_params
+ 
++    def _init_conds_jax_spsolve(self, params: Dict):
++        """Given length, radius, and r_a, set the coupling conductances."""
++        conds = compute_axial_conductances(self._comp_edges, params)
++        return {"axial_conductances": conds}
++
+     def init_syns(self):
+         """Initialize synapses."""
+         self.synapses = []
+diff --git a/jaxley/solver_voltage.py b/jaxley/solver_voltage.py
+index a9248bc67..7ab32a4fb 100644
+--- a/jaxley/solver_voltage.py
++++ b/jaxley/solver_voltage.py
+@@ -5,6 +5,7 @@
+ 
+ import jax.numpy as jnp
+ from jax import vmap
++from jax.experimental.sparse.linalg import spsolve as jax_spsolve
+ from tridiax.stone import stone_backsub_lower, stone_triang_upper
+ from tridiax.thomas import thomas_backsub_lower, thomas_triang_upper
+ 
+@@ -62,10 +63,10 @@ def step_voltage_explicit(
+         debug_states,
+     )
+     new_voltates = voltages + delta_t * update
+-    return new_voltates
++    return new_voltates.ravel(order="C")
+ 
+ 
+-def step_voltage_implicit(
++def step_voltage_implicit_with_custom_spsolve(
+     voltages: jnp.ndarray,
+     voltage_terms: jnp.ndarray,
+     constant_terms: jnp.ndarray,
+@@ -196,8 +197,50 @@ def step_voltage_implicit(
+         root_inds,
+         debug_states,
+     )
++    return solves.ravel(order="C")
+ 
+-    return solves
++
++def step_voltage_implicit_with_jax_spsolve(
++    voltages,
++    voltage_terms,
++    constant_terms,
++    axial_conductances,
++    data_inds,
++    indices,
++    indptr,
++    sinks,
++    delta_t,
++    n_nodes,
++    internal_node_inds,
++):
++    # Build diagonals.
++    diagonal_values = jnp.zeros(n_nodes)
++
++    # if-case needed because `.at` does not allow empty inputs, but the input is
++    # empty for compartments.
++    if len(sinks) > 0:
++        diagonal_values = diagonal_values.at[sinks].add(delta_t * axial_conductances)
++
++    diagonal_values = diagonal_values.at[internal_node_inds].add(
++        delta_t * voltage_terms
++    )
++    diagonal_values = diagonal_values.at[internal_node_inds].add(1.0)
++
++    # Build off-diagonals.
++    axial_conductances = -delta_t * axial_conductances
++
++    # Concatenate diagonals and off-diagonals.
++    all_values = jnp.concatenate([diagonal_values, axial_conductances])
++
++    # Build solve.
++    solves = jnp.zeros(n_nodes)
++    solves = solves.at[internal_node_inds].add(voltages + delta_t * constant_terms)
++
++    # Solve the voltage equations.
++    solution = jax_spsolve(all_values[data_inds], indices, indptr, solves)[
++        internal_node_inds
++    ]
++    return solution
+ 
+ 
+ def voltage_vectorfield(
+diff --git a/jaxley/utils/cell_utils.py b/jaxley/utils/cell_utils.py
+index 5a3516fcf..136093b47 100644
+--- a/jaxley/utils/cell_utils.py
++++ b/jaxley/utils/cell_utils.py
+@@ -2,7 +2,7 @@
+ # licensed under the Apache License Version 2.0, see <https://www.apache.org/licenses/>
+ 
+ from math import pi
+-from typing import Dict, List, Optional, Union
++from typing import Dict, List, Optional, Tuple, Union
+ 
+ import jax.numpy as jnp
+ import numpy as np
+@@ -339,12 +339,8 @@ def convert_point_process_to_distributed(
+ 
+ 
+ def build_branchpoint_group_inds(
+-    num_branchpoints,
+-    child_belongs_to_branchpoint,
+-    nseg,
+-    nbranches,
++    num_branchpoints, child_belongs_to_branchpoint, start_ind_for_branchpoints
+ ):
+-    start_ind_for_branchpoints = nseg * nbranches
+     branchpoint_inds_parents = start_ind_for_branchpoints + jnp.arange(num_branchpoints)
+     branchpoint_inds_children = (
+         start_ind_for_branchpoints + child_belongs_to_branchpoint
+@@ -411,3 +407,134 @@ def query_channel_states_and_params(d, keys, idcs):
+ 
+     Only loops over necessary keys, as opposed to looping over `d.items()`."""
+     return dict(zip(keys, (v[idcs] for v in map(d.get, keys))))
++
++
++def convert_to_csc(
++    num_elements: int, row_ind: np.ndarray, col_ind: np.ndarray
++) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
++    """Convert between two representations for sparse systems.
++
++    This is needed because `jax.scipy.linalg.spsolve` requires the `(ind, indptr)`
++    representation, but the `(row, col)` is more intuitive and easier to build.
++
++    This function uses `np` instead of `jnp` because it only deals with indexing which
++    can be dealt with only based on the branch structure (i.e. independent of any
++    parameter values).
++
++    Written by ChatGPT.
++    """
++    data_inds = np.arange(num_elements)
++    # Step 1: Sort by (col_ind, row_ind)
++    sorted_indices = np.lexsort((row_ind, col_ind))
++    data_inds = data_inds[sorted_indices]
++    row_ind = row_ind[sorted_indices]
++    col_ind = col_ind[sorted_indices]
++
++    # Step 2: Create indptr array
++    n_cols = col_ind.max() + 1
++    indptr = np.zeros(n_cols + 1, dtype=int)
++    np.add.at(indptr, col_ind + 1, 1)
++    np.cumsum(indptr, out=indptr)
++
++    # Step 3: The row indices are already sorted
++    indices = row_ind
++
++    return data_inds, indices, indptr
++
++
++def comp_edges_to_indices(
++    comp_edges: pd.DataFrame,
++) -> Tuple[int, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
++    """Generates sparse matrix indices from the table of node edges.
++
++    This is only used for the `jax.sparse` voltage solver.
++
++    Args:
++        comp_edges: Dataframe with three columns (sink, source, type).
++
++    Returns:
++        n_nodes: The number of total nodes (including branchpoints).
++        data_inds: The indices to reorder the data.
++        indices and indptr: Indices passed to the sparse matrix solver.
++    """
++    # Build indices for diagonals.
++    sources = np.asarray(comp_edges["source"].to_list())
++    sinks = np.asarray(comp_edges["sink"].to_list())
++    n_nodes = np.max(sinks) + 1 if len(sinks) > 0 else 1
++    diagonal_inds = jnp.stack([jnp.arange(n_nodes), jnp.arange(n_nodes)])
++
++    # Build indices for off-diagonals.
++    off_diagonal_inds = jnp.stack([sources, sinks]).astype(int)
++
++    # Concatenate indices of diagonals and off-diagonals.
++    all_inds = jnp.concatenate([diagonal_inds, off_diagonal_inds], axis=1)
++
++    # Cast (row, col) indices to the format required for the `jax` sparse solver.
++    data_inds, indices, indptr = convert_to_csc(
++        num_elements=all_inds.shape[1],
++        row_ind=all_inds[0],
++        col_ind=all_inds[1],
++    )
++    return n_nodes, data_inds, indices, indptr
++
++
++def compute_axial_conductances(
++    comp_edges: pd.DataFrame, params: Dict[str, jnp.ndarray]
++) -> jnp.ndarray:
++    """Given `comp_edges`, radius, length, r_a, compute the axial conductances."""
++    # `Compartment-to-compartment` (c2c) conductances.
++    condition = comp_edges["type"].to_numpy() == 0
++    source_comp_inds = np.asarray(comp_edges[condition]["source"].to_list())
++    sink_comp_inds = np.asarray(comp_edges[condition]["sink"].to_list())
++
++    conds_c2c = vmap(compute_coupling_cond, in_axes=(0, 0, 0, 0, 0, 0))(
++        params["radius"][sink_comp_inds],
++        params["radius"][source_comp_inds],
++        params["axial_resistivity"][sink_comp_inds],
++        params["axial_resistivity"][source_comp_inds],
++        params["length"][sink_comp_inds],
++        params["length"][source_comp_inds],
++    )
++
++    # `branchpoint-to-compartment` (bp2c) conductances.
++    condition = comp_edges["type"].to_numpy() == 1
++    sink_comp_inds = np.asarray(comp_edges[condition]["sink"].to_list())
++
++    if len(sink_comp_inds) > 0:
++        conds_bp2c = vmap(compute_coupling_cond_branchpoint, in_axes=(0, 0, 0))(
++            params["radius"][sink_comp_inds],
++            params["axial_resistivity"][sink_comp_inds],
++            params["length"][sink_comp_inds],
++        )
++    else:
++        conds_bp2c = jnp.asarray([])
++
++    # `compartment-to-branchpoint` (c2bp) conductances.
++    condition = comp_edges["type"].to_numpy() == 2
++    source_comp_inds = np.asarray(comp_edges[condition]["source"].to_list())
++
++    if len(source_comp_inds) > 0:
++        conds_c2bp = vmap(compute_impact_on_node, in_axes=(0, 0, 0))(
++            params["radius"][source_comp_inds],
++            params["axial_resistivity"][source_comp_inds],
++            params["length"][source_comp_inds],
++        )
++        # For numerical stability. These values are very small, but their scale
++        # does not matter.
++        conds_c2bp *= 1_000
++    else:
++        conds_c2bp = jnp.asarray([])
++
++    # All conductances.
++    return jnp.concatenate([conds_c2c, conds_bp2c, conds_c2bp])
++
++
++def compute_children_and_parents(
++    branch_edges: pd.DataFrame,
++) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, int]:
++    """Build indices used during `._init_morph_custom_spsolve()."""
++    par_inds = branch_edges["parent_branch_index"].to_numpy()
++    child_inds = branch_edges["child_branch_index"].to_numpy()
++    child_belongs_to_branchpoint = remap_to_consecutive(par_inds)
++    par_inds = np.unique(par_inds)
++    return par_inds, child_inds, child_belongs_to_branchpoint
+diff --git a/jaxley/utils/debug_solver.py b/jaxley/utils/debug_solver.py
+index 43beee4b9..84743e0c6 100644
+--- a/jaxley/utils/debug_solver.py
++++ b/jaxley/utils/debug_solver.py
+@@ -183,37 +183,3 @@ def drop_nseg_th_element(
+     )
+ 
+     return result
+-
+-
+-def convert_to_csc(
+-    num_elements: int, row_ind: np.ndarray, col_ind: np.ndarray
+-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+-    """Convert between two representations for sparse systems.
+-
+-    This is needed because `jax.scipy.linalg.spsolve` requires the `(ind, indptr)`
+-    representation, but for `scipy` (and for intuition) we build the `(row, col)`
+-    representation.
+-
+-    This function uses `np` instead of `jnp` because it only deals with indexing which
+-    can be dealt with only based on the branch structure (i.e. independent of any
+-    parameter values).
+-
+-    Written by ChatGPT.
+-    """
+-    data_inds = np.arange(num_elements)
+-    # Step 1: Sort by (col_ind, row_ind)
+-    sorted_indices = np.lexsort((row_ind, col_ind))
+-    data_inds = data_inds[sorted_indices]
+-    row_ind = row_ind[sorted_indices]
+-    col_ind = col_ind[sorted_indices]
+-
+-    # Step 2: Create indptr array
+-    n_cols = col_ind.max() + 1
+-    indptr = np.zeros(n_cols + 1, dtype=int)
+-    np.add.at(indptr, col_ind + 1, 1)
+-    np.cumsum(indptr, out=indptr)
+-
+-    # Step 3: The row indices are already sorted
+-    indices = row_ind
+-
+-    return data_inds, indices, indptr
+diff --git a/tests/jaxley_identical/test_basic_modules.py b/tests/jaxley_identical/test_basic_modules.py
+index 0980fe3e1..c78d9b232 100644
+--- a/tests/jaxley_identical/test_basic_modules.py
++++ b/tests/jaxley_identical/test_basic_modules.py
+@@ -14,6 +14,7 @@
+ 
+ import jax.numpy as jnp
+ import numpy as np
++import pytest
+ 
+ import jaxley as jx
+ from jaxley.channels import HH
+@@ -21,7 +22,8 @@
+ from jaxley.synapses import IonotropicSynapse, TestSynapse
+ 
+ 
+-def test_compartment():
++@pytest.mark.parametrize("voltage_solver", ["jaxley.stone", "jax.sparse"])
++def test_compartment(voltage_solver: str):
+     dt = 0.025  # ms
+     t_max = 5.0  # ms
+     current = jx.step_current(0.5, 1.0, 0.02, dt, t_max)
+@@ -31,7 +33,7 @@ def test_compartment():
+     comp.record()
+     comp.stimulate(current)
+ 
+-    voltages = jx.integrate(comp, delta_t=dt)
++    voltages = jx.integrate(comp, delta_t=dt, voltage_solver=voltage_solver)
+ 
+     voltages_081123 = jnp.asarray(
+         [
+@@ -55,7 +57,8 @@ def test_compartment():
+     assert max_error <= tolerance, f"Error is {max_error} > {tolerance}"
+ 
+ 
+-def test_branch():
++@pytest.mark.parametrize("voltage_solver", ["jaxley.stone", "jax.sparse"])
++def test_branch(voltage_solver: str):
+     nseg_per_branch = 2
+     dt = 0.025  # ms
+     t_max = 5.0  # ms
+@@ -67,7 +70,7 @@ def test_branch():
+     branch.loc(0.0).record()
+     branch.loc(0.0).stimulate(current)
+ 
+-    voltages = jx.integrate(branch, delta_t=dt)
++    voltages = jx.integrate(branch, delta_t=dt, voltage_solver=voltage_solver)
+ 
+     voltages_081123 = jnp.asarray(
+         [
+@@ -91,7 +94,8 @@ def test_branch():
+     assert max_error <= tolerance, f"Error is {max_error} > {tolerance}"
+ 
+ 
+-def test_cell():
++@pytest.mark.parametrize("voltage_solver", ["jaxley.stone", "jax.sparse"])
++def test_cell(voltage_solver: str):
+     nseg_per_branch = 2
+     dt = 0.025  # ms
+     t_max = 5.0  # ms
+@@ -107,7 +111,7 @@ def test_cell():
+     cell.branch(1).loc(0.0).record()
+     cell.branch(1).loc(0.0).stimulate(current)
+ 
+-    voltages = jx.integrate(cell, delta_t=dt)
++    voltages = jx.integrate(cell, delta_t=dt, voltage_solver=voltage_solver)
+ 
+     voltages_300724 = jnp.asarray(
+         [
+@@ -131,7 +135,42 @@ def test_cell():
+     assert max_error <= tolerance, f"Error is {max_error} > {tolerance}"
+ 
+ 
+-def test_net():
++def test_cell_unequal_compartment_number():
++    """Tests a cell where every branch has a different number of compartments."""
++    dt = 0.025  # ms
++    t_max = 5.0  # ms
++    current = jx.step_current(0.5, 1.0, 0.1, dt, t_max)
++
++    comp = jx.Compartment()
++    branch1 = jx.Branch(comp, nseg=1)
++    branch2 = jx.Branch(comp, nseg=2)
++    branch3 = jx.Branch(comp, nseg=3)
++    branch4 = jx.Branch(comp, nseg=4)
++    cell = jx.Cell([branch1, branch2, branch3, branch4], parents=[-1, 0, 0, 1])
++    cell.set("axial_resistivity", 10_000.0)
++    cell.insert(HH())
++    cell.branch(1).comp(1).stimulate(current)
++    cell.branch(0).comp(0).record()
++    cell.branch(2).comp(2).record()
++    cell.branch(3).comp(1).record()
++    cell.branch(3).comp(3).record()
++
++    voltages = jx.integrate(cell, delta_t=dt, voltage_solver="jax.sparse")
++    voltages_170924 = jnp.asarray(
++        [
++            [-70.0, -53.80615874, 22.05497283, -47.39519176, -75.64644816],
++            [-70.0, -61.74975007, 34.11362303, -28.88940829, -75.73717223],
++            [-70.0, -52.99972332, 20.97523461, -47.83840746, -75.66974145],
++            [-70.0, -60.86509139, 35.1106244, -33.89684951, -75.76946014],
++        ]
++    )
++    max_error = np.max(np.abs(voltages[:, ::50] - voltages_170924))
++    tolerance = 1e-8
++    assert max_error <= tolerance, f"Error is {max_error} > {tolerance}"
++
++
++@pytest.mark.parametrize("voltage_solver", ["jaxley.stone", "jax.sparse"])
++def test_net(voltage_solver: str):
+     nseg_per_branch = 2
+     dt = 0.025  # ms
+     t_max = 5.0  # ms
+@@ -164,7 +203,7 @@ def test_net():
+     network.IonotropicSynapse.set(
+         "IonotropicSynapse_gS", 0.5 / point_process_to_dist_factor
+     )
+-    voltages = jx.integrate(network, delta_t=dt)
++    voltages = jx.integrate(network, delta_t=dt, voltage_solver=voltage_solver)
+ 
+     voltages_300724 = jnp.asarray(
+         [
+@@ -202,7 +241,8 @@ def test_net():
+     assert max_error <= tolerance, f"Error is {max_error} > {tolerance}"
+ 
+ 
+-def test_complex_net():
++@pytest.mark.parametrize("voltage_solver", ["jaxley.stone", "jax.sparse"])
++def test_complex_net(voltage_solver: str):
+     comp = jx.Compartment()
+     branch = jx.Branch(comp, nseg=4)
+     cell = jx.Cell(branch, parents=[-1, 0, 0, 1, 1])
+@@ -238,7 +278,7 @@ def test_complex_net():
+ 
+     net.cell(6).branch(0).loc(0.0).record()
+ 
+-    voltages = jx.integrate(net)
++    voltages = jx.integrate(net, voltage_solver=voltage_solver)
+ 
+     voltages_300724 = jnp.asarray(
+         [
+diff --git a/tests/jaxley_identical/test_radius_and_length.py b/tests/jaxley_identical/test_radius_and_length.py
+index f5905de18..5078e5cb1 100644
+--- a/tests/jaxley_identical/test_radius_and_length.py
++++ b/tests/jaxley_identical/test_radius_and_length.py
+@@ -15,13 +15,15 @@
+ 
+ import jax.numpy as jnp
+ import numpy as np
++import pytest
+ 
+ import jaxley as jx
+ from jaxley.channels import HH
+ from jaxley.synapses import IonotropicSynapse
+ 
+ 
+-def test_radius_and_length_compartment():
++@pytest.mark.parametrize("voltage_solver", ["jaxley.stone", "jax.sparse"])
++def test_radius_and_length_compartment(voltage_solver: str):
+     dt = 0.025  # ms
+     t_max = 5.0  # ms
+     current = jx.step_current(0.5, 1.0, 0.02, dt, t_max)
+@@ -36,7 +38,7 @@ def test_radius_and_length_compartment():
+     comp.record()
+     comp.stimulate(current)
+ 
+-    voltages = jx.integrate(comp, delta_t=dt)
++    voltages = jx.integrate(comp, delta_t=dt, voltage_solver=voltage_solver)
+ 
+     voltages_081123 = jnp.asarray(
+         [
+@@ -60,7 +62,8 @@ def test_radius_and_length_compartment():
+     assert max_error <= tolerance, f"Error is {max_error} > {tolerance}"
+ 
+ 
+-def test_radius_and_length_branch():
++@pytest.mark.parametrize("voltage_solver", ["jaxley.stone", "jax.sparse"])
++def test_radius_and_length_branch(voltage_solver: str):
+     nseg_per_branch = 2
+     dt = 0.025  # ms
+     t_max = 5.0  # ms
+@@ -77,7 +80,7 @@ def test_radius_and_length_branch():
+     branch.loc(0.0).record()
+     branch.loc(0.0).stimulate(current)
+ 
+-    voltages = jx.integrate(branch, delta_t=dt)
++    voltages = jx.integrate(branch, delta_t=dt, voltage_solver=voltage_solver)
+ 
+     voltages_300724 = jnp.asarray(
+         [
+@@ -101,7 +104,8 @@ def test_radius_and_length_branch():
+     assert max_error <= tolerance, f"Error is {max_error} > {tolerance}"
+ 
+ 
+-def test_radius_and_length_cell():
++@pytest.mark.parametrize("voltage_solver", ["jaxley.stone", "jax.sparse"])
++def test_radius_and_length_cell(voltage_solver: str):
+     nseg_per_branch = 2
+     dt = 0.025  # ms
+     t_max = 5.0  # ms
+@@ -126,7 +130,7 @@ def test_radius_and_length_cell():
+     cell.branch(1).loc(0.0).record()
+     cell.branch(1).loc(0.0).stimulate(current)
+ 
+-    voltages = jx.integrate(cell, delta_t=dt)
++    voltages = jx.integrate(cell, delta_t=dt, voltage_solver=voltage_solver)
+ 
+     voltages_300724 = jnp.asarray(
+         [
+@@ -150,7 +154,8 @@ def test_radius_and_length_cell():
+     assert max_error <= tolerance, f"Error is {max_error} > {tolerance}"
+ 
+ 
+-def test_radius_and_length_net():
++@pytest.mark.parametrize("voltage_solver", ["jaxley.stone", "jax.sparse"])
++def test_radius_and_length_net(voltage_solver: str):
+     nseg_per_branch = 2
+     dt = 0.025  # ms
+     t_max = 5.0  # ms
+@@ -200,7 +205,7 @@ def test_radius_and_length_net():
+     for stim_ind in range(2):
+         network.cell(stim_ind).branch(1).loc(0.0).stimulate(current)
+ 
+-    voltages = jx.integrate(network, delta_t=dt)
++    voltages = jx.integrate(network, delta_t=dt, voltage_solver=voltage_solver)
+ 
+     voltages_300724 = jnp.asarray(
+         [
+diff --git a/tests/jaxley_vs_neuron/test_cell.py b/tests/jaxley_vs_neuron/test_cell.py
+index cbe5901a0..12f438404 100644
+--- a/tests/jaxley_vs_neuron/test_cell.py
++++ b/tests/jaxley_vs_neuron/test_cell.py
+@@ -130,3 +130,116 @@ def integrate():
+ 
+     voltages = np.asarray([list(voltage1), list(voltage2), list(voltage3)])
+     return voltages
++
++
++def test_similarity_unequal_number_of_compartments():
++    """Test similarity of jaxley vs neuron."""
++    i_delay = 3.0  # ms
++    i_dur = 2.0  # ms
++    i_amp = 1.0  # nA
++
++    dt = 0.025  # ms
++    t_max = 10.0  # ms
++
++    voltages_jaxley = _run_jaxley_unequal_ncomp(i_delay, i_dur, i_amp, dt, t_max)
++    voltages_neuron = _run_neuron_unequal_ncomp(i_delay, i_dur, i_amp, dt, t_max)
++
++    assert np.mean(np.abs(voltages_jaxley - voltages_neuron)) < 0.05
++
++
++def _run_jaxley_unequal_ncomp(i_delay, i_dur, i_amp, dt, t_max):
++    comp = jx.Compartment()
++    branch1 = jx.Branch(comp, nseg=1)
++    branch2 = jx.Branch(comp, nseg=2)
++    branch3 = jx.Branch(comp, nseg=3)
++    branch4 = jx.Branch(comp, nseg=4)
++    cell = jx.Cell([branch1, branch2, branch3, branch4], parents=[-1, 0, 0, 1])
++    cell.set("axial_resistivity", 10_000.0)
++    cell.insert(HH())
++
++    cell.set("radius", 5.0)
++    cell.set("length", 20.0)
++    cell.set("axial_resistivity", 1_000.0)
++
++    cell.set("HH_gNa", 0.120)
++    cell.set("HH_gK", 0.036)
++    cell.set("HH_gLeak", 0.0003)
++    cell.set("HH_m", 0.07490098835688629)
++    cell.set("HH_h", 0.488947681848153)
++    cell.set("HH_n", 0.3644787002343737)
++    cell.set("v", -62.0)
++
++    current = jx.step_current(i_delay, i_dur, i_amp, dt, t_max)
++    cell.branch(1).comp(1).stimulate(current)
++    cell.branch(0).comp(0).record()
++    cell.branch(2).comp(2).record()
++    cell.branch(3).comp(1).record()
++    cell.branch(3).comp(3).record()
++
++    voltages = jx.integrate(cell, delta_t=dt, voltage_solver="jax.sparse")
++    return voltages
++
++
++def _run_neuron_unequal_ncomp(i_delay, i_dur, i_amp, dt, t_max):
++    h.secondorder = 0
++    h.dt = dt
++
++    for sec in h.allsec():
++        h.delete_section(sec=sec)
++
++    branch1 = h.Section()
++    branch2 = h.Section()
++    branch3 = h.Section()
++    branch4 = h.Section()
++
++    branch2.connect(branch1, 1, 0)
++    branch3.connect(branch1, 1, 0)
++    branch4.connect(branch2, 1, 0)
++
++    nsegs = [1, 2, 3, 4]
++    for i, sec in enumerate(h.allsec()):
++        sec.nseg = nsegs[i]
++
++        sec.Ra = 1_000.0
++        sec.L = 20.0 * nsegs[i]
++        sec.diam = 2 * 5.0
++
++        sec.insert("hh")
++        sec.gnabar_hh = 0.120  # S/cm2
++        sec.gkbar_hh = 0.036  # S/cm2
++        sec.gl_hh = 0.0003  # S/cm2
++        sec.ena = 50  # mV
++        sec.ek = -77.0  # mV
++        sec.el_hh = -54.3  # mV
++
++    stim = h.IClamp(branch2(0.6))  # The second out of two.
++    stim.delay = i_delay
++    stim.dur = i_dur
++    stim.amp = i_amp
++
++    voltage1 = h.Vector()
++    voltage1.record(branch1(0.5)._ref_v)  # Only 1 compartment.
++    voltage2 = h.Vector()
++    voltage2.record(branch3(0.8)._ref_v)  # The third out of three compartments.
++    voltage3 = h.Vector()
++    voltage3.record(branch4(0.3)._ref_v)  # The second out of four comps.
++    voltage4 = h.Vector()
++    voltage4.record(branch4(0.9)._ref_v)  # The last out of four comps.
++
++    v_init = -62.0
++
++    def initialize():
++        h.finitialize(v_init)
++        h.fcurrent()
++
++    def integrate():
++        while h.t < t_max:
++            h.fadvance()
++
++    initialize()
++    integrate()
++
++    voltages = np.asarray(
++        [list(voltage1), list(voltage2), list(voltage3), list(voltage4)]
++    )
++    return voltages
+diff --git a/tests/test_api_equivalence.py b/tests/test_api_equivalence.py
+index f5112a529..aaf872853 100644
+--- a/tests/test_api_equivalence.py
++++ b/tests/test_api_equivalence.py
+@@ -186,3 +186,46 @@ def test_api_equivalence_continued_simulation():
+ 
+     v2 = jnp.concatenate([v21, v22[:, 1:]], axis=1)
+     assert np.max(np.abs(v1 - v2)) < 1e-8
++
++
++def test_api_equivalence_network_matches_cell():
++    """Test whether a network with w=0 synapses equals the individual cells.
++
++    This runs an unequal number of compartments per branch."""
++    dt = 0.025  # ms
++    t_max = 5.0  # ms
++    current = jx.step_current(0.5, 1.0, 0.1, dt, t_max)
++
++    comp = jx.Compartment()
++    branch1 = jx.Branch(comp, nseg=1)
++    branch2 = jx.Branch(comp, nseg=2)
++    branch3 = jx.Branch(comp, nseg=3)
++    cell1 = jx.Cell([branch1, branch2, branch3], parents=[-1, 0, 0])
++    cell2 = jx.Cell([branch1, branch2], parents=[-1, 0])
++    cell1.insert(HH())
++    cell2.insert(HH())
++
++    net = jx.Network([cell1, cell2])
++    pre = net.cell(0).branch(2).comp(2)
++    post = net.cell(1).branch(1).comp(1)
++    connect(pre, post, IonotropicSynapse())
++    net.IonotropicSynapse("all").set("IonotropicSynapse_gS", 0.0)
++
++    net.cell(0).branch(2).comp(2).stimulate(current)
++    net.cell(0).branch(0).comp(0).record()
++
++    net.cell(1).branch(1).comp(1).stimulate(current)
++    net.cell(1).branch(0).comp(0).record()
++    voltages_net = jx.integrate(net, delta_t=dt, voltage_solver="jax.sparse")
++
++    cell1.branch(2).comp(2).stimulate(current)
++    cell1.branch(0).comp(0).record()
++
++    cell2.branch(1).comp(1).stimulate(current)
++    cell2.branch(0).comp(0).record()
++    voltages_cell1 = jx.integrate(cell1, delta_t=dt, voltage_solver="jax.sparse")
++    voltages_cell2 = jx.integrate(cell2, delta_t=dt, voltage_solver="jax.sparse")
++    voltages_cells = jnp.concatenate([voltages_cell1, voltages_cell2], axis=0)
++
++    max_error = np.max(np.abs(voltages_net - voltages_cells))
++    assert max_error < 1e-8, f"Error is {max_error}"
+diff --git a/tests/test_make_trainable.py b/tests/test_make_trainable.py
+index 6117e5359..a0ea26736 100644
+--- a/tests/test_make_trainable.py
++++ b/tests/test_make_trainable.py
+@@ -122,7 +122,7 @@ def test_diverse_synapse_types():
+     params[1]["TestSynapse_gC"] = params[1]["TestSynapse_gC"].at[1].set(4.4)
+     net.to_jax()
+     pstate = params_to_pstate(params, net.indices_set_by_trainables)
+-    all_parameters = net.get_all_parameters(pstate)
++    all_parameters = net.get_all_parameters(pstate, voltage_solver="jaxley.thomas")
+ 
+     assert np.all(all_parameters["radius"] == 1.0)
+     assert np.all(all_parameters["length"] == 10.0)
+@@ -142,7 +142,7 @@ def test_diverse_synapse_types():
+     params[2]["IonotropicSynapse_gS"] = params[2]["IonotropicSynapse_gS"].at[:].set(5.5)
+     net.to_jax()
+     pstate = params_to_pstate(params, net.indices_set_by_trainables)
+-    all_parameters = net.get_all_parameters(pstate)
++    all_parameters = net.get_all_parameters(pstate, voltage_solver="jaxley.thomas")
+     assert np.all(all_parameters["IonotropicSynapse_gS"][0] == 2.2)
+     assert np.all(all_parameters["IonotropicSynapse_gS"][1] == 5.5)
+ 
+@@ -230,7 +230,7 @@ def get_params_subset_trainable(net):
+     params[0]["HH_gNa"] = params[0]["HH_gNa"].at[:].set(0.0)
+     net.to_jax()
+     pstate = params_to_pstate(params, net.indices_set_by_trainables)
+-    return net.get_all_parameters(pstate)
++    return net.get_all_parameters(pstate, voltage_solver="jaxley.thomas")
+ 
+ 
+ def get_params_set_subset(net):
+@@ -238,7 +238,7 @@ def get_params_set_subset(net):
+     params = net.get_parameters()
+     net.to_jax()
+     pstate = params_to_pstate(params, net.indices_set_by_trainables)
+-    return net.get_all_parameters(pstate)
++    return net.get_all_parameters(pstate, voltage_solver="jaxley.thomas")
+ 
+ 
+ def get_params_all_trainable(net):
+@@ -247,7 +247,7 @@ def get_params_all_trainable(net):
+     params[0]["HH_gNa"] = params[0]["HH_gNa"].at[:].set(0.0)
+     net.to_jax()
+     pstate = params_to_pstate(params, net.indices_set_by_trainables)
+-    return net.get_all_parameters(pstate)
++    return net.get_all_parameters(pstate, voltage_solver="jaxley.thomas")
+ 
+ 
+ def get_params_set(net):
+@@ -255,7 +255,7 @@ def get_params_set(net):
+     params = net.get_parameters()
+     net.to_jax()
+     pstate = params_to_pstate(params, net.indices_set_by_trainables)
+-    return net.get_all_parameters(pstate)
++    return net.get_all_parameters(pstate, voltage_solver="jaxley.thomas")
+ 
+ 
+ def test_make_trainable_corresponds_to_set_pospischil():
+@@ -268,7 +268,7 @@ def test_make_trainable_corresponds_to_set_pospischil():
+     params1[0]["vt"] = params1[0]["vt"].at[:].set(0.05)
+     net1.to_jax()
+     pstate1 = params_to_pstate(params1, net1.indices_set_by_trainables)
+-    all_params1 = net1.get_all_parameters(pstate1)
++    all_params1 = net1.get_all_parameters(pstate1, voltage_solver="jaxley.thomas")
+ 
+     net2.cell(0).insert(Na())
+     net2.insert(K())
+@@ -277,7 +277,7 @@ def test_make_trainable_corresponds_to_set_pospischil():
+     params2[0]["vt"] = params2[0]["vt"].at[:].set(0.05)
+     net2.to_jax()
+     pstate2 = params_to_pstate(params2, net2.indices_set_by_trainables)
+-    all_params2 = net2.get_all_parameters(pstate2)
++    all_params2 = net2.get_all_parameters(pstate2, voltage_solver="jaxley.thomas")
+     assert np.array_equal(all_params1["vt"], all_params2["vt"], equal_nan=True)
+     assert np.array_equal(all_params1["Na_gNa"], all_params2["Na_gNa"], equal_nan=True)
+     assert np.array_equal(all_params1["K_gK"], all_params2["K_gK"], equal_nan=True)
+@@ -313,14 +313,14 @@ def build_net():
+     params[0]["radius"] = params[0]["radius"].at[:].set(2.5)
+     net1.to_jax()
+     pstate = params_to_pstate(params, net1.indices_set_by_trainables)
+-    all_parameters1 = net1.get_all_parameters(pstate)
++    all_parameters1 = net1.get_all_parameters(pstate, voltage_solver="jaxley.thomas")
+ 
+     net2 = build_net()
+     net2.test.set("radius", 2.5)
+     params = net2.get_parameters()
+     net2.to_jax()
+     pstate = params_to_pstate(params, net2.indices_set_by_trainables)
+-    all_parameters2 = net2.get_all_parameters(pstate)
++    all_parameters2 = net2.get_all_parameters(pstate, voltage_solver="jaxley.thomas")
+ 
+     assert np.allclose(all_parameters1["radius"], all_parameters2["radius"])
+ 
+@@ -334,14 +334,14 @@ def test_data_set_vs_make_trainable_pospischil():
+     params1[0]["vt"] = params1[0]["vt"].at[:].set(0.05)
+     net1.to_jax()
+     pstate1 = params_to_pstate(params1, net1.indices_set_by_trainables)
+-    all_params1 = net1.get_all_parameters(pstate1)
++    all_params1 = net1.get_all_parameters(pstate1, voltage_solver="jaxley.thomas")
+ 
+     net2.cell(0).insert(Na())
+     net2.insert(K())
+     val = params1[0]["vt"]
+     pstate = net2.cell("all").branch("all").loc("all").data_set("vt", val.item(), None)
+     net2.to_jax()
+-    all_params2 = net2.get_all_parameters(pstate)
++    all_params2 = net2.get_all_parameters(pstate, voltage_solver="jaxley.thomas")
+     assert np.array_equal(all_params1["vt"], all_params2["vt"], equal_nan=True)
+     assert np.array_equal(all_params1["Na_gNa"], all_params2["Na_gNa"], equal_nan=True)
+     assert np.array_equal(all_params1["K_gK"], all_params2["K_gK"], equal_nan=True)

@@ -1,0 +1,396 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3f9171d6a..d1e2e8d15 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ### 🧩 New features
+ 
++- Add AdEx simplified neuron model, similar to the implementation of Izhikevich channel.
++Implements Brette et al. (2005), 'Adaptive exponential integrate-and-fire model as an effective description of neuronal activity.'
+ - Add an identity transformation (`jaxley.optimize.transforms.IdentityTransform`) (#777, @chaseking)
+ - Add handling of inhomogeneous branches for import and export of morphologies. (#779,@NicolasRR)
+ - Add an logistic transformation (`jaxley.optimize.transforms.LogisticTransform`) (#788, @jnsbck)
+diff --git a/jaxley/channels/__init__.py b/jaxley/channels/__init__.py
+index 1dcf57786..fab2ec067 100644
+--- a/jaxley/channels/__init__.py
++++ b/jaxley/channels/__init__.py
+@@ -3,6 +3,7 @@
+ 
+ from jaxley.channels.channel import Channel  # isort: skip
+ from jaxley.channels.hh import HH
++from jaxley.channels.non_capacitive.adex import AdEx
+ from jaxley.channels.non_capacitive.izhikevich import Izhikevich
+ from jaxley.channels.non_capacitive.rate import Rate
+ from jaxley.channels.non_capacitive.spike import Fire
+@@ -11,6 +12,7 @@
+ __all__ = [
+     "Channel",
+     "HH",
++    "AdEx",
+     "Izhikevich",
+     "Rate",
+     "Fire",
+diff --git a/jaxley/channels/non_capacitive/adex.py b/jaxley/channels/non_capacitive/adex.py
+new file mode 100644
+index 000000000..00b91c0e5
+--- /dev/null
++++ b/jaxley/channels/non_capacitive/adex.py
+@@ -0,0 +1,180 @@
++# This file is part of Jaxley, a differentiable neuroscience simulator. Jaxley is
++# licensed under the Apache License Version 2.0, see <https://www.apache.org/licenses/>
++
++"""
++Unified AdEx (Adaptive Exponential Integrate-and-Fire) neuron model.
++
++References:
++    Brette, R., & Gerstner, W. (2005). Adaptive exponential integrate-and-fire model
++    as an effective description of neuronal activity.
++"""
++
++from typing import Optional
++from warnings import warn
++
++import jax
++import jax.numpy as jnp
++from jax import Array
++
++from jaxley.channels import Channel
++from jaxley.solver_gate import exponential_euler, save_exp
++
++__all__ = ["AdEx"]
++
++
++class AdEx(Channel):
++    """
++    Unified Adaptive Exponential Integrate-and-Fire (AdEx) neuron model.
++
++    This channel implements the full AdEx dynamics:
++    - Leak current
++    - Exponential spike mechanism
++    - Adaptation current
++    - Spike detection and reset
++
++    The membrane equation is:
++        C_m * dV/dt = -g_L * (V - E_L) + g_L * delta_T * exp((V - V_T) / delta_T) - w + I_ext
++        tau_w * dw/dt = a * (V - E_L) - w
++
++    When V > v_threshold:
++        V -> v_reset
++        w -> w + b
++
++    Parameters (set via channel_params):
++        g_L: Leak conductance (default: 10.0 nS)
++        E_L: Leak reversal potential (default: -70.0 mV)
++        v_T: Spike threshold potential (default: -50.0 mV)
++        delta_T: Spike slope factor (default: 2.0 mV)
++        v_threshold: Spike detection threshold (default: 20.0 mV)
++        v_reset: Reset potential after spike (default: -70.0 mV)
++        tau_w: Adaptation time constant (default: 30.0 ms)
++        a: Subthreshold adaptation (default: 2.0 nS)
++        b: Spike-triggered adaptation (default: 0.0 pA)
++    """
++
++    def __init__(self, name: Optional[str] = None, surrogate_warning=True):
++        self.current_is_in_mA_per_cm2 = True
++        super().__init__(name)
++
++        prefix = self._name
++
++        # All AdEx parameters
++        # Note: Conductances are in S/cm^2, currents in mA/cm^2
++        # These defaults give reasonable tonic spiking behavior
++        self.channel_params = {
++            # Leak parameters
++            # f"capacitance": 200.,
++            f"{prefix}_g_L": 10,  # S/cm^2 (leak conductance density)
++            f"{prefix}_E_L": -70.0,  # mV
++            # Exponential spike parameters
++            f"{prefix}_v_T": -50.0,  # mV (spike threshold)
++            f"{prefix}_delta_T": 2.0,  # mV (spike slope factor)
++            # Spike reset parameters
++            f"{prefix}_v_threshold": 0.0,  # mV (detection threshold)
++            f"{prefix}_v_reset": -58.0,  # mV (reset potential)
++            # Adaptation parameters
++            f"{prefix}_tau_w": 30.0,  # ms
++            f"{prefix}_a": 2,  # S/cm^2 (sub-threshold adaptation)
++            f"{prefix}_b": 0,  # mA/cm^2 (spike-triggered adaptation)
++        }
++
++        # AdEx state variables
++        self.channel_states = {
++            f"{prefix}_w": 0.0,  # Adaptation current
++            f"{prefix}_spikes": False,  # Spike indicator
++        }
++
++        self.current_name = f"i_{prefix}"
++
++        if surrogate_warning:
++            warn(
++                f"The {self.name} channel does not support surrogate gradients. "
++                "Its gradient will be zero after every spike. "
++                "Use AdExSurrogate for differentiable spiking."
++            )
++
++    def update_states(
++        self, states: dict[str, Array], dt: float, v: Array, params: dict[str, Array]
++    ) -> dict[str, Array]:
++        """
++        Update adaptation variable, integrate voltage, and handle spike reset.
++
++        Like Izhikevich, all dynamics are handled here. This allows proper clamping
++        of the exponential spike mechanism.
++
++        Args:
++            states: Current state dictionary
++            dt: Time step (ms)
++            v: Membrane potential (mV)
++            params: Parameter dictionary
++
++        Returns:
++            Dictionary with updated states: v, w, spikes
++        """
++        prefix = self._name
++
++        # Get parameters
++        C_m = params[f"capacitance"]
++        g_L = params[f"{prefix}_g_L"]
++        E_L = params[f"{prefix}_E_L"]
++        v_T = params[f"{prefix}_v_T"]
++        v_reset = params[f"{prefix}_v_reset"]
++        v_threshold = params[f"{prefix}_v_threshold"]
++        delta_T = params[f"{prefix}_delta_T"]
++
++        tau_w = params[f"{prefix}_tau_w"]
++        a = params[f"{prefix}_a"]
++        b = params[f"{prefix}_b"]
++
++        # Get adaptation current
++        w = states[f"{prefix}_w"]
++
++        # Update adaptation variable with exponential Euler
++        w = exponential_euler(w, dt, a * (v - E_L), tau_w)
++
++        # Leak current
++        i_leak = g_L * (v - E_L)
++
++        # Exponential spike current (clamped to prevent overflow)
++        exp_arg = (v - v_T) / delta_T
++        exp_arg = jnp.minimum(exp_arg, 10.0)  # Clamp at exp(10) ≈ 22000
++        i_exp = g_L * delta_T * save_exp(exp_arg)
++
++        # Total derivative
++        dv = (-i_leak + i_exp - w) / C_m
++        # Forward Euler
++        v = v + dt * dv
++
++        # Check for spike and reset
++        spike_occurred = (
++            v >= v_threshold
++        )  # ToDo: replace this with heaviside function in v1.0.0
++        v = jax.lax.select(spike_occurred, v_reset, v)
++        w = jax.lax.select(spike_occurred, w + b, w)
++
++        return {
++            "v": v,
++            f"{prefix}_w": w,
++            f"{prefix}_spikes": spike_occurred.astype(jnp.float32),
++        }
++
++    def compute_current(
++        self, states: dict[str, Array], v: Array, params: dict[str, Array]
++    ) -> Array:
++        """
++        Return zero current since all dynamics are handled in update_states.
++
++        Like Izhikevich, AdEx integrates voltage directly in update_states,
++        so compute_current returns zero to avoid double-integration.
++        """
++        return jnp.zeros((1,))
++
++    def init_state(
++        self,
++        states: dict[str, Array],
++        v: Array,
++        params: dict[str, Array],
++        delta_t: float,
++    ) -> dict[str, Array]:
++        """ """
++        return {}
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ec961354f..9a528bd9d 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -3,12 +3,14 @@
+ 
+ import json
+ import os
++import warnings
+ from copy import deepcopy
+ from typing import Optional
+ 
+ import pytest
+ 
+ import jaxley as jx
++from jaxley.channels import AdEx
+ from jaxley.synapses import IonotropicSynapse
+ from tests.test_regression import generate_regression_report, load_json
+ 
+@@ -143,6 +145,62 @@ def get_or_build_net(
+     nets = {}
+ 
+ 
++@pytest.fixture(scope="session")
++def SpikeNet(SimpleComp):
++    """Fixture for creating a network with AdEx spiking neurons."""
++    nets = {}
++
++    def get_or_build_net(
++        ncells: int,
++        nbranches: int,
++        ncomp: int,
++        connect: bool = False,
++        copy: bool = True,
++        force_init: bool = False,
++    ) -> jx.Network:
++        """Create or retrieve a spiking network with AdEx neurons.
++
++        Args:
++            ncells: Number of cells in the network.
++            nbranches: Number of branches in each cell.
++            ncomp: Number of compartments in each branch.
++            connect: Whether to connect cells with synapses.
++            copy: Whether to return a copy of the network. Default is True.
++            force_init: Force the init from scratch. Default is False.
++
++        Returns:
++            jx.Network() with AdEx neurons."""
++        if key := (ncells, nbranches, ncomp, connect) not in nets or force_init:
++            # Build cells with AdEx
++            cells = []
++            for _ in range(ncells):
++                # Simple branch structure
++                parents = [-1]
++                depth = 0
++                while nbranches > len(parents):
++                    parents = [-1] + [b // 2 for b in range(0, 2**depth - 2)]
++                    depth += 1
++                parents = parents[:nbranches]
++
++                comp = SimpleComp(force_init=force_init)
++                branch = jx.Branch([comp] * ncomp)
++                cell = jx.Cell([branch] * nbranches, parents)
++                with warnings.catch_warnings():
++                    warnings.simplefilter("ignore")  # Ignore surrogate warning
++                    cell.insert(AdEx())
++                cell.set("capacitance", 200.0)
++                cells.append(cell)
++
++            net = jx.Network(cells)
++            if connect and ncells >= 2:
++                jx.connect(net[0, 0, 0], net[1, 0, 0], IonotropicSynapse())
++            nets[key] = net
++        return deepcopy(nets[key]) if copy and not force_init else nets[key]
++
++    yield get_or_build_net
++    nets = {}
++
++
+ @pytest.fixture(scope="session")
+ def SimpleMorphCell():
+     """Fixture for creating or retrieving an already created morpholgy."""
+diff --git a/tests/test_channels.py b/tests/test_channels.py
+index f67ae15d7..616a667fa 100644
+--- a/tests/test_channels.py
++++ b/tests/test_channels.py
+@@ -16,6 +16,7 @@
+ import jaxley as jx
+ from jaxley.channels import (
+     HH,
++    AdEx,
+     CaL,
+     CaT,
+     Channel,
+@@ -587,3 +588,58 @@ def test_multicompartment_izhikevich(SimpleCell):
+     cell.branch(0).comp(0).stimulate(jx.step_current(5.0, 20.0, 0.02, dt, t_max))
+     recordings = jx.integrate(cell, delta_t=dt)
+     assert np.invert(np.any(np.isnan(recordings)))
++
++
++def test_adex():
++    """Test that AdEx produces expected spiking behavior."""
++    import warnings
++
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore")  # Ignore surrogate gradient warning
++        cell = jx.Cell()
++        cell.insert(AdEx())
++
++    # Set parameters for reliable spiking (from test_adex.py)
++    cell.set("capacitance", 200.0)
++    cell.set("radius", 33.0)
++    cell.set("length", 100.0)
++    cell.set("v", -58.0)
++    cell.record("v")
++    cell.record("AdEx_spikes")
++
++    dt = 0.1
++    t_max = 100.0
++
++    cell.stimulate(jx.step_current(5.0, 80.0, 100.0, dt, t_max))
++    recordings = jx.integrate(cell, delta_t=dt)
++
++    # Check that simulation runs without NaN
++    assert np.invert(np.any(np.isnan(recordings)))
++
++    # Check that spikes occurred (voltage should have been reset at some point)
++    v = np.asarray(recordings[0]).flatten()
++    spikes = np.asarray(recordings[1]).flatten()
++    assert np.any(spikes > 0), "AdEx should produce spikes with this stimulation"
++
++
++def test_multicompartment_adex(SimpleCell):
++    """Test that AdEx can be run in multicompartment simulation."""
++    import warnings
++
++    cell = SimpleCell(2, 4)
++    # Insert AdEx only in "soma" compartment, Leak elsewhere
++    cell.insert(Leak())
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore")  # Ignore surrogate gradient warning
++        cell.branch(0).comp(0).insert(AdEx())
++
++    cell.set("capacitance", 200.0)
++    cell.record("v")
++    cell.branch(0).comp(0).record("AdEx_spikes")
++
++    dt = 0.1
++    t_max = 40.0
++
++    cell.branch(0).comp(0).stimulate(jx.step_current(5.0, 20.0, 100.0, dt, t_max))
++    recordings = jx.integrate(cell, delta_t=dt)
++    assert np.invert(np.any(np.isnan(recordings)))
+diff --git a/tests/test_syn.py b/tests/test_syn.py
+index 3159e0364..b030c4341 100644
+--- a/tests/test_syn.py
++++ b/tests/test_syn.py
+@@ -49,3 +49,19 @@ def test_set_and_querying_params_one_type(SimpleNet):
+         assert net.edges[p][0] == 0.32
+         assert net.edges[p][1] == 0.18
+         assert np.all(net.edges[p].to_numpy()[np.asarray([2, 3])] == 0.12)
++
++
++def test_adex_spike_synapse(SpikeNet):
++    """Test if AdEx neurons properly propagate current through their synapses."""
++    n_neurons = 2
++    half = n_neurons // 2
++    net = SpikeNet(n_neurons, 1, 1, connect=True)
++
++    dt = 0.1
++    t_max = 40.0
++
++    # Stimulate the first half of neurons
++    net.cell(range(half)).stimulate(jx.step_current(5.0, 20.0, 100.0, dt, t_max))
++    net.cell(n_neurons - 1).record("v")
++    recordings = np.asarray(jx.integrate(net, delta_t=dt))
++    assert np.invert(np.any(np.isnan(recordings)))

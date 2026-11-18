@@ -1,0 +1,189 @@
+diff --git a/cloudvolume/datasource/precomputed/image/__init__.py b/cloudvolume/datasource/precomputed/image/__init__.py
+index 95673e8df..458694139 100644
+--- a/cloudvolume/datasource/precomputed/image/__init__.py
++++ b/cloudvolume/datasource/precomputed/image/__init__.py
+@@ -7,7 +7,9 @@
+ 
+ This datasource contains the code for manipulating images.
+ """
++from functools import reduce
+ import itertools
++import operator
+ import uuid
+ 
+ import numpy as np
+@@ -17,11 +19,11 @@
+ 
+ from cloudvolume import lib, exceptions
+ from ....lib import Bbox, Vec, sip, first
+-from .... import sharedmemory
++from .... import sharedmemory, chunks
+ 
+ from ... import autocropfn, readonlyguard, ImageSourceInterface
+ from .. import sharding
+-from .common import chunknames
++from .common import chunknames, gridpoints, compressed_morton_code
+ from . import tx, rx
+ 
+ class PrecomputedImageSource(ImageSourceInterface):
+@@ -56,6 +58,10 @@ def unlink_shared_memory(self):
+     """Unlink the current shared memory location from the filesystem."""
+     return sharedmemory.unlink(self.shared_memory_id)
+ 
++  def grid_size(self, mip=None):
++    mip = mip if mip is not None else self.config.mip
++    return np.ceil(self.meta.volume_size(mip) / self.meta.chunk_size(mip)).astype(np.int64)
++
+   def check_bounded(self, bbox, mip):
+     if self.bounded and not self.meta.bounds(mip).contains_bbox(bbox):
+       raise exceptions.OutOfBoundsError("""
+@@ -185,6 +191,16 @@ def upload(
+     if location is None:
+       location = self.shared_memory_id
+ 
++    if self.is_sharded(mip):
++      (filename, shard) = self.make_shard(image, bbox, mip)
++      basepath = self.meta.join(self.meta.cloudpath, self.meta.key(mip))
++      CloudFiles(basepath, progress=self.config.progress).put(
++        filename, shard, 
++        compress=self.config.compress, 
++        cache_control=self.config.cdn_cache
++      )
++      return
++
+     return tx.upload(
+       self.meta, self.cache,
+       image, offset, mip,
+@@ -352,3 +368,73 @@ def transfer_to(self, cloudpath, bbox, mip, block_size=None, compress=True, comp
+           content_type=tx.content_type(destvol),
+         )
+         pbar.update()
++
++  def make_shard(self, img, bbox, mip=None, spec=None):
++    """
++    Convert an image that represents a single complete shard 
++    into a shard file.
++  
++    img: a volumetric numpy array image
++    bbox: the bbox it represents in voxel coordinates
++    mip: if specified, use the sharding specification from 
++      this mip level, otherwise use the sharding spec from
++      the current implicit mip level in config.
++    spec: use the provided specification (overrides mip parameter)
++
++    Returns: (filename, shard_file)
++    """
++    mip = mip if mip is not None else self.config.mip
++    scale = self.meta.scale(mip)
++
++    if spec is None:
++      if 'sharding' in scale:
++        spec = sharding.ShardingSpecification.from_dict(scale['sharding'])
++      else:
++        raise ValueError("mip {} does not have a sharding specification.".format(mip))
++
++    if bbox.subvoxel():
++      raise ValueError("Bounding box is too small to make a shard. Got: {}".format(bbox))
++
++    bbox = Bbox.create(bbox, self.meta.bounds(mip), bounded=True)
++    aligned_bbox = bbox.expand_to_chunk_size(
++      self.meta.chunk_size(mip), offset=self.meta.voxel_offset(mip)
++    )
++    aligned_bbox = Bbox.clamp(aligned_bbox, self.meta.bounds(mip))
++
++    if bbox != aligned_bbox:
++      raise exceptions.AlignmentError(
++        "Unable to create shard from a non-chunk aligned bounding box. Requested: {}, Aligned: {}".format(
++        bbox, aligned_bbox
++      ))
++
++    grid_size = self.grid_size(mip)
++    chunk_size = self.meta.chunk_size(mip)
++    reader = sharding.ShardReader(self.meta, self.cache, spec)
++
++    gpts = lambda: gridpoints(bbox, self.meta.bounds(mip), chunk_size)
++    all_same_shard = bool(reduce(lambda a,b: operator.eq(a,b) and a,
++      map(reader.get_filename,
++        map(lambda gpt: compressed_morton_code(gpt, grid_size), gpts())
++      )
++    ))
++
++    if not all_same_shard:
++      raise exceptions.AlignmentError(
++        "The gridpoints for this image did not all correspond to the same shard. Got: {}".format(bbox)
++      )
++
++    labels = {}
++    for pt in gpts():
++      cutout_bbx = Bbox( pt * chunk_size, (pt+1) * chunk_size )
++      chunk = img[ cutout_bbx.to_slices() ]
++      morton_code = compressed_morton_code(pt, grid_size)
++      labels[morton_code] = chunks.encode(chunk, self.meta.encoding(mip))
++
++    shard_filename = reader.get_filename(first(labels.keys()))
++
++    return (shard_filename, spec.synthesize_shard(labels))
++
++  def is_sharded(self, mip):
++    scale = self.meta.scale(mip)
++    return 'sharding' in scale and scale['sharding'] is not None
++
+diff --git a/cloudvolume/datasource/precomputed/image/rx.py b/cloudvolume/datasource/precomputed/image/rx.py
+index 0b734702b..1bef894c5 100644
+--- a/cloudvolume/datasource/precomputed/image/rx.py
++++ b/cloudvolume/datasource/precomputed/image/rx.py
+@@ -55,7 +55,7 @@ def download_sharded(
+ 
+   renderbuffer = np.zeros(shape=shape, dtype=meta.dtype, order=order)
+ 
+-  gpts = list(gridpoints(full_bbox, bounds, chunk_size))
++  gpts = gridpoints(full_bbox, bounds, chunk_size)
+ 
+   code_map = {}
+   for gridpoint in gpts:
+diff --git a/test/test_sharding.py b/test/test_sharding.py
+index 86bad9a04..8b78bae4e 100644
+--- a/test/test_sharding.py
++++ b/test/test_sharding.py
+@@ -5,6 +5,8 @@
+ from cloudvolume.exceptions import SpecViolation
+ 
+ from cloudvolume import Vec
++from cloudvolume import exceptions
++from layer_harness import delete_layer, create_layer
+ 
+ import numpy as np
+ 
+@@ -225,8 +227,30 @@ def test_image_fidelity():
+ 
+   assert N_labels == 144
+ 
++def test_write_image_shard():
++  delete_layer()
++  cv, data = create_layer(size=(256,256,256,1), offset=(0,0,0))
+ 
+-
+-
++  spec = {
++    "@type" : "neuroglancer_uint64_sharded_v1",
++    "data_encoding" : "gzip",
++    "hash" : "murmurhash3_x86_128",
++    "minishard_bits" : 1,
++    "minishard_index_encoding" : "raw",
++    "preshift_bits" : 3,
++    "shard_bits" : 0
++  }
++  cv.scale['sharding'] = spec
++
++  cv[:] = data
++  sharded_data = cv[:]
++  assert np.all(data == sharded_data)
++
++  spec['shard_bits'] = 1
++  try:
++    cv[:] = data
++    assert False
++  except exceptions.AlignmentError:
++    pass
+ 
+ 

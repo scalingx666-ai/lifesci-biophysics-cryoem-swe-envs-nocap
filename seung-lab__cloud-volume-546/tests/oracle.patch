@@ -1,0 +1,393 @@
+diff --git a/README.md b/README.md
+index 040536a51..7f4a23fd0 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ [![Build Status](https://travis-ci.org/seung-lab/cloud-volume.svg?branch=master)](https://travis-ci.org/seung-lab/cloud-volume) [![PyPI version](https://badge.fury.io/py/cloud-volume.svg)](https://badge.fury.io/py/cloud-volume) [![SfN 2018 Poster](https://img.shields.io/badge/poster-SfN%202018-blue.svg)](https://drive.google.com/open?id=1RKtaAGV2f7F13opnkQfbp6YBqmoD3fZi) [![codecov](https://img.shields.io/badge/codecov-link-%23d819a6)](https://codecov.io/gh/seung-lab/cloud-volume) [![DOI](https://zenodo.org/badge/98333149.svg)](https://zenodo.org/badge/latestdoi/98333149)
+ 
+-# CloudVolume
++# CloudVolume: IO for Neuroglancer Datasets
+ 
+ ```python3
+ from cloudvolume import CloudVolume
+@@ -38,13 +38,14 @@ You can find a collection of CloudVolume accessible and Neuroglancer viewable da
+ - Accomodates downloading missing tiles (`fill_missing=True`).
+ - Accomodates uploading compressed black tiles to erasure coded file systems (`delete_black_uploads=True`).
+ - Growing support for the Neuroglancer [sharded format](https://github.com/google/neuroglancer/tree/master/src/neuroglancer/datasource/precomputed) which dramatically condenses the number of files required to represent petascale datasets, similar to [Cloud Optimized GeoTIFF](https://www.cogeo.org/), which can result in [dramatic cost savings](https://github.com/seung-lab/kimimaro/wiki/The-Economics:-Skeletons-for-the-People).
++- Reads Precomputed meshes and skeletons.
+ - Includes viewers for small images, meshes, and skeletons.
+ - Only 3 dimensions + RBG channels currently supported for images.
+ - No data versioning.
+ 
+ ## Setup
+ 
+-Cloud-volume is regularly tested on Ubuntu with 3.6, 3.7, 3.8, and 3.9. We officially support Linux and Mac OS. Windows is community supported. After installation, you'll also need to set up your cloud credentials if you're planning on writing files or reading from a private dataset. Once you're finished setting up, you can try [reading from a public dataset](https://github.com/seung-lab/cloud-volume/wiki/Reading-Public-Data-Examples).
++Cloud-volume is regularly tested on Ubuntu with 3.7, 3.8, 3.9 and 3.10. We officially support Linux and Mac OS. Windows is community supported. After installation, you'll also need to set up your cloud credentials if you're planning on writing files or reading from a private dataset. Once you're finished setting up, you can try [reading from a public dataset](https://github.com/seung-lab/cloud-volume/wiki/Reading-Public-Data-Examples).
+ 
+ #### `pip` Binary Installation
+ 
+@@ -186,14 +187,14 @@ The format or protocol fields may be omitted where required. In the case of the
+ | precomputed | gs, s3, http, https, file, matrix, tigerdata | Yes     | gs://mybucket/dataset/layer            |
+ | graphene    | gs, s3, http, https, file, matrix, tigerdata |         | graphene://gs://mybucket/dataset/layer |
+ | boss        | N/A                                          |         | boss://collection/experiment/channel   |
++| n5          | gs, s3, http, https, file, matrix, tigerdata |         | n5://mybucket/dataset/layer                          |
+ 
+ ### Supported Formats
+ 
+ * precomputed: Neuroglancer's native format. ([specification](https://github.com/google/neuroglancer/tree/master/src/neuroglancer/datasource/precomputed))
+ * graphene: Precomputed based format used by the PyChunkGraph server.
+ * boss: The BOSS (https://docs.theboss.io/docs)
+-
+-We currently support reading the sharded skeleton format within Precomputed that is used in some newer datasets. Other data types are forthcoming.
++* n5: Not HDF5 (https://github.com/saalfeldlab/n5) Read-only support. Supports raw, gzip, bz2, and xz but not lz4 compression. mode 0 datasets only.
+ 
+ ### Supported Protocols
+ 
+diff --git a/cloudvolume/__init__.py b/cloudvolume/__init__.py
+index 27fe7875d..ddc31a56e 100644
+--- a/cloudvolume/__init__.py
++++ b/cloudvolume/__init__.py
+@@ -83,6 +83,11 @@
+ except ImportError:
+   pass
+ 
++try:
++  from .datasource.n5 import register as register_n5
++  register_n5()
++except ImportError:
++  pass
+ 
+ 
+ 
+diff --git a/cloudvolume/datasource/boss/image.py b/cloudvolume/datasource/boss/image.py
+index bcf6e2704..2883dd87c 100644
+--- a/cloudvolume/datasource/boss/image.py
++++ b/cloudvolume/datasource/boss/image.py
+@@ -14,6 +14,7 @@
+ )
+ from ...secrets import boss_credentials
+ from ...volumecutout import VolumeCutout
++from ..precomputed.image.common import shade
+ 
+ class BossImageSource(ImageSourceInterface):
+   def __init__(
+@@ -78,7 +79,7 @@ def download(self, bbox, mip, parallel=1, renumber=False):
+     # is needed.
+     shape = list(bbox.size3()) + [ cutout.shape[3] ]
+     renderbuffer = np.zeros(shape=shape, dtype=self.meta.dtype, order='F')
+-    txrx.shade(renderbuffer, bbox, cutout, bounds)
++    shade(renderbuffer, bbox, cutout, bounds)
+     return VolumeCutout.from_volume(self.meta, mip, renderbuffer, bbox)
+ 
+   @readonlyguard
+diff --git a/cloudvolume/datasource/n5/__init__.py b/cloudvolume/datasource/n5/__init__.py
+new file mode 100644
+index 000000000..7972e6729
+--- /dev/null
++++ b/cloudvolume/datasource/n5/__init__.py
+@@ -0,0 +1,61 @@
++from typing import Optional
++
++from .image import N5ImageSource
++from .metadata import N5Metadata
++
++from ...frontends.precomputed import CloudVolumePrecomputed
++
++from .. import get_cache_path
++from ...cacheservice import CacheService
++from ...cloudvolume import (
++  register_plugin, SharedConfiguration,
++  CompressType, ParallelType, CacheType,
++  SecretsType
++)
++from ...paths import strict_extract
++
++def create_n5(
++  cloudpath:str, mip:int=0, bounded:bool=True, autocrop:bool=False,
++  fill_missing:bool=False, cache:CacheType=False, compress_cache:CompressType=None,
++  cdn_cache:bool=True, progress:bool=False, 
++  compress:CompressType=None, compress_level:Optional[int]=None,
++  non_aligned_writes:bool=False, 
++  parallel:ParallelType=1,green_threads:bool=False, secrets:SecretsType=None, 
++  **kwargs # absorb graphene arguments
++):
++    path = strict_extract(cloudpath)
++    config = SharedConfiguration(
++      cdn_cache=cdn_cache,
++      compress=compress,
++      compress_level=None,
++      green=green_threads,
++      mip=mip,
++      parallel=parallel,
++      progress=progress,
++      secrets=secrets,
++      spatial_index_db=None,
++    )
++    cache = CacheService(
++      cloudpath=get_cache_path(cache, cloudpath),
++      enabled=bool(cache),
++      config=config,
++      compress=compress_cache,
++    )
++
++    meta = N5Metadata(cloudpath, config=config, cache=cache)
++    imagesrc = N5ImageSource(
++      config, meta, cache, 
++      autocrop=bool(autocrop),
++      bounded=bool(bounded),
++      non_aligned_writes=bool(non_aligned_writes),
++      fill_missing=bool(fill_missing),
++    )
++
++    return CloudVolumePrecomputed(
++      meta, cache, config, 
++      imagesrc, mesh=None, skeleton=None,
++      mip=mip
++    )
++
++def register():
++  register_plugin('n5', create_n5)
+\ No newline at end of file
+diff --git a/cloudvolume/datasource/n5/image.py b/cloudvolume/datasource/n5/image.py
+new file mode 100644
+index 000000000..de2bad4f1
+--- /dev/null
++++ b/cloudvolume/datasource/n5/image.py
+@@ -0,0 +1,138 @@
++import re
++import os
++
++import numpy as np
++from cloudfiles import CloudFiles
++
++from .. import autocropfn, readonlyguard, ImageSourceInterface
++
++from ... import compression
++from ... import chunks
++from ... import exceptions 
++from ...lib import ( 
++  colorize, red, mkdir, Vec, Bbox,  
++  jsonify, generate_random_string,
++  xyzrange
++)
++from ...secrets import boss_credentials
++from ...volumecutout import VolumeCutout
++from ..precomputed.image.common import shade
++
++class N5ImageSource(ImageSourceInterface):
++  def __init__(
++    self, config, meta, cache,
++    autocrop=False, bounded=True,
++    non_aligned_writes=False,
++    delete_black_uploads=False,
++    fill_missing=False,
++    readonly=False,
++  ):
++    self.config = config
++    self.meta = meta 
++    self.cache = cache 
++
++    self.autocrop = bool(autocrop)
++    self.bounded = bool(bounded)
++    self.fill_missing = bool(fill_missing)
++    self.non_aligned_writes = bool(non_aligned_writes)
++    self.readonly = bool(readonly)
++
++  def parse_chunk(self, binary, mip, filename, default_shape):
++    if binary is None:
++      if self.fill_missing:
++        data = np.zeros(default_shape, dtype=self.meta.dtype, order="F")
++        shape = list(self.meta.chunk_size(mip)) + [ self.meta.num_channels ]
++        return data, shape
++      else:
++        raise exceptions.EmptyVolumeException(f"{filename} is missing.")
++
++    toint = lambda n: int.from_bytes(n, byteorder="big", signed=False)
++
++    mode = toint(binary[0:2])
++
++    if mode != 0:
++      raise exceptions.DecodingError(
++        f"This implementation cannot read volumes "
++        f"with mode != 0. Got mode: {mode}"
++      )
++
++    ndim = toint(binary[2:4])
++    dims = [ toint(binary[4+4*i:4+4*(i+1)]) for i in range(ndim) ]
++    while len(dims) < 4:
++      dims.append(1)
++    dims[3] = self.meta.num_channels
++
++    compressed_stream = binary[4+4*ndim:]
++    compressed_stream = compression.decompress(
++      compressed_stream, self.meta.encoding(mip), filename
++    )
++
++    data = chunks.decode(
++      compressed_stream, 
++      encoding='raw', 
++      shape=dims, 
++      dtype=self.meta.dtype,
++    )
++    return data, dims
++
++  def download(self, bbox, mip, parallel=1, renumber=False):
++    if parallel != 1:
++      raise ValueError("Only parallel=1 is supported for n5.")
++    elif renumber != False:
++      raise ValueError("Only renumber=False is supported for n5.")
++
++    bounds = Bbox.clamp(bbox, self.meta.bounds(mip))
++
++    if self.autocrop:
++      image, bounds = autocropfn(self.meta, image, bounds, mip)
++    
++    if bounds.subvoxel():
++      raise exceptions.EmptyRequestException(f'Requested less than one pixel of volume. {bounds}')
++
++    cf = CloudFiles(self.meta.cloudpath, progress=self.config.progress)
++    realized_bbox = bbox.expand_to_chunk_size(self.meta.chunk_size(mip))
++    grid_bbox = realized_bbox // self.meta.chunk_size(mip)
++
++    urls = [
++      cf.join(f"s{mip}", str(x), str(y), str(z))
++      for x,y,z in xyzrange(grid_bbox.minpt, grid_bbox.maxpt)
++    ]
++
++    all_chunks = cf.get(urls, parallel=parallel, return_dict=True)
++    shape = list(bbox.size3()) + [ self.meta.num_channels ]
++    renderbuffer = np.zeros(shape=shape, dtype=self.meta.dtype, order='F')
++
++    sep = '/'
++    if cf._path.protocol == "file":
++      sep = os.path.sep
++    if sep == '\\':
++      sep = '\\\\' # compensate for regexp escaping
++
++    regexp = re.compile(rf"s(?P<mip>\d+){sep}(?P<x>\d+){sep}(?P<y>\d+){sep}(?P<z>\d+)")
++    for fname, binary in all_chunks.items():
++      m = re.search(regexp, fname).groupdict()
++      assert mip == int(m["mip"])
++      gridpoint = Vec(*[ int(i) for i in [ m["x"], m["y"], m["z"] ] ])
++      chunk_bbox = Bbox(gridpoint, gridpoint + 1) * self.meta.chunk_size(mip)
++      chunk_bbox = Bbox.clamp(chunk_bbox, self.meta.bounds(mip))
++      default_shape = list(chunk_bbox.size3()) + [ self.meta.num_channels ]
++      chunk, chunk_shape = self.parse_chunk(binary, mip, fname, default_shape)
++      chunk_bbox = Bbox(chunk_bbox.minpt, chunk_bbox.minpt + Vec(*chunk_shape[:3]))
++      chunk_bbox = Bbox.clamp(chunk_bbox, self.meta.bounds(mip))
++      shade(renderbuffer, bbox, chunk, chunk_bbox)
++
++    return VolumeCutout.from_volume(self.meta, mip, renderbuffer, bbox)
++
++  @readonlyguard
++  def upload(self, image, offset, mip):
++    raise NotImplementedError()
++
++  def exists(self, bbox, mip=None):
++    raise NotImplementedError()
++
++  @readonlyguard
++  def delete(self, bbox, mip=None):
++    raise NotImplementedError()
++
++  def transfer_to(self, cloudpath, bbox, mip, block_size=None, compress=True):
++    raise NotImplementedError()
+\ No newline at end of file
+diff --git a/cloudvolume/datasource/n5/metadata.py b/cloudvolume/datasource/n5/metadata.py
+new file mode 100644
+index 000000000..324dce8c4
+--- /dev/null
++++ b/cloudvolume/datasource/n5/metadata.py
+@@ -0,0 +1,78 @@
++from cloudfiles import CloudFiles
++
++from cloudvolume.datasource.precomputed.metadata import PrecomputedMetadata
++from cloudvolume.lib import jsonify, Vec, Bbox
++
++class N5Metadata(PrecomputedMetadata):
++  def __init__(self, cloudpath, config, cache, info=None):
++    
++    # some default values, to be overwritten
++    info = PrecomputedMetadata.create_info(
++      num_channels=1, layer_type='image', data_type='uint8', 
++      encoding='raw', resolution=[1,1,1], voxel_offset=[0,0,0], 
++      volume_size=[1,1,1]
++    )
++
++    super().__init__(
++      cloudpath, config, cache, info=info, provenance=None
++    )
++    self.attributes = {
++      "root": {},
++      "scales": {},
++    }
++
++    self.info = self.fetch_info()
++
++  def commit_info(self):
++    """We only are supporing read-only."""
++    pass
++
++  def fetch_info(self):
++    cf = CloudFiles(self.cloudpath, secrets=self.config.secrets)
++    self.attributes["root"] = cf.get_json("attributes.json")
++
++    if 'pixelResolution' in self.attributes["root"]:
++      resolution = self.attributes["root"]["pixelResolution"]["dimensions"]
++    else:
++      resolution = self.attributes["root"]["resolution"]
++
++    scale_dirs = [ 
++      cf.join(f"s{i}", "attributes.json") 
++      for i in range(len(self.attributes["root"]["scales"])) 
++    ]
++    scale_attrs = cf.get_json(scale_dirs)
++    self.attributes["scales"] = scale_attrs
++    
++    # glossing over that each scale can have 
++    # a different data type, but usually it 
++    # should all be the same
++    data_type = scale_attrs[0]["dataType"] 
++
++    info = PrecomputedMetadata.create_info(
++      num_channels=1,
++      layer_type="image",
++      data_type=data_type,
++      encoding=scale_attrs[0]["compression"]["type"],
++      resolution=resolution,
++      voxel_offset=[0,0,0],
++      volume_size=scale_attrs[0]["dimensions"][:3],
++      chunk_size=scale_attrs[0]["blockSize"],
++    )
++    
++    for scale in scale_attrs[1:]:
++      self.add_scale(
++        scale["downsamplingFactors"],
++        chunk_size=scale["blockSize"],
++        encoding=scale["compression"]["type"],
++        info=info
++      )
++
++    return info
++
++  def commit_provenance(self):
++    """N5 doesn't support provenance files."""
++    pass
++
++  def fetch_provenance(self):
++    """N5 doesn't support provenance files."""
++    pass
+\ No newline at end of file
+diff --git a/cloudvolume/paths.py b/cloudvolume/paths.py
+index efe4f490c..ad5af6fd8 100644
+--- a/cloudvolume/paths.py
++++ b/cloudvolume/paths.py
+@@ -14,7 +14,7 @@
+ )
+ 
+ ALLOWED_PROTOCOLS = cloudfiles.paths.ALLOWED_PROTOCOLS
+-ALLOWED_FORMATS = [ 'graphene', 'precomputed', 'boss' ] 
++ALLOWED_FORMATS = [ 'graphene', 'precomputed', 'boss', 'n5' ] 
+ 
+ def cloudpath_error(cloudpath):
+   global ALLOWED_PROTOCOLS

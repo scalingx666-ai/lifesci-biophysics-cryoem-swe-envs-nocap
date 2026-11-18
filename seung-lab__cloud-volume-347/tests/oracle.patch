@@ -1,0 +1,454 @@
+diff --git a/cloudvolume/cacheservice.py b/cloudvolume/cacheservice.py
+index 09c80ae0a..1a11068c0 100644
+--- a/cloudvolume/cacheservice.py
++++ b/cloudvolume/cacheservice.py
+@@ -504,9 +504,7 @@ def get(self, cloudpaths, progress=None):
+     
+     StorageClass = self.pick_storage_class(cloudpaths)
+     with StorageClass('file://' + self.path, progress=progress) as stor:
+-      results = stor.get_files(
+-        [ filepath for filepath in cloudpaths ]
+-      )
++      results = stor.get_files(list(cloudpaths))
+ 
+     return { res['filename']: res['content'] for res in results }
+ 
+@@ -515,6 +513,7 @@ def put_single(self, path, content, *args, **kwargs):
+     return self.put([ (path, content) ], *args, **kwargs)
+ 
+   def put(self, files, progress=None, compress=None, compress_level=None):
++    """files: [ (filename, content) ]"""
+     if progress is None:
+       progress = self.config.progress
+ 
+diff --git a/cloudvolume/datasource/graphene/mesh/sharded.py b/cloudvolume/datasource/graphene/mesh/sharded.py
+index a7dbfba3c..74937614f 100644
+--- a/cloudvolume/datasource/graphene/mesh/sharded.py
++++ b/cloudvolume/datasource/graphene/mesh/sharded.py
+@@ -182,36 +182,59 @@ def get_meshes_via_manifest_byte_offsets(self, seg_id, bounding_box):
+   def get_meshes_via_manifest_labels(self, seg_id, bounding_box):
+     level = self.meta.meta.decode_layer_id(seg_id)
+     labels = self.get_fragment_labels(seg_id, level=level, bbox=bounding_box)
+-    return [ 
+-      self.get_mesh_on_bypass(label) 
+-      for label in tqdm(labels, disable=(not self.config.progress), desc="Mesh Fragments") 
+-    ]
++    meshes = self.get_meshes_on_bypass(labels)
++    return list(meshes.values())
+ 
+   def get_meshes_via_manifest(self, seg_id, bounding_box, use_byte_offsets):
+     if use_byte_offsets:
+       return self.get_meshes_via_manifest_byte_offsets(seg_id, bounding_box)
+     return self.get_meshes_via_manifest_labels(seg_id, bounding_box)
+ 
+-  def get_mesh_on_bypass(self, seg_id):
++  def get_meshes_on_bypass(self, segids):
+     """
+     Attempt to fetch a mesh directly from storage without going through
+     the chunk graph server. This capability should only be used in special
+     circumstances.
+     """
+-    level = self.meta.meta.decode_layer_id(seg_id)
++    segids = toiter(segids)
++    StorageClass = GreenStorage if self.config.green else Storage
+     dynamic_cloudpath = self.meta.join(self.meta.meta.cloudpath, self.dynamic_path())
+-    raw_binary = SimpleStorage(dynamic_cloudpath).get_file(
+-      self.compute_filename(seg_id)
+-    )
++    filenames = [ self.compute_filename(segid) for segid in segids ]
++    with StorageClass(dynamic_cloudpath, progress=self.config.progress) as stor:
++      raw_binaries = stor.get_files(filenames)
+ 
+-    if raw_binary is None:
+-      subdirectory = self.meta.join(self.meta.mesh_path, 'initial', str(level))
+-      raw_binary = self.readers[level].get_data(seg_id, path=subdirectory)
++    # extract the label ID from the mesh manifest.
++    # e.g. 387463568301300850:0:24576-25088_17920-18432_2048-3072
++    label_regexp = re.compile(r'(\d+):\d:[\d_-]+$')
+ 
+-    if raw_binary is None:
+-      raise IndexError('No mesh found for segment {}'.format(seg_id))
++    output = {}
++    remaining = []
++    for res in raw_binaries:
++      if res['error']:
++        raise res['error']
++
++      (label,) = re.search(label_regexp, res['filename']).groups()
++      label = int(label)
++
++      if res['content'] is None:
++        remaining.append(label)
++      else:
++        output[label] = res['content']
++
++    layers = defaultdict(list)
++    for segid in remaining:
++      layer_id = self.meta.meta.decode_layer_id(segid)
++      layers[layer_id].append(segid)
++
++    for layer_id, labels in layers.items():
++      subdirectory = self.meta.join(self.meta.mesh_path, 'initial', str(layer_id))
++      initial_output = self.readers[layer_id].get_data(labels, path=subdirectory, progress=self.config.progress)
++      for label, raw_binary in initial_output.items():
++        if raw_binary is None:
++          raise IndexError('No mesh found for segment {}'.format(label))
++      output.update(initial_output)
+ 
+-    return Mesh.from_draco(raw_binary)
++    return { label: Mesh.from_draco(raw_binary) for label, raw_binary in output.items() }
+ 
+   def download_segid(self, seg_id, bounding_box, bypass=False, use_byte_offsets=True):    
+     """See GrapheneUnshardedMeshSource.get for the user facing function."""
+@@ -220,7 +243,7 @@ def download_segid(self, seg_id, bounding_box, bypass=False, use_byte_offsets=Tr
+       raise KeyError("There is no shard configuration in the mesh info file for level {}.".format(level))
+ 
+     if bypass:
+-      mesh = self.get_mesh_on_bypass(seg_id)
++      mesh = self.get_meshes_on_bypass(seg_id)[seg_id]
+     else:
+       meshes = self.get_meshes_via_manifest(seg_id, bounding_box, use_byte_offsets=use_byte_offsets)
+       mesh = Mesh.concatenate(*meshes)
+diff --git a/cloudvolume/datasource/precomputed/image/rx.py b/cloudvolume/datasource/precomputed/image/rx.py
+index cefdebb6e..61f115cd3 100644
+--- a/cloudvolume/datasource/precomputed/image/rx.py
++++ b/cloudvolume/datasource/precomputed/image/rx.py
+@@ -54,22 +54,21 @@ def download_sharded(
+ 
+   renderbuffer = np.zeros(shape=shape, dtype=meta.dtype, order=order)
+ 
+-  gpts = tqdm(
+-    list(gridpoints(full_bbox, bounds, chunk_size)),
+-    disable=(not progress), 
+-    desc='Downloading'
+-  )
++  gpts = list(gridpoints(full_bbox, bounds, chunk_size))
+ 
++  code_map = {}
+   for gridpoint in gpts:
+     zcurve_code = compressed_morton_code(gridpoint, grid_size)
+     cutout_bbox = Bbox(
+       bounds.minpt + gridpoint * chunk_size,
+       min2(bounds.minpt + (gridpoint + 1) * chunk_size, bounds.maxpt)
+     )
++    code_map[zcurve_code] = cutout_bbox
+ 
+-    try:
+-      chunkdata = reader.get_data(zcurve_code, meta.key(mip))
+-    except EmptyFileException:
++  all_chunkdata = reader.get_data(list(code_map.keys()), meta.key(mip), progress=progress)
++  for zcode, chunkdata in all_chunkdata.items():
++    cutout_bbox = code_map[zcode]
++    if chunkdata is None:
+       if fill_missing:
+         chunkdata = None
+       else:
+diff --git a/cloudvolume/datasource/precomputed/mesh/__init__.py b/cloudvolume/datasource/precomputed/mesh/__init__.py
+index 19870c872..60e0ff236 100644
+--- a/cloudvolume/datasource/precomputed/mesh/__init__.py
++++ b/cloudvolume/datasource/precomputed/mesh/__init__.py
+@@ -16,7 +16,7 @@ def __new__(cls, meta, cache, config, readonly=False):
+     mesh_meta = PrecomputedMeshMetadata(meta, cache)
+ 
+     if mesh_meta.is_sharded():
+-      raise UnsupportedFormatError(red("This mesh volume is sharded. Mesh shard support is coming but is not available yet."))
++      print(red("This mesh volume is sharded. Mesh shard support is coming but is not available yet."))
+       # return ShardedLegacyPrecomputedMeshSource(mesh_meta, cache, config, readonly) 
+ 
+     return UnshardedLegacyPrecomputedMeshSource(mesh_meta, cache, config, readonly)
+diff --git a/cloudvolume/datasource/precomputed/sharding.py b/cloudvolume/datasource/precomputed/sharding.py
+index 991e2c873..db99c0e51 100644
+--- a/cloudvolume/datasource/precomputed/sharding.py
++++ b/cloudvolume/datasource/precomputed/sharding.py
+@@ -14,7 +14,7 @@
+ from ...lib import jsonify, toiter
+ from ...lru import LRU
+ from ...exceptions import SpecViolation, EmptyFileException
+-from ...storage import SimpleStorage, Storage
++from ...storage import SimpleStorage, GreenStorage, Storage
+ 
+ ShardLocation = namedtuple('ShardLocation', 
+   ('shard_number', 'minishard_number', 'remainder')
+@@ -218,6 +218,7 @@ def __init__(
+     self, meta, cache, spec,
+     shard_index_cache_size=512,
+     minishard_index_cache_size=128,
++    green=False
+   ):
+     """
+     Reads standard Precomputed shard files. 
+@@ -232,6 +233,7 @@ def __init__(
+     self.meta = meta
+     self.cache = cache
+     self.spec = spec
++    self.green = green
+ 
+     self.shard_index_cache = LRU(shard_index_cache_size)
+     self.minishard_index_cache = LRU(minishard_index_cache_size)
+@@ -256,33 +258,31 @@ def get_index(self, filename, path=""):
+     Returns: 2^minishard_bits entries of a uint64 
+       array of [[ byte start, byte end ], ... ] 
+     """
+-    index_path = self.meta.join(path, filename)
+-    alias_path = self.meta.join(path, filename.replace('.shard', '.index'))
+-
+-    if filename in self.shard_index_cache:
+-      return self.shard_index_cache[filename]
+-
+-    index_length = self.spec.index_length()
+-
+-    binary = self.cache.download_single_as(
+-      index_path, alias_path,
+-      start=0, end=index_length,
+-      compress=False
+-    )
+-
+-    index = self.decode_index(binary)
+-    self.shard_index_cache[filename] = index
++    indices = self.get_indices([ filename ], path, progress=False)
++    index = list(indices.values())[0]
++    if index is None:
++      raise EmptyFileException(filename + " was zero bytes.")
+     return index
+ 
+   def get_indices(self, filenames, path="", progress=None):
++    """
++    For all given files, retrieves the shard index which 
++    is used for locating the appropriate minishard indices.
++
++    Returns: { 
++      path_to_/filename.shard: 2^minishard_bits entries of a uint64 
++            array of [[ byte start, byte end ], ... ],
++      ...
++    } 
++    """
+     filenames = toiter(filenames)
+     filenames = [ self.meta.join(path, fname) for fname in filenames ]
+-
+     fufilled = { 
+       fname: self.shard_index_cache[fname] \
+       for fname in filenames \
+       if fname in self.shard_index_cache  
+     }
++
+     requests = []
+     for fname in filenames:
+       if fname in fufilled:
+@@ -508,7 +508,7 @@ def exists(self, labels, path="", return_byte_range=False, progress=None):
+               results[label] = filepath
+ 
+     if return_one:
+-      return next(results.values())
++      return next(list(results.values()))
+     return results
+ 
+   def disassemble_shard(self, shard):
+@@ -535,44 +535,88 @@ def disassemble_shard(self, shard):
+ 
+     return shattered
+ 
+-  def get_data(self, label, path=""):
+-    filename, minishard_number = self.compute_shard_location(label)
+-    
++  def get_data(self, label, path="", progress=None):
++    """Fetches data from shards.
++
++    label: one or more segment ids
++    path: subdirectory path
++    progress: display progress bars
++
++    Return: 
++      if label is a scalar:
++        a byte string
++      else: (label is an iterable)
++        {
++          label_1: byte string,
++          ....
++        }
++    """
++    label, return_multiple = toiter(label, is_iter=True)
++    label = set(( int(l) for l in label))
++
++    results = {}
+     if self.cache.enabled:
+-      cached = self.cache.get_single(self.meta.join(path, str(label)), progress=False)
+-      if cached is not None:
+-        return cached
++      results = self.cache.get([ 
++        self.meta.join(path, str(lbl)) for lbl in label
++      ], progress=progress)
+ 
+-    index = self.get_index(filename, path)
++    for cloudpath, content in results.items():
++      if content is None:
++        label.remove(int(basename(cloudpath)))
+ 
+-    minishard_index = self.get_minishard_index(
+-      filename, index, 
+-      minishard_number, path
+-    )
+ 
+-    if minishard_index is None:
+-      return None
++    # { label: [ filename, byte start, num_bytes ] }
++    exists = self.exists(label, path, return_byte_range=True, progress=progress)
++    for k in list(exists.keys()):
++      if exists[k] is None:
++        results[k] = None
++        del exists[k]
+ 
+-    idx = np.where(minishard_index[:,0] == label)[0]
+-    if len(idx) == 0:
+-      return None
+-    else:
+-      idx = idx[0]
++    key_label = { (basename(v[0]), v[1], v[2]): k for k,v in exists.items() }
++
++    filenames = ( basename(ext[0]) for ext in exists.values() )
++    starts = ( int(ext[1]) for ext in exists.values() )
++    ends = ( int(ext[1]) + int(ext[2]) for ext in exists.values() )
+ 
+-    _, offset, size = minishard_index[idx,:]
+-    offset, size = int(offset), int(size)
+     full_path = self.meta.join(self.meta.cloudpath, path)
+ 
+-    with SimpleStorage(full_path) as stor:
+-      binary = stor.get_file(filename, start=offset, end=int(offset + size))
++    StorageClass = Storage
++    if self.green:
++      StorageClass = GreenStorage
++    elif len(exists) == 1:
++      StorageClass = SimpleStorage
++
++    with StorageClass(full_path, progress=progress) as stor:
++      remote_files = stor.get_files(filenames, starts=starts, ends=ends)
++
++    binaries = {}
++    for res in remote_files:
++      if res['error']:
++        raise res['error']
++      start, end = res['byte_range']
++      key = (res['filename'], start, end - start)
++      lbl = key_label[key]
++      binaries[lbl] = res['content']
++    del remote_files
+ 
+     if self.spec.data_encoding != 'raw':
+-      binary = compression.decompress(binary, encoding=self.spec.data_encoding, filename=filename)
++      for filepath, binary in tqdm(binaries.items(), desc="Decompressing", disable=(not progress)):
++        if binary is None:
++          continue
++        binaries[filepath] = compression.decompress(
++          binary, encoding=self.spec.data_encoding, filename=filepath
++        )
+       
+     if self.cache.enabled:
+-      self.cache.put_single(self.meta.join(path, str(label)), binary, progress=False)
++      self.cache.put([ 
++        (filepath, binary) for filepath, binary in binaries.items()
++      ], progress=progress)
++
++    results.update(binaries)
+ 
+-    return binary
++    if return_multiple:
++      return results
++    return next(iter(results.values()))
+ 
+   def list_labels(self, filename, path="", size=False):
+     """
+diff --git a/cloudvolume/datasource/precomputed/skeleton/sharded.py b/cloudvolume/datasource/precomputed/skeleton/sharded.py
+index dc2dab058..32e3c92b4 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/sharded.py
++++ b/cloudvolume/datasource/precomputed/skeleton/sharded.py
+@@ -1,6 +1,7 @@
+ from ..sharding import ShardingSpecification, ShardReader
+ from ....skeleton import Skeleton
+ from ..spatial_index import CachedSpatialIndex
++from ....exceptions import EmptyFileException
+ 
+ class ShardedPrecomputedSkeletonSource(object):
+   def __init__(self, meta, cache, config, readonly=False):
+@@ -36,8 +37,18 @@ def get(self, segids):
+     #   compress = True
+ 
+     results = []
++    binaries = self.reader.get_data(
++      segids, self.meta.skeleton_path, 
++      progress=self.config.progress
++    )
++
+     for segid in segids:
+-      binary = self.reader.get_data(segid, self.meta.skeleton_path)
++      binary = binaries[segid]
++      del binaries[segid]
++
++      if binary is None:
++        raise EmptyFileException("segid {} is missing.".format(segid))
++
+       skeleton = Skeleton.from_precomputed(
+         binary, segid=segid, 
+         vertex_attributes=self.meta.info['vertex_attributes']
+diff --git a/cloudvolume/storage/__init__.py b/cloudvolume/storage/__init__.py
+index 494772992..3d9f65c50 100644
+--- a/cloudvolume/storage/__init__.py
++++ b/cloudvolume/storage/__init__.py
+@@ -22,5 +22,14 @@
+ from .storage_interfaces import reset_connection_pools
+ 
+ # For backwards compatibility
+-Storage = ThreadedStorage 
+ 
++class Storage(object):
++  def __new__(kls, *args, **kwargs):
++    green = False
++    if 'green' in kwargs:
++      green = bool(kwargs['green'])
++      del kwargs['green']
++
++    if green:
++      return GreenStorage(*args, **kwargs)
++    return ThreadedStorage(*args, **kwargs)
+diff --git a/test/test_skeletons.py b/test/test_skeletons.py
+index 2ca3ac19c..d9e1d61b9 100644
+--- a/test/test_skeletons.py
++++ b/test/test_skeletons.py
+@@ -710,7 +710,7 @@ def test_sharded():
+ 
+       labels = []
+       for fname in files.keys():
+-        lbls = cv.skeleton.reader.list_labels(fname)
++        lbls = cv.skeleton.reader.list_labels(fname, path='skeletons')
+         labels += list(lbls)
+       
+       labels.sort()
+@@ -721,18 +721,18 @@ def test_sharded():
+         for label, binary in decoded_skels.items():
+           Skeleton.from_precomputed(binary)
+ 
+-      exists = cv.skeleton.reader.exists(list(range(11)))
++      exists = cv.skeleton.reader.exists(list(range(11)), path='skeletons')
+       assert exists == {
+-        0: '0.shard', 
+-        1: '0.shard', 
+-        2: '0.shard', 
+-        3: '0.shard', 
+-        4: '0.shard', 
+-        5: '0.shard', 
+-        6: '0.shard', 
+-        7: '0.shard', 
+-        8: '1.shard', 
+-        9: '1.shard',
++        0: 'skeletons/0.shard', 
++        1: 'skeletons/0.shard', 
++        2: 'skeletons/0.shard', 
++        3: 'skeletons/0.shard', 
++        4: 'skeletons/0.shard', 
++        5: 'skeletons/0.shard', 
++        6: 'skeletons/0.shard', 
++        7: 'skeletons/0.shard', 
++        8: 'skeletons/1.shard', 
++        9: 'skeletons/1.shard',
+         10: None,
+       }
+ 

@@ -1,0 +1,733 @@
+diff --git a/README.md b/README.md
+index 532399ff8..1730194ad 100644
+--- a/README.md
++++ b/README.md
+@@ -249,6 +249,10 @@ skel = vol.skeleton.get(12345)
+ vol.skeleton.upload_raw(segid, skel.vertices, skel.edges, skel.radii, skel.vertex_types) 
+ vol.skeleton.upload(skel) 
+ 
++# specified in nm, only available for datasets with a generated index
++skels = vol.skeleton.get_by_bbox( Bbox( (0,0,0), (500, 500, 500) ) ) 
++vol.skeleton.spatial_index # None if not available
++
+ skel.empty() # boolean
+ 
+ bytes = skel.encode() # encode to Precomputed format (bytes)
+diff --git a/cloudvolume/cacheservice.py b/cloudvolume/cacheservice.py
+index a87d42d12..04589de7f 100644
+--- a/cloudvolume/cacheservice.py
++++ b/cloudvolume/cacheservice.py
+@@ -314,7 +314,7 @@ def upload_single(self, filename, content, *args, **kwargs):
+     kwargs['progress'] = False
+     return self.upload( [(filename, content)], *args, **kwargs )
+ 
+-  def upload(self, files, subdir, compress, cache_control, content_type=None, progress=None):
++  def upload(self, files, compress, cache_control, content_type=None, progress=None):
+     files = list(files)
+ 
+     progress = progress if progress is not None else self.config.progress
+@@ -348,6 +348,27 @@ def download_single(self, path, compress=None):
+     files = self.download([ path ], compress=compress, progress=False)
+     return files[path]
+ 
++  def download_single_as(
++    self, path, local_alias, 
++    compress=None, start=None, end=None
++  ):
++    """
++    Download a file or a byte range from a file 
++    and save it locally as `local_alias`.
++    """
++    if self.enabled:
++      locs = self.compute_data_locations([local_alias])
++      if locs['local']:
++        return self.get_single(local_alias)
++
++    with SimpleStorage(self.meta.cloudpath) as stor:
++      filedata = stor.get_file(path, start=start, end=end)
++
++    if self.enabled:
++      self.put([ (local_alias, filedata) ], compress=compress)
++
++    return filedata
++
+   def download(self, paths, compress=None, progress=None):
+     """
+     Download the provided paths, but grab them from cache first
+diff --git a/cloudvolume/datasource/precomputed/sharding.py b/cloudvolume/datasource/precomputed/sharding.py
+index d786672d0..165a9b8c9 100644
+--- a/cloudvolume/datasource/precomputed/sharding.py
++++ b/cloudvolume/datasource/precomputed/sharding.py
+@@ -1,12 +1,16 @@
+-from collections import namedtuple
++from __future__ import print_function
++
++from collections import namedtuple, defaultdict
+ import copy
+ import json
+ 
+ import numpy as np
+ import struct
++from tqdm import tqdm
+ 
+ from . import mmh3
+ from ... import compression
++from ...lib import jsonify
+ from ...exceptions import SpecViolation
+ from ...storage import SimpleStorage
+ 
+@@ -37,6 +41,9 @@ def __init__(
+ 
+     self.validate()
+ 
++  def index_length(self):
++    return int((2 ** self.minishard_bits) * 16)
++
+   @property
+   def hash(self):
+     return self._hash
+@@ -86,6 +93,9 @@ def from_json(cls, vals):
+     dct = json.loads(vals.decode('utf8'))
+     return cls.from_dict(dct)
+ 
++  def to_json(self):
++    return jsonify(self.to_dict())
++
+   @classmethod
+   def from_dict(cls, vals):
+     vals = copy.deepcopy(vals)
+@@ -93,6 +103,17 @@ def from_dict(cls, vals):
+     del vals['@type']
+     return cls(**vals)
+ 
++  def to_dict(self):
++    return {
++      '@type': self.type,
++      'preshift_bits': self.preshift_bits,
++      'hash': self.hash,
++      'minishard_bits': self.minishard_bits,
++      'shard_bits': self.shard_bits,
++      'minishard_index_encoding': self.minishard_index_encoding,
++      'data_encoding': self.data_encoding,
++    }
++
+   def compute_shard_location(self, key):
+     chunkid = uint64(key) >> uint64(self.preshift_bits)
+     chunkid = self.hashfn(chunkid)
+@@ -103,6 +124,22 @@ def compute_shard_location(self, key):
+ 
+     return ShardLocation(shard_number, minishard_number, remainder)
+ 
++  def synthesize_shards(self, data, progress=False):
++    """
++    Given this specification and a comprehensive listing of
++    all the items that could be combined into a given shard,
++    synthesize the shard files for this set of labels.
++
++    data: { label: binary, ... }
++
++    e.g. { 5: b'...', 7: b'...' }
++
++    Returns: {
++      $filename: binary data,
++    }
++    """
++    return synthesize_shard_files(self, data, progress)
++
+   def validate(self):
+     if self.type not in ('neuroglancer_uint64_sharded_v1',):
+       raise SpecViolation(
+@@ -143,15 +180,21 @@ def __init__(self, meta, cache, spec):
+   def get_index(self, label, path=""):
+     shard_loc = self.spec.compute_shard_location(label)
+ 
+-    filename = str(shard_loc.shard_number) + ".index"
+-    index_path = self.meta.join(path, filename)
+-    binary = self.cache.download_single(index_path)
++    filename = str(shard_loc.shard_number)
++    index_path = self.meta.join(path, filename + '.shard')
++    alias_path = self.meta.join(path, filename + '.index')
+ 
+-    index_length = (2 ** self.spec.minishard_bits) * 16
++    index_length = self.spec.index_length()
++
++    binary = self.cache.download_single_as(
++      index_path, alias_path,
++      start=0, end=index_length,
++      compress=False
++    )
+ 
+     if len(binary) != index_length:
+-      return SpecViolation(
+-        filename + " was an incorrect length ({}) for this specification ({}).".format(
++      raise SpecViolation(
++        filename + ".shard was an incorrect length ({}) for this specification ({}).".format(
+           len(binary), index_length
+         ))
+     
+@@ -166,45 +209,163 @@ def get_data(self, label, path=""):
+       if cached is not None:
+         return cached
+ 
+-    index = self.get_index(label, path)
++    index_offset = self.spec.index_length()
+ 
++    index = self.get_index(label, path)
+     bytes_start, bytes_end = index[shard_loc.minishard_number]
+-    filename = shard_loc.shard_number + ".data"
++    bytes_start += index_offset
++    bytes_end += index_offset
++    bytes_start, bytes_end = int(bytes_start), int(bytes_end)
++
++    filename = shard_loc.shard_number + ".shard"
+ 
+     full_path = self.meta.join(self.meta.cloudpath, path)
+ 
+     with SimpleStorage(full_path) as stor:
+       minishard_index = stor.get_file(filename, start=bytes_start, end=bytes_end)
+ 
+-    if self.spec.minishard_index_encoding == 'gzip':
+-      minishard_index = compression.decompress(minishard_index, encoding='gzip', filename=filename)
++    if self.spec.minishard_index_encoding != 'raw':
++      minishard_index = compression.decompress(
++        minishard_index, encoding=self.spec.minishard_index_encoding, filename=filename
++      )
+ 
+     minishard_index = np.copy(np.frombuffer(minishard_index, dtype=np.uint64))
+     minishard_index = minishard_index.reshape( (3, len(minishard_index) // 3), order='C' ).T
+-    
++
+     for i in range(1, minishard_index.shape[0]):
+       minishard_index[i, 0] += minishard_index[i-1, 0]
+       minishard_index[i, 1] += minishard_index[i-1, 1] + minishard_index[i-1, 2]
+-    
++
+     idx = np.where(minishard_index == label)[0][0]
+     _, offset, size = minishard_index[idx,:]
+-    
++    offset = int(offset + index_offset)
++       
+     with SimpleStorage(full_path) as stor:
+-      binary = stor.get_file(filename, start=offset, end=(offset + size))
++      binary = stor.get_file(filename, start=offset, end=int(offset + size))
+ 
+-    if self.spec.data_encoding == 'gzip':
+-      binary = compression.decompress(binary, encoding='gzip', filename=filename)
++    if self.spec.data_encoding != 'raw':
++      binary = compression.decompress(binary, encoding=self.spec.data_encoding, filename=filename)
+       
+     if self.cache.enabled:
+       self.cache.put_single(self.meta.join(path, str(label)), binary, progress=False)
+-      
+-    return binary
+-
+-
+-
+-
+-
+-
+-
+ 
++    return binary
+ 
++def synthesize_shard_files(spec, data, progress=False):
++  """
++  From a set of data guaranteed to constitute one or more
++  complete and comprehensive shards (no partial shards) 
++  return a set of files ready for upload.
++
++  spec: a ShardingSpecification
++  data: { label: binary, ... }
++
++  Returns: { filename: binary, ... }
++  """
++  shard_groupings = defaultdict(lambda: defaultdict(dict))
++  pbar = tqdm(
++    data.items(), 
++    desc='Creating Shard Groupings', 
++    disable=(not progress)
++  )
++
++  for label, binary in pbar:
++    loc = spec.compute_shard_location(label)
++    shard_groupings[loc.shard_number][loc.minishard_number][label] = binary
++
++  shard_files = {}
++
++  pbar = tqdm(
++    shard_groupings.items(), 
++    desc="Synthesizing Shard Files", 
++    disable=(not progress)
++  )
++
++  for shardno, shardgrp in pbar:
++    filename = str(shardno) + '.shard'
++    shard_files[filename] = _synthesize_shard_file(spec, shardgrp, progress)
++
++  return shard_files
++
++# NB: This is going to be memory hungry and can be optimized
++def _synthesize_shard_file(spec, shardgrp, progress):
++  # Assemble the .shard file like:
++  # [ shard index; minishards; all minishard indices ]
++
++  minishardnos = []
++  minishard_indicies = []
++  minishards = []
++
++  for minishardno, minishardgrp in tqdm(shardgrp.items(), desc="Minishard Indices", disable=(not progress)):
++    labels = sorted([ int(label) for label in minishardgrp.keys() ])
++    if len(labels) == 0:
++      continue
++
++    minishard_index = np.zeros( (3, len(labels)), dtype=np.uint64, order='C')
++    minishard = b''
++    
++    # label and offset are delta encoded
++    last_label = 0
++    for i, label in enumerate(labels):
++      binary = minishardgrp[label]
++      if spec.data_encoding != 'raw':
++        binary = compression.compress(binary, method=spec.data_encoding)
++
++      minishard_index[0, i] = label - last_label
++      minishard_index[1, i] = 0 # minishard_index[2, i - 1]
++      minishard_index[2, i] = len(binary)
++      minishard += binary
++      last_label = label
++    
++    minishardnos.append(minishardno)
++    minishard_indicies.append(minishard_index) 
++    minishards.append(minishard)
++
++  cum_minishard_size = 0
++  for idx, minishard in zip(minishard_indicies, minishards):
++    idx[1, 0] = cum_minishard_size
++    cum_minishard_size += len(minishard)
++
++  if progress:
++    print("Partial assembly of minishard indicies and data... ", end="", flush=True)
++
++  variable_index_part = [ idx.tobytes('C') for idx in minishard_indicies ]
++  if spec.minishard_index_encoding != 'raw':
++    variable_index_part = [ 
++      compression.compress(idx, method=spec.minishard_index_encoding) \
++      for idx in variable_index_part 
++    ]
++
++  data_part = b''.join(minishards)
++  del minishards
++
++  if progress:
++    print("Assembled.")
++
++  fixed_index = np.zeros( 
++    (int(2 ** spec.minishard_bits), 2), 
++    dtype=np.uint64, order='C'
++  )
++
++  start = len(data_part)
++  end = len(data_part)
++  for i, idx in zip(minishardnos, variable_index_part):
++    start = end
++    end += len(idx)
++    fixed_index[i, 0] = start
++    fixed_index[i, 1] = end
++
++  if progress:
++    print("Final assembly... ", end="", flush=True)
++
++  # The order here is important. The fixed index must go first because the locations
++  # of the other parts are calculated with it implicitly in front. The variable
++  # index must go last because otherwise compressing it will affect offset of the
++  # data it is attempting to index.
++
++  result = fixed_index.tobytes('C') + data_part + b''.join(variable_index_part) 
++
++  if progress:
++    print("Done.")
++
++  return result
+\ No newline at end of file
+diff --git a/cloudvolume/datasource/precomputed/skeleton/metadata.py b/cloudvolume/datasource/precomputed/skeleton/metadata.py
+index e41120e73..4d441f984 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/metadata.py
++++ b/cloudvolume/datasource/precomputed/skeleton/metadata.py
+@@ -12,6 +12,12 @@ def __init__(self, meta, cache=None, info=None):
+     else:
+       self.info = self.fetch_info()
+ 
++  @property
++  def spatial_index(self):
++    if 'spatial_index' in self.info:
++      return self.info['spatial_index']
++    return None  
++
+   @property
+   def skeleton_path(self):
+     if 'skeletons' in self.meta.info:
+@@ -54,7 +60,7 @@ def refresh_info(self):
+   def commit_info(self):
+     if self.info:
+       self.cache.upload_single(
+-      self.meta.join(self.path, 'info'),
++        self.meta.join(self.skeleton_path, 'info'),
+         jsonify(self.info), 
+         content_type='application/json',
+         compress=False,
+@@ -82,6 +88,7 @@ def default_info(self):
+         }
+       ],
+       'sharding': None,
++      'spatial_index': None, # { 'chunk_size': physical units }
+     }
+ 
+   def is_sharded(self):
+diff --git a/cloudvolume/datasource/precomputed/skeleton/sharded.py b/cloudvolume/datasource/precomputed/skeleton/sharded.py
+index c6cb7af05..5cac5bdf8 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/sharded.py
++++ b/cloudvolume/datasource/precomputed/skeleton/sharded.py
+@@ -1,6 +1,6 @@
+ from ..sharding import ShardingSpecification, ShardReader
+ from ....skeleton import Skeleton
+-
++from ..spatial_index import CachedSpatialIndex
+ 
+ class ShardedPrecomputedSkeletonSource(object):
+   def __init__(self, meta, cache, config, readonly=False):
+@@ -12,6 +12,15 @@ def __init__(self, meta, cache, config, readonly=False):
+     spec = ShardingSpecification.from_dict(self.meta.info['sharding'])
+     self.reader = ShardReader(meta, cache, spec)
+ 
++    self.spatial_index = None
++    if self.meta.spatial_index:
++      self.spatial_index = CachedSpatialIndex(
++        self.cache,
++        cloudpath=self.meta.layerpath, 
++        bounds=self.meta.meta.bounds(0) * self.meta.meta.resolution(0),
++        chunk_size=self.meta.info['spatial_index']['chunk_size'],
++      )
++
+   @property
+   def path(self):
+     return self.meta.path 
+@@ -45,4 +54,11 @@ def upload(self):
+     raise NotImplementedError()
+ 
+   def raw_upload(self):
+-    raise NotImplementedError()
+\ No newline at end of file
++    raise NotImplementedError()
++
++  def get_bbox(self, bbox):
++    if self.spatial_index is None:
++      raise IndexError("A spatial index has not been created.")
++
++    segids = self.spatial_index.query(bbox)
++    return self.get(segids)
+\ No newline at end of file
+diff --git a/cloudvolume/datasource/precomputed/skeleton/unsharded.py b/cloudvolume/datasource/precomputed/skeleton/unsharded.py
+index 0d1676c74..a94797772 100644
+--- a/cloudvolume/datasource/precomputed/skeleton/unsharded.py
++++ b/cloudvolume/datasource/precomputed/skeleton/unsharded.py
+@@ -14,6 +14,7 @@
+ from cloudvolume.storage import Storage, SimpleStorage
+ 
+ from ..common import cdn_cache_control
++from ..spatial_index import CachedSpatialIndex
+ from ... import readonlyguard
+ 
+ from ....skeleton import Skeleton
+@@ -26,6 +27,15 @@ def __init__(self, meta, cache, config, readonly=False):
+ 
+     self.readonly = bool(readonly)
+ 
++    self.spatial_index = None
++    if self.meta.spatial_index:
++      self.spatial_index = CachedSpatialIndex(
++        self.cache,
++        cloudpath=self.meta.layerpath, 
++        bounds=self.meta.meta.bounds(0) * self.meta.meta.resolution(0),
++        chunk_size=self.meta.info['spatial_index']['chunk_size'],
++      )
++
+   @property
+   def path(self):
+     return self.meta.skeleton_path 
+@@ -103,7 +113,13 @@ def upload(self, skeletons):
+     files = [ (os.path.join(self.meta.skeleton_path, str(skel.id)), skel.to_precomputed()) for skel in skeletons ]
+     self.cache.upload(
+       files=files, 
+-      subdir=self.meta.skeleton_path,
+       compress='gzip', 
+       cache_control=cdn_cache_control(self.config.cdn_cache)
+-    )
+\ No newline at end of file
++    )
++
++  def get_bbox(self, bbox):
++    if self.spatial_index is None:
++      raise IndexError("A spatial index has not been created.")
++
++    segids = self.spatial_index.query(bbox)
++    return self.get(segids)
+diff --git a/cloudvolume/datasource/precomputed/spatial_index.py b/cloudvolume/datasource/precomputed/spatial_index.py
+new file mode 100644
+index 000000000..d5408de46
+--- /dev/null
++++ b/cloudvolume/datasource/precomputed/spatial_index.py
+@@ -0,0 +1,109 @@
++import json
++import os 
++
++import numpy as np
++
++from ...exceptions import SpatialIndexGapError
++from ...storage import Storage, SimpleStorage
++from ... import paths
++from ...lib import Bbox, Vec, xyzrange, min2
++
++class SpatialIndex(object):
++  """
++  Implements the client side reader of the 
++  spatial index. During data generation, the
++  labels in a given task are enumerated and 
++  assigned their bounding box as JSON:
++
++  {
++    SEGID: [ x,y,z, x,y,z ],
++    ...
++  }
++
++  The filename is the physical bounding box of the
++  task dot spatial.
++
++  e.g. "0-1024_0-1024_0-500.spatial" where the bbox 
++  units are nanometers.
++
++  The info file of the data type can then be augmented
++  with:
++
++  {
++    "spatial_index": { "chunk_size": [ sx, sy, sz ] }
++  }
++
++  Where sx, sy, and sz are given in physical dimensions.
++  """
++  def __init__(self, cloudpath, bounds, chunk_size, progress=False):
++    self.cloudpath = cloudpath
++    self.path = paths.extract(cloudpath)
++    self.bounds = Bbox.create(bounds)
++    self.chunk_size = Vec(*chunk_size)
++    self.progress = progress
++
++  def join(self, *paths):
++    if self.path.protocol == 'file':
++      return os.path.join(*paths)
++    else:
++      return posixpath.join(*paths)    
++
++  def fetch_index_files(self, index_files):
++    with Storage(self.cloudpath, progress=self.progress) as stor:
++      results = stor.get_files(index_files)
++
++    for res in results:
++      if res['error'] is not None:
++        raise SpatialIndexGapError(res['error'])
++
++    return { res['filename']: res['content'] for res in results }
++
++  def query(self, bbox):
++    """
++    For the specified bounding box (or equivalent representation),
++    list all segment ids enclosed within it.
++
++    Returns: set(labels)
++    """
++    bbox = Bbox.create(bbox, context=self.bounds, autocrop=True)
++    original_bbox = bbox.clone()
++    bbox = bbox.expand_to_chunk_size(self.chunk_size, offset=self.bounds.minpt)
++
++    if bbox.subvoxel():
++      return []
++
++    index_files = []
++    for pt in xyzrange(bbox.minpt, bbox.maxpt, self.chunk_size):
++      search = Bbox( pt, min2(pt + self.chunk_size, self.bounds.maxpt) )
++      index_files.append(search.to_filename() + '.spatial')
++
++    results = self.fetch_index_files(index_files)
++
++    labels = set()
++    for filename, content in results.items():
++      if content is None:
++        raise SpatialIndexGapError(filename + " was not found.")
++
++      res = json.loads(content)
++
++      for label, label_bbx in res.items():
++        label = int(label)
++        label_bbx = Bbox.from_list(label_bbx)
++
++        if Bbox.intersects(label_bbx, original_bbox):
++          labels.add(label)
++
++    return labels
++
++class CachedSpatialIndex(SpatialIndex):
++  def __init__(self, cache, cloudpath, bounds, chunk_size, progress=None):
++    self.cache = cache
++    self.subdir = os.path.relpath(cloudpath, cache.meta.cloudpath)
++
++    super(CachedSpatialIndex, self).__init__(
++      cloudpath, bounds, chunk_size, progress
++    )
++
++  def fetch_index_files(self, index_files):
++    index_files = [ self.cache.meta.join(self.subdir, fname) for fname in index_files ]
++    return self.cache.download(index_files, progress=self.progress)
+diff --git a/cloudvolume/exceptions.py b/cloudvolume/exceptions.py
+index 13ba87de3..52c7ab70e 100644
+--- a/cloudvolume/exceptions.py
++++ b/cloudvolume/exceptions.py
+@@ -110,4 +110,8 @@ class UnsupportedProtocolError(ValueError):
+ 
+ class SpecViolation(Exception):
+   """The values held by this object violate its written specification."""
++  pass
++
++class SpatialIndexGapError(Exception):
++  """Part of the spatial index was not found. A complete result set cannot be fetched."""
+   pass
+\ No newline at end of file
+diff --git a/cloudvolume/lib.py b/cloudvolume/lib.py
+index 08e916b9f..fbc433f0f 100644
+--- a/cloudvolume/lib.py
++++ b/cloudvolume/lib.py
+@@ -572,6 +572,9 @@ def expand_to_chunk_size(self, chunk_size, offset=Vec(0,0,0, dtype=int)):
+     Required:
+       chunk_size: arraylike (x,y,z), the size of chunks in the 
+                     dataset e.g. (64,64,64)
++      offset: arraylike (x,y,z) the origin of the coordinate system
++        so that this offset can be accounted for in the grid line 
++        calculation.
+     Optional:
+       offset: arraylike (x,y,z), the starting coordinate of the dataset
+     """
+@@ -590,6 +593,9 @@ def shrink_to_chunk_size(self, chunk_size, offset=Vec(0,0,0, dtype=int)):
+     Required:
+       chunk_size: arraylike (x,y,z), the size of chunks in the 
+                     dataset e.g. (64,64,64)
++      offset: arraylike (x,y,z) the origin of the coordinate system
++        so that this offset can be accounted for in the grid line 
++        calculation.
+     Optional:
+       offset: arraylike (x,y,z), the starting coordinate of the dataset
+     """
+@@ -615,6 +621,9 @@ def round_to_chunk_size(self, chunk_size, offset=Vec(0,0,0, dtype=int)):
+     Required:
+       chunk_size: arraylike (x,y,z), the size of chunks in the 
+                     dataset e.g. (64,64,64)
++      offset: arraylike (x,y,z) the origin of the coordinate system
++        so that this offset can be accounted for in the grid line 
++        calculation.
+     Optional:
+       offset: arraylike (x,y,z), the starting coordinate of the dataset
+     """
+diff --git a/test/test_skeletons.py b/test/test_skeletons.py
+index 97523f629..2e66e6d53 100644
+--- a/test/test_skeletons.py
++++ b/test/test_skeletons.py
+@@ -10,8 +10,9 @@
+ 
+ from cloudvolume import CloudVolume, chunks, Storage, Skeleton
+ from cloudvolume.storage import SimpleStorage
+-from cloudvolume.lib import mkdir, Bbox, Vec
++from cloudvolume.lib import mkdir, Bbox, Vec, jsonify
+ 
++from cloudvolume.datasource.precomputed.sharding import ShardingSpecification
+ from cloudvolume.exceptions import SkeletonDecodeError, SkeletonAttributeMixingError
+ 
+ info = CloudVolume.create_new_info(
+@@ -26,6 +27,14 @@
+   chunk_size=(64, 64, 64),
+ )
+ 
++skel_info = {
++  "@type": "neuroglancer_skeletons", 
++  "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0], 
++  "vertex_attributes": [
++    {"id": "radius", "data_type": "float32", "num_components": 1}
++  ], 
++}
++
+ def test_skeletons():
+   
+   # Skeleton of my initials
+@@ -638,6 +647,66 @@ def test_simple_merge():
+   except SkeletonAttributeMixingError:
+     pass
+ 
++def test_sharded():
++  skel = Skeleton(
++    [ 
++      (0,0,0), (1,0,0), (2,0,0),
++      (0,1,0), (0,2,0), (0,3,0),
++    ], 
++    edges=[ 
++      (0,1), (1,2), 
++      (3,4), (4,5), (3,5)
++    ],
++    segid=1,
++    extra_attributes=[
++      {
++          "id": "radius",
++          "data_type": "float32",
++          "num_components": 1,
++      }
++    ]
++  ).physical_space()
++
++  skels = {}
++  for i in range(10):
++    sk = skel.clone()
++    sk.id = i
++    skels[i] = sk.to_precomputed()
++
++  mkdir('/tmp/removeme/skeletons/sharded/skeletons')
++  with open('/tmp/removeme/skeletons/sharded/info', 'wt') as f:
++    f.write(jsonify(info))
++
++  for idxenc in ('raw', 'gzip'):
++    for dataenc in ('raw', 'gzip'):
++
++      spec = ShardingSpecification(
++        'neuroglancer_uint64_sharded_v1', 
++        preshift_bits=1,
++        hash='murmurhash3_x86_128', 
++        minishard_bits=2, 
++        shard_bits=1, 
++        minishard_index_encoding=idxenc, 
++        data_encoding=dataenc,
++      )
++      skel_info['sharding'] = spec.to_dict()
++
++      with open('/tmp/removeme/skeletons/sharded/skeletons/info', 'wt') as f:
++        f.write(jsonify(skel_info))
++
++      files = spec.synthesize_shards(skels)
++      for fname in files.keys():
++        with open('/tmp/removeme/skeletons/sharded/skeletons/' + fname, 'wb') as f:
++          f.write(files[fname])      
++
++      cv = CloudVolume('file:///tmp/removeme/skeletons/sharded/')
++
++      for i in range(10):
++        sk = cv.skeleton.get(i).physical_space()
++        sk.id = 1
++        assert sk == skel
++
++  shutil.rmtree('/tmp/removeme/skeletons')
+ 
+ 
+ 

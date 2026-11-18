@@ -1,0 +1,246 @@
+diff --git a/cloudvolume/datasource/graphene/mesh/sharded.py b/cloudvolume/datasource/graphene/mesh/sharded.py
+index 64edc88ed..7fdf14acc 100644
+--- a/cloudvolume/datasource/graphene/mesh/sharded.py
++++ b/cloudvolume/datasource/graphene/mesh/sharded.py
+@@ -13,13 +13,13 @@
+ 
+ from cloudfiles import CloudFiles
+ 
+-from ....lib import red, toiter, Bbox, Vec
++from ....lib import red, toiter, Bbox, Vec, first
+ from ....mesh import Mesh
+ from .... import paths
+ 
+ from ..sharding import GrapheneShardReader
+ from ...precomputed.sharding import ShardingSpecification
+-
++from ....mesh import is_draco_chunk_aligned
+ from .unsharded import GrapheneUnshardedMeshSource
+ 
+ class GrapheneShardedMeshSource(GrapheneUnshardedMeshSource):
+@@ -102,8 +102,7 @@ def exists(self, labels, progress=None):
+ 
+     Returns: { label: path or None, ... }
+     """
+-    labels = toiter(labels)
+-    labels = set(labels)
++    labels = set(toiter(labels))
+ 
+     dynamic_labels = self.dynamic_exists(labels, progress)
+     remainder_labels = set([ label for label, path in dynamic_labels.items() if path ])
+@@ -113,11 +112,13 @@ def exists(self, labels, progress=None):
+     dynamic_labels.update(initial_labels)
+     return dynamic_labels
+ 
+-  def parse_manifest_filenames(self, filenames):
++  def parse_manifest_filenames(self, manifest):
+     lists = defaultdict(list)
+     initial_regexp = re.compile(r'~(\d+)/([\d\-]+\.shard):(\d+):(\d+)')
+ 
+-    for filename in filenames:
++    filenames, segids = manifest['fragments'], manifest['seg_ids']
++
++    for filename, segid in zip(filenames, segids):
+       if not filename:
+         continue
+ 
+@@ -129,7 +130,7 @@ def parse_manifest_filenames(self, filenames):
+         (layer_id, parsed_filename, byte_start, size) = re.search(
+           initial_regexp, filename
+         ).groups()
+-        lists['initial'].append((layer_id, parsed_filename, int(byte_start), int(size)))
++        lists['initial'].append((layer_id, parsed_filename, int(byte_start), int(size), int(segid)))
+       else:
+         lists['dynamic'].append(filename)
+         
+@@ -146,27 +147,45 @@ def get_meshes_via_manifest_byte_offsets(self, seg_id, bounding_box):
+     level = self.meta.meta.decode_layer_id(seg_id)
+     dynamic_cloudpath = self.meta.join(self.meta.meta.cloudpath, self.dynamic_path())
+ 
+-    filenames = self.get_fragment_filenames(seg_id, level=level, bbox=bounding_box)
+-    lists = self.parse_manifest_filenames(filenames)
++    manifest = self.fetch_manifest(seg_id, level=level, bbox=bounding_box, return_segids=True)
++    lists = self.parse_manifest_filenames(manifest)
+ 
+-    meshes = []
++    files = []
+     if lists['dynamic']:
+-      meshes = CloudFiles(dynamic_cloudpath, green=self.config.green).get(lists['dynamic'])
++      files = CloudFiles(dynamic_cloudpath, green=self.config.green).get(lists['dynamic'])
++    
++    dynamic_meshes = []
++    while files:
++      f = files.pop()
++      mesh = Mesh.from_draco(f['content'])
++      mesh.segid = int(os.path.basename(f['path']).split(':')[0])
++      dynamic_meshes.append(mesh)
+ 
+     fetches = []
+-    for layer_id, filename, byte_start, size in lists['initial']:
++    segid_map = {}
++    for layer_id, filename, byte_start, size, segid in lists['initial']:
++      path = self.meta.join(layer_id, filename)
++      byte_end = byte_start + size
+       fetches.append({
+-        'path': self.meta.join(layer_id, filename),
++        'path': path,
+         'start': byte_start,
+-        'end': byte_start + size,
++        'end': byte_end,
+       })
++      segid_map[(path, byte_start, byte_end)] = segid
+ 
+     cloudpath = self.meta.join(self.meta.meta.cloudpath, self.meta.mesh_path, 'initial')
+     
+-    initial_meshes = CloudFiles(cloudpath, green=self.config.green).get(fetches)
+-    meshes += initial_meshes
+-
+-    return [ Mesh.from_draco(mesh['content']) for mesh in meshes ]
++    files = CloudFiles(cloudpath, green=self.config.green).get(fetches)
++    initial_meshes = []
++    while files:
++      f = files.pop()
++      mesh = Mesh.from_draco(f['content'])
++      start, end = f['byte_range']
++      key = (f['path'], start, end)
++      mesh.segid = segid_map[key]
++      initial_meshes.append(mesh)    
++
++    return dynamic_meshes + initial_meshes
+ 
+   def get_meshes_via_manifest_labels(self, seg_id, bounding_box):
+     level = self.meta.meta.decode_layer_id(seg_id)
+@@ -179,6 +198,40 @@ def get_meshes_via_manifest(self, seg_id, bounding_box, use_byte_offsets):
+       return self.get_meshes_via_manifest_byte_offsets(seg_id, bounding_box)
+     return self.get_meshes_via_manifest_labels(seg_id, bounding_box)
+ 
++  def get_chunk_aligned_mask(self, meshes):
++    meta = self.meta.meta
++    draco_grid_size = meta.get_draco_grid_size(
++      meta.decode_layer_id(first(meshes).segid)
++    )
++    base_resolution = meta.resolution(self.config.mip)
++    lvl2_resolution = meta.resolution(self.meta.mip)
++
++    voxel_offset = Vec(0,0,0)
++    if meta.chunks_start_at_voxel_offset:
++      voxel_offset = meta.voxel_offset(self.meta.mip)
++      
++    offset = voxel_offset * lvl2_resolution
++    lvl_2_size_nm = meta.chunk_size(self.meta.mip) * base_resolution
++
++    chunk_aligned_masks = []
++    for mesh in meshes:
++      level = meta.decode_layer_id(mesh.segid)
++      chunk_size = (lvl_2_size_nm * (2 ** (level-2))).astype(np.int32)
++      verts = mesh.vertices - offset
++      # find all vertices that are exactly on chunk_size boundaries
++      is_chunk_aligned = is_draco_chunk_aligned(
++        verts, chunk_size, draco_grid_size=draco_grid_size
++      )
++      chunk_aligned_masks.append(is_chunk_aligned)
++    
++    return np.concatenate(chunk_aligned_masks)
++
++  def stitch_multi_level_draco_mesh_fragments(self, meshes, segid):
++    chunk_aligned_mask = self.get_chunk_aligned_mask(meshes)
++    mesh = Mesh.concatenate(*meshes)
++    mesh.segid = segid
++    return mesh.deduplicate_vertices(chunk_aligned_mask)
++
+   def get_meshes_on_bypass(self, segids, allow_missing=False):
+     """
+     Attempt to fetch a mesh directly from storage without going through
+@@ -240,7 +293,7 @@ def download_segid(self, seg_id, bounding_box, bypass=False, use_byte_offsets=Fa
+       mesh = self.get_meshes_on_bypass(seg_id)[seg_id]
+     else:
+       meshes = self.get_meshes_via_manifest(seg_id, bounding_box, use_byte_offsets=use_byte_offsets)
+-      mesh = Mesh.concatenate(*meshes)
++      mesh = self.stitch_multi_level_draco_mesh_fragments(meshes, seg_id)
+ 
+     if mesh is None:
+       raise IndexError('No mesh found for segment {}'.format(seg_id))
+diff --git a/cloudvolume/frontends/graphene.py b/cloudvolume/frontends/graphene.py
+index 3f29600fa..bf850394c 100644
+--- a/cloudvolume/frontends/graphene.py
++++ b/cloudvolume/frontends/graphene.py
+@@ -21,6 +21,7 @@
+ from ..datasource.graphene.metadata import GrapheneApiVersion
+ 
+ from .precomputed import CloudVolumePrecomputed
++import tqdm
+ 
+ def warn(text):
+   print(colorize('yellow', text))
+@@ -36,10 +37,10 @@ def to_unix_time(timestamp):
+   if isinstance(timestamp, datetime): # NB. do not change to elif
+     timestamp = datetime.timestamp(timestamp)
+ 
+-  if not isinstance(timestamp, int) and timestamp is not None:
++  if not isinstance(timestamp, (int, float, np.integer, np.floating)) and timestamp is not None:
+     raise ValueError("Not able to convert {} to UNIX time.".format(timestamp))
+ 
+-  return timestamp
++  return int(timestamp)
+ 
+ class CloudVolumeGraphene(CloudVolumePrecomputed):
+ 
+diff --git a/cloudvolume/mesh.py b/cloudvolume/mesh.py
+index 10c4a229c..d8937cf37 100644
+--- a/cloudvolume/mesh.py
++++ b/cloudvolume/mesh.py
+@@ -22,7 +22,6 @@ def deprecation_notice(key):
+   """.format(key, key)))
+     NOTICE[key] += 1
+ 
+-
+ def is_draco_chunk_aligned(verts, chunk_size, draco_grid_size):
+   """
+   Return a mask that for each vertex is true iff it is within
+@@ -330,19 +329,9 @@ def from_draco(cls, binary):
+       encoding_options=mesh_object.encoding_options
+     )
+ 
+-  def deduplicate_chunk_boundaries(self, chunk_size, is_draco=False, draco_grid_size=None, offset=(0,0,0)):
+-    offset = Vec(*offset)
+-    verts = self.vertices - offset
+-    # find all vertices that are exactly on chunk_size boundaries
+-    if is_draco:
+-      if draco_grid_size is None:
+-        raise ValueError('Must specify draco grid size to dedup draco meshes')
+-      is_chunk_aligned = is_draco_chunk_aligned(verts, chunk_size, draco_grid_size=draco_grid_size)
+-    else:
+-      is_chunk_aligned = np.any(np.mod(verts, chunk_size) == 0, axis=1)
+-
++  def deduplicate_vertices(self, is_chunk_aligned):
+     faces = self.faces
+-
++    verts = self.vertices
+     # find all vertices that have exactly 2 duplicates
+     unique_vertices, unique_inverse, counts = np.unique(
+       verts, return_inverse=True, return_counts=True, axis=0
+@@ -365,10 +354,23 @@ def deduplicate_chunk_boundaries(self, chunk_size, is_draco=False, draco_grid_si
+     vertices, newfaces = np.unique(new_vertices[faces], return_inverse=True, axis=0)
+     newfaces = newfaces.astype(np.uint32).reshape( (len(newfaces) // 3, 3) )
+ 
+-    return Mesh(vertices[:,0:3] + offset, newfaces, None, segid=self.segid, 
++    return Mesh(vertices[:,0:3], newfaces, None, segid=self.segid, 
+       encoding_type=self.encoding_type, encoding_options=self.encoding_options
+     )
+ 
++  def deduplicate_chunk_boundaries(self, chunk_size, is_draco=False, draco_grid_size=None, offset=(0,0,0)):
++    offset = Vec(*offset)
++    verts = self.vertices - offset
++    # find all vertices that are exactly on chunk_size boundaries
++    if is_draco:
++      if draco_grid_size is None:
++        raise ValueError('Must specify draco grid size to dedup draco meshes')
++      is_chunk_aligned = is_draco_chunk_aligned(verts, chunk_size, draco_grid_size=draco_grid_size)
++    else:
++      is_chunk_aligned = np.any(np.mod(verts, chunk_size) == 0, axis=1)
++
++    return self.deduplicate_vertices(is_chunk_aligned)
++
+   def viewer(self):
+     try:
+       import vtk

@@ -9,9 +9,9 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: biophysics-cryoem.
 | Domain candidates (deduped) | 422 |
 | After active+star+noise filter | 169 |
 | Final target list (cap unlimited) | 169 |
-| Repos with >=1 task | 71 |
-| Repos with 0 tasks | 95 |
-| Total tasks (unlimited (no per-repo cap)) | 5627 |
+| Repos with >=1 task | 74 |
+| Repos with 0 tasks | 92 |
+| Total tasks (unlimited (no per-repo cap)) | 5985 |
 
 ## Generation
 
@@ -23,7 +23,7 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: biophysics-cryoem.
 - Overlap with the 3 published cancer editions is allowed (user decision);
   domains are independent selections, not a partition of one repo set.
 
-## Zero-yield repos (informational, 95)
+## Zero-yield repos (informational, 92)
 
 - BradyAJohnston/MolecularNodes
 - CERN/TIGRE
@@ -45,13 +45,11 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: biophysics-cryoem.
 - OpenEIT/OpenEIT
 - llnl/LEAP
 - eitcom/pyEIT
-- jaxleyverse/jaxley
 - wangqiannudt/nerf-arxiv-daily
 - seto77/ReciPro
 - sandialabs/pyGSTi
 - 3dem/model-angelo
 - Electrostatics/pdb2pqr
-- seung-lab/cloud-volume
 - ELEKTRONN/elektronn3
 - pinder-org/pinder
 - David-OConnor/molchanica
@@ -71,7 +69,6 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: biophysics-cryoem.
 - fmagrini/seislib
 - iszhanjiawei/flow_matching_arxiv_daily
 - OJB-Quantum/QC-Hardware-How-To
-- google-research/sofima
 - TLCFEM/suanPan
 - DiamondLightSource/discorpy
 - jnagy1/IRtools

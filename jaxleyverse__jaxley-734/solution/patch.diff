@@ -1,0 +1,363 @@
+diff --git a/jaxley/utils/dynamics.py b/jaxley/utils/dynamics.py
+index be5ae046..de9c2011 100644
+--- a/jaxley/utils/dynamics.py
++++ b/jaxley/utils/dynamics.py
+@@ -6,7 +6,7 @@
+ from jax import Array
+ from jax.flatten_util import ravel_pytree
+ from jax.tree import leaves
+-from jax.tree_util import tree_map
++from jax.tree_util import tree_map, tree_map_with_path
+ 
+ 
+ def _remove_currents_from_states(states: dict[str, Array], current_keys: list[str]):
+@@ -235,12 +235,12 @@ def loss_fn(params, param_state_value):
+     """
+ 
+     all_states = module.get_all_states([])
+-
+-    # Get the names of all keys that will be removed by `remove_observables()`.
+     added_keys = module.membrane_current_names + module.synapse_current_names
+ 
+-    # Remove branchpoints if needed.
+-    original_length = len(leaves(all_states)[0])
++    # Remove branchpoints if needed
++    membrane_states_keys = module.jaxnodes.keys()
++    original_length = len(all_states["v"])
++
+     if hasattr(module, "_branchpoints") and len(module._branchpoints.index) > 0:
+         filter_indices = jnp.array(module._branchpoints.index.to_numpy(), dtype=int)
+         all_indices = jnp.arange(original_length)
+@@ -250,8 +250,12 @@ def loss_fn(params, param_state_value):
+         keep_indices = jnp.arange(original_length)
+         branch_filter_applied = False
+ 
+-    all_states = tree_map(lambda x: jnp.take(x, keep_indices, axis=0), all_states)
+-    filtered_length = len(leaves(all_states)[0])
++    all_states = tree_map_leaves_with_valid_key(
++        all_states,
++        lambda x: jnp.take(x, keep_indices, axis=0),
++        valid_keys=membrane_states_keys,
++    )
++    filtered_length = len(all_states["v"])  # len(leaves(all_states)[0])
+ 
+     # Remove NaNs (appear if some states are not defined on all compartments)
+     nan_mask_tree = tree_map(jnp.isnan, all_states)
+@@ -262,30 +266,34 @@ def take_by_idx(x, idx):
+             return x
+         return jnp.take(x, idx, axis=0)
+ 
+-    dynamic_states_pytree = tree_map(take_by_idx, all_states, nan_indices_tree)
++    all_states_no_nans = tree_map_leaves_with_valid_key_2_trees(
++        all_states, nan_indices_tree, take_by_idx, valid_keys=membrane_states_keys
++    )
+ 
+-    # Get the unflatten function.
+-    _, unflatten = ravel_pytree(dynamic_states_pytree)
++    # Flatten to a vector
++    _, unflatten = ravel_pytree(all_states_no_nans)
+ 
+-    def flatten(dynamic_states_pytree: dict[str, Array]) -> Array:
++    def flatten(all_states_no_nans: dict[str, Array]) -> Array:
+         """Convert the state vector back to a pytree.
+ 
+-        Args:
+-            dynamic_states_pytree: Dynamic states as dict of jnp.Arrays. Contains all
+-                dynamic states.
++        Args: Dynamic states as dict of jnp.Arrays. Contains all dynamic states.
+ 
+-        Returns:
+-            Flattened dynamic states as an jnp.Array
++        Returns: Flattened dynamic states as an jnp.Array.
+         """
+-        states_vec, _ = ravel_pytree(dynamic_states_pytree)
++        states_vec, _ = ravel_pytree(all_states_no_nans)
+         return states_vec
+ 
+-    def remove_observables(all_states: dict[str, Array]) -> dict[str, Array]:
++    # Now we can create functions that convert between the full state pytree
++    # and the filtered state vector
++    # ----------------------------------------------------------
++
++    # Ravel from pytree (post-step) to vector
++    def remove_observables(states: dict[str, Array]) -> dict[str, Array]:
+         r"""Remove the membrane currents, synaptic currents, and branchpoint voltages.
+ 
+         Thus, the returned states only include true "dynamic" states.
+ 
+-        Args:
++         Args:
+             all_states:. All observalbe states of the system, including membrane
+                 and synaptic currents, branchpoint voltages, and NaN-padded states
+                 in cases where some mechanisms exist only in some compartments.
+@@ -293,13 +301,37 @@ def remove_observables(all_states: dict[str, Array]) -> dict[str, Array]:
+         Returns:
+             All dynamic states of the system.
+         """
+-        filtered_states = _remove_currents_from_states(all_states, added_keys)
+-        filtered_states = tree_map(
+-            lambda x: jnp.take(x, keep_indices, axis=0), filtered_states
++        filtered_states = _remove_currents_from_states(states, added_keys)
++
++        filtered_states = tree_map_leaves_with_valid_key(
++            filtered_states,
++            lambda x: jnp.take(x, keep_indices, axis=0),
++            valid_keys=membrane_states_keys,
+         )
+-        filtered_states = tree_map(take_by_idx, filtered_states, nan_indices_tree)
++
++        filtered_states = tree_map_leaves_with_valid_key_2_trees(
++            filtered_states,
++            nan_indices_tree,
++            take_by_idx,
++            valid_keys=membrane_states_keys,
++        )
++
+         return filtered_states
+ 
++    # Unravel from vector to full restored state pytree
++
++    def restore_leaf(filtered_array, nan_indices_leaf):
++        """Restore NaN padding"""
++        restored_array = jnp.full(filtered_length, jnp.nan)
++        restored_array = restored_array.at[nan_indices_leaf].set(filtered_array)
++        return restored_array
++
++    def restore_branch_leaf(leaf):
++        """Restore branchpoint voltages"""
++        restored_array = jnp.full(original_length, -1.0)
++        restored_array = restored_array.at[keep_indices].set(leaf)
++        return restored_array
++
+     def add_observables(
+         dynamic_states_pytree: dict[str, Array],
+         all_params: dict[str, Array],
+@@ -319,32 +351,77 @@ def add_observables(
+             ``jx.integrate.build_init_and_step_fn``).
+         """
+ 
+-        # Step 1: First restore NaN padding.
+-        def restore_leaf(filtered_array, nan_indices_leaf):
+-            restored_array = jnp.full(filtered_length, jnp.nan)
+-            restored_array = restored_array.at[nan_indices_leaf].set(filtered_array)
+-            return restored_array
+-
+-        all_states_with_nans = tree_map(
+-            restore_leaf, dynamic_states_pytree, nan_indices_tree
++        # First restore NaN padding
++        all_states_with_nans = tree_map_with_path(
++            lambda path, leaf: (
++                restore_leaf(leaf, nan_indices_tree[get_key_name(path)])
++                if is_valid_membrane_leaf(
++                    get_key_name(path), leaf, membrane_states_keys
++                )
++                else leaf
++            ),
++            dynamic_states_pytree,
+         )
+ 
+-        # Step 2: Restore branchpoint voltages if there were any branchpoints
++        # Restore branchpoint voltages if there were any branchpoints
+         if branch_filter_applied:
+-
+-            def restore_branch_leaf(leaf):
+-                restored_array = jnp.full(original_length, -1.0)
+-                restored_array = restored_array.at[keep_indices].set(leaf)
+-                return restored_array
+-
+-            restored_states = tree_map(restore_branch_leaf, all_states_with_nans)
++            restored_states = tree_map_leaves_with_valid_key(
++                all_states_with_nans,
++                restore_branch_leaf,
++                valid_keys=membrane_states_keys,
++            )
+         else:
+             restored_states = all_states_with_nans
+ 
+-        # Step 3: Add channel currents to the restored states
++        # Add channel currents to the restored states
+         restored_states = module.append_channel_currents_to_states(
+             restored_states, all_params, delta_t=delta_t
+         )
+         return restored_states
+ 
+     return remove_observables, add_observables, flatten, unflatten
++
++
++def is_valid_membrane_leaf(key, leaf, valid_keys):
++    """Check if the leaf is non-zero and its key is in valid_keys"""
++    return key in valid_keys and getattr(leaf, "ndim", None) and leaf.ndim > 0
++
++
++def tree_map_leaves_with_valid_key(tree, fn, valid_keys=None):
++    """
++    Apply fn(leaf) selectively to leaves that satisfy is_valid_membrane_leaf(key, leaf, valid_keys).
++    """
++    return tree_map_with_path(
++        lambda path, leaf: (
++            fn(leaf)
++            if is_valid_membrane_leaf(get_key_name(path), leaf, valid_keys)
++            else leaf
++        ),
++        tree,
++    )
++
++
++def tree_map_leaves_with_valid_key_2_trees(tree1, tree2, fn, valid_keys=None):
++    """Apply fn(leaf1, leaf2) selectively to leaves that satisfy is_valid_membrane_leaf(key, leaf1, valid_keys)."""
++    valid_keys = set(valid_keys) if valid_keys is not None else None
++
++    def wrapper(path, leaf1, leaf2):
++        key = get_key_name(path)
++        if is_valid_membrane_leaf(key, leaf1, valid_keys):
++            return fn(leaf1, leaf2)
++        else:
++            return leaf1
++
++    return tree_map_with_path(wrapper, tree1, tree2)
++
++
++def get_key_name(path):
++    """Extract string name from JAX path elements"""
++    if not path:
++        return None
++    last = path[-1]
++    if hasattr(last, "key"):  # DictKey
++        return str(last.key)
++    elif hasattr(last, "idx"):  # SequenceKey
++        return str(last.idx)
++    return str(last)
+diff --git a/tests/test_dynamics_step_fn.py b/tests/test_dynamics_step_fn.py
+index f2cf3de6..4cd62f4b 100644
+--- a/tests/test_dynamics_step_fn.py
++++ b/tests/test_dynamics_step_fn.py
+@@ -7,8 +7,11 @@
+ import jaxley.optimize.transforms as jt
+ from jaxley.channels import Leak
+ from jaxley.channels.hh import HH
++from jaxley.connect import fully_connect
+ from jaxley.integrate import add_stimuli, build_init_and_step_fn
+ from jaxley.modules import cell
++from jaxley.synapses.ionotropic import IonotropicSynapse
++from jaxley.synapses.test import TestSynapse
+ from jaxley.utils.dynamics import build_dynamic_state_utils
+ 
+ jax.config.update("jax_enable_x64", True)
+@@ -72,8 +75,6 @@ def step_once(dynamic_states):
+ def test_jit_and_grad(hh_cell):
+     """Test jitting the dynamics step function and gradients"""
+     cell = hh_cell
+-
+-    # make some parameters trainable
+     cell.make_trainable("Leak_gLeak")
+     cell.make_trainable("v")
+     params = cell.get_parameters()
+@@ -166,6 +167,108 @@ def loss(opt_params):
+     assert np.all(abs(gradient[1]["v"]) > 0)
+ 
+ 
++def test_jit_and_grad_network():
++    """Test jitting the dynamics step function and gradients"""
++    cell = jx.Cell()
++    net = jx.Network([cell for _ in range(10)], vectorize_cells=True)
++    net.insert(Leak())
++
++    fully_connect(net.cell(range(5)), net.cell(range(3)), TestSynapse())
++    fully_connect(net.cell(range(6, 8)), net.cell(range(8, 10)), IonotropicSynapse())
++    # make some parameters trainable
++    net.make_trainable("Leak_gLeak")
++    net.make_trainable("v")
++    params = net.get_parameters()
++
++    # Define parameter transform and apply it to the parameters.
++    transform = jx.ParamTransform(
++        [
++            {"Leak_gLeak": jt.SigmoidTransform(0.00001, 0.0002)},
++            {"v": jt.SigmoidTransform(-100, -30)},
++        ]
++    )
++    opt_params = transform.inverse(params)
++    params = transform.forward(opt_params)
++    net.to_jax()
++
++    # add some inputs
++    externals = net.externals.copy()
++    external_inds = net.external_inds.copy()
++    current = jx.step_current(
++        i_delay=1.0, i_dur=2.0, i_amp=0.08, delta_t=0.025, t_max=0.075
++    )
++    data_stimuli = None
++    data_stimuli = net.branch(0).comp(0).data_stimulate(current, data_stimuli)
++    externals, external_inds = add_stimuli(externals, external_inds, data_stimuli)
++
++    def get_externals_now(externals, step):
++        externals_now = {}
++        for key in externals.keys():
++            externals_now[key] = externals[key][:, step]
++        return externals_now
++
++    target_voltage = -50.0
++    state_idx = 0
++
++    # Define the optimizer
++    optimizer = optax.adam(learning_rate=0.01)
++    opt_state = optimizer.init(opt_params)
++
++    init_fn, step_fn = build_init_and_step_fn(net)
++    remove_observables, add_observables, flatten, unflatten = build_dynamic_state_utils(
++        net
++    )
++
++    def init_dynamics(params, param_state):
++        all_states, all_params = init_fn(params, None, param_state)
++        dynamic_states = flatten(remove_observables(all_states))
++        return dynamic_states, all_params
++
++    @jit
++    def step_dynamics(
++        dynamic_states, all_params, externals, external_inds, delta_t=0.025
++    ):
++        all_states = add_observables(
++            unflatten(dynamic_states), all_params, delta_t=delta_t
++        )
++        all_states = step_fn(
++            all_states, all_params, externals, external_inds, delta_t=delta_t
++        )
++        dynamic_states = flatten(remove_observables(all_states))
++        return dynamic_states
++
++    def loss(opt_params):
++        params = transform.forward(opt_params)
++
++        dynamic_states, all_params = init_dynamics(params, None)
++
++        dynamic_states_list = [dynamic_states]
++
++        # Simulate the model
++        for step in range(3):
++            # Get inputs at this time step
++            externals_now = get_externals_now(externals, step)
++            # Step the ODE
++            dynamic_states = step_dynamics(
++                dynamic_states, all_params, externals_now, external_inds, delta_t=0.025
++            )
++            # Store the state
++            dynamic_states_list.append(dynamic_states)
++        # Compute the loss at the last time step
++        loss = jnp.mean((dynamic_states_list[-1][state_idx] - target_voltage) ** 2)
++        return loss
++
++    # Compute the gradient of the loss with respect to the parameters
++    grad_loss = value_and_grad(loss, argnums=0)
++    value, gradient = grad_loss(opt_params)
++
++    updates, opt_state = optimizer.update(gradient, opt_state)
++    print(value)
++    print(gradient)
++    assert np.all(abs(gradient[0]["Leak_gLeak"]) > 0)
++    assert np.all(abs(gradient[1]["v"]) > 0)
++
++
+ def test_jit_and_grad_pstate(hh_cell):
+     """Test jitting the dynamics step function and gradients wrt pstate"""
+     cell = hh_cell

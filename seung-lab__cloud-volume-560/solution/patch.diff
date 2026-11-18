@@ -1,0 +1,293 @@
+diff --git a/cloudvolume/cacheservice.py b/cloudvolume/cacheservice.py
+index bd81b391..10f6fc00 100644
+--- a/cloudvolume/cacheservice.py
++++ b/cloudvolume/cacheservice.py
+@@ -139,6 +139,14 @@ def flush_provenance(self):
+       return
+     os.remove(path)
+ 
++  def delete(self, filenames):
++    filenames = toiter(filenames)
++
++    for filename in filenames:
++      path = os.path.join(self.path, filename)
++      if os.path.exists(path):
++        os.remove(path)
++
+   def flush(self, preserve=None):
+     """
+     Delete the cache for this dataset. Optionally preserve
+diff --git a/cloudvolume/cloudvolume.py b/cloudvolume/cloudvolume.py
+index 89692a76..f5ff5692 100644
+--- a/cloudvolume/cloudvolume.py
++++ b/cloudvolume/cloudvolume.py
+@@ -8,6 +8,7 @@
+ from .exceptions import UnsupportedFormatError, DimensionError
+ from .lib import generate_random_string
+ from .paths import strict_extract, to_https_protocol
++from .types import CompressType, ParallelType, CacheType, SecretsType
+ 
+ # NOTE: Plugins are registered in __init__.py
+ 
+@@ -21,11 +22,6 @@
+ def register_plugin(key, creation_function):
+   REGISTERED_PLUGINS[key.lower()] = creation_function
+ 
+-CompressType = Optional[Union[str,bool]]
+-ParallelType = Union[int,bool]
+-CacheType = Union[bool,str]
+-SecretsType = Optional[Union[str,dict]]
+-
+ class SharedConfiguration(object):
+   """
+   Hack around python's inability to
+diff --git a/cloudvolume/datasource/precomputed/mesh/multilod.py b/cloudvolume/datasource/precomputed/mesh/multilod.py
+index 6c874fb3..ea2fc875 100644
+--- a/cloudvolume/datasource/precomputed/mesh/multilod.py
++++ b/cloudvolume/datasource/precomputed/mesh/multilod.py
+@@ -157,6 +157,27 @@ def get(self, segids, lod=0, concat=True, progress=None):
+ 
+     return meshdata
+ 
++  def put(self, *args, **kwargs):
++    raise NotImplementedError("put is not implemented for multi-res meshes.")
++
++  def delete(self, segids):
++    """
++    Removes fragment and manifest files for each segid specified.
++    """
++    segids = toiter(segids)
++
++    def filenames(segids):
++      for segid in segids:
++        yield self.meta.join(full_path, f"{segid}.index")
++        yield self.meta.join(full_path, f"{segid}")
++
++    full_path = self.meta.join(self.meta.cloudpath, self.path)
++    progress = progress if progress is not None else self.config.progress
++    CloudFiles(
++      full_path, progress=progress,
++      green=self.config.green, secrets=self.config.secrets
++    ).delete(filenames(segids), total=len(segids) * 2)
++
+ class ShardedMultiLevelPrecomputedMeshSource(UnshardedLegacyPrecomputedMeshSource):
+   def __init__(self, meta, cache, config, readonly=False):
+     super(ShardedMultiLevelPrecomputedMeshSource, self).__init__(meta, cache, config, readonly)
+@@ -263,6 +284,12 @@ def get(self, segids, lod=0, concat=True, progress=None):
+ 
+     return meshdata
+ 
++  def put(self, *args, **kwargs):
++    raise NotImplementedError("put is not implemented for multi-res meshes.")
++
++  def delete(self, *args, **kwargs):
++    raise NotImplementedError("delete is not implemented for individual sharded multi-res meshes.")
++
+ class MultiLevelPrecomputedMeshManifest:
+   # Parse the multi-resolution mesh manifest file format:
+   # https://github.com/google/neuroglancer/blob/master/src/neuroglancer/datasource/precomputed/meshes.md
+diff --git a/cloudvolume/datasource/precomputed/mesh/unsharded.py b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+index 74a8e40c..87d74bcc 100644
+--- a/cloudvolume/datasource/precomputed/mesh/unsharded.py
++++ b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+@@ -1,8 +1,8 @@
+-import six
++from typing import Union, Iterable, Optional
+ 
+ from collections import defaultdict
+ import itertools
+-import json
++import simdjson
+ import re
+ import os
+ 
+@@ -13,8 +13,9 @@
+ from cloudfiles import CloudFiles
+ 
+ from .... import exceptions
+-from ....lib import yellow, red, toiter
++from ....lib import yellow, red, toiter, sip
+ from ....mesh import Mesh
++from ....types import CompressType
+ from ..spatial_index import CachedSpatialIndex
+ from .common import apply_transform
+ 
+@@ -62,16 +63,23 @@ def manifest_path(self, segid):
+     mesh_json_file_name = str(segid) + ':0'
+     return self.meta.join(self.path, mesh_json_file_name)
+ 
+-  def _get_manifests(self, segids):
++  def _get_manifests(self, segids, allow_missing=False):
+     segids = toiter(segids)    
+     paths = [ self.manifest_path(segid) for segid in segids ]
+     fragments = self.cache.download(paths)
+ 
+     contents = {}
+     for filename, content in fragments.items():
+-      content = content.decode('utf8')
+-      content = json.loads(content)
+       segid = filename_to_segid(filename)
++      if content is None:
++        if allow_missing:
++          contents[segid] = None
++          continue
++        else:
++          raise ValueError(f"manifest is missing for {filename}")
++
++      content = content.decode('utf8')
++      content = simdjson.loads(content)
+       contents[segid] = content['fragments']
+ 
+     return contents
+@@ -167,19 +175,21 @@ def get(
+       meshdata[segid].append(mesh)
+ 
+     if not fuse:
+-      meshdata = { segid: Mesh.concatenate(*meshes) for segid, meshes in meshdata.items() }
++      meshdata = { 
++          segid: Mesh.concatenate(*meshes) 
++          for segid, meshes in meshdata.items() 
++      }
+       for mesh in meshdata.values():
+         mesh.vertices = apply_transform(mesh.vertices, self.transform)
+       return meshdata
+ 
+-    meshdata = [ (segid, mesh) for segid, mesh in six.iteritems(meshdata) ]
++    meshdata = [ (segid, mesh) for segid, mesh in meshdata.items() ]
+     meshdata = sorted(meshdata, key=lambda sm: sm[0])
+     meshdata = [ mesh for segid, mesh in meshdata ]
+     meshdata = list(itertools.chain.from_iterable(meshdata)) # flatten
+     mesh = Mesh.concatenate(*meshdata)
+     mesh.vertices = apply_transform(mesh.vertices, self.transform)
+ 
+-
+     if not remove_duplicate_vertices:
+       return mesh 
+ 
+@@ -205,6 +215,71 @@ def get(
+       offset=(chunk_offset * resolution)
+     )
+ 
++  def put(
++    self, 
++    meshes:Union[Mesh,Iterable[Mesh]], 
++    batch_size:int = 200,
++    compress:CompressType = "gzip", 
++    compression_level:int = 6,
++    cdn_cache:Optional[str] = None,
++    skip_delete:bool = False,
++  ):
++    """
++    Upload a pre-existing mesh. 
++
++    batch_size: affects performance, controls size of each upload batch
++    skip_delete: Since meshes consist of an arbitrary number of files, 
++      a simple upload won't necessarily replace the old mesh. Therefore,
++      we read the manifest and delete the old mesh if it exists before
++      uploading. You can skip this step by stetting this flag to True.
++    """
++    if isinstance(meshes, Mesh):
++      meshes = [ meshes ]
++
++    # using this odd structuring to ensure generators will
++    # work correctly
++    toupload = ( 
++      (
++        f"{m.segid}:0", { "fragments": [ f"{m.segid}:0:1" ] }, # manifest
++        f"{m.segid}:0:1", m.to_precomputed() # fragment file
++      )
++      for m in meshes
++    )
++
++    # need to clear out pre-existing meshes
++    if not skip_delete:
++      self.delete(( m.segid for m in meshes ))
++
++    cf = CloudFiles(self.meta.layerpath)
++    for mshs in sip(toupload, batch_size):
++      cf.put_jsons([ m[:2] for m in mshs ])
++      cf.puts(
++        [ m[2:4] for m in mshs ],
++        content_type="application/octet-stream",
++        compress=compress,
++        compression_level=compression_level,
++        cache_control=cdn_cache,
++      )
++
++  def delete(self, segids):
++    """
++    Removes fragment and manifest files for each segid specified.
++    """
++    manifests = self._get_manifests(segids, allow_missing=True)
++
++    cf = CloudFiles(self.meta.layerpath)
++    for segid, filenames in manifests.items():
++      if segid is None:
++        raise ValueError("Cannot delete segid None")
++
++      if filenames is None:
++        continue
++      filenames += [ f"{segid}:0" ]
++      cf.delete(filenames)
++
++      if self.cache.enabled:
++        self.cache.delete(filenames)
++
+   def save(self, segids, filepath=None, file_format='ply'):
+     """
+     Save one or more segids into a common mesh format as a single file.
+diff --git a/cloudvolume/mesh.py b/cloudvolume/mesh.py
+index dc8ef1ea..dd1f2209 100644
+--- a/cloudvolume/mesh.py
++++ b/cloudvolume/mesh.py
+@@ -146,7 +146,7 @@ def triangles(self):
+     return tris
+ 
+   @classmethod
+-  def concatenate(cls, *meshes):
++  def concatenate(cls, *meshes, segid=None):
+     vertex_ct = np.zeros(len(meshes) + 1, np.uint32)
+     vertex_ct[1:] = np.cumsum([ len(mesh) for mesh in meshes ])
+ 
+@@ -162,7 +162,7 @@ def concatenate(cls, *meshes):
+     if len(encoding_type) == 1:
+       encoding_type = encoding_type[0]
+ 
+-    return Mesh(vertices, faces, normals, encoding_type=encoding_type)
++    return Mesh(vertices, faces, normals, encoding_type=encoding_type, segid=segid)
+ 
+   def consolidate(self):
+     """Remove duplicate vertices and faces. Returns a new mesh object."""
+diff --git a/test/test_meshing.py b/test/test_meshing.py
+index 6ae62cc1..daaf224a 100644
+--- a/test/test_meshing.py
++++ b/test/test_meshing.py
+@@ -2,6 +2,7 @@
+ import numpy as np
+ import pytest 
+ 
++from cloudfiles import CloudFiles
+ from cloudvolume import Vec, Bbox, CloudVolume, Storage, Mesh
+ 
+ @pytest.fixture
+@@ -67,6 +68,20 @@ def test_get_mesh(unsharded_vol):
+   mesh_orig = vol.mesh.get(94081437)
+   assert mesh == mesh_orig
+ 
++def test_put(unsharded_vol):
++  mesh = Mesh(vertices=[[0,0,0], [1,1,1], [2,2,2]], faces=[0,1,2])
++  mesh.segid = 777
++
++  cf = CloudFiles(unsharded_vol.mesh.meta.layerpath)
++
++  unsharded_vol.mesh.put(mesh)
++  assert list(cf) == ["777:0", "777:0:1"]
++  m = unsharded_vol.mesh.get(777, fuse=False)[777]
++  assert len(m.faces) == 1
++  assert m.segid == 777
++  unsharded_vol.mesh.delete(777)
++  assert list(cf) == []
++
+ def test_duplicate_vertices():
+   verts = np.array([
+     [0,0,0], [0,1,0],

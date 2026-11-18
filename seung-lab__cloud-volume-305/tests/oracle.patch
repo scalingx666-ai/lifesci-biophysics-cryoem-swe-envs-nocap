@@ -1,0 +1,207 @@
+diff --git a/cloudvolume/datasource/graphene/mesh.py b/cloudvolume/datasource/graphene/mesh.py
+index 70d11979e..d5da1c0c8 100644
+--- a/cloudvolume/datasource/graphene/mesh.py
++++ b/cloudvolume/datasource/graphene/mesh.py
+@@ -11,7 +11,7 @@
+ import numpy as np
+ from tqdm import tqdm
+ 
+-from ...lib import red, toiter, Bbox
++from ...lib import red, toiter, Bbox, Vec
+ from ...mesh import Mesh
+ from ... import paths
+ from ...storage import Storage, GreenStorage
+@@ -104,11 +104,34 @@ def get(
+       mesh = Mesh.concatenate(*fragments)
+       mesh.segid = seg_id
+       resolution = self.meta.resolution(self.config.mip)
++      if self.meta.chunks_start_at_voxel_offset:
++        offset = self.meta.voxel_offset(self.config.mip)
++      else:
++        offset = Vec(0,0,0)
+ 
+       if remove_duplicate_vertices:
+         mesh = mesh.consolidate()
++      elif is_draco:
++        if level == 2:
++          # Deduplicate at quantized lvl2 chunk borders
++          draco_grid_size = self.meta.get_draco_grid_size(level)
++          mesh = mesh.deduplicate_chunk_boundaries(
++            self.meta.mesh_chunk_size * resolution,
++            offset=offset * resolution,
++            is_draco=True,
++            draco_grid_size=draco_grid_size,
++          )
++        else:
++          # TODO: cyclic draco quantization to properly
++          # stitch and deduplicate draco meshes at variable
++          # levels (see github issue #299)
++          print('Warning: deduplication not currently supported for this layer\'s variable layered draco meshes')
+       else:
+-        mesh = mesh.deduplicate_chunk_boundaries(self.meta.mesh_chunk_size * resolution, is_draco=is_draco)
++        mesh = mesh.deduplicate_chunk_boundaries(
++            self.meta.mesh_chunk_size * resolution,
++            offset=offset * resolution,
++            is_draco=False,
++          )
+       
+       meshes.append(mesh)
+ 
+diff --git a/cloudvolume/datasource/graphene/metadata.py b/cloudvolume/datasource/graphene/metadata.py
+index d85a88d82..8cf5d57d1 100644
+--- a/cloudvolume/datasource/graphene/metadata.py
++++ b/cloudvolume/datasource/graphene/metadata.py
+@@ -67,6 +67,58 @@ def manifest_endpoint(self):
+     url += pth.domain
+     return url + '/' + posixpath.join('meshing', pth.version, pth.dataset, 'manifest')
+ 
++  @property
++  def chunks_start_at_voxel_offset(self):
++    """
++    Boolean property specifying whether ChunkedGraph chunks begin
++    at voxel offset or at origin.
++    """
++    if 'chunks_start_at_voxel_offset' in self.info:
++      return self.info["chunks_start_at_voxel_offset"]
++    return False
++
++  @property
++  def mesh_metadata(self):
++    if 'mesh_metadata' in self.info:
++      return self.info["mesh_metadata"]
++    return None
++
++  @property
++  def uniform_draco_grid_size(self):
++    """
++    If not None, a number that specifies the draco_grid_size at every ChunkedGraph level.
++    """
++    if self.mesh_metadata and 'uniform_draco_grid_size' in self.mesh_metadata:
++      return self.mesh_metadata["uniform_draco_grid_size"]
++    return None
++
++  @property
++  def max_meshed_layer(self):
++    """
++    The highest level in the ChunkedGraph that we create meshes for in this dataset.
++    """
++    if self.mesh_metadata and 'max_meshed_layer' in self.mesh_metadata:
++      return self.mesh_metadata["max_meshed_layer"]
++    return None
++
++  def get_draco_grid_size(self, level):
++    """
++    Returns the draco_grid_size for specified ChunkedGraph level.
++    """
++    if self.mesh_metadata is None:
++      raise ValueError('This layer is not draco meshed')
++    if self.uniform_draco_grid_size is not None:
++      return self.uniform_draco_grid_size
++    if self.mesh_metadata["max_meshed_layer"] < level:
++      raise ValueError(
++        "Request level",
++        level,
++        ". But the maximum meshed level is ",
++        self.mesh_metadata["max_meshed_layer"],
++      )
++    return self.mesh_metadata["draco_grid_sizes"][str(level)]
++
++
+ GraphenePath = namedtuple('GraphenePath', ('scheme', 'subdomain', 'domain', 'modality', 'version', 'dataset'))
+ EXTRACTION_RE = re.compile(r'/?(\w+)/([\d.]+)/([\w\d\.\_\-]+)/?')
+ 
+diff --git a/cloudvolume/datasource/precomputed/mesh/unsharded.py b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+index 10db52562..e46af4180 100644
+--- a/cloudvolume/datasource/precomputed/mesh/unsharded.py
++++ b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+@@ -10,6 +10,7 @@
+ import numpy as np
+ from tqdm import tqdm
+ 
++from .... import exceptions
+ from ....lib import yellow, red, toiter
+ from ....mesh import Mesh
+ from ....storage import Storage
+diff --git a/cloudvolume/mesh.py b/cloudvolume/mesh.py
+index bd121bc92..10c4a229c 100644
+--- a/cloudvolume/mesh.py
++++ b/cloudvolume/mesh.py
+@@ -23,17 +23,23 @@ def deprecation_notice(key):
+     NOTICE[key] += 1
+ 
+ 
+-def dist_to_chunk(v, chunk_size):
+-      plus_one_dist = np.mod(v, chunk_size)
+-      minus_one_dist = chunk_size - plus_one_dist
+-      return np.minimum(plus_one_dist, minus_one_dist)
+-  
+-def is_draco_chunk_aligned(verts, chunk_size, draco_grid_size=21):
+-    d_me = dist_to_chunk(verts, chunk_size)
+-    d_up = dist_to_chunk(verts+draco_grid_size, chunk_size)
+-    d_down = dist_to_chunk(verts-draco_grid_size, chunk_size)
+-    is_draco_grid = np.any((d_me<d_down) &(d_me<d_up) & (d_me<draco_grid_size), axis=1)
+-    return is_draco_grid
++def is_draco_chunk_aligned(verts, chunk_size, draco_grid_size):
++  """
++  Return a mask that for each vertex is true iff it is within
++  half a draco_grid_size from a chunk border.
++  """
++  dist_to_chunk_behind = np.mod(verts, chunk_size)
++  dist_to_chunk_ahead = chunk_size - dist_to_chunk_behind
++  # Draco rounds up
++  is_on_chunk_behind = np.any(
++    dist_to_chunk_behind < (draco_grid_size / 2),
++    axis=1,
++  )
++  is_on_chunk_ahead = np.any(
++    dist_to_chunk_ahead <= (draco_grid_size / 2),
++    axis=1,
++  )
++  return np.logical_or(is_on_chunk_behind, is_on_chunk_ahead)
+     
+ 
+ class Mesh(object):
+@@ -324,15 +330,13 @@ def from_draco(cls, binary):
+       encoding_options=mesh_object.encoding_options
+     )
+ 
+-  def deduplicate_chunk_boundaries(
+-    self, chunk_size, is_draco=False, 
+-    draco_grid_size=21, offset=(0,0,0)
+-  ):
++  def deduplicate_chunk_boundaries(self, chunk_size, is_draco=False, draco_grid_size=None, offset=(0,0,0)):
+     offset = Vec(*offset)
+     verts = self.vertices - offset
+-
+     # find all vertices that are exactly on chunk_size boundaries
+     if is_draco:
++      if draco_grid_size is None:
++        raise ValueError('Must specify draco grid size to dedup draco meshes')
+       is_chunk_aligned = is_draco_chunk_aligned(verts, chunk_size, draco_grid_size=draco_grid_size)
+     else:
+       is_chunk_aligned = np.any(np.mod(verts, chunk_size) == 0, axis=1)
+diff --git a/test/test_graphene.py b/test/test_graphene.py
+index 668d6ed9d..f5adfd3b4 100644
+--- a/test/test_graphene.py
++++ b/test/test_graphene.py
+@@ -34,6 +34,7 @@ def cv_graphene_mesh_precomputed(requests_mock):
+         128
+         ]
+         },
++        "chunks_start_at_voxel_offset": False,
+         "mesh": "mesh_mip_2_err_40_sv16",
+         "num_channels": 1,
+         "scales": [
+@@ -103,7 +104,12 @@ def cv_graphene_mesh_draco(requests_mock):
+         128
+         ]
+         },
++        "chunks_start_at_voxel_offset": False,
+         "mesh": "mesh_mip_2_draco_sv16",
++        "mesh_metadata": {
++            "max_meshed_layer": 6,
++            "uniform_draco_grid_size": 21
++        },
+         "num_channels": 1,
+         "scales": [
+         {

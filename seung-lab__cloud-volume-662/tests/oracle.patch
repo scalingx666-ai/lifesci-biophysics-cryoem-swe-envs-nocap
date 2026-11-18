@@ -1,0 +1,2004 @@
+diff --git a/cloudvolume/__init__.py b/cloudvolume/__init__.py
+index 6462eefb..d0f32b8a 100644
+--- a/cloudvolume/__init__.py
++++ b/cloudvolume/__init__.py
+@@ -72,11 +72,15 @@
+ from .datasource.graphene import register as register_graphene
+ from .datasource.n5 import register as register_n5
+ from .datasource.zarr import register as register_zarr
++from .datasource.zarr2 import register as register_zarr2
++from .datasource.zarr3 import register as register_zarr3
+ 
+ register_precomputed()
+ register_graphene()
+ register_n5()
+ register_zarr()
++register_zarr2()
++register_zarr3()
+ 
+ try:
+   from .datasource.boss import register as register_boss
+diff --git a/cloudvolume/cloudvolume.py b/cloudvolume/cloudvolume.py
+index 38344226..4ab30cb9 100644
+--- a/cloudvolume/cloudvolume.py
++++ b/cloudvolume/cloudvolume.py
+@@ -6,6 +6,8 @@
+ import numpy as np
+ from tqdm import tqdm
+ 
++from cloudfiles.paths import normalize
++
+ from .exceptions import UnsupportedFormatError, DimensionError, InfoUnavailableError
+ from .lib import generate_random_string
+ from .paths import strict_extract, to_https_protocol
+@@ -241,6 +243,7 @@ def __new__(cls,
+     def init(cloudpath):
+       path = strict_extract(cloudpath)
+       if path.format in REGISTERED_PLUGINS:
++        kwargs["cloudpath"] = normalize(cloudpath)
+         return REGISTERED_PLUGINS[path.format](**kwargs)
+       else:
+         raise UnsupportedFormatError(
+@@ -252,7 +255,7 @@ def init(cloudpath):
+     except InfoUnavailableError as err:
+       if 'precomputed://' not in cloudpath and cloudpath[:4] != 'zarr':
+         try:
+-          return init('zarr2://' + cloudpath)
++          return init('zarr://' + cloudpath)
+         except:
+           raise err
+       else:
+diff --git a/cloudvolume/datasource/__init__.py b/cloudvolume/datasource/__init__.py
+index 7d227405..289fafbb 100644
+--- a/cloudvolume/datasource/__init__.py
++++ b/cloudvolume/datasource/__init__.py
+@@ -97,7 +97,7 @@ def get_cache_path_helper(base, cloudpath):
+     base, path.protocol, basepath, path.layer
+   ))
+ 
+-def generate_chunks(meta, img, offset, mip):
++def generate_chunks(meta, img, offset, mip, chunk_size=None):
+   """
+   Converts an image into a series of chunks
+   described by:
+@@ -109,7 +109,10 @@ def generate_chunks(meta, img, offset, mip):
+ 
+   bounds = Bbox( offset, shape + offset)
+ 
+-  alignment_check = bounds.round_to_chunk_size(meta.chunk_size(mip), meta.voxel_offset(mip))
++  if chunk_size is None:
++    chunk_size = meta.chunk_size(mip)
++
++  alignment_check = bounds.round_to_chunk_size(chunk_size, meta.voxel_offset(mip))
+ 
+   if not np.all(alignment_check.minpt == bounds.minpt):
+     raise AlignmentError(f"""
+@@ -127,7 +130,7 @@ def generate_chunks(meta, img, offset, mip):
+ 
+   class ChunkIterator():
+     def __len__(self):
+-      csize = meta.chunk_size(mip)
++      csize = chunk_size
+       bbox = Bbox(img_offset, img_end)
+       # round up and avoid conversion to float
+       n_chunks = (bbox.dx + csize[0] - 1) // csize[0]
+@@ -135,9 +138,9 @@ def __len__(self):
+       n_chunks *= (bbox.dz + csize[2] - 1) // csize[2]
+       return n_chunks
+     def __iter__(self):
+-      for startpt in xyzrange( img_offset, img_end, meta.chunk_size(mip) ):
++      for startpt in xyzrange( img_offset, img_end, chunk_size ):
+         startpt = startpt.clone()
+-        endpt = min2(startpt + meta.chunk_size(mip), shape)
++        endpt = min2(startpt + chunk_size, shape)
+         spt = (startpt + bounds.minpt).astype(int)
+         ept = (endpt + bounds.minpt).astype(int)
+         yield (startpt, endpt, spt, ept)
+diff --git a/cloudvolume/datasource/precomputed/image/xfer.py b/cloudvolume/datasource/precomputed/image/xfer.py
+index bb4780e2..249bab8b 100644
+--- a/cloudvolume/datasource/precomputed/image/xfer.py
++++ b/cloudvolume/datasource/precomputed/image/xfer.py
+@@ -68,6 +68,7 @@ def transfer_by_rerendering(
+   shape = np.array(dest_cv.chunk_size * 4)
+ 
+   bbox = bbox.expand_to_chunk_size(dest_cv.chunk_size, offset=dest_cv.voxel_offset)
++  bbox = Bbox.clamp(bbox, dest_cv.bounds)
+ 
+   grid_box = bbox / shape
+   grid_size = grid_box.size()
+diff --git a/cloudvolume/datasource/zarr/__init__.py b/cloudvolume/datasource/zarr/__init__.py
+index abd1382b..cc8872e1 100644
+--- a/cloudvolume/datasource/zarr/__init__.py
++++ b/cloudvolume/datasource/zarr/__init__.py
+@@ -1,65 +1,20 @@
+-from typing import Optional
++from cloudfiles import CloudFiles
+ 
+-from .image import ZarrImageSource
+-from .metadata import ZarrMetadata
++from ..zarr2 import create_zarr2
++from ..zarr3 import create_zarr3
+ 
+-from ...frontends.precomputed import CloudVolumePrecomputed
+-
+-from .. import get_cache_path
+-from ...cacheservice import CacheService
+-from ...cloudvolume import (
+-  register_plugin, SharedConfiguration,
+-  CompressType, ParallelType, CacheType,
+-  SecretsType
+-)
+-from ...paths import strict_extract
++from ...cloudvolume import register_plugin
+ 
+ def create_zarr(
+-  cloudpath:str, mip:int=0, bounded:bool=True, autocrop:bool=False,
+-  fill_missing:bool=False, cache:CacheType=False, compress_cache:CompressType=None,
+-  cdn_cache:bool=True, progress:bool=False, info:Optional[dict]=None,
+-  compress:CompressType=None, compress_level:Optional[int]=None,
+-  non_aligned_writes:bool=False, delete_black_uploads:bool=False,
+-  parallel:ParallelType=1,green_threads:bool=False, 
+-  secrets:SecretsType=None, cache_locking:bool = True,
+-  **kwargs # absorb graphene arguments
++  cloudpath:str, *args, **kwargs 
+ ):
+-    path = strict_extract(cloudpath)
+-    config = SharedConfiguration(
+-      cdn_cache=cdn_cache,
+-      compress=compress,
+-      compress_level=None,
+-      green=green_threads,
+-      mip=mip,
+-      parallel=parallel,
+-      progress=progress,
+-      secrets=secrets,
+-      spatial_index_db=None,
+-      cache_locking=cache_locking,
+-    )
+-    cache = CacheService(
+-      cloudpath=get_cache_path(cache, cloudpath),
+-      enabled=bool(cache),
+-      config=config,
+-      compress=compress_cache,
+-    )
+-
+-    meta = ZarrMetadata(cloudpath, config=config, cache=cache, info=info)
+-    imagesrc = ZarrImageSource(
+-      config, meta, cache, 
+-      autocrop=bool(autocrop),
+-      bounded=bool(bounded),
+-      non_aligned_writes=bool(non_aligned_writes),
+-      fill_missing=bool(fill_missing),
+-    )
++  cf = CloudFiles(cloudpath)
++  is_zarr3 = cf.exists("zarr.json")
+ 
+-    return CloudVolumePrecomputed(
+-      meta, cache, config, 
+-      imagesrc, mesh=None, skeleton=None,
+-      mip=mip
+-    )
++  if is_zarr3:
++    return create_zarr3(cloudpath, *args, **kwargs)
++  else:
++    return create_zarr2(cloudpath, *args, **kwargs)
+ 
+ def register():
+-  register_plugin('zarr', create_zarr)
+-  register_plugin('zarr2', create_zarr)
+-  register_plugin('zarr3', create_zarr)
+\ No newline at end of file
++  register_plugin('zarr', create_zarr)
+\ No newline at end of file
+diff --git a/cloudvolume/datasource/zarr2/__init__.py b/cloudvolume/datasource/zarr2/__init__.py
+new file mode 100644
+index 00000000..1eeab818
+--- /dev/null
++++ b/cloudvolume/datasource/zarr2/__init__.py
+@@ -0,0 +1,63 @@
++from typing import Optional
++
++from .image import Zarr2ImageSource
++from .metadata import Zarr2Metadata
++
++from ...frontends.precomputed import CloudVolumePrecomputed
++
++from .. import get_cache_path
++from ...cacheservice import CacheService
++from ...cloudvolume import (
++  register_plugin, SharedConfiguration,
++  CompressType, ParallelType, CacheType,
++  SecretsType
++)
++from ...paths import strict_extract
++
++def create_zarr2(
++  cloudpath:str, mip:int=0, bounded:bool=True, autocrop:bool=False,
++  fill_missing:bool=False, cache:CacheType=False, compress_cache:CompressType=None,
++  cdn_cache:bool=True, progress:bool=False, info:Optional[dict]=None,
++  compress:CompressType=None, compress_level:Optional[int]=None,
++  non_aligned_writes:bool=False, delete_black_uploads:bool=False,
++  parallel:ParallelType=1,green_threads:bool=False, 
++  secrets:SecretsType=None, cache_locking:bool = True,
++  **kwargs # absorb graphene arguments
++):
++    path = strict_extract(cloudpath)
++    config = SharedConfiguration(
++      cdn_cache=cdn_cache,
++      compress=compress,
++      compress_level=None,
++      green=green_threads,
++      mip=mip,
++      parallel=parallel,
++      progress=progress,
++      secrets=secrets,
++      spatial_index_db=None,
++      cache_locking=cache_locking,
++    )
++    cache = CacheService(
++      cloudpath=get_cache_path(cache, cloudpath),
++      enabled=bool(cache),
++      config=config,
++      compress=compress_cache,
++    )
++
++    meta = Zarr2Metadata(cloudpath, config=config, cache=cache, info=info)
++    imagesrc = Zarr2ImageSource(
++      config, meta, cache, 
++      autocrop=bool(autocrop),
++      bounded=bool(bounded),
++      non_aligned_writes=bool(non_aligned_writes),
++      fill_missing=bool(fill_missing),
++    )
++
++    return CloudVolumePrecomputed(
++      meta, cache, config, 
++      imagesrc, mesh=None, skeleton=None,
++      mip=mip
++    )
++
++def register():
++  register_plugin('zarr2', create_zarr2)
+\ No newline at end of file
+diff --git a/cloudvolume/datasource/zarr/image.py b/cloudvolume/datasource/zarr2/image.py
+similarity index 99%
+rename from cloudvolume/datasource/zarr/image.py
+rename to cloudvolume/datasource/zarr2/image.py
+index cc1047dc..21e74542 100644
+--- a/cloudvolume/datasource/zarr/image.py
++++ b/cloudvolume/datasource/zarr2/image.py
+@@ -28,7 +28,7 @@
+ from ..precomputed.image.common import shade
+ from ..precomputed.image import xfer
+ 
+-class ZarrImageSource(ImageSourceInterface):
++class Zarr2ImageSource(ImageSourceInterface):
+   def __init__(
+     self, config, meta, cache,
+     autocrop=False, bounded=True,
+diff --git a/cloudvolume/datasource/zarr/metadata.py b/cloudvolume/datasource/zarr2/metadata.py
+similarity index 98%
+rename from cloudvolume/datasource/zarr/metadata.py
+rename to cloudvolume/datasource/zarr2/metadata.py
+index fefbc6ed..e4c71743 100644
+--- a/cloudvolume/datasource/zarr/metadata.py
++++ b/cloudvolume/datasource/zarr2/metadata.py
+@@ -26,7 +26,7 @@
+   "float64": "<f8",
+ }
+ 
+-class ZarrMetadata(PrecomputedMetadata):
++class Zarr2Metadata(PrecomputedMetadata):
+   def __init__(self, cloudpath, config, cache,  info=None):
+     
+     orig_info = info
+@@ -53,6 +53,10 @@ def __init__(self, cloudpath, config, cache,  info=None):
+ 
+     self.provenance = DataLayerProvenance()
+ 
++  @property
++  def zarr_format(self):
++    return self.zinfo["zarr_format"]
++
+   def default_zattrs(self):
+     return {
+       "multiscales": [
+@@ -124,13 +128,13 @@ def unit2factor(unit):
+         continue
+       
+       if axis["name"] == "x":
+-        scale_factors[0] = unit2factor(axis["unit"])
++        scale_factors[0] = unit2factor(axis.get("unit", "nanometer"))
+         positions[0] = i
+       elif axis["name"] == "y":
+-        scale_factors[1] = unit2factor(axis["unit"])
++        scale_factors[1] = unit2factor(axis.get("unit", "nanometer"))
+         positions[1] = i
+       elif axis["name"] == "z":
+-        scale_factors[2] = unit2factor(axis["unit"])
++        scale_factors[2] = unit2factor(axis.get("unit", "nanometer"))
+         positions[2] = i
+ 
+     resolution = self.zattrs["multiscales"][0]["datasets"][mip]["coordinateTransformations"][0]["scale"]
+diff --git a/cloudvolume/datasource/zarr3/__init__.py b/cloudvolume/datasource/zarr3/__init__.py
+new file mode 100644
+index 00000000..c028fbc2
+--- /dev/null
++++ b/cloudvolume/datasource/zarr3/__init__.py
+@@ -0,0 +1,63 @@
++from typing import Optional
++
++from .image import Zarr3ImageSource
++from .metadata import Zarr3Metadata
++
++from ...frontends.precomputed import CloudVolumePrecomputed
++
++from .. import get_cache_path
++from ...cacheservice import CacheService
++from ...cloudvolume import (
++  register_plugin, SharedConfiguration,
++  CompressType, ParallelType, CacheType,
++  SecretsType
++)
++from ...paths import strict_extract
++
++def create_zarr3(
++  cloudpath:str, mip:int=0, bounded:bool=True, autocrop:bool=False,
++  fill_missing:bool=False, cache:CacheType=False, compress_cache:CompressType=None,
++  cdn_cache:bool=True, progress:bool=False, info:Optional[dict]=None,
++  compress:CompressType=None, compress_level:Optional[int]=None,
++  non_aligned_writes:bool=False, delete_black_uploads:bool=False,
++  parallel:ParallelType=1,green_threads:bool=False, 
++  secrets:SecretsType=None, cache_locking:bool = True,
++  **kwargs # absorb graphene arguments
++):
++    path = strict_extract(cloudpath)
++    config = SharedConfiguration(
++      cdn_cache=cdn_cache,
++      compress=compress,
++      compress_level=None,
++      green=green_threads,
++      mip=mip,
++      parallel=parallel,
++      progress=progress,
++      secrets=secrets,
++      spatial_index_db=None,
++      cache_locking=cache_locking,
++    )
++    cache = CacheService(
++      cloudpath=get_cache_path(cache, cloudpath),
++      enabled=bool(cache),
++      config=config,
++      compress=compress_cache,
++    )
++
++    meta = Zarr3Metadata(cloudpath, config=config, cache=cache, info=info)
++    imagesrc = Zarr3ImageSource(
++      config, meta, cache, 
++      autocrop=bool(autocrop),
++      bounded=bool(bounded),
++      non_aligned_writes=bool(non_aligned_writes),
++      fill_missing=bool(fill_missing),
++    )
++
++    return CloudVolumePrecomputed(
++      meta, cache, config, 
++      imagesrc, mesh=None, skeleton=None,
++      mip=mip
++    )
++
++def register():
++  register_plugin('zarr3', create_zarr3)
+\ No newline at end of file
+diff --git a/cloudvolume/datasource/zarr3/image.py b/cloudvolume/datasource/zarr3/image.py
+new file mode 100644
+index 00000000..0e68f361
+--- /dev/null
++++ b/cloudvolume/datasource/zarr3/image.py
+@@ -0,0 +1,412 @@
++from typing import Optional
++
++import copy
++import re
++import os
++
++import numpy as np
++from cloudfiles import CloudFiles
++import cloudfiles.compression
++
++from .. import (
++  autocropfn, readonlyguard, 
++  ImageSourceInterface, check_grid_aligned,
++  generate_chunks
++)
++
++from ...types import CompressType, MipType
++from ... import compression
++from ... import chunks
++from ... import exceptions 
++from ...lib import ( 
++  colorize, red, mkdir, Vec, Bbox, BboxLikeType, 
++  jsonify, generate_random_string,
++  xyzrange
++)
++from ...paths import extract
++from ...volumecutout import VolumeCutout
++from ..precomputed.image.common import shade
++from ..precomputed.image import xfer
++
++class Zarr3ImageSource(ImageSourceInterface):
++  def __init__(
++    self, config, meta, cache,
++    autocrop=False, bounded=True,
++    non_aligned_writes=False,
++    delete_black_uploads=False,
++    fill_missing=False,
++    readonly=False,
++  ):
++    self.config = config
++    self.meta = meta 
++    self.cache = cache 
++
++    self.autocrop = bool(autocrop)
++    self.bounded = bool(bounded)
++    self.fill_missing = bool(fill_missing)
++    self.non_aligned_writes = bool(non_aligned_writes)
++    self.readonly = bool(readonly)
++
++  def decode_chunk(self, binary, mip, filename, default_shape):
++    if binary is None:
++      if self.fill_missing:
++        return None
++      else:
++        raise exceptions.EmptyVolumeException(f"{filename} is missing.")
++
++    codecs = self.meta.codecs(mip)
++    arr = binary
++
++    transposed = False
++
++    for codec in reversed(codecs):
++      encoding = codec["name"]
++      if encoding == "bytes":
++        arr = np.frombuffer(arr, dtype=self.meta.dtype)
++        arr = arr.reshape(default_shape, order='C')
++        continue
++      elif encoding == "brotli":
++        encoding = "br"
++      elif encoding == "zlib":
++        encoding = "gzip"
++      elif encoding == "lzma":
++        encoding = "xz"
++
++      if encoding == "blosc":
++        import blosc
++        arr = blosc.decompress(arr)
++      elif encoding == "crc32c":
++        import crc32c
++        stored_crc = int.from_bytes(arr[-4:], byteorder='little')
++        calculated_crc = crc32c.crc32c(arr[:-4])
++        if stored_crc != calculated_crc:
++          raise ValueError(
++            f"Stored crc32c {stored_crc} did not match "
++            f"calculated crc32c {calculated_crc} for file {filename}."
++          )
++        arr = arr[:-4]
++      elif encoding in ["zstd", "xz", "br", "gzip"]:
++        arr = cloudfiles.compression.decompress(arr, encoding, filename)
++      elif encoding == "transpose":
++        transposed = True
++        arr = np.transpose(arr, axes=codec["configuration"]["order"])
++      else:
++        raise exceptions.DecodingError(f"Unsupported decoding method: {encoding}")
++    
++    if not transposed:
++      arr = arr.T
++
++    return arr
++
++  def encode_chunk(self, arr:np.ndarray, mip:int) -> bytes:
++    codecs = self.meta.codecs(mip)
++
++    transposed = False
++
++    binary = arr
++    for codec in codecs:
++      encoding = codec["name"]
++
++      if encoding == "bytes":
++        order = 'C'
++        if not transposed:
++          order = 'F'
++        binary = binary.tobytes(order)
++        continue
++      elif encoding == "brotli":
++        encoding = "br"
++      elif encoding == "zlib":
++        encoding = "gzip"
++      elif encoding == "lzma":
++        encoding = "xz"
++
++      if encoding == "blosc":
++        import blosc
++        binary = blosc.compress(binary)
++      elif encoding == "crc32c":
++        import crc32c
++        calculated_crc = crc32c.crc32c(binary)
++        binary += calculated_crc.to_bytes(4, byteorder='little')
++      elif encoding in ["zstd", "xz", "br", "gzip"]:
++        compress_level = codec.get("configuration", { "level": 1 })
++        compress_level = compress_level.get("level", 1)
++        binary = cloudfiles.compression.compress(binary, encoding, compress_level=compress_level)
++      elif encoding == "transpose":
++        transposed = True
++        binary = np.transpose(binary, axes=codec["configuration"]["order"])
++      else:
++        raise exceptions.DecodingError(f"Unsupported decoding method: {encoding}")
++
++    return binary
++
++  def download(
++    self, 
++    bbox:BboxLikeType, 
++    mip:MipType, 
++    parallel:int = 1, 
++    renumber:bool = False, 
++    label:Optional[int] = None,
++    t:int = 0,
++  ) -> VolumeCutout:
++    if self.meta.is_sharded(mip):
++      raise NotImplementedError("sharded volumes are not currently supported.")
++    elif parallel != 1:
++      raise ValueError("Only parallel=1 is supported for zarr.")
++    elif renumber != False:
++      raise ValueError("Only renumber=False is supported for zarr.")
++
++    bounds = Bbox.clamp(bbox, self.meta.bounds(mip))
++
++    if self.autocrop:
++      image, bounds = autocropfn(self.meta, image, bounds, mip)
++    
++    if bounds.subvoxel():
++      raise exceptions.EmptyRequestException(f'Requested less than one pixel of volume. {bounds}')
++
++    cf = CloudFiles(
++      self.meta.cloudpath, 
++      progress=self.config.progress, 
++      secrets=self.config.secrets,
++      green=self.config.green,
++    )
++
++    spatial_chunk_size = self.meta.spatial_chunk_size(mip)
++    realized_bbox = bounds.expand_to_chunk_size(spatial_chunk_size, offset=self.meta.voxel_offset(mip))
++
++    paths = self._chunknames(
++      realized_bbox, self.meta.bounds(mip), 
++      mip, spatial_chunk_size,
++      t=t,
++    )
++
++    all_chunks = cf.get(paths, parallel=parallel, return_dict=True)
++    shape = list(bounds.size3()) + [ self.meta.num_channels ]
++
++    dtype = self.meta.dtype
++    if label is not None:
++      dtype = bool
++
++    if self.meta.background_color(mip) == 0:
++      renderbuffer = np.zeros(shape=shape, dtype=dtype, order="F")
++    else:
++      renderbuffer = np.full(
++        shape=shape,
++        fill_value=self.meta.background_color(mip),
++        dtype=dtype,
++        order="F",
++      )
++
++    regexp = self.meta.filename_regexp(mip)
++
++    axis_mapping = self.meta.zarr_axes_to_cv_axes()
++
++    tslice = 0
++    taxis = self.meta.has_time_axis()
++
++    if taxis:
++      tslice = t - tchunk * self.meta.time_chunk_size(mip)
++
++    voxel_offset = self.meta.voxel_offset(mip)
++
++    for fname, binary in all_chunks.items():
++      m = re.search(regexp, fname).groupdict()
++      assert self.meta.key(mip) == m.get("mip", '')
++      gridpoint = Vec(*[ int(i) for i in [ m["x"], m["y"], m["z"] ] ])
++      chunk_bbox = Bbox(gridpoint, gridpoint + 1) * spatial_chunk_size
++      chunk_bbox += voxel_offset
++      chunk_size = chunk_bbox.size()[axis_mapping]
++      chunk = self.decode_chunk(binary, mip, fname, chunk_size)
++      if chunk is None:
++        continue
++      if taxis:
++        chunk = chunk[...,tslice]
++      slcs = (chunk_bbox - chunk_bbox.minpt).to_slices()
++
++      chunk = chunk[slcs]
++      if label is not None:
++        chunk = chunk == label
++      shade(renderbuffer, bounds, chunk, chunk_bbox, channel=int(m.get("c", 0)))
++
++    return VolumeCutout.from_volume(self.meta, mip, renderbuffer, bounds)
++
++  @readonlyguard
++  def upload(self, image, offset, mip, parallel=1, t=0):
++    if self.meta.is_sharded(mip):
++      raise NotImplementedError("sharded volumes are not currently supported.")
++    elif not np.issubdtype(image.dtype, np.dtype(self.meta.dtype).type):
++      raise ValueError(f"""
++        The uploaded image data type must match the volume data type. 
++
++        Volume: {self.meta.dtype}
++        Image: {image.dtype}
++        """
++      )
++
++    shape = Vec(*image.shape)[:3]
++    offset = Vec(*offset)[:3]
++    bounds = Bbox( offset, shape + offset)
++
++    is_aligned = check_grid_aligned(
++      self.meta, image, bounds, mip, 
++      throw_error=True, # (self.non_aligned_writes == False)
++    )
++
++    spatial_chunk_size = self.meta.spatial_chunk_size(mip)
++
++    expanded = bounds.expand_to_chunk_size(spatial_chunk_size, self.meta.voxel_offset(mip))
++    all_chunknames = self._chunknames(
++      expanded, self.meta.bounds(mip), 
++      mip, spatial_chunk_size,
++      t=t,
++    )
++
++    all_chunks = generate_chunks(self.meta, image, offset, mip, chunk_size=spatial_chunk_size)
++
++    to_upload = []
++
++    bgcolor = self.meta.background_color(mip)
++
++    def all_chunks_by_channel(all_chunks):
++      for ispt, iept, vol_spt, vol_ept in all_chunks:
++        for c in range(self.meta.num_channels):
++          cutout = image[ ispt.x:iept.x, ispt.y:iept.y, ispt.z:iept.z, c ]
++          if np.any(np.array(cutout.shape) < spatial_chunk_size):
++            diff = spatial_chunk_size - np.array(cutout.shape)
++            pad_width = [ (0, diff[0]), (0, diff[1]), (0, diff[2]) ]
++            cutout = np.pad(cutout, pad_width, 'constant', constant_values=bgcolor)
++          yield cutout
++
++    for filename, imgchunk in zip(all_chunknames, all_chunks_by_channel(all_chunks)):
++      binary = self.encode_chunk(imgchunk, mip)
++      to_upload.append(
++        (filename, binary)
++      )
++
++    CloudFiles(self.meta.cloudpath).puts(to_upload)
++
++  def _chunknames(self, bbox, volume_bbox, mip, chunk_size, t):
++    meta = self.meta
++    cf = CloudFiles(self.meta.cloudpath)
++    num_channels = self.meta.num_channels
++
++    has_t = self.meta.has_time_axis()
++    tchunk = 0
++    if has_t:
++      tchunk = int(t / self.meta.num_time_chunks(mip))
++
++    axes = [ (axis["type"], axis["name"]) for axis in self.meta.axes() ]
++    voxel_offset = self.meta.voxel_offset(mip)[:3]
++
++    class ZarrChunkNamesIterator():
++      def __len__(self):
++        # round up and avoid conversion to float
++        n_chunks = (bbox.dx + chunk_size[0] - 1) // chunk_size[0]
++        n_chunks *= (bbox.dy + chunk_size[1] - 1) // chunk_size[1]
++        n_chunks *= (bbox.dz + chunk_size[2] - 1) // chunk_size[2]
++        return n_chunks
++      def __iter__(self):
++        nonlocal volume_bbox
++        volume_bbox = Bbox.expand_to_chunk_size(volume_bbox, chunk_size, offset=voxel_offset)
++        bbox_grid = (bbox - voxel_offset) // chunk_size
++
++        for x,y,z in xyzrange(bbox_grid.minpt, bbox_grid.maxpt):
++          for c in range(num_channels):
++            params = []
++            
++            for typ, name in axes:
++              if typ == "time":
++                params.append(str(tchunk))
++              elif typ == "space" and name == "x":
++                params.append(str(x))
++              elif typ == "space" and name == "y":
++                params.append(str(y))
++              elif typ == "space" and name == "z":
++                params.append(str(z))
++              elif typ == "channel":
++                params.append(str(c))
++
++            yield meta.chunk_name(mip, *params)
++
++    return ZarrChunkNamesIterator()
++
++  def exists(self, bbox, mip=None, t=0):
++    if mip is None:
++      mip = self.config.mip
++
++    bounds = Bbox.clamp(bbox, self.meta.bounds(mip))
++
++    if self.autocrop:
++      image, bounds = autocropfn(self.meta, image, bounds, mip)
++    
++    if bounds.subvoxel():
++      raise exceptions.EmptyRequestException(f'Requested less than one pixel of volume. {bounds}')
++
++    expanded = bounds.expand_to_chunk_size(
++      self.meta.chunk_size(mip), self.meta.voxel_offset(mip)
++    )
++    all_chunknames = self._chunknames(
++      expanded, self.meta.bounds(mip), 
++      mip, self.meta.chunk_size(mip), 
++      t=t
++    )
++
++    cf = CloudFiles(
++      self.meta.cloudpath, 
++      progress=self.config.progress, 
++      secrets=self.config.secrets,
++      green=self.config.green,
++    )
++
++    return cf.exists(all_chunknames)
++
++  @readonlyguard
++  def delete(self, bbox, mip=None, t=0):
++    if mip is None:
++      mip = self.config.mip
++
++    if mip in self.meta.locked_mips():
++      raise exceptions.ReadOnlyException(
++        f"MIP {mip} is currently write locked. If this should not be the case, "
++        f"run vol.meta.unlock_mips({mip})."
++      )
++
++    bbox = Bbox.create(bbox, self.meta.bounds(mip), bounded=True)
++    realized_bbox = bbox.expand_to_chunk_size(
++      self.meta.chunk_size(mip), offset=self.meta.voxel_offset(mip)
++    )
++    all_chunknames = self._chunknames(
++      realized_bbox, self.meta.bounds(mip), 
++      mip, self.meta.chunk_size(mip),
++      t=t
++    )
++
++    cf = CloudFiles(self.meta.cloudpath, progress=self.config.progress, secrets=self.config.secrets)
++    cf.delete(all_chunknames)
++
++  def transfer_to(
++    self,
++    cloudpath:str, 
++    bbox:BboxLikeType, 
++    mip:MipType, 
++    block_size:Optional[int] = None, 
++    compress:CompressType = True, 
++    compress_level:Optional[int] = None, 
++    encoding:Optional[str] = None,
++    sharded:Optional[bool] = None,
++  ):
++    pth = extract(cloudpath)
++
++    if pth.format != self.meta.path.format and encoding is None:
++      if pth.format == "n5":
++        encoding = "gzip"
++      elif pth.format == "precomputed":
++        encoding = "raw"
++
++    return xfer.transfer_by_rerendering(
++      self, cloudpath,
++      bbox=bbox,
++      mip=mip,
++      compress=compress,
++      compress_level=compress_level,
++      encoding=encoding,
++    )
+\ No newline at end of file
+diff --git a/cloudvolume/datasource/zarr3/metadata.py b/cloudvolume/datasource/zarr3/metadata.py
+new file mode 100644
+index 00000000..7240c996
+--- /dev/null
++++ b/cloudvolume/datasource/zarr3/metadata.py
+@@ -0,0 +1,873 @@
++import copy
++import re
++import os
++
++import numpy as np
++
++from cloudfiles import CloudFiles
++
++from cloudvolume.datasource.precomputed.metadata import PrecomputedMetadata
++from cloudvolume.lib import jsonify, Vec, Bbox
++
++from ... import exceptions
++from ...provenance import DataLayerProvenance
++
++ZARR3_VALID_DATATYPES = { 
++  "int8", "int16", "int32", "int64",
++  "uint8", "uint16", "uint32", "uint64",
++  "float16", "float32", "float64",
++  "complex64", "complex128",
++  "r8", "r16", "r32", "r64",
++}
++
++DEFAULT_CODEC = [
++  {"configuration":{"endian":"little"},"name":"bytes"},
++  {
++    "name": "blosc",
++    "configuration": {
++          "cname": "lz4",
++          "clevel": 1,
++          "shuffle": "shuffle",
++          "typesize": 4,
++          "blocksize": 0,
++    },
++  }
++]
++
++def spatial_unit_in_meters(unit):
++  if unit == "meter":
++    return 1
++  elif unit == "centimeter":
++    return 1e-2
++  elif unit == "millimeter":
++    return 1e-3
++  elif unit == "micrometer":
++    return 1e-6
++  elif unit == "nanometer":
++    return 1e-9
++  elif unit == "picometer":
++    return 1e-12
++  elif unit == "femtometer":
++    return 1e-15
++  elif unit == "angstrom":
++    return 1e-10
++  elif unit == "foot":
++    return 0.3048
++  elif unit == "yard":
++    return 3 * 0.3048
++  elif unit == "inch":
++    return 0.0254
++  else:
++    raise ValueError(f"unit not supported: {unit}")
++
++def time_unit_in_seconds(unit):
++  if unit == "yottasecond":
++    return 1e24
++  elif unit == "zettasecond":
++    return 1e21
++  elif unit == "exasecond":
++    return 1e18
++  elif unit == "petasecond":
++    return 1e15
++  elif unit == "terasecond":
++    return 1e12
++  elif unit == "gigasecond":
++    return 1e9
++  elif unit == "megasecond":
++    return 1e6
++  elif unit == "kilosecond":
++    return 1e3
++  elif unit == "hectosecond":
++    return 1e2
++  elif unit == "second":
++    return 1.0
++  elif unit == "decisecond":
++    return 0.1
++  elif unit == "centisecond":
++    return 1e-2
++  elif unit == "millisecond":
++    return 1e-3
++  elif unit == "microsecond":
++    return 1e-6
++  elif unit == "nanosecond":
++    return 1e-9
++  elif unit == "picosecond":
++    return 1e-12
++  elif unit == "femtosecond":
++    return 1e-15
++  elif unit == "attosecond":
++    return 1e-18
++  elif unit == "zeptosecond":
++    return 1e-21
++  elif unit == "minute":
++    return 60.0
++  elif unit == "hour":
++    return 3600.0
++  elif unit == "day":
++    return 24.0 * 3600.0
++  else:
++    raise ValueError(f"{unit} is not supported.")
++
++class Zarr3Metadata(PrecomputedMetadata):
++  def __init__(self, cloudpath, config, cache,  info=None):
++    
++    orig_info = info
++
++    # some default values, to be overwritten
++    if not info:
++      info = PrecomputedMetadata.create_info(
++        num_channels=1, layer_type='image', data_type='uint8', 
++        encoding='raw', resolution=[1,1,1], voxel_offset=[0,0,0], 
++        volume_size=[1,1,1]
++      )
++
++    super().__init__(
++      cloudpath, config, cache, info=info, provenance=None
++    )
++
++    self.zarrays = []
++    self.zinfo = {}
++    self.ome = self.default_attributes(3)
++
++    if orig_info is None:
++      self.info = self.fetch_info()
++    else:
++      self.render_zarr_metadata()
++
++    self.provenance = DataLayerProvenance()
++
++    if self.ndim > 5:
++      raise ValueError("CloudVolume's zarr3 implementation only supports up to 5 dimensions (x,y,z,channel,time)")
++
++  @property
++  def zarr_format(self) -> int:
++    return self.zinfo.get("zarr_format", None)
++
++  def compute_resolution(self, mip:int) -> np.ndarray:
++    scale = self.datasets()[mip]
++
++    transforms = scale["coordinateTransformations"]
++
++    res = np.ones([ self.ndim ], dtype=np.float32)
++
++    for transform in transforms:
++      if transform["type"] != "scale":
++        continue
++
++      if isinstance(transform["scale"], str):
++        raise NotImplementedError(f"Binary scale data not currently supported. Located at {transform['scale'][:1000]}...")
++
++      res *= np.array(transform["scale"], dtype=np.float32)
++
++    return res
++
++  def compute_voxel_offset(self, mip:int) -> np.ndarray:
++    ds =  self.datasets()
++
++    if len(ds) == 0:
++      return np.zeros([self.ndim], dtype=int)
++
++    scale = ds[mip]
++
++    transforms = scale["coordinateTransformations"]
++
++    # given in physical units
++    voxel_offset = np.zeros([ self.ndim ], dtype=np.float32)
++
++    for transform in transforms:
++      if transform["type"] != "translation":
++        continue
++
++      if isinstance(transform["translation"], str):
++        raise NotImplementedError(f"Binary translation data not currently supported. Located at {transform['scale'][:1000]}...")
++
++      voxel_offset += np.array(transform["translation"], dtype=np.float32)
++
++    resolution = self.compute_resolution(mip)
++
++    return voxel_offset // resolution
++
++  def default_attributes(self, num_axes):
++    ome = {
++      "version": "0.5",
++      "multiscales": [
++        {
++          "axes": [
++            {
++              "name": "t",
++              "type": "time",
++              "unit": "millisecond"
++            },
++            {
++              "name": "c",
++              "type": "channel"
++            },
++            {
++              "name": "z",
++              "type": "space",
++              "unit": "nanometer"
++            },
++            {
++              "name": "y",
++              "type": "space",
++              "unit": "nanometer"
++            },
++            {
++              "name": "x",
++              "type": "space",
++              "unit": "nanometer"
++            }
++          ],
++          "datasets": [
++            
++          ],
++        }
++      ],
++    }
++    ome["multiscales"][0]["axes"] = ome["multiscales"][0]["axes"][-num_axes:]
++    return ome
++
++  def spatial_resolution_in_nm(self, mip):
++    scale_factors = np.ones([3], dtype=np.float64)
++    positions = [0,0,0]
++    for i, axis in enumerate(self.axes()):
++      if axis["type"] != "space":
++        continue
++      
++      if axis["name"] == "x":
++        scale_factors[0] = spatial_unit_in_meters(axis.get("unit", "nanometer"))
++        positions[0] = i
++      elif axis["name"] == "y":
++        scale_factors[1] = spatial_unit_in_meters(axis.get("unit", "nanometer"))
++        positions[1] = i
++      elif axis["name"] == "z":
++        scale_factors[2] = spatial_unit_in_meters(axis.get("unit", "nanometer"))
++        positions[2] = i
++
++    try:
++      resolution = self.compute_resolution(mip)
++      resolution = np.array([
++        resolution[positions[0]],
++        resolution[positions[1]],
++        resolution[positions[2]]
++      ], dtype=np.float64)
++    except IndexError:
++      resolution = np.ones([3], dtype=np.float64)
++
++    return resolution * (scale_factors / 1e-9)
++
++  def time_resolution_in_seconds(self, mip):
++    i = 0
++    unit = None
++    for axis in self.axes():
++      if axis["type"] == "time":
++        unit = axis["unit"]
++        break
++      i += 1
++
++    scale_factor = time_unit_in_seconds(unit)
++
++    try:
++      resolution = self.compute_resolution(mip)
++      return resolution[i] * scale_factor
++    except IndexError:
++      return scale_factor
++
++  def is_group(self):
++    return len(self.datasets()) > 0
++
++  def is_sharded(self, mip):
++    for codec in self.codecs(mip):
++      if codec.get("name", "") == "sharding_indexed":
++        return True
++    return False
++
++  def has_time_axis(self):
++    try:
++      return self.time_index() is not None
++    except ValueError:
++      return False
++
++  def datasets(self):
++    return self.ome["multiscales"][0]["datasets"]
++
++  def axes(self):
++    return self.ome["multiscales"][0]["axes"]
++
++  def time_index(self):
++    for i, axis in enumerate(self.axes()):
++      if axis["type"] == "time":
++        return i
++    raise ValueError("No time axis.")
++
++  def shape(self, mip):
++    """Returns Vec(x,y,z,channels) shape of the volume similar to numpy.""" 
++    size = self.volume_size(mip)
++    values = [size.x, size.y, size.z, self.num_channels]
++    if self.has_time_axis():
++      values.append(self.num_frames(mip))
++    return Vec(*values)
++
++  def spatial_chunk_size(self, mip):
++    axes = self.axes()
++
++    shape = [0,0,0]
++    for i, axis in enumerate(axes):
++      if axis["type"] == "space" and axis["name"] == "x":
++        shape[0] = i
++      elif axis["type"] == "space" and axis["name"] == "y":
++        shape[1] = i
++      elif axis["type"] == "space" and axis["name"] == "z":
++        shape[2] = i
++
++    cs = self.zarrays[0]["chunk_grid"]["configuration"]["chunk_shape"]
++    return np.array([ cs[shape[0]], cs[shape[1]], cs[shape[2]] ], dtype=int)
++
++  def time_chunk_size(self, mip):
++    i = self.time_index()
++    return self.zarrays[mip]["chunk_grid"]["configuration"]["chunk_shape"][i]
++
++  def num_time_chunks(self, mip):
++    nframes = self.num_frames(mip)
++    t_chunk_size = self.time_chunk_size(mip)
++    return int(np.ceil(nframes / t_chunk_size))
++
++  def num_frames(self, mip):
++    try:
++      i = self.time_index()
++      return self.zarrays[mip]["shape"][i]
++    except ValueError:
++      return 1
++
++  def chunk_name(self, mip, *args, convert_order=False):
++    sep = self.dimension_separator(mip)
++
++    if convert_order:
++      seq = self.zarr_axes_to_cv_axes()
++      values = [ str(args[val]) for val in seq ]
++    else:
++      values = [ str(val) for val in args ]
++
++    dsep = self.directory_separator()
++
++    filename = sep.join([ *values ])
++
++    chunk_key_encoding = self.chunk_key_encoding(mip)["name"]
++
++    if chunk_key_encoding == "default":
++      if self.is_group():
++        return dsep.join([ self.key(mip), 'c', filename ])
++      else:
++        return dsep.join([ 'c', filename ])
++    elif chunk_key_encoding == "v2":
++      if self.is_group():
++        return dsep.join([ self.key(mip), filename ])
++      else:
++        return filename
++    else:
++      raise ValueError(f"chunk_key_encoding '{chunk_key_encoding}' is not supported.")
++
++  @property
++  def ndim(self):
++    return len(self.axes())
++
++  def duration_in_seconds(self):
++    return self.time_resolution_in_seconds(0) * self.num_frames(0)
++
++  def codecs(self, mip):
++    return self.zarrays[mip].get("codecs", [{}])
++
++  def background_color(self, mip):
++    color = self.zarrays[mip].get("fill_value", 0)
++    if color == "NaN":
++      return np.nan
++    return color
++
++  def set_background_color(self, mip, value):
++    self.zarrays[mip]["fill_value"] = value
++
++  def filename_regexp(self, mip):
++    scale = self.ome["multiscales"][0]
++    axes = scale["axes"]
++
++    dsep = self.directory_separator()
++    regexp = ""
++    if len(self.ome["multiscales"][0]["datasets"]):
++      regexp = rf"(?P<mip>\d+){dsep}"
++    
++    if self.chunk_key_encoding(mip)["name"] == "default":
++      regexp += f'c{dsep}'
++
++    groups = []
++    for axis in axes:
++      groups.append(fr"(?P<{axis['name']}>-?\d+)")
++
++    regexp += self.dimension_separator(mip).join(groups)
++
++    return re.compile(regexp)
++
++  def directory_separator(self):
++    cf = CloudFiles(self.cloudpath)
++    dsep = '/'
++    if cf.protocol == "file":
++      dsep = os.path.sep  
++    if dsep == '\\':
++      dsep = '\\\\' # compensate for regexp escaping
++    return dsep
++
++  def chunk_key_encoding(self, mip):
++    return self.zarrays[mip].get("chunk_key_encoding", {
++      "name": "default",
++      "configuration": { "separator": "/" },
++    })
++
++  def dimension_separator(self, mip):
++    data = self.chunk_key_encoding(mip)
++    config = data.get("configuration", { "separator": "/" })
++    return config.get("separator", "/")
++
++  def commit_info(self):
++    self.render_zarr_metadata()
++
++    cf = CloudFiles(self.cloudpath, secrets=self.config.secrets)
++
++    to_upload = []
++    if self.is_group():
++      for i, zarray in enumerate(self.zarrays):
++        to_upload.append(
++          (cf.join(str(i), "zarr.json"), zarray)
++        )
++
++    zinfo = copy.deepcopy(self.zinfo)
++    ome = copy.deepcopy(self.ome)
++    ome["version"] = "0.5"
++
++    if 'attributes' in zinfo:
++      zinfo["attributes"]["ome"] = ome
++    else:
++      zinfo["attributes"] = { "ome": ome }
++
++    to_upload.append(
++      ( "zarr.json", zinfo )
++    )
++
++    compress = "br"
++    if cf.protocol == "file":
++      compress = False # otherwise zarr can't read the file
++
++    cf.put_jsons(to_upload, compress=compress)
++
++  def to_zarr_volume_size(self, mip):
++    axes = self.axes()
++      
++    shape = []
++    for axis in axes:
++      if axis["type"] == "channel":
++        shape.append(self.num_channels)
++      elif axis["type"] == "time":
++        shape.append(1)
++      elif axis["type"] == "space" and axis["name"] == "x":
++        shape.append(self.volume_size(mip)[0])
++      elif axis["type"] == "space" and axis["name"] == "y":
++        shape.append(self.volume_size(mip)[1])
++      elif axis["type"] == "space" and axis["name"] == "z":
++        shape.append(self.volume_size(mip)[2])
++
++    return shape
++
++  def zarr_axes_to_cv_axes(self):
++    axes = self.axes()
++
++    shape = []
++    for i, axis in enumerate(axes):
++      if axis["type"] == "channel":
++        shape.append(3)
++      elif axis["type"] == "time":
++        shape.append(4)
++      elif axis["type"] == "space" and axis["name"] == "x":
++        shape.append(0)
++      elif axis["type"] == "space" and axis["name"] == "y":
++        shape.append(1)
++      elif axis["type"] == "space" and axis["name"] == "z":
++        shape.append(2)
++
++    return shape
++
++  def cv_axes_to_zarr_axes(self):
++    seq = self.zarr_axes_to_cv_axes()
++    shape = [0] * len(seq)
++    for i, val in enumerate(seq):
++      shape[val] = i
++    return shape
++
++  def render_zarr_metadata(self):
++    """Convert the current info file into zarr metadata."""
++    datasets = []
++
++    while len(self.zarrays) < len(self.scales):
++      self.zarrays.append({})
++
++    for mip, scale in enumerate(self.scales):
++
++      scale_params = []
++      chunk_params = []
++      translation_params = []
++      for axis in self.axes():
++        if axis["type"] == "channel":
++          scale_params.append(1.0)
++          chunk_params.append(self.num_channels)
++          translation_params.append(0.0)
++        elif axis["type"] == "time":
++          scale_params.append(1.0)
++          chunk_params.append(self.time_chunk_size(mip))
++          translation_params.append(0.0)
++        elif axis["type"] == "space" and axis["name"] == "x":
++          scale_params.append(scale["resolution"][0])
++          chunk_params.append(self.chunk_size(mip)[0])
++          translation_params.append(scale_params[-1] * scale["voxel_offset"][0])
++        elif axis["type"] == "space" and axis["name"] == "y":
++          scale_params.append(scale["resolution"][1])
++          chunk_params.append(self.chunk_size(mip)[1])
++          translation_params.append(scale_params[-1] * scale["voxel_offset"][1])
++        elif axis["type"] == "space" and axis["name"] == "z":
++          scale_params.append(scale["resolution"][2])
++          chunk_params.append(self.chunk_size(mip)[2])
++          translation_params.append(scale_params[-1] * scale["voxel_offset"][2])
++
++      dataset = {
++        "coordinateTransformations": [
++          {
++            "scale": scale_params,
++            "type": "scale"
++          },
++          {
++            "translation": translation_params,
++            "type": "translation",
++          },
++        ],
++        "path": str(mip),
++      }
++      datasets.append(dataset)
++
++      zscale = self.zarrays[mip] or {}
++
++      if self.data_type not in ZARR3_VALID_DATATYPES:
++        raise ValueError(f"{self.data_type} is not a valid zarr3 data type.")
++
++      zscale["data_type"] = self.data_type
++
++      zscale["chunk_grid"] = {
++        "name": "regular", # core
++        "configuration": { 
++          "chunk_shape": [ int(x) for x in chunk_params ],
++        }
++      }
++      zscale["shape"] = self.to_zarr_volume_size(mip)
++
++      zscale["fill_value"] = self.background_color(mip)
++
++      zscale["zarr_format"] = 3
++      zscale["chunk_key_encoding"] = zscale.get("chunk_key_encoding", {
++        "name": "default",
++        "configuration": {
++          "separator": "/",
++        },
++      })
++
++      # TODO: In the future, figure out how to make it easier to 
++      # render this from info file scales. There's a number of
++      # features that don't really translate across the formats
++      # like e.g. transpose, crc32, codecs.
++      zscale["codecs"] = zscale.get("codecs", DEFAULT_CODEC)
++
++      self.zarrays[mip] = zscale
++
++    self.ome["multiscales"][0]["datasets"] = datasets
++
++    self.zinfo = self.zarrays[0]
++    if self.is_group():
++      self.zinfo["node_type"] = "group"
++    else:
++      self.zinfo["node_type"] = "array"
++
++
++  def zarr_to_info(self, zarrays):
++    def extract_spatial(attr, dtype):
++      spatial = np.ones([3], dtype=dtype)
++      scale = self.ome["multiscales"][0]
++      axes = scale["axes"]
++      
++      for axis, res in zip(axes, attr):
++        if axis["type"] != "space":
++          continue
++        if axis["name"] == "x":
++          spatial[0] = res
++        elif axis["name"] == "y":
++          spatial[1] = res
++        elif axis["name"] == "z":
++          spatial[2] = res
++
++      return spatial
++
++    def chunk_size_mip(mip:int):
++      zchunk_size = zarrays[mip]["chunk_grid"]["configuration"]["chunk_shape"]
++      chunk_size = zchunk_size[::-1]
++      if 'dimension_names' in zarrays[mip]:
++        chunk_size = [0,0,0]
++        for i, axis in enumerate(zarrays[mip]['dimension_names']):
++          if axis == 'x':
++            chunk_size[0] = zchunk_size[i]
++          elif axis == 'y':
++            chunk_size[1] = zchunk_size[i]
++          elif axis == 'z':
++            chunk_size[2] = zchunk_size[i]
++      return chunk_size
++
++    def extract_spatial_size(mip:int):
++      shape = zarrays[mip]["shape"]
++      return extract_spatial(shape, int)
++
++    try:
++      num_channels = len([ 
++        chan for chan in self.ome["channels"] if chan["active"] 
++      ])
++    except KeyError:
++      num_channels = 1
++
++    if not zarrays:
++      raise exceptions.InfoUnavailableError("Missing mip level zarr.json")
++
++    base_res = self.spatial_resolution_in_nm(0)
++
++    encoding = zarrays[0]["codecs"][0].get("name", "raw")
++    if encoding == "bytes":
++      encoding = "raw"
++
++    info = PrecomputedMetadata.create_info(
++      num_channels=num_channels,
++      layer_type='image',
++      data_type=str(np.dtype(zarrays[0]["data_type"])),
++      encoding=encoding,
++      resolution=base_res,
++      voxel_offset=self.compute_voxel_offset(0),
++      volume_size=extract_spatial_size(0),
++      chunk_size=chunk_size_mip(0),
++    )
++
++    num_mips = len(zarrays)
++
++    for mip in range(1, num_mips):
++      res = self.spatial_resolution_in_nm(mip)
++      factor = np.round(res / base_res)
++
++      zarray = zarrays[mip]
++
++      if zarray is None:
++        continue
++
++      self.add_scale(
++        factor,
++        chunk_size=chunk_size_mip(mip),
++        encoding=encoding,
++        info=info
++      )
++
++    return info
++
++  def key(self, mip:int) -> str:
++    datasets = self.ome["multiscales"][0]["datasets"]
++    if len(datasets) == 0:
++      return ''
++    return datasets[mip].get("path", mip+1)
++
++  def fetch_info(self):
++    cf = CloudFiles(self.cloudpath, secrets=self.config.secrets)
++    self.zinfo = cf.get_json("zarr.json")
++
++    if self.zinfo is None or self.zinfo == {}:
++      raise exceptions.InfoUnavailableError("No zarr.json file was found.")
++
++    if self.zarr_format != 3:
++      raise exceptions.UnsupportedFormatError(
++        f"zarr3 module cannot parse zarr format version {self.zarr_format}."
++      )
++
++    datasets = []
++    
++    if "attributes" in self.zinfo:
++      try:
++        # Detect OME-Zarr 0.5
++        # https://ngff.openmicroscopy.org/0.5/#metadata
++        self.ome = self.zinfo["attributes"]["ome"]
++        assert self.ome["version"] == "0.5" # < 1 version number means anything can change...
++      except KeyError: 
++        try:
++          # OME-Zarr 0.4
++          # https://ngff.openmicroscopy.org/0.4/
++          self.ome = self.zinfo["attributes"]
++          assert self.ome["version"] == "0.4" # < 1 version number means anything can change...
++        except KeyError:
++          self.ome = self.default_attributes(3) # make a guess at least...
++
++    datasets = self.ome["multiscales"][0]["datasets"]
++
++    zarray_paths = [
++      f"{ds.get('path', i+1)}/zarr.json" for i, ds in enumerate(datasets)
++    ]
++    res = cf.get_json(zarray_paths)
++
++    if res:
++      self.zarrays.extend(res)
++    else:
++      self.zarrays.append(self.zinfo)
++
++    return self.zarr_to_info(self.zarrays)
++
++  def zarr_chunk_size(self, mip:int):
++    cs = self.chunk_size(mip)
++
++    attr = []
++    for axis in self.axes():
++      if axis["name"] == 't':
++        attr.append(self.time_chunk_size(mip))
++      elif axis["name"] == 'c':
++        attr.append(self.num_channels)
++      elif axis["name"] == 'x':
++        attr.append(cs[0])
++      elif axis["name"] == 'y':
++        attr.append(cs[1])
++      elif axis["name"] == 'z':
++        attr.append(cs[2])
++
++    return attr
++
++  def commit_provenance(self):
++    """Zarr doesn't support provenance files."""
++    pass
++
++  def fetch_provenance(self):
++    """Zarr doesn't support provenance files."""
++    pass
++
++# Example zarr.json array file
++
++# {
++#   "chunk_grid": {
++#     "configuration":{
++#       "chunk_shape":[64,64,64]
++#     },
++#     "name":"regular"
++#   },
++#   "chunk_key_encoding":{
++#     "name":"default"
++#   },
++#   "codecs":[{
++#     "configuration":{"endian":"little"},
++#     "name":"bytes"
++#   }],
++#   "data_type": "uint32",
++#   "fill_value": 0,
++#   "node_type": "array",
++#   "shape": [1460,1491,3281],
++#   "zarr_format":3
++# }
++
++# Example zarr.json group file
++
++# {
++#     "zarr_format": 3,
++#     "node_type": "group",
++#     "attributes": {
++#         "ome": {
++#             "version": "0.5",
++#             "multiscales": [
++#                 {
++#                     "axes": [
++#                         {
++#                             "name": "c",
++#                             "type": "channel"
++#                         },
++#                         {
++#                             "name": "x",
++#                             "type": "space",
++#                             "unit": "nanometer"
++#                         },
++#                         {
++#                             "name": "y",
++#                             "type": "space",
++#                             "unit": "nanometer"
++#                         },
++#                         {
++#                             "name": "z",
++#                             "type": "space",
++#                             "unit": "nanometer"
++#                         }
++#                     ],
++#                     "datasets": [
++#                         {
++#                             "path": "1",
++#                             "coordinateTransformations": [
++#                                 {
++#                                     "type": "scale",
++#                                     "scale": [
++#                                         1.0,
++#                                         650.0,
++#                                         748.0,
++#                                         748.0
++#                                     ]
++#                                 }
++#                             ]
++#                         },
++#                         {
++#                             "path": "2",
++#                             "coordinateTransformations": [
++#                                 {
++#                                     "type": "scale",
++#                                     "scale": [
++#                                         1.0,
++#                                         1300.0,
++#                                         1496.0,
++#                                         1496.0
++#                                     ]
++#                                 }
++#                             ]
++#                         },
++#                         {
++#                             "path": "4",
++#                             "coordinateTransformations": [
++#                                 {
++#                                     "type": "scale",
++#                                     "scale": [
++#                                         1.0,
++#                                         2600.0,
++#                                         2992.0,
++#                                         2992.0
++#                                     ]
++#                                 }
++#                             ]
++#                         },
++#                         {
++#                             "path": "8",
++#                             "coordinateTransformations": [
++#                                 {
++#                                     "type": "scale",
++#                                     "scale": [
++#                                         1.0,
++#                                         5200.0,
++#                                         5984.0,
++#                                         5984.0
++#                                     ]
++#                                 }
++#                             ]
++#                         }
++#                     ]
++#                 }
++#             ]
++#         }
++#     }
++# }
++
++# Example sub zarr.json
++
++# {"chunk_grid":{"configuration":{"chunk_shape":[1,4096,4096,32]},"name":"regular"},"chunk_key_encoding":{"name":"default"},"codecs":[{"configuration":{"chunk_shape":[1,32,32,32],"codecs":[{"configuration":{"order":[3,2,1,0]},"name":"transpose"},{"configuration":{"endian":"little"},"name":"bytes"},{"configuration":{"checksum":true,"level":5},"name":"zstd"}],"index_codecs":[{"configuration":{"endian":"little"},"name":"bytes"},{"name":"crc32c"}]},"name":"sharding_indexed"}],"data_type":"uint16","dimension_names":["c","x","y","z"],"fill_value":0,"node_type":"array","shape":[1,4096,4096,2400],"zarr_format":3}
++
+diff --git a/setup.py b/setup.py
+index 3552ba87..fa1ece55 100644
+--- a/setup.py
++++ b/setup.py
+@@ -33,6 +33,12 @@ def requirements():
+   "zstandard",
+ ]
+ 
++ZARR_CODECS = [
++  "blosc",
++  "zstandard",
++]
++
++
+ setuptools.setup(
+   name="cloud_volume",
+   version="12.2.0",
+@@ -57,9 +63,11 @@ def requirements():
+     "skeleton_viewer": [ 'matplotlib>=3.6' ],
+     "all_viewers": [ 'vtk', 'matplotlib>=3.6' ],
+     "dask": [ 'dask[array]' ],
+-    "zarr": [ 'blosc', 'zstandard' ],
+-    "test": [ "pytest", "pytest-cov", "codecov", "requests_mock", "scipy"],
+-
++    "zarr": ZARR_CODECS,
++    "test": [ 
++      "pytest", "pytest-cov", "codecov", 
++      "requests_mock", "scipy", "zarr" 
++    ] + ZARR_CODECS,
+     # image compression codecs
+     "blosc": [ "blosc" ],
+     "jxl": [ "imagecodecs" ],
+diff --git a/test/test_zarr.py b/test/test_zarr.py
+new file mode 100644
+index 00000000..d6becf03
+--- /dev/null
++++ b/test/test_zarr.py
+@@ -0,0 +1,276 @@
++import pytest
++
++import os
++import shutil
++
++import zarr
++from cloudvolume import CloudVolume, Bbox
++
++import numpy as np
++
++TEST_DIR = os.path.dirname("/tmp/removeme/cloudvolume/")
++
++def create_simple_dataset():
++    test_location = os.path.join(TEST_DIR, "zarr3_simple_unsharded.zarr")
++
++    if os.path.exists(test_location):
++        shutil.rmtree(test_location)
++
++    shape = [1000, 1000, 50]
++    data = np.ones(shape, dtype=np.uint8, order="C")
++
++    arr = zarr.open(store=test_location, shape=shape, chunks=(100, 100, 10), dtype='uint8', mode='w')
++    arr[:] = data
++    arr.store.close()
++
++    return test_location
++
++def create_simple_ragged_dataset():
++    test_location = os.path.join(TEST_DIR, "zarr3_simple_unsharded.zarr")
++
++    if os.path.exists(test_location):
++        shutil.rmtree(test_location)
++
++    shape = [1005, 1003, 51]
++    data = np.ones(shape, dtype=np.uint8, order="C")
++
++    arr = zarr.open(store=test_location, shape=shape, chunks=(100, 100, 10), dtype='uint8', mode='w')
++    arr[:] = data
++    arr.store.close()
++
++    return test_location
++
++def test_zarr3_unsharded_read_write():
++    test_location = os.path.join(TEST_DIR, "zarr_unsharded.zarr")
++
++    shape = [1000, 1000, 50]
++    data = np.zeros(shape, dtype=np.uint8, order="C")
++    data[:20] = 1
++
++    arr = zarr.open(store=test_location, shape=shape, chunks=(100, 100, 10), dtype='uint8', mode='w')
++    arr[:] = data
++    arr.store.close()
++
++    cv = CloudVolume(f"zarr3://file://{test_location}", fill_missing=True)
++
++    # by default zarr3 in C order [z,y,x], so inverting axes
++    # results in a full transposition [x,y,z]
++    assert np.all(cv[:][...,0] == data.T)
++
++    cv[:] = 2
++
++    arr = zarr.open(store=test_location, shape=shape, chunks=(100, 100, 10), dtype='uint8', mode='r')
++    assert np.all(arr[:] == 2)
++    assert np.all(cv[:] == 2)
++
++    shutil.rmtree(test_location)
++
++    test_location = create_simple_ragged_dataset()
++
++    cv = CloudVolume(f"zarr3://file://{test_location}", fill_missing=False)
++
++    # by default zarr3 in C order [z,y,x], so inverting axes
++    # results in a full transposition [x,y,z]
++    assert np.all(cv[:] == 1)
++
++    shutil.rmtree(test_location)
++
++def test_zarr3_crc():
++    test_location = os.path.join(TEST_DIR, "zarr_unsharded_crc.zarr")
++
++    shape = [100, 100, 50]
++    data = np.zeros(shape, dtype=np.uint8, order="C")
++    data[:20] = 1
++
++    arr = zarr.open(store=test_location, shape=shape, chunks=(100, 100, 10), dtype='uint8', mode='w')
++    arr[:] = data
++    arr.store.close()
++
++    cv = CloudVolume(f"zarr3://file://{test_location}", fill_missing=True)
++
++    codecs = cv.meta.codecs(0)
++    codecs.append({
++        "name": "crc32c",
++        "configuration": { "endian": "little" },
++    })
++
++    cv[:] = 3
++
++    assert np.all(cv[:] == 3)
++
++    shutil.rmtree(test_location)
++
++def test_zarr3_blosc():
++    test_location = os.path.join(TEST_DIR, "zarr_unsharded_blosc.zarr")
++
++    shape = [100, 100, 100]
++    data = np.zeros(shape, dtype=np.uint8, order="C")
++    data[:20] = 1
++
++    arr = zarr.open(store=test_location, shape=shape, chunks=(20, 20, 20), dtype='uint8', mode='w')
++    arr[:] = data
++    arr.store.close()
++
++    cv = CloudVolume(f"zarr3://file://{test_location}", fill_missing=True)
++
++    codecs = cv.meta.codecs(0)
++
++    codecs[1] = {
++        "name": "blosc",
++        "configuration": {
++            "cname": "lz4",
++            "clevel": 1,
++            "shuffle": "shuffle",
++            "typesize": 4,
++            "blocksize": 0
++        }
++    }
++    while len(codecs) > 1:
++        codecs.pop()
++
++    cv.commit_info()
++
++    cv = CloudVolume(f"zarr3://file://{test_location}", fill_missing=True)
++    cv[:] = 4
++
++    assert np.all(cv[:] == 4)
++
++    binimg = cv.download(cv.bounds, label=4)
++    assert np.all(binimg == 1)
++    assert binimg.dtype == bool
++
++    shutil.rmtree(test_location)
++
++def test_zarr3_exists():
++    simple_dataset_loc = create_simple_dataset()
++
++    chunknames = os.listdir(os.path.join(simple_dataset_loc, 'c', '0', '0'))
++    chunknames.sort()
++    assert chunknames == ['0', '1', '2', '3', '4']
++
++    cv = CloudVolume("zarr3://file://" + simple_dataset_loc)
++    res = cv.exists(cv.bounds)
++
++    paths = []
++    for z in range(10):
++        for y in range(10):
++            for x in range(5):
++                paths.append(os.path.join("c", str(z), str(y), str(x)))
++
++    ans_paths = set(paths)
++    res_paths = set(res.keys())
++
++    assert ans_paths == res_paths
++
++    shutil.rmtree(simple_dataset_loc)
++
++def test_zarr3_delete_all():
++
++    simple_dataset_loc = create_simple_dataset()
++
++    arr = zarr.open(store=simple_dataset_loc)
++
++    chunknames = os.listdir(os.path.join(simple_dataset_loc, 'c', '0', '0'))
++    chunknames.sort()
++    assert chunknames == ['0', '1', '2', '3', '4']
++
++    cv = CloudVolume("zarr3://file://" + simple_dataset_loc)
++    cv.delete(cv.bounds)
++
++    for i in range(10):
++        chunknames = os.listdir(os.path.join(simple_dataset_loc, 'c', '0', str(i)))
++        chunknames.sort()
++        assert chunknames == []
++
++    shutil.rmtree(simple_dataset_loc)
++
++def test_zarr3_delete_some():
++    simple_dataset_loc = create_simple_dataset()
++    arr = zarr.open(store=simple_dataset_loc)
++
++    chunknames = os.listdir(os.path.join(simple_dataset_loc, 'c', '0', '0'))
++    chunknames.sort()
++    assert chunknames == [ str(i) for i in range(0,5) ]
++
++    cv = CloudVolume("zarr3://file://" + simple_dataset_loc)
++    bbx = cv.bounds.clone()
++    bbx.maxpt.x = 10
++    cv.delete(bbx)
++
++    for i in range(10):
++        chunknames = os.listdir(os.path.join(simple_dataset_loc, 'c', '0', str(i)))
++        chunknames.sort()
++        assert chunknames == [ str(i) for i in range(1,5) ]
++
++    shutil.rmtree(simple_dataset_loc)
++
++def test_zarr3_transfer_to():
++    simple_dataset_loc = create_simple_dataset()
++
++    precomputed_loc = os.path.join(TEST_DIR, "precomputed_simple_unsharded.zarr")
++
++    cv_zarr = CloudVolume("zarr3://file://" + simple_dataset_loc)
++    cv_zarr.transfer_to("precomputed://file://" + precomputed_loc, cv_zarr.bounds)
++
++    cv_precomputed = CloudVolume("precomputed://file://" + precomputed_loc)
++
++    assert np.all(cv_zarr[:] == cv_precomputed[:])
++
++    shutil.rmtree(simple_dataset_loc)
++    shutil.rmtree(precomputed_loc)
++
++
++def test_zarr3_metadata_modification():
++    simple_dataset_loc = create_simple_dataset()
++
++    cv_zarr = CloudVolume("zarr3://file://" + simple_dataset_loc)
++
++    assert all(cv_zarr.chunk_size == [10,100,100])
++
++    cv_zarr.scale["chunk_sizes"] = [[25,200,200]]
++    cv_zarr.commit_info()
++
++    cv_zarr.refresh_info()
++
++    assert all(cv_zarr.chunk_size == [25,200,200])
++
++
++def test_zarr3_transfer_from_precomputed():
++    loc = os.path.join(TEST_DIR, "precomputed_simple_unsharded.precomputed")
++    loc2 = os.path.join(TEST_DIR, "zarr_simple_unsharded.zarr")
++
++    volume_size = [ 1003, 1001, 105 ]
++
++    info = CloudVolume.create_new_info(
++        num_channels    = 1,
++        layer_type      = 'image',
++        data_type       = 'uint8', 
++        encoding        = 'raw', 
++        resolution      = [4, 4, 40], 
++        voxel_offset    = [5, 5, 5],
++        chunk_size      = [ 100, 100, 10 ], 
++        volume_size     = volume_size,
++    )
++
++    cv = CloudVolume(f"precomputed://file://{loc}", info=info)
++    cv.commit_info()
++    data = np.random.randint(0, 255, size=volume_size, dtype=np.uint8)
++    cv[:] = data
++    
++    zarr_cv = cv.transfer_to(f"zarr3://file://{loc2}", cv.bounds)
++
++    assert cv.meta.path.format == "precomputed"
++    assert zarr_cv.meta.path.format == "zarr3"
++
++    assert np.all(zarr_cv[:][...,0] == data)
++
++    shutil.rmtree(loc)
++    shutil.rmtree(loc2)
++    
++
++
++
++
++
++
++

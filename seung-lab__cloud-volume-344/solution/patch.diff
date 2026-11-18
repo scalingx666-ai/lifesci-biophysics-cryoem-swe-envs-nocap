@@ -1,0 +1,187 @@
+diff --git a/cloudvolume/datasource/graphene/mesh/sharded.py b/cloudvolume/datasource/graphene/mesh/sharded.py
+index 4f1ca2586..e5a1ad2b9 100644
+--- a/cloudvolume/datasource/graphene/mesh/sharded.py
++++ b/cloudvolume/datasource/graphene/mesh/sharded.py
+@@ -30,10 +30,88 @@ def __init__(self, mesh_meta, cache, config, readonly):
+       spec = ShardingSpecification.from_dict(sharding)
+       self.readers[int(level)] = GrapheneShardReader(self.meta, self.cache, spec)
+ 
++  def initial_path(self, level):
++    return self.meta.join(self.meta.mesh_path, 'initial', str(level))
++
++  def dynamic_path(self, level):
++    return self.meta.join(self.meta.mesh_path, 'dynamic')
++
+   # 1. determine if the segid is before or after the shard time point
+   # 2. assuming it is sharded, fetch the draco encoded file from the
+   #    correct level
+ 
++  def dynamic_exists(self, labels, progress=None):
++    """
++    Checks for dynamic mesh existence.
++  
++    Returns: { label: path or None, ... }
++    """
++    labels = toiter(labels)
++
++    checks = [
++      self.meta.join('dynamic', str(label)) for label in labels
++    ]
++    
++    cloudpath = self.meta.join(self.meta.meta.cloudpath, self.meta.mesh_path) 
++    StorageClass = GreenStorage if self.config.green else Storage
++
++    with StorageClass(cloudpath, progress=progress) as stor:
++      results = stor.files_exist(checks)
++
++    output = {}
++    for filepath, exists in results.items():
++      label = int(os.path.basename(filepath))
++      output[label] = filepath if exists else None
++
++    return output
++
++  def initial_exists(self, labels, return_byte_range=False, progress=None):
++    """
++    Checks for initial mesh existence.
++  
++    Returns: 
++      If return_byte_range:
++        { label: [ path, byte offset, byte size ] or None, ... }
++      Else:
++        { label: path or None, ... }
++    """
++    labels = toiter(labels)
++
++    layers = defaultdict(list)
++    for label in labels:
++      layer = self.meta.meta.decode_layer_id(label)
++      layers[layer].append(label)
++
++    all_results = {}
++    for layer, layer_labels in layers.items():
++      path = self.initial_path(layer)
++      results = self.readers[int(layer)].exists(
++        layer_labels, 
++        path=path, 
++        return_byte_range=return_byte_range, 
++        progress=progress
++      )
++      all_results.update(results)
++
++    return all_results
++
++  def exists(self, labels, progress=None):
++    """
++    Checks dynamic then initial meshes for existence.
++
++    Returns: { label: path or None, ... }
++    """
++    labels = toiter(labels)
++    labels = set(labels)
++
++    dynamic_labels = self.dynamic_exists(labels, progress)
++    remainder_labels = set([ label for label, path in dynamic_labels.items() if path ])
++
++    initial_labels = self.initial_exists(remainder_labels, progress=progress, return_byte_range=False)
++
++    dynamic_labels.update(initial_labels)
++    return dynamic_labels
++
+   def download_segid(self, seg_id, bounding_box):    
+     """See GrapheneUnshardedMeshSource.get for the user facing function."""
+     import DracoPy
+diff --git a/cloudvolume/datasource/graphene/mesh/unsharded.py b/cloudvolume/datasource/graphene/mesh/unsharded.py
+index e3583cab5..3e10d54e4 100644
+--- a/cloudvolume/datasource/graphene/mesh/unsharded.py
++++ b/cloudvolume/datasource/graphene/mesh/unsharded.py
+@@ -15,12 +15,36 @@
+ from ....mesh import Mesh
+ from .... import paths
+ from ....storage import Storage, GreenStorage
++from ....scheduler import schedule_jobs
+ 
+ from ...precomputed.mesh import UnshardedLegacyPrecomputedMeshSource, PrecomputedMeshMetadata
+ 
+ 
+ class GrapheneUnshardedMeshSource(UnshardedLegacyPrecomputedMeshSource):
+ 
++  def compute_filename(self, label):
++    layer_id = self.meta.meta.decode_layer_id(label)
++    chunk_block_shape = 2 * Vec(*self.meta.meta.mesh_chunk_size)
++    start = self.meta.meta.decode_chunk_position(label)
++    start *= chunk_block_shape
++    bbx = Bbox(start, start + chunk_block_shape)
++    return "{}:0:{}".format(label, bbx.to_filename())
++
++  def exists(self, labels, progress=None):
++    """
++    Checks for dynamic mesh existence.
++  
++    Returns: { label: boolean, ... }
++    """
++    labels = toiter(labels)
++    filenames = [
++      self.compute_filename(label) for label in labels
++    ]
++
++    cloudpath = self.meta.join(self.meta.cloudpath, self.meta.mesh_path)
++    with Storage(cloudpath) as stor:
++      return stor.files_exist(filenames)
++    
+   def _get_fragment_filenames(self, seg_id, lod=0, level=2, bbox=None):
+     # TODO: add lod to endpoint
+     query_d = {
+diff --git a/cloudvolume/datasource/precomputed/mesh/unsharded.py b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+index 1e8e9fd83..3553205b5 100644
+--- a/cloudvolume/datasource/precomputed/mesh/unsharded.py
++++ b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+@@ -77,19 +77,29 @@ def _get_mesh_fragments(self, paths):
+     fragments = sorted(fragments, key=lambda frag: frag[0]) # make decoding deterministic
+     return fragments
+ 
+-  def _check_missing_manifests(self, segids):
+-    """Check if there are any missing mesh manifests prior to downloading."""
++  def exists(self, segids, progress=None):
++    """
++    Checks if the mesh exists.
++
++    Returns: { label: path or None, ... }
++    """
+     manifest_paths = [ self.manifest_path(segid) for segid in segids ]
+-    with Storage(self.meta.cloudpath, progress=self.config.progress) as stor:
++    StorageClass = GreenStorage if self.config.green else Storage
++
++    progress = progress if progress is not None else self.config.progress
++
++    with StorageClass(self.meta.cloudpath, progress=progress) as stor:
+       exists = stor.files_exist(manifest_paths)
+ 
+-    dne = []
+-    for path, there in exists.items():
+-      if not there:
+-        (segid,) = re.search(r'(\d+):0$', path).groups()
+-        dne.append(segid)
+-    return dne
++    segid_regexp = re.compile(r'(\d+):0$')
+ 
++    output = {}
++    for path, there in exists.items():
++      (segid,) = re.search(segid_regexp, path).groups()
++      output[segid] = path if there else None
++  
++    return output
++  
+   def get(
+       self, segids, 
+       remove_duplicate_vertices=True, 
+@@ -112,7 +122,8 @@ def get(
+     Returns: Mesh object if fused, else { segid: Mesh, ... }
+     """
+     segids = toiter(segids)
+-    dne = self._check_missing_manifests(segids)
++    dne = self.exists(segids)
++    dne = [ label for label, path in dne.items() if path is None ]
+ 
+     if dne:
+       missing = ', '.join([ str(segid) for segid in dne ])

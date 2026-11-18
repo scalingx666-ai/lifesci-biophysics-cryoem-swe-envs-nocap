@@ -1,0 +1,577 @@
+diff --git a/cloudvolume/cacheservice.py b/cloudvolume/cacheservice.py
+index b8dcd0ac3..09c80ae0a 100644
+--- a/cloudvolume/cacheservice.py
++++ b/cloudvolume/cacheservice.py
+@@ -1,8 +1,11 @@
++from functools import partial
+ import json
+ import os
+ import posixpath
+ import shutil
+ 
++from . import scheduler
++
+ from .provenance import DataLayerProvenance
+ from .storage import SimpleStorage, Storage, GreenStorage
+ from .storage.storage_interfaces import COMPRESSION_EXTENSIONS
+@@ -375,6 +378,78 @@ def download_single_as(
+ 
+     return filedata
+ 
++  def download_as(self, requests, compress=None, progress=None):
++    """
++    Works with byte ranges.
++
++    requests: [{
++      'path': ...,
++      'local_alias': ...,
++      'start': ...,
++      'end': ...,
++    }]
++    """
++    # import pdb; pdb.set_trace()
++    if len(requests) == 0:
++      return {}
++
++    progress = progress if progress is not None else self.config.progress
++
++    aliases = [ req['local_alias'] for req in requests ]
++    alias_tuples = { req['local_alias']: (req['path'], req['start'], req['end']) for req in requests }
++    alias_to_path = { req['local_alias']: req['path'] for req in requests }
++    path_to_alias = { v:k for k,v in alias_tuples.items() }
++
++    if None in alias_to_path:
++      del alias_to_path[None]
++      del alias_tuples[None]
++
++    locs = self.compute_data_locations(aliases)
++
++    fragments = {}
++    if self.enabled:
++      fragments = self.get(locs['local'], progress=progress)
++      keys = list(fragments.keys())
++      for key in keys:
++        return_key = (alias_to_path[key], alias_tuples[key][1], alias_tuples[key][2])
++        fragments[return_key] = fragments[key]
++        del fragments[key]
++      for alias in locs['local']:
++        del alias_tuples[alias]
++
++    remote_path_tuples = list(alias_tuples.values())
++
++    remote_paths = ( path for path, start, end in remote_path_tuples )
++    starts = ( start for path, start, end in remote_path_tuples )
++    ends = ( end for path, start, end in remote_path_tuples )
++
++    StorageClass = self.pick_storage_class(remote_path_tuples)
++    with StorageClass(self.meta.cloudpath, progress=progress) as stor:
++      remote_fragments = stor.get_files(remote_paths, starts=starts, ends=ends)
++
++    for frag in remote_fragments:
++      if frag['error'] is not None:
++        raise frag['error']
++
++    remote_fragments = { 
++      (res['filename'], res['byte_range'][0], res['byte_range'][1]): res['content'] \
++      for res in remote_fragments 
++    }
++
++    if self.enabled:
++      self.put(
++        [ 
++          (path_to_alias[file_bytes_tuple], content) \
++          for file_bytes_tuple, content in remote_fragments.items() \
++          if content is not None 
++        ],
++        compress=compress,
++        progress=progress
++      )
++
++    fragments.update(remote_fragments)
++    return fragments
++
+   def download(self, paths, compress=None, progress=None):
+     """
+     Download the provided paths, but grab them from cache first
+@@ -452,6 +527,7 @@ def put(self, files, progress=None, compress=None, compress_level=None):
+     StorageClass = self.pick_storage_class(files)
+ 
+     save_location = 'file://' + self.path
++    progress = 'to Cache' if progress else None
+     with StorageClass(save_location, progress=progress) as stor:
+       stor.put_files(
+         [ (name, content) for name, content in files ],
+diff --git a/cloudvolume/datasource/precomputed/sharding.py b/cloudvolume/datasource/precomputed/sharding.py
+index 3f71a012c..991e2c873 100644
+--- a/cloudvolume/datasource/precomputed/sharding.py
++++ b/cloudvolume/datasource/precomputed/sharding.py
+@@ -3,6 +3,7 @@
+ from collections import namedtuple, defaultdict
+ import copy
+ import json
++from os.path import basename
+ import struct
+ 
+ import numpy as np
+@@ -273,6 +274,39 @@ def get_index(self, filename, path=""):
+     self.shard_index_cache[filename] = index
+     return index
+ 
++  def get_indices(self, filenames, path="", progress=None):
++    filenames = toiter(filenames)
++    filenames = [ self.meta.join(path, fname) for fname in filenames ]
++
++    fufilled = { 
++      fname: self.shard_index_cache[fname] \
++      for fname in filenames \
++      if fname in self.shard_index_cache  
++    }
++    requests = []
++    for fname in filenames:
++      if fname in fufilled:
++        continue
++      requests.append({
++        'path': fname, 
++        'local_alias': fname + '.index', 
++        'start': 0, 
++        'end': self.spec.index_length(),
++      })
++
++    progress = 'Shard Indices' if progress else False
++    binaries = self.cache.download_as(requests, progress=progress)
++    for (fname, start, end), content in binaries.items():
++      try:
++        index = self.decode_index(content, fname)
++        self.shard_index_cache[fname] = index
++        fufilled[fname] = index
++      except EmptyFileException:
++        self.shard_index_cache[fname] = None
++        fufilled[fname] = None
++
++    return fufilled
++
+   def decode_index(self, binary, filename='Shard'):
+     if binary is None or len(binary) == 0:
+       raise EmptyFileException(filename + " was zero bytes.")
+@@ -306,17 +340,87 @@ def decode_minishard_index(self, minishard_index, filename=''):
+     return minishard_index 
+ 
+   def get_minishard_index(self, filename, index, minishard_no, path=""):
++    """
++    Retrieves the minishard index for a given minishard number.
++
++    Returns: uint64 Nx3 array with multiple rows of [segid, byte start, byte end]
++    """
+     res = self.get_minishard_indices(filename, index, minishard_no, path)
+     return res[minishard_no]
+ 
+   def get_minishard_indices(self, filename, index, minishard_nos, path=""):
+     """
+-    Retrieves the minishard index for a given minishard number.
++    Retrieves the minishard indices for a set of minishard numbers.
+ 
+-    Returns: uint64 Nx3 array with multiple rows of [segid, byte start, byte end]
++    Returns: { minishard_no: uint64 Nx3 array of [segid, byte start, byte end], ... }
++    """
++    res = self.get_minishard_indices_for_files(( (filename, index, minishard_nos), ), path)
++    return res[filename]
++
++  def get_minishard_indices_for_files(self, requests, path="", progress=None):
++    """
++    Fetches the specified minishard indices for all the specified files
++    at once. This is required to get high performance as opposed to fetching
++    the all minishard indices for a single file.
++
++    requests: iterable of tuples
++      [  (filename, index, minishard_numbers), ... ]
++
++    Returns: map of filename -> minishard numbers -> minishard indices
++
++    e.g. 
++    {
++      filename_1: {
++          0: uint64 Nx3 array of [segid, byte start, byte end],
++          1: ...,
++      }
++      filename_2: ...
++    }
++    """
++    fufilled_by_filename = defaultdict(dict)
++    msn_map = {}
++
++    download_requests = []
++    for filename, index, minishard_nos in requests:
++      fufilled_requests, pending_requests = self.compute_minishard_index_requests(
++        filename, index, minishard_nos, path
++      ) 
++      fufilled_by_filename[filename] = fufilled_requests
++      for msn, start, end in pending_requests:
++        msn_map[(filename, start, end)] = msn
++
++        filepath = self.meta.join(path, filename)
++
++        download_requests.append({
++          'path': filepath,
++          'local_alias': '{}-{}.msi'.format(filepath, msn),
++          'start': start,
++          'end': end,
++        })
++
++    progress = 'Minishard Indices' if progress else False
++    results = self.cache.download_as(download_requests, progress=progress)
++  
++    for (filename, start, end), content in results.items():
++      filename = basename(filename)
++      cache_key = (filename, start, end)
++      msn = msn_map[cache_key]
++      minishard_index = self.decode_minishard_index(content, filename)
++      self.minishard_index_cache[cache_key] = minishard_index
++      fufilled_by_filename[filename][msn] = minishard_index
++
++    return fufilled_by_filename
++
++  def compute_minishard_index_requests(self, filename, index, minishard_nos, path=""):
++    """
++    Helper method for get_minishard_indices_for_files. 
++    Computes which requests must be made over the network vs can be fufilled from LRU cache.
+     """
+     minishard_nos = toiter(minishard_nos)
+ 
++    if index is None:
++      return ({ msn: None for msn in minishard_nos }, [])
++
+     fufilled_requests = {}
+ 
+     byte_ranges = {}
+@@ -339,30 +443,11 @@ def get_minishard_indices(self, filename, index, minishard_nos, path=""):
+       if cache_key in self.minishard_index_cache:
+         fufilled_requests[msn] = self.minishard_index_cache[cache_key]
+       else:
+-        pending_requests.append((bytes_start, bytes_end))
+-
+-    StorageClass = SimpleStorage if len(pending_requests) == 1 else Storage
+-
+-    with StorageClass(full_path) as stor:
+-      filenames = ( filename for _ in pending_requests )
+-      starts = ( start for (start, end) in pending_requests )
+-      ends = ( end for (start, end) in pending_requests )
+-      results = stor.get_files(filenames, starts, ends)
+-  
+-    del pending_requests
++        pending_requests.append((msn, bytes_start, bytes_end))
+ 
+-    byte_ranges = { v: k for k, v in byte_ranges.items() }
+-    for res in results:
+-      start, end = res['byte_range']
+-      msn = byte_ranges[(start, end)]
+-      cache_key = (filename, start, end)
+-      minishard_index = self.decode_minishard_index(res['content'], filename)
+-      self.minishard_index_cache[cache_key] = minishard_index
+-      fufilled_requests[msn] = minishard_index
+-
+-    return fufilled_requests
++    return (fufilled_requests, pending_requests)
+ 
+-  def exists(self, labels, path="", return_byte_range=False):
++  def exists(self, labels, path="", return_byte_range=False, progress=None):
+     """
+     Checks a shard's minishard index for whether a file exists.
+ 
+@@ -384,45 +469,46 @@ def exists(self, labels, path="", return_byte_range=False):
+     except TypeError:
+       return_one = True
+ 
+-    results = {}
++    to_labels = defaultdict(list)
++    to_all_labels = defaultdict(list)
++    filename_to_minishard_num = defaultdict(list)
++
+     for label in set(toiter(labels)):
+       filename, minishard_number = self.compute_shard_location(label)
+-      
+-      filepath = self.meta.join(path, filename)
+-
+-      if self.cache.enabled:
+-        cached = self.cache.has(self.meta.join(path, str(label)), progress=False)
+-        if cached is not None:
+-          results[label] = filepath
+-          continue
++      to_labels[(filename, minishard_number)].append(label)
++      to_all_labels[filename].append(label)
++      filename_to_minishard_num[filename].append(minishard_number)
+ 
+-      try:
+-        index = self.get_index(filename, path)
+-      except EmptyFileException:
+-        results[label] = None
+-        continue
++    indices = self.get_indices(to_all_labels.keys(), path, progress=progress)
+ 
+-      minishard_index = self.get_minishard_index(
+-        filename, index, 
+-        minishard_number, path
+-      )
++    all_minishards = self.get_minishard_indices_for_files([ 
++      (basename(filepath), index, filename_to_minishard_num[basename(filepath)]) \
++      for filepath, index in indices.items()
++    ], path, progress=progress)
+ 
+-      if minishard_index is None:
+-        results[label] = None
+-        continue
+-
+-      idx = np.where(minishard_index[:,0] == label)[0]
+-      if len(idx) == 0:
+-        results[label] = None
+-      else:
+-        if return_byte_range:
+-          _, offset, size = minishard_index[idx,:][0]
+-          results[label] = [ filepath, int(offset), int(size) ]
+-        else:
+-          results[label] = filepath
++    results = {}
++    for filename, file_minishards in all_minishards.items():
++      filepath = self.meta.join(path, filename)
++      for mini_no, msi in file_minishards.items():
++        labels = to_labels[(filename, mini_no)]
++
++        for label in labels:
++          if msi is None:
++            results[label] = None
++            continue
++
++          idx = np.where(msi[:,0] == label)[0]
++          if len(idx) == 0:
++            results[label] = None
++          else:
++            if return_byte_range:
++              _, offset, size = msi[idx,:][0]
++              results[label] = [ filepath, int(offset), int(size) ]
++            else:
++              results[label] = filepath
+ 
+     if return_one:
+-      return results[label]
++      return next(results.values())
+     return results
+ 
+   def disassemble_shard(self, shard):
+diff --git a/cloudvolume/lib.py b/cloudvolume/lib.py
+index 09963f3d3..cfb65be3f 100644
+--- a/cloudvolume/lib.py
++++ b/cloudvolume/lib.py
+@@ -58,6 +58,15 @@ def toiter(obj, is_iter=False):
+       return [ obj ], False
+     return [ obj ]
+ 
++def duplicates(lst):
++  dupes = []
++  seen = set()
++  for elem in lst:
++    if elem in seen:
++      dupes.append(elem)
++    seen.add(elem)
++  return set(dupes)
++
+ def jsonify(obj, **kwargs):
+   return json.dumps(obj, cls=NumpyEncoder, **kwargs)
+ 
+diff --git a/cloudvolume/scheduler.py b/cloudvolume/scheduler.py
+index 555243843..f3565bb3f 100644
+--- a/cloudvolume/scheduler.py
++++ b/cloudvolume/scheduler.py
+@@ -9,14 +9,27 @@ def schedule_threaded_jobs(
+     progress=None, total=None
+   ):
+ 
+-  def wrap(fn):
+-    def wrapped(iface):
+-      return fn()
+-    return wrapped
++  if total is None:
++    try:
++      total = len(fns)
++    except TypeError: # generators don't have len
++      pass
++
++  pbar = tqdm(total=total, desc=progress, disable=(not progress))
++  results = []
++  
++  def updatefn(fn):
++    def realupdatefn(iface):
++      res = fn()
++      pbar.update(1)
++      results.append(res)
++    return realupdatefn
+ 
+-  with ThreadedQueue(n_threads=concurrency, progress=progress) as tq:
++  with ThreadedQueue(n_threads=concurrency) as tq:
+     for fn in fns:
+-      tq.put(wrap(fn))
++      tq.put(updatefn(fn))
++
++  return results
+ 
+ def schedule_green_jobs(
+     fns, concurrency=DEFAULT_THREADS, 
+diff --git a/cloudvolume/storage/storage.py b/cloudvolume/storage/storage.py
+index 9a0d7ed71..31a993aca 100644
+--- a/cloudvolume/storage/storage.py
++++ b/cloudvolume/storage/storage.py
+@@ -7,12 +7,13 @@
+ import posixpath
+ import re
+ from functools import partial
++import types
+ 
+ from tqdm import tqdm
+ 
+ from cloudvolume import compression
+ from cloudvolume.exceptions import UnsupportedProtocolError
+-from cloudvolume.lib import mkdir, scatter, jsonify
++from cloudvolume.lib import mkdir, scatter, jsonify, duplicates
+ from cloudvolume.threaded_queue import ThreadedQueue, DEFAULT_THREADS
+ from cloudvolume.scheduler import schedule_green_jobs
+ 
+@@ -55,6 +56,12 @@ def __init__(self, layer_path, progress=False):
+   def layer_path(self):
+     return self._layer_path
+ 
++  def progress_description(self, prefix):
++    if isinstance(self.progress, str):
++      return prefix + ' ' + self.progress
++    else:
++      return prefix if self.progress else None
++
+   def get_connection(self):
+     return self._interface_cls(self._path)
+ 
+@@ -144,7 +151,8 @@ def put_files(self, files, content_type=None, compress=None, compress_level=None
+     Required:
+       files: [ (filepath, content), .... ]
+     """
+-    for path, content in tqdm(files, disable=(not self.progress), desc="Uploading"):
++    desc = self.progress_description('Uploading')
++    for path, content in tqdm(files, disable=(not self.progress), desc=desc):
+       content = compression.compress(content, method=compress, compress_level=compress_level)
+       self._interface.put_file(path, content, content_type, compress, cache_control=cache_control)
+     return self
+@@ -178,7 +186,7 @@ def get_files(self, file_paths, starts=None, ends=None):
+     iterator = tqdm(
+       zip(file_paths, starts, ends),
+       disable=(not self.progress), 
+-      desc="Downloading"
++      desc=self.progress_description("Downloading")
+     )
+ 
+     results = []
+@@ -281,9 +289,10 @@ def exist_thunk(paths):
+       with self.get_connection() as conn:
+         results.update(conn.files_exist(paths))
+     
++    desc = self.progress_description('Existence Testing')
+     schedule_green_jobs(  
+       fns=( partial(exist_thunk, paths) for paths in scatter(file_paths, self.concurrency) ),
+-      progress=('Existence Testing' if self.progress else None),
++      progress=(desc if self.progress else None),
+       concurrency=self.concurrency,
+       total=len(file_paths),
+     )
+@@ -333,12 +342,14 @@ def getfn(path, start, end):
+         "error": error,
+       }
+ 
++    desc = self.progress_description('Downloading')
++
+     return schedule_green_jobs(  
+       fns=( 
+         partial(getfn, path, start, end) 
+         for path, start, end in zip(file_paths, starts, ends) 
+       ),
+-      progress=('Downloading' if self.progress else None),
++      progress=(desc if self.progress else None),
+       concurrency=self.concurrency,
+       total=len(file_paths),
+     )
+@@ -369,12 +380,18 @@ def uploadfn(path, content):
+           cache_control=cache_control,
+         )
+ 
++    if not isinstance(gen, types.GeneratorType):
++      dupes = duplicates([ path for path, content in files ])
++      if dupes:
++        raise ValueError("Cannot write the same file multiple times in one pass. This causes a race condition. Files: " + ", ".join(dupes))
++
+     fns = ( partial(uploadfn, path, content) for path, content in files )
+ 
+     if block:
++      desc = desc = self.progress_description('Uploading')
+       schedule_green_jobs(
+         fns=fns,
+-        progress=('Uploading' if self.progress else None),
++        progress=(desc if self.progress else None),
+         concurrency=self.concurrency,
+         total=len(files),
+       )
+@@ -405,9 +422,11 @@ def thunk_delete(path):
+       with self.get_connection() as conn:
+         conn.delete_file(path)
+ 
++    desc = self.progress_description('Deleting')
++
+     schedule_green_jobs(
+       fns=( partial(thunk_delete, path) for path in file_paths ),
+-      progress=('Deleting' if self.progress else None),
++      progress=(desc if self.progress else None),
+       concurrency=self.concurrency,
+       total=len(file_paths),
+     )
+@@ -518,7 +537,12 @@ def put_files(self, files, content_type=None, compress=None, compress_level=None
+     def base_uploadfn(path, content, interface):
+       interface.put_file(path, content, content_type, compress, cache_control=cache_control)
+ 
++    seen = set() 
+     for path, content in files:
++      if path in seen:
++        raise ValueError("Cannot write the same file multiple times in one pass. This causes a race condition. File: " + path)
++      seen.add(path)
++
+       content = compression.compress(content, method=compress, compress_level=compress_level)
+       uploadfn = partial(base_uploadfn, path, content)
+ 
+@@ -528,7 +552,7 @@ def base_uploadfn(path, content, interface):
+         uploadfn(self._interface)
+ 
+     if block:
+-      desc = 'Uploading' if self.progress else None
++      desc = self.progress_description('Uploading')
+       self.wait(desc)
+ 
+     return self
+@@ -556,7 +580,7 @@ def exist_thunk(paths, interface):
+     else:
+       exist_thunk(file_paths, self._interface)
+ 
+-    desc = 'Existence Testing' if self.progress else None
++    desc = self.progress_description('Existence Testing')
+     self.wait(desc)
+ 
+     return results
+@@ -604,7 +628,7 @@ def get_file_thunk(path, start, end, interface):
+       else:
+         get_file_thunk(path, start, end, self._interface)
+ 
+-    desc = 'Downloading' if self.progress else None
++    desc = self.progress_description('Downloading')
+     self.wait(desc)
+ 
+     return results
+@@ -632,7 +656,7 @@ def thunk_delete(path, interface):
+       else:
+         thunk_delete(path, self._interface)
+ 
+-    desc = 'Deleting' if self.progress else None
++    desc = self.progress_description('Deleting')
+     self.wait(desc)
+ 
+     return self

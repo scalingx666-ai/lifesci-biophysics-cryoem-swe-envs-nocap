@@ -1,0 +1,292 @@
+diff --git a/README.md b/README.md
+index 9553559f8..c2f1b3615 100644
+--- a/README.md
++++ b/README.md
+@@ -272,6 +272,7 @@ exists = vol.image.has_data(mip=0) # boolean check to see if any data is there
+ listing = vol.delete( np.s_[0:64, 0:128, 0:64] ) # delete this region (bbox must be chunk aligned)
+ vol[64:128, 64:128, 64:128] = image # Write a 64^3 image to the volume
+ img = vol.download_point( (x,y,z), size=256, mip=3 ) # download region around (mip 0) x,y,z at mip 3
++pts = vol.scattered_points([ (x1,y1,z1), (x2,y2,z2) ]) # download voxel labels located at indicated points
+ # download image files without decompressing or rendering them. Good for caching!
+ files = vol.download_files(bbox, mip, decompress=False) 
+ 
+diff --git a/cloudvolume/datasource/precomputed/image/__init__.py b/cloudvolume/datasource/precomputed/image/__init__.py
+index f39b29e29..f7e977ab4 100644
+--- a/cloudvolume/datasource/precomputed/image/__init__.py
++++ b/cloudvolume/datasource/precomputed/image/__init__.py
+@@ -7,7 +7,8 @@
+ 
+ This datasource contains the code for manipulating images.
+ """
+-from functools import reduce
++from typing import Dict, Tuple, Sequence, Union
++from functools import reduce, partial
+ import itertools
+ import operator
+ import uuid
+@@ -19,7 +20,8 @@
+ 
+ from cloudvolume import lib, exceptions
+ from cloudvolume.lru import LRU
+-from ....lib import Bbox, Vec, sip, first, BboxLikeType
++from cloudvolume.scheduler import schedule_jobs, DEFAULT_THREADS
++from ....lib import Bbox, Vec, sip, first, BboxLikeType, toiter
+ from .... import sharedmemory, chunks
+ 
+ from ... import autocropfn, readonlyguard, ImageSourceInterface
+@@ -104,6 +106,38 @@ def has_data(self, mip=None):
+     key = self.meta.key(mip)
+     return first(cf.list(prefix=key)) is not None
+ 
++  def download_points(
++    self, points, mip:int
++  ) -> Dict[Tuple[int,int,int], int]:
++    """For accessing a list of individual voxels."""
++    total = len(points) if hasattr(points, "__len__") else None
++    points = toiter(points)
++    bbxs = ( Bbox(pt, Vec(*pt)+1) for pt in points )
++
++    res = {}
++    def getpt(bbx):
++      nonlocal mip
++      value = self.download(bbx, mip)
++      res[tuple(bbx.minpt)] = value[0][0][0][0]
++
++    fns = ( partial(getpt, bbx) for bbx in bbxs )
++    progress = self.config.progress
++    if progress and not isinstance(progress, str):
++      progress = "Downloading"
++
++    concurrency = DEFAULT_THREADS
++    if self.meta.path.protocol == "file":
++      concurrency = 0
++
++    schedule_jobs(
++      fns, 
++      concurrency=concurrency,
++      progress=progress, 
++      total=total, 
++      green=self.config.green,
++    )
++    return res
++
+   def download(
+       self, bbox, mip, parallel=1, 
+       location=None, retain=False,
+diff --git a/cloudvolume/datasource/precomputed/metadata.py b/cloudvolume/datasource/precomputed/metadata.py
+index 2d81f53a2..4dc23ec31 100644
+--- a/cloudvolume/datasource/precomputed/metadata.py
++++ b/cloudvolume/datasource/precomputed/metadata.py
+@@ -632,7 +632,7 @@ def bbox(self, mip):
+   def point_to_mip(self, pt, mip, to_mip):
+     pt = Vec(*pt)
+     downsample_ratio = self.resolution(mip).astype(np.float32) / self.resolution(to_mip).astype(np.float32)
+-    return np.floor(pt * downsample_ratio)
++    return np.floor(pt * downsample_ratio).astype(np.int64)
+ 
+   def bbox_to_mip(self, bbox, mip, to_mip):
+     """Convert bbox or slices from one mip level to another."""
+diff --git a/cloudvolume/frontends/graphene.py b/cloudvolume/frontends/graphene.py
+index f7986946c..beb3afdf0 100644
+--- a/cloudvolume/frontends/graphene.py
++++ b/cloudvolume/frontends/graphene.py
+@@ -71,7 +71,82 @@ def graph_chunk_size(self):
+   def mesh_chunk_size(self):
+     # TODO: add this as new parameter to the info as it can be different from the chunkedgraph chunksize
+     return self.meta.mesh_chunk_size
+-  
++
++  def scattered_points(
++    self, pts, 
++    mip=None, coord_resolution=None,
++    agglomerate=None, timestamp=None, stop_layer=None,
++  ):
++    """
++    Download one or more single voxel values that may be scattered
++    across the dataset. You can accelerate this query with an LRU
++    if there is some spatial localization.
++
++    pts: iterable of triples
++    mip: which resolution level to get (default self.mip)
++    coord_resolution: (rx,ry,rz) the coordinate resolution of the input point.
++      Sometimes Neuroglancer is working in the resolution of another
++      higher res layer and this can help correct that.
++
++    agglomerate: if true, remap all watershed ids in the volume
++      and return a flat segmentation.
++
++    if agglomerate is true these options are available:
++
++    timestamp: (agglomerate only) get the roots from this date and time
++      formats accepted:
++        int: unix timestamp
++        datetime: self explainatory
++        string: ISO 8601 date
++    stop_layer: (agglomerate only) (int) if specified, return the lowest 
++      parent at or above that layer. If not specified, go all the way 
++      to the root id. 
++        Layer 1: Watershed
++        Layer 2: Within-Chunk Agglomeration
++        Layer 2+: Between chunk interconnections (skip connections possible)
++
++    If agglomerate is None, then the cv.meta.agglomerate controls
++    its value.
++
++    Returns: 
++    
++      { (x,y,z): label, ... }
++    """
++    pts = list(pts)
++    if isinstance(pts[0], int):
++      pts = [ pts ]
++
++    if mip is None:
++      mip = self.mip
++    mip = self.meta.to_mip(mip)
++
++    if coord_resolution is not None:
++      factor = self.meta.resolution(0) / Vec(*coord_resolution)
++      pts = [ Vec(*pt) / factor for pt in pts ]
++
++    pts = set([ tuple(self.point_to_mip(pt, mip=0, to_mip=mip)) for pt in pts ])
++    results = self.image.download_points(pts, mip)
++
++    agglomerate = agglomerate if agglomerate is not None else self.agglomerate
++    if (agglomerate and stop_layer is not None) and (stop_layer <= 0 or stop_layer > self.meta.n_layers):
++      raise ValueError(
++        f"Stop layer {stop_layer} must be "
++        f"1 <= stop_layer <= {self.meta.n_layers} or None."
++      )
++
++    if not agglomerate:
++      return results
++
++    labels = np.array(list(results.values()), dtype=np.uint64)
++    roots = self.agglomerate_cutout(
++      labels, 
++      timestamp=timestamp, 
++      stop_layer=stop_layer,
++      in_place=False,
++    )
++    mapping = { segid: root for segid, root in zip(labels, roots) }
++    return { pt: mapping[label] for pt, label in results.items() }
++
+   def download_point(
+     self, pt, size=256, 
+     mip=None, parallel=None, 
+@@ -445,10 +520,13 @@ def download(
+       return img, renumber_remap
+     return img
+   
+-  def agglomerate_cutout(self, img, timestamp=None, stop_layer=None):
++  def agglomerate_cutout(self, img, timestamp=None, stop_layer=None, in_place=True):
+     """Remap a graphene volume to its latest root ids. This creates a flat segmentation."""
+     if np.all(img == self.image.background_color) or stop_layer == 1:
+-      return img
++      if not in_place:
++        return np.copy(img)
++      else:
++        return img
+ 
+     labels = fastremap.unique(img)
+     if labels.size and labels[0] == 0:
+@@ -456,7 +534,7 @@ def agglomerate_cutout(self, img, timestamp=None, stop_layer=None):
+ 
+     roots = self.get_roots(labels, timestamp=timestamp, binary=True, stop_layer=stop_layer)
+     mapping = { segid: root for segid, root in zip(labels, roots) }
+-    return fastremap.remap(img, mapping, preserve_missing_labels=True, in_place=True)
++    return fastremap.remap(img, mapping, preserve_missing_labels=True, in_place=in_place)
+ 
+   def __getitem__(self, slices):
+     return self.download(
+@@ -476,7 +554,7 @@ def get_chunk_layer(self, node_or_chunk_id):
+ 
+   def get_root(self, segid, *args, **kwargs):
+     """Deprecated. Get a single root id for a single segid."""
+-    return get_roots(segid, *args, **kwargs)[0]
++    return self.get_roots(segid, *args, **kwargs)[0]
+ 
+   def get_roots(self, segids, timestamp=None, binary=True, stop_layer=None):
+     """
+diff --git a/cloudvolume/frontends/precomputed.py b/cloudvolume/frontends/precomputed.py
+index 39f7ebbb4..fc64f1bb7 100644
+--- a/cloudvolume/frontends/precomputed.py
++++ b/cloudvolume/frontends/precomputed.py
+@@ -735,6 +735,39 @@ def download(
+     else:
+       return img
+ 
++  def scattered_points(
++    self, pts, 
++    mip=None, coord_resolution=None
++  ):
++    """
++    Download one or more single voxel values that may be scattered
++    across the dataset. You can accelerate this query with an LRU
++    if there is some spatial localization.
++
++    pts: iterable of triples
++    mip: which resolution level to get (default self.mip)
++    coord_resolution: (rx,ry,rz) the coordinate resolution of the input point.
++      Sometimes Neuroglancer is working in the resolution of another
++      higher res layer and this can help correct that.
++
++    Returns:     
++      { (x,y,z): label, ... }
++    """
++    pts = list(pts)
++    if isinstance(pts[0], int):
++      pts = [ pts ]
++
++    if mip is None:
++      mip = self.mip
++    mip = self.meta.to_mip(mip)
++
++    if coord_resolution is not None:
++      factor = self.meta.resolution(0) / Vec(*coord_resolution)
++      pts = [ Vec(*pt) / factor for pt in pts ]
++
++    pts = set([ tuple(self.point_to_mip(pt, mip=0, to_mip=mip)) for pt in pts ])
++    return self.image.download_points(pts, mip)
++
+   def download_point(
+     self, pt, size=256, 
+     mip=None, parallel=None, 
+diff --git a/test/test_cloudvolume.py b/test/test_cloudvolume.py
+index b1b967ab5..f158819c7 100644
+--- a/test/test_cloudvolume.py
++++ b/test/test_cloudvolume.py
+@@ -541,6 +541,33 @@ def test_download_files():
+   files = cv.download_files(cv.bounds, cache_only=True)
+   assert files == {}
+ 
++def test_download_points():
++  delete_layer()
++  cv, img = create_layer(size=(256,256,256,1), offset=(0,0,0))
++
++  pts = np.random.randint(0,256, size=(20,3), dtype=np.uint64)
++  res = cv.image.download_points(pts, mip=0)
++
++  for pt in pts:
++    pt = tuple(pt)
++    label = cv[pt]
++    assert label == res[pt]
++
++def test_scattered_points():
++  delete_layer()
++  cv, img = create_layer(size=(256,256,256,1), offset=(0,0,0))
++
++  pts = np.random.randint(0,256, size=(20,3), dtype=np.uint64)
++  res = cv.scattered_points(pts)
++
++  for pt in pts:
++    pt = tuple(pt)
++    label = cv[pt]
++    assert label == res[pt]
++
++  res = cv.scattered_points([0,0,0])
++  assert res[(0,0,0)] == cv[0,0,0]
++
+ def test_numpy_memmap():
+   delete_layer()
+   cv, data = create_layer(size=(50,50,50,1), offset=(0,0,0))

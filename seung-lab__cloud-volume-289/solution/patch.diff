@@ -1,0 +1,401 @@
+diff --git a/cloudvolume/__init__.py b/cloudvolume/__init__.py
+index a0ae4ebe4..c86f70c86 100644
+--- a/cloudvolume/__init__.py
++++ b/cloudvolume/__init__.py
+@@ -50,6 +50,7 @@
+ 
+ from .connectionpools import ConnectionPool
+ from .lib import Bbox, Vec
++from .mesh import Mesh
+ from .provenance import DataLayerProvenance
+ from .storage import Storage
+ from .threaded_queue import ThreadedQueue
+@@ -77,7 +78,7 @@
+ register_graphene()
+ 
+ try:
+-  from .datasource.boss  import register as register_boss
++  from .datasource.boss import register as register_boss
+   register_boss()
+ except ImportError:
+   pass
+diff --git a/cloudvolume/datasource/precomputed/mesh/metadata.py b/cloudvolume/datasource/precomputed/mesh/metadata.py
+index 63e340fa8..703a6583a 100644
+--- a/cloudvolume/datasource/precomputed/mesh/metadata.py
++++ b/cloudvolume/datasource/precomputed/mesh/metadata.py
+@@ -1,7 +1,11 @@
++import re
++
+ from ....lib import jsonify
+ 
+ import numpy as np
+ 
++MESH_MIP_REGEXP = re.compile(r'mesh_mip_(\d+)')
++
+ class PrecomputedMeshMetadata(object):
+   def __init__(self, meta, cache=None, info=None):
+     self.meta = meta
+@@ -12,6 +16,27 @@ def __init__(self, meta, cache=None, info=None):
+     else:
+       self.info = self.fetch_info()
+ 
++  @property
++  def chunk_size(self):
++    if 'chunk_size' in self.info:
++      return self.info['chunk_size']
++    return None
++
++  @property
++  def mip(self):
++    if 'mip' in self.info:
++      return int(self.info['mip'])
++    
++    # Igneous has long used mesh_mip_N_err_M to store
++    # some information about the meshing job. Let's 
++    # exploit that for now.
++    matches = re.search(MESH_MIP_REGEXP, self.mesh_path)
++    if matches is None:
++      return None 
++
++    mip, = matches.groups()
++    return int(mip)
++  
+   @property
+   def spatial_index(self):
+     if 'spatial_index' in self.info:
+diff --git a/cloudvolume/datasource/precomputed/mesh/unsharded.py b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+index 5e75e65d8..10db52562 100644
+--- a/cloudvolume/datasource/precomputed/mesh/unsharded.py
++++ b/cloudvolume/datasource/precomputed/mesh/unsharded.py
+@@ -150,8 +150,24 @@ def get(
+     if not chunk_size:
+       return mesh.consolidate()
+ 
+-    resolution = self.meta.resolution(self.config.mip)
+-    return mesh.deduplicate_chunk_boundaries(chunk_size*resolution, is_draco=False)
++    if self.meta.mip is not None:
++      mip = self.meta.mip
++    else:
++      # This will usually be wrong, but it's backwards compatible.
++      # Throwing an exception instead would probably break too many
++      # things.
++      mip = self.config.mip
++
++    if mip not in self.meta.meta.available_mips:
++      raise exceptions.ScaleUnavailableError("mip {} is not available.".format(mip))
++
++    resolution = self.meta.meta.resolution(mip)
++    chunk_offset = self.meta.meta.voxel_offset(mip)
++
++    return mesh.deduplicate_chunk_boundaries(
++      chunk_size * resolution, is_draco=False,
++      offset=(chunk_offset * resolution)
++    )
+ 
+   def save(self, segids, filepath=None, file_format='ply'):
+     """
+diff --git a/cloudvolume/mesh.py b/cloudvolume/mesh.py
+index 9b866f488..bd121bc92 100644
+--- a/cloudvolume/mesh.py
++++ b/cloudvolume/mesh.py
+@@ -4,7 +4,7 @@
+ import numpy as np
+ 
+ from .exceptions import MeshDecodeError
+-from .lib import yellow
++from .lib import yellow, Vec
+ 
+ NOTICE = {
+   'vertices': 0,
+@@ -16,7 +16,7 @@ def deprecation_notice(key):
+   if NOTICE[key] < 1:
+     print(yellow("""
+   Deprecation Notice: Meshes, formerly dicts, are now PrecomputedMesh objects
+-  as of CloudVolume 0.51.0. 
++  as of CloudVolume 0.51.0, renamed to Mesh objects as of 0.53.0
+ 
+   Please change mesh['{}'] to mesh.{}
+   """.format(key, key)))
+@@ -41,11 +41,10 @@ class Mesh(object):
+   Represents the vertices, faces, and normals of a mesh
+   as numpy arrays.
+ 
+-  class PrecomputedMesh:
++  class Mesh:
+     ndarray[float32, ndim=2] self.vertices: [ [x,y,z], ... ]
+     ndarray[uint32,  ndim=2] self.faces:    [ [v1,v2,v3], ... ]
+     ndarray[float32, ndim=2] self.normals:  [ [nx,ny,nz], ... ]
+-
+   """
+   def __init__(
+     self, vertices, faces, normals=None, 
+@@ -325,14 +324,20 @@ def from_draco(cls, binary):
+       encoding_options=mesh_object.encoding_options
+     )
+ 
+-  def deduplicate_chunk_boundaries(self, chunk_size, is_draco=False, draco_grid_size=21):
++  def deduplicate_chunk_boundaries(
++    self, chunk_size, is_draco=False, 
++    draco_grid_size=21, offset=(0,0,0)
++  ):
++    offset = Vec(*offset)
++    verts = self.vertices - offset
++
+     # find all vertices that are exactly on chunk_size boundaries
+     if is_draco:
+-      is_chunk_aligned = is_draco_chunk_aligned(self.vertices, chunk_size, draco_grid_size=draco_grid_size)
++      is_chunk_aligned = is_draco_chunk_aligned(verts, chunk_size, draco_grid_size=draco_grid_size)
+     else:
+-      is_chunk_aligned = np.any(np.mod(self.vertices, chunk_size) == 0, axis=1)
++      is_chunk_aligned = np.any(np.mod(verts, chunk_size) == 0, axis=1)
+ 
+-    verts, faces = self.vertices, self.faces
++    faces = self.faces
+ 
+     # find all vertices that have exactly 2 duplicates
+     unique_vertices, unique_inverse, counts = np.unique(
+@@ -356,7 +361,7 @@ def deduplicate_chunk_boundaries(self, chunk_size, is_draco=False, draco_grid_si
+     vertices, newfaces = np.unique(new_vertices[faces], return_inverse=True, axis=0)
+     newfaces = newfaces.astype(np.uint32).reshape( (len(newfaces) // 3, 3) )
+ 
+-    return Mesh(vertices[:,0:3], newfaces, None, segid=self.segid, 
++    return Mesh(vertices[:,0:3] + offset, newfaces, None, segid=self.segid, 
+       encoding_type=self.encoding_type, encoding_options=self.encoding_options
+     )
+ 
+diff --git a/test/test_cloudvolume.py b/test/test_cloudvolume.py
+index adb45a3c4..0e475d9b3 100644
+--- a/test/test_cloudvolume.py
++++ b/test/test_cloudvolume.py
+@@ -1212,83 +1212,6 @@ def test_slices_to_global_coords():
+   result = Bbox.from_slices(slices)
+   assert result == Bbox( (100, 100, 1), (500, 512, 2) )
+ 
+-@pytest.mark.parametrize(("use_https"),[True, False])
+-def test_mesh_fragment_download(use_https):
+-  vol = CloudVolume('gs://seunglab-test/test_v0/segmentation', use_https=use_https)
+-  paths = vol.mesh._get_manifests(18)
+-  assert len(paths) == 1
+-  assert paths[18] == [ '18:0:0-512_0-512_0-100' ]
+-
+-  paths = vol.mesh._get_manifests(147)
+-  assert len(paths) == 1
+-  assert paths[147] == [ '147:0:0-512_0-512_0-100' ]
+-
+-
+-
+-def test_get_mesh():
+-  vol = CloudVolume('gs://seunglab-test/test_v0/segmentation')
+-  mesh = vol.mesh.get(18)
+-  assert len(mesh) == 6123
+-  assert mesh.vertices.shape[0] == 6123
+-  assert len(mesh.faces) == 12242
+-  assert isinstance(mesh.vertices, np.ndarray)
+-  assert mesh.vertices.dtype == np.float32
+-  assert mesh.faces.dtype == np.uint32
+-
+-  meshes = vol.mesh.get([148, 18], fuse=False)
+-  assert len(meshes) == 2
+-  mesh = meshes[18]
+-  assert len(mesh.vertices) == 6123
+-  assert len(mesh.vertices) == 6123
+-  assert len(mesh.faces) == 12242
+-  
+-  try:
+-    vol.mesh.get(666666666)
+-    assert False
+-  except ValueError:
+-    pass
+-
+-def test_get_mesh_caching():
+-  vol = CloudVolume('gs://seunglab-test/test_v0/segmentation', cache=True)
+-  vol.cache.flush()
+-
+-  mesh = vol.mesh.get(18)
+-  
+-  assert set(vol.cache.list_meshes()) == set([ '18:0:0-512_0-512_0-100.gz', '18:0' ])
+-
+-  assert len(mesh) == 6123
+-  assert mesh.vertices.shape[0] == 6123
+-  assert len(mesh.faces) == 12242
+-  assert isinstance(mesh.vertices, np.ndarray)
+-  assert mesh.vertices.dtype == np.float32
+-  assert mesh.faces.dtype == np.uint32
+-
+-  meshes = vol.mesh.get([148, 18], fuse=False)
+-  assert len(meshes) == 2
+-  mesh = meshes[18]
+-  assert len(mesh.vertices) == 6123
+-  assert len(mesh.vertices) == 6123
+-  assert len(mesh.faces) == 12242
+-  
+-  try:
+-    vol.mesh.get(666666666)
+-    assert False
+-  except ValueError:
+-    pass
+-
+-  vol.cache.flush()
+-
+-
+-def test_get_mesh_order_stability():
+-  vol = CloudVolume('gs://seunglab-test/test_v0/segmentation')
+-  first_mesh = vol.mesh.get([148, 18], fuse=True)
+-  
+-  for _ in range(5):
+-    next_mesh = vol.mesh.get([148, 18], fuse=True)
+-    assert len(first_mesh.vertices) == len(next_mesh.vertices)
+-    assert np.all(first_mesh.vertices == next_mesh.vertices)
+-    assert np.all(first_mesh.faces == next_mesh.faces)
+-
+ # def test_boss_download():
+ #   vol = CloudVolume('gs://seunglab-test/test_v0/image')
+ #   bossvol = CloudVolume('boss://automated_testing/test_v0/image')
+diff --git a/test/test_meshing.py b/test/test_meshing.py
+new file mode 100644
+index 000000000..a4f3a5278
+--- /dev/null
++++ b/test/test_meshing.py
+@@ -0,0 +1,142 @@
++import numpy as np
++import pytest 
++
++from cloudvolume import Vec, Bbox, CloudVolume, Storage, Mesh
++
++@pytest.mark.parametrize(("use_https"),[True, False])
++def test_mesh_fragment_download(use_https):
++  vol = CloudVolume('gs://seunglab-test/test_v0/segmentation', use_https=use_https)
++  paths = vol.mesh._get_manifests(18)
++  assert len(paths) == 1
++  assert paths[18] == [ '18:0:0-512_0-512_0-100' ]
++
++  paths = vol.mesh._get_manifests(147)
++  assert len(paths) == 1
++  assert paths[147] == [ '147:0:0-512_0-512_0-100' ]
++
++def test_get_mesh():
++  vol = CloudVolume('gs://seunglab-test/test_v0/segmentation')
++  mesh = vol.mesh.get(18)
++  assert len(mesh) == 6123
++  assert mesh.vertices.shape[0] == 6123
++  assert len(mesh.faces) == 12242
++  assert isinstance(mesh.vertices, np.ndarray)
++  assert mesh.vertices.dtype == np.float32
++  assert mesh.faces.dtype == np.uint32
++
++  meshes = vol.mesh.get([148, 18], fuse=False)
++  assert len(meshes) == 2
++  mesh = meshes[18]
++  assert len(mesh.vertices) == 6123
++  assert len(mesh.vertices) == 6123
++  assert len(mesh.faces) == 12242
++  
++  try:
++    vol.mesh.get(666666666)
++    assert False
++  except ValueError:
++    pass
++
++  # just don't crash
++  mesh = vol.mesh.get(18, chunk_size=(512, 512, 100), fuse=True)
++
++def test_duplicate_vertices():
++  verts = np.array([
++    [0,0,0], [0,1,0],
++    [1,0,0], [1,1,0],
++    [2,0,0], [2,1,0],
++    [3,0,0], [3,1,0], 
++    [3,0,0],
++    [4,0,0], [4,1,0],
++    [4,0,0],          # duplicate in x direction
++    [5,0,0], [5,1,0],
++    [5,0,0],
++    [6,0,0], [6,1,0], [6,1,2],
++    [7,0,0], [7,1,0],
++    [4,0,0]
++  ], dtype=np.float32)
++
++  faces = np.array([ 
++    [0,1,2], [2,3,4], [4,5,6], [7,8,9],
++    [9,10,11], [10,11,12],
++    [12,13,14], [14,15,16], [15,16,17],
++    [15,18,19], [18,19,20]
++  ], dtype=np.uint32)
++
++  mesh = Mesh(verts, faces, segid=666)
++
++  def deduplicate(mesh, x, offset_x=0):
++    return mesh.deduplicate_chunk_boundaries(
++      (x, 100, 100), is_draco=False, 
++      offset=(offset_x,-1,-1) # so y=0,z=0 isn't a chunk boundary
++    )
++
++  # test that triple 4 isn't affected
++  mesh2 = deduplicate(mesh, x=4)
++  assert not np.all(mesh.vertices == mesh2.vertices)
++  assert mesh2.vertices.shape[0] == mesh.vertices.shape[0] 
++
++  # pop off the last 4
++  mesh.vertices = mesh.vertices[:-1]
++  mesh.faces = mesh.faces[:-1]
++
++  # test that 4 is now affected
++  mesh2 = deduplicate(mesh, x=4)
++  assert not np.all(mesh.vertices == mesh2.vertices)
++  assert mesh2.vertices.shape[0] == mesh.vertices.shape[0] - 1
++
++  mesh2 = deduplicate(mesh, x=3)
++  assert not np.all(mesh.vertices == mesh2.vertices)
++  assert mesh2.vertices.shape[0] == mesh.vertices.shape[0] - 1
++
++  mesh2 = deduplicate(mesh, x=4, offset_x=-1)
++  assert not np.all(mesh.vertices == mesh2.vertices)
++  assert mesh2.vertices.shape[0] == mesh.vertices.shape[0] - 1
++
++  mesh2 = deduplicate(mesh, x=5)
++  assert not np.all(mesh.vertices == mesh2.vertices)
++  assert mesh2.vertices.shape[0] == mesh.vertices.shape[0] - 1
++
++  mesh2 = deduplicate(mesh, x=1)
++  assert not np.all(mesh.vertices == mesh2.vertices)
++  assert mesh2.vertices.shape[0] == mesh.vertices.shape[0] - 3
++
++def test_get_mesh_caching():
++  vol = CloudVolume('gs://seunglab-test/test_v0/segmentation', cache=True)
++  vol.cache.flush()
++
++  mesh = vol.mesh.get(18)
++  
++  assert set(vol.cache.list_meshes()) == set([ '18:0:0-512_0-512_0-100.gz', '18:0' ])
++
++  assert len(mesh) == 6123
++  assert mesh.vertices.shape[0] == 6123
++  assert len(mesh.faces) == 12242
++  assert isinstance(mesh.vertices, np.ndarray)
++  assert mesh.vertices.dtype == np.float32
++  assert mesh.faces.dtype == np.uint32
++
++  meshes = vol.mesh.get([148, 18], fuse=False)
++  assert len(meshes) == 2
++  mesh = meshes[18]
++  assert len(mesh.vertices) == 6123
++  assert len(mesh.vertices) == 6123
++  assert len(mesh.faces) == 12242
++  
++  try:
++    vol.mesh.get(666666666)
++    assert False
++  except ValueError:
++    pass
++
++  vol.cache.flush()
++
++def test_get_mesh_order_stability():
++  vol = CloudVolume('gs://seunglab-test/test_v0/segmentation')
++  first_mesh = vol.mesh.get([148, 18], fuse=True)
++  
++  for _ in range(5):
++    next_mesh = vol.mesh.get([148, 18], fuse=True)
++    assert len(first_mesh.vertices) == len(next_mesh.vertices)
++    assert np.all(first_mesh.vertices == next_mesh.vertices)
++    assert np.all(first_mesh.faces == next_mesh.faces)

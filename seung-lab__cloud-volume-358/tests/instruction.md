@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** feat(PrecomputedImage): add make_shard function
+
+## Description
+
+Enables writing single shards using the familiar upload syntax. Multiple shards will currently crash.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `29d4eb651ca9`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.
